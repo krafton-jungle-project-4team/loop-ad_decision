@@ -3,7 +3,7 @@ import pytest
 from app.metrics.schemas import FunnelMetricFilters
 from app.root_causes.repository import GroupedFunnelCountsRow
 from app.root_causes.schemas import RootCauseAnalysisRequest
-from app.root_causes.service import calculate_root_causes
+from app.root_causes.service import calculate_root_causes, resolve_candidate_dimensions
 
 
 class FakeRootCauseRepository:
@@ -180,6 +180,16 @@ def test_calculate_root_causes_excludes_filtered_dimensions_from_default_candida
     assert "channel" not in called_dimensions
     assert "campaign_id" in called_dimensions
     assert response.candidates == []
+
+
+def test_resolve_candidate_dimensions_rejects_explicit_filtered_dimension() -> None:
+    request = RootCauseAnalysisRequest.model_construct(
+        filters=FunnelMetricFilters(channel="kakao"),
+        candidate_dimensions=["channel"],
+    )
+
+    with pytest.raises(ValueError):
+        resolve_candidate_dimensions(request)
 
 
 def test_calculate_root_causes_evaluates_volume_anomaly_candidates() -> None:

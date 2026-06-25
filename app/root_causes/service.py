@@ -176,12 +176,22 @@ def build_anomaly_request(request: RootCauseAnalysisRequest):
 
 
 def resolve_candidate_dimensions(request: RootCauseAnalysisRequest) -> list[str]:
-    if request.candidate_dimensions is not None:
-        return list(dict.fromkeys(request.candidate_dimensions))
-
     filtered_dimensions = (
         set(request.filters.model_dump(exclude_none=True)) if request.filters else set()
     )
+
+    if request.candidate_dimensions is not None:
+        duplicated_filter_dimensions = [
+            dimension
+            for dimension in request.candidate_dimensions
+            if dimension in filtered_dimensions
+        ]
+        if duplicated_filter_dimensions:
+            raise ValueError(
+                "candidate_dimensions must not include fields already set in filters"
+            )
+        return list(dict.fromkeys(request.candidate_dimensions))
+
     return [
         dimension
         for dimension in FILTER_COLUMNS

@@ -96,6 +96,21 @@ def test_post_root_causes_funnel_rejects_unknown_candidate_dimension() -> None:
     assert response.status_code == 400
 
 
+def test_post_root_causes_funnel_rejects_filtered_candidate_dimension() -> None:
+    response = TestClient(app).post(
+        "/root-causes/funnel",
+        json={
+            "project_id": "loopad-demo-shop",
+            "window_start": "2026-06-24T17:00:00+09:00",
+            "window_end": "2026-06-24T18:00:00+09:00",
+            "filters": {"channel": "kakao"},
+            "candidate_dimensions": ["channel"],
+        },
+    )
+
+    assert response.status_code == 400
+
+
 def test_post_root_causes_funnel_rejects_warning_threshold_above_critical() -> None:
     response = TestClient(app).post(
         "/root-causes/funnel",

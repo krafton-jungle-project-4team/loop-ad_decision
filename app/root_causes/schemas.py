@@ -66,6 +66,19 @@ class RootCauseAnalysisRequest(BaseModel):
             if unknown_dimensions:
                 raise ValueError("candidate_dimensions contains unsupported fields")
 
+            filter_dimensions = (
+                set(self.filters.model_dump(exclude_none=True)) if self.filters else set()
+            )
+            duplicated_filter_dimensions = [
+                dimension
+                for dimension in self.candidate_dimensions
+                if dimension in filter_dimensions
+            ]
+            if duplicated_filter_dimensions:
+                raise ValueError(
+                    "candidate_dimensions must not include fields already set in filters"
+                )
+
         if self.warning_abs_drop > self.critical_abs_drop:
             raise ValueError("warning_abs_drop must be less than or equal to critical_abs_drop")
         if self.warning_relative_drop > self.critical_relative_drop:
