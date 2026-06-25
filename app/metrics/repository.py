@@ -91,6 +91,42 @@ FROM session_funnel
     return query, parameters
 
 
+def build_segment_values_query(
+    base_filters: FunnelMetricFilters | None,
+    segment_by: list[str],
+) -> tuple[str, dict[str, Any]]:
+    segment_columns = [FILTER_COLUMNS[segment_key] for segment_key in segment_by]
+    where_clauses = [
+        "project_id = {project_id:String}",
+        "event_time >= parseDateTime64BestEffort({window_start:String}, 3, 'Asia/Seoul')",
+        "event_time < parseDateTime64BestEffort({window_end:String}, 3, 'Asia/Seoul')",
+        "event_name IN ('product_view', 'add_to_cart', 'checkout_start', 'purchase')",
+    ]
+    parameters: dict[str, Any] = {}
+
+    if base_filters is not None:
+        for filter_key, filter_value in base_filters.model_dump(exclude_none=True).items():
+            column = FILTER_COLUMNS[filter_key]
+            parameter_name = f"filter_{filter_key}"
+            where_clauses.append(f"{column} = {{{parameter_name}:String}}")
+            parameters[parameter_name] = filter_value
+
+    for column in segment_columns:
+        where_clauses.append(f"{column} IS NOT NULL")
+        where_clauses.append(f"{column} != ''")
+
+    select_sql = ",\n    ".join(segment_columns)
+    where_sql = "\n  AND ".join(where_clauses)
+    query = f"""
+SELECT DISTINCT
+    {select_sql}
+FROM events
+WHERE {where_sql}
+LIMIT {{segment_limit:UInt32}}
+""".strip()
+    return query, parameters
+
+
 class FunnelMetricsRepository:
     def __init__(self, client: ClickHouseClient) -> None:
         self.client = client
@@ -113,3 +149,33 @@ class FunnelMetricsRepository:
         result = self.client.query(query, parameters=parameters)
         row = result.result_rows[0] if result.result_rows else (0, 0, 0, 0)
         return (int(row[0] or 0), int(row[1] or 0), int(row[2] or 0), int(row[3] or 0))
+
+    def fetch_segment_values(
+        self,
+        project_id: str,
+        window_start: datetime,
+        window_end: datetime,
+        base_filters: FunnelMetricFilters | None,
+        segment_by: list[str],
+        limit: int,
+    ) -> list[dict[str, str]]:
+        query, filter_parameters = build_segment_values_query(base_filters, segment_by)
+        parameters = {
+            "project_id": project_id,
+            "window_start": format_clickhouse_datetime(window_start),
+            "window_end": format_clickhouse_datetime(window_end),
+            "segment_limit": limit,
+            **filter_parameters,
+        }
+
+        result = self.client.query(query, parameters=parameters)
+        segments: list[dict[str, str]] = []
+        for row in result.result_rows:
+            values = {
+                segment_key: str(row[index])
+                for index, segment_key in enumerate(segment_by)
+                if row[index] is not None and str(row[index]) != ""
+            }
+            if len(values) == len(segment_by):
+                segments.append(values)
+        return segments

@@ -2,8 +2,13 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends
 
-from app.anomalies.schemas import FunnelAnomalyRequest, FunnelAnomalyResponse
-from app.anomalies.service import calculate_funnel_anomalies
+from app.anomalies.schemas import (
+    FunnelAnomalyRequest,
+    FunnelAnomalyResponse,
+    SegmentFunnelAnomalyRequest,
+    SegmentFunnelAnomalyResponse,
+)
+from app.anomalies.service import calculate_funnel_anomalies, calculate_segment_funnel_anomalies
 from app.db.clickhouse import ClickHouseClientFactory, get_clickhouse_client_factory
 from app.metrics.repository import FunnelMetricsRepository
 
@@ -18,3 +23,13 @@ def get_funnel_anomalies(
     with client_factory() as client:
         repository = FunnelMetricsRepository(client)
         return calculate_funnel_anomalies(request, repository)
+
+
+@router.post("/funnel/segments", response_model=SegmentFunnelAnomalyResponse)
+def get_segment_funnel_anomalies(
+    request: SegmentFunnelAnomalyRequest,
+    client_factory: Annotated[ClickHouseClientFactory, Depends(get_clickhouse_client_factory)],
+) -> SegmentFunnelAnomalyResponse:
+    with client_factory() as client:
+        repository = FunnelMetricsRepository(client)
+        return calculate_segment_funnel_anomalies(request, repository)

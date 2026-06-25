@@ -6,10 +6,13 @@ from app.anomalies.schemas import (
     FunnelAnomalyRequest,
     FunnelAnomalyResponse,
     FunnelAnomalyStatus,
+    SegmentFunnelAnomalyRequest,
+    SegmentFunnelAnomalyResponse,
+    SegmentFunnelAnomalyResult,
     VolumeAnomalyEvaluation,
 )
-from app.metrics.repository import FunnelMetricsRepository
-from app.metrics.schemas import FunnelMetricRequest, FunnelMetrics
+from app.metrics.repository import FunnelMetricsRepository, build_segment, normalize_to_event_timezone
+from app.metrics.schemas import FunnelMetricFilters, FunnelMetricRequest, FunnelMetrics
 from app.metrics.service import calculate_funnel_metrics
 
 
@@ -140,6 +143,121 @@ def calculate_funnel_anomalies(
         primary_anomaly=primary_anomaly,
         summary_message=build_summary_message(status, primary_anomaly),
     )
+
+
+def calculate_segment_funnel_anomalies(
+    request: SegmentFunnelAnomalyRequest,
+    repository: FunnelMetricsRepository,
+) -> SegmentFunnelAnomalyResponse:
+    baseline_start, baseline_end = resolve_segment_baseline_window(request)
+    segment_candidates = repository.fetch_segment_values(
+        project_id=request.project_id,
+        window_start=request.window_start,
+        window_end=request.window_end,
+        base_filters=request.base_filters,
+        segment_by=request.segment_by,
+        limit=request.candidate_limit,
+    )
+
+    evaluated_results = [
+        calculate_segment_result(
+            request=request,
+            repository=repository,
+            segment_values=segment_values,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+        )
+        for segment_values in segment_candidates
+    ]
+    anomalous_results = [
+        result
+        for result in evaluated_results
+        if result.status in {"warning", "critical"}
+    ]
+    sorted_results = sorted(
+        anomalous_results,
+        key=build_segment_sort_key,
+        reverse=True,
+    )[: request.limit]
+    status = resolve_segment_response_status(evaluated_results, sorted_results)
+
+    return SegmentFunnelAnomalyResponse(
+        project_id=request.project_id,
+        window_start=normalize_to_event_timezone(request.window_start),
+        window_end=normalize_to_event_timezone(request.window_end),
+        baseline_start=normalize_to_event_timezone(baseline_start),
+        baseline_end=normalize_to_event_timezone(baseline_end),
+        base_segment=build_segment(request.base_filters),
+        segment_by=request.segment_by,
+        status=status,
+        total_segments_discovered=len(segment_candidates),
+        total_segments_evaluated=len(evaluated_results),
+        segments=sorted_results,
+        summary_message=build_segment_summary_message(status, sorted_results),
+    )
+
+
+def resolve_segment_baseline_window(
+    request: SegmentFunnelAnomalyRequest,
+) -> tuple[datetime, datetime]:
+    if request.baseline_start is not None and request.baseline_end is not None:
+        return request.baseline_start, request.baseline_end
+
+    window_duration = request.window_end - request.window_start
+    return request.window_start - window_duration, request.window_start
+
+
+def calculate_segment_result(
+    *,
+    request: SegmentFunnelAnomalyRequest,
+    repository: FunnelMetricsRepository,
+    segment_values: dict[str, str],
+    baseline_start: datetime,
+    baseline_end: datetime,
+) -> SegmentFunnelAnomalyResult:
+    filters = build_segment_filters(request.base_filters, segment_values)
+    anomaly_response = calculate_funnel_anomalies(
+        FunnelAnomalyRequest(
+            project_id=request.project_id,
+            window_start=request.window_start,
+            window_end=request.window_end,
+            baseline_start=baseline_start,
+            baseline_end=baseline_end,
+            filters=filters,
+            min_sample_size=request.min_sample_size,
+            warning_abs_drop=request.warning_abs_drop,
+            critical_abs_drop=request.critical_abs_drop,
+            warning_relative_drop=request.warning_relative_drop,
+            critical_relative_drop=request.critical_relative_drop,
+            include_volume_anomalies=request.include_volume_anomalies,
+            min_volume_count=request.min_volume_count,
+            warning_volume_relative_drop=request.warning_volume_relative_drop,
+            critical_volume_relative_drop=request.critical_volume_relative_drop,
+        ),
+        repository,
+    )
+
+    return SegmentFunnelAnomalyResult(
+        segment=anomaly_response.segment,
+        status=anomaly_response.status,
+        score=calculate_segment_score(anomaly_response.primary_anomaly),
+        primary_anomaly=anomaly_response.primary_anomaly,
+        summary_message=anomaly_response.summary_message,
+        current_metrics=anomaly_response.current_metrics,
+        baseline_metrics=anomaly_response.baseline_metrics,
+        evaluations=anomaly_response.evaluations,
+        anomalies=anomaly_response.anomalies,
+        volume_evaluations=anomaly_response.volume_evaluations,
+        volume_anomalies=anomaly_response.volume_anomalies,
+    )
+
+
+def build_segment_filters(
+    base_filters: FunnelMetricFilters | None,
+    segment_values: dict[str, str],
+) -> FunnelMetricFilters:
+    values = base_filters.model_dump(exclude_none=True) if base_filters else {}
+    return FunnelMetricFilters(**{**values, **segment_values})
 
 
 def evaluate_funnel_metric(
@@ -378,6 +496,60 @@ def build_primary_anomaly_sort_key(
     return severity_rank, float(anomaly.drop_point or 0)
 
 
+def calculate_segment_score(
+    primary_anomaly: FunnelAnomalyEvaluation | VolumeAnomalyEvaluation | None,
+) -> float:
+    if primary_anomaly is None:
+        return 0.0
+
+    severity_score = 1.0 if primary_anomaly.severity == "critical" else 0.0
+    return severity_score + calculate_anomaly_magnitude(primary_anomaly)
+
+
+def calculate_anomaly_magnitude(
+    anomaly: FunnelAnomalyEvaluation | VolumeAnomalyEvaluation | None,
+) -> float:
+    if anomaly is None:
+        return 0.0
+    if anomaly.relative_drop is not None:
+        return anomaly.relative_drop
+    if isinstance(anomaly, VolumeAnomalyEvaluation):
+        return float(anomaly.drop)
+    return float(anomaly.drop_point or 0)
+
+
+def build_segment_sort_key(result: SegmentFunnelAnomalyResult) -> tuple[int, float, float]:
+    severity_rank = 2 if result.status == "critical" else 1
+    return (
+        severity_rank,
+        result.score,
+        calculate_anomaly_relative_drop(result.primary_anomaly),
+    )
+
+
+def calculate_anomaly_relative_drop(
+    anomaly: FunnelAnomalyEvaluation | VolumeAnomalyEvaluation | None,
+) -> float:
+    if anomaly is None or anomaly.relative_drop is None:
+        return 0.0
+    return anomaly.relative_drop
+
+
+def resolve_segment_response_status(
+    evaluated_results: list[SegmentFunnelAnomalyResult],
+    returned_results: list[SegmentFunnelAnomalyResult],
+) -> FunnelAnomalyStatus:
+    if any(result.status == "critical" for result in returned_results):
+        return "critical"
+    if any(result.status == "warning" for result in returned_results):
+        return "warning"
+    if not evaluated_results:
+        return "insufficient_data"
+    if all(result.status == "insufficient_data" for result in evaluated_results):
+        return "insufficient_data"
+    return "normal"
+
+
 def build_evaluation_message(
     *,
     funnel_step: str,
@@ -453,3 +625,17 @@ def build_summary_message(
         return primary_anomaly.message
 
     return primary_anomaly.message
+
+
+def build_segment_summary_message(
+    status: FunnelAnomalyStatus,
+    segments: list[SegmentFunnelAnomalyResult],
+) -> str:
+    if status == "critical":
+        critical_count = sum(1 for segment in segments if segment.status == "critical")
+        return f"Critical funnel anomalies detected in {critical_count} segment(s)."
+    if status == "warning":
+        return f"Funnel anomalies detected in {len(segments)} segment(s)."
+    if status == "insufficient_data":
+        return "Not enough segment data to determine funnel anomalies."
+    return "No segment funnel anomaly detected."
