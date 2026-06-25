@@ -3,6 +3,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.anomalies.router import router as anomalies_router
 from app.metrics.router import router as metrics_router
 
 
@@ -26,3 +27,4 @@ def health_check() -> dict[str, str]:
 
 
 app.include_router(metrics_router)
+app.include_router(anomalies_router)
