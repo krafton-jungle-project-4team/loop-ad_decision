@@ -20,6 +20,10 @@ class FunnelAnomalyRequest(BaseModel):
     critical_abs_drop: float = Field(default=0.10, ge=0, le=1)
     warning_relative_drop: float = Field(default=0.30, ge=0, le=1)
     critical_relative_drop: float = Field(default=0.50, ge=0, le=1)
+    include_volume_anomalies: bool = True
+    min_volume_count: int = Field(default=30, ge=1)
+    warning_volume_relative_drop: float = Field(default=0.30, ge=0, le=1)
+    critical_volume_relative_drop: float = Field(default=0.50, ge=0, le=1)
 
     model_config = ConfigDict(extra="forbid")
 
@@ -45,11 +49,18 @@ class FunnelAnomalyRequest(BaseModel):
         if self.baseline_start is not None and self.baseline_end is not None:
             if self.baseline_start >= self.baseline_end:
                 raise ValueError("baseline_start must be earlier than baseline_end")
+            if self.baseline_end > self.window_start:
+                raise ValueError("baseline_end must be earlier than or equal to window_start")
 
         if self.warning_abs_drop > self.critical_abs_drop:
             raise ValueError("warning_abs_drop must be less than or equal to critical_abs_drop")
         if self.warning_relative_drop > self.critical_relative_drop:
             raise ValueError("warning_relative_drop must be less than or equal to critical_relative_drop")
+        if self.warning_volume_relative_drop > self.critical_volume_relative_drop:
+            raise ValueError(
+                "warning_volume_relative_drop must be less than or equal to "
+                "critical_volume_relative_drop"
+            )
 
         return self
 
@@ -70,6 +81,19 @@ class FunnelAnomalyEvaluation(BaseModel):
     message: str
 
 
+class VolumeAnomalyEvaluation(BaseModel):
+    metric: str
+    severity: FunnelAnomalyStatus
+    current_value: int
+    baseline_value: int
+    delta: int
+    relative_change: float | None
+    drop: int
+    relative_drop: float | None
+    min_volume_count: int
+    message: str
+
+
 class FunnelAnomalyResponse(BaseModel):
     project_id: str
     window_start: datetime
@@ -82,3 +106,7 @@ class FunnelAnomalyResponse(BaseModel):
     baseline_metrics: FunnelMetrics
     evaluations: list[FunnelAnomalyEvaluation]
     anomalies: list[FunnelAnomalyEvaluation]
+    volume_evaluations: list[VolumeAnomalyEvaluation] = Field(default_factory=list)
+    volume_anomalies: list[VolumeAnomalyEvaluation] = Field(default_factory=list)
+    primary_anomaly: FunnelAnomalyEvaluation | VolumeAnomalyEvaluation | None = None
+    summary_message: str
