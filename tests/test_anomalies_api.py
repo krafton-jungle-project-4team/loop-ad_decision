@@ -61,6 +61,7 @@ def test_post_anomalies_funnel_returns_warning_anomaly() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "warning"
+    assert body["summary_message"]
     assert body["segment"]["channel"] == "kakao"
     assert body["segment"]["age_group"] == "30s"
     assert len(body["evaluations"]) == 4
@@ -83,6 +84,34 @@ def test_post_anomalies_funnel_returns_warning_anomaly() -> None:
     assert fake_client.parameters[0]["window_end"] == "2026-06-24T18:00:00.000+09:00"
     assert fake_client.parameters[1]["window_start"] == "2026-06-24T16:00:00.000+09:00"
     assert fake_client.parameters[1]["window_end"] == "2026-06-24T17:00:00.000+09:00"
+
+
+def test_post_anomalies_funnel_route_is_registered() -> None:
+    fake_client = FakeClickHouseClient(
+        rows=[
+            (1000, 200, 100, 50),
+            (1000, 200, 100, 50),
+        ]
+    )
+
+    @contextmanager
+    def override_client() -> Iterator[ClickHouseClient]:
+        yield fake_client
+
+    app.dependency_overrides[get_clickhouse_client_factory] = lambda: override_client
+    try:
+        response = TestClient(app).post(
+            "/anomalies/funnel",
+            json={
+                "project_id": "loopad-demo-shop",
+                "window_start": "2026-06-24T17:00:00+09:00",
+                "window_end": "2026-06-24T18:00:00+09:00",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
 
 
 def test_post_anomalies_funnel_uses_previous_equal_window_as_default_baseline() -> None:
@@ -116,6 +145,116 @@ def test_post_anomalies_funnel_uses_previous_equal_window_as_default_baseline() 
     assert body["baseline_end"] == "2026-06-24T17:00:00+09:00"
     assert fake_client.parameters[1]["window_start"] == "2026-06-24T16:00:00.000+09:00"
     assert fake_client.parameters[1]["window_end"] == "2026-06-24T17:00:00.000+09:00"
+
+
+def test_post_anomalies_funnel_returns_volume_warning_without_mixing_evaluations() -> None:
+    fake_client = FakeClickHouseClient(
+        rows=[
+            (1000, 100, 50, 20),
+            (2000, 200, 100, 40),
+        ]
+    )
+
+    @contextmanager
+    def override_client() -> Iterator[ClickHouseClient]:
+        yield fake_client
+
+    app.dependency_overrides[get_clickhouse_client_factory] = lambda: override_client
+    try:
+        response = TestClient(app).post(
+            "/anomalies/funnel",
+            json={
+                "project_id": "loopad-demo-shop",
+                "window_start": "2026-06-24T17:00:00+09:00",
+                "window_end": "2026-06-24T18:00:00+09:00",
+                "critical_volume_relative_drop": 0.60,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "warning"
+    assert len(body["evaluations"]) == 4
+    assert body["anomalies"] == []
+    assert len(body["volume_evaluations"]) == 4
+    assert len(body["volume_anomalies"]) == 4
+    assert body["volume_anomalies"][0]["metric"] == "product_view_sessions"
+    assert body["volume_anomalies"][0]["severity"] == "warning"
+    assert body["volume_anomalies"][0]["relative_drop"] == pytest.approx(0.5)
+    assert body["primary_anomaly"]["metric"] == "product_view_sessions"
+    assert body["summary_message"] == (
+        "product_view_sessions dropped by 50.0% compared with baseline."
+    )
+
+
+def test_post_anomalies_funnel_can_disable_volume_anomalies() -> None:
+    fake_client = FakeClickHouseClient(
+        rows=[
+            (1000, 100, 50, 20),
+            (2000, 200, 100, 40),
+        ]
+    )
+
+    @contextmanager
+    def override_client() -> Iterator[ClickHouseClient]:
+        yield fake_client
+
+    app.dependency_overrides[get_clickhouse_client_factory] = lambda: override_client
+    try:
+        response = TestClient(app).post(
+            "/anomalies/funnel",
+            json={
+                "project_id": "loopad-demo-shop",
+                "window_start": "2026-06-24T17:00:00+09:00",
+                "window_end": "2026-06-24T18:00:00+09:00",
+                "include_volume_anomalies": False,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "normal"
+    assert body["volume_evaluations"] == []
+    assert body["volume_anomalies"] == []
+    assert body["primary_anomaly"] is None
+    assert body["summary_message"] == "No funnel anomaly detected."
+
+
+def test_post_anomalies_funnel_primary_anomaly_prefers_most_severe_drop() -> None:
+    fake_client = FakeClickHouseClient(
+        rows=[
+            (1000, 90, 50, 25),
+            (2000, 300, 100, 50),
+        ]
+    )
+
+    @contextmanager
+    def override_client() -> Iterator[ClickHouseClient]:
+        yield fake_client
+
+    app.dependency_overrides[get_clickhouse_client_factory] = lambda: override_client
+    try:
+        response = TestClient(app).post(
+            "/anomalies/funnel",
+            json={
+                "project_id": "loopad-demo-shop",
+                "window_start": "2026-06-24T17:00:00+09:00",
+                "window_end": "2026-06-24T18:00:00+09:00",
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "critical"
+    assert body["primary_anomaly"]["metric"] == "add_to_cart_sessions"
+    assert body["primary_anomaly"]["severity"] == "critical"
+    assert body["primary_anomaly"]["relative_drop"] == pytest.approx(0.7)
 
 
 def test_post_anomalies_funnel_rejects_naive_datetime() -> None:
@@ -167,6 +306,36 @@ def test_post_anomalies_funnel_rejects_warning_threshold_above_critical() -> Non
             "window_end": "2026-06-24T18:00:00+09:00",
             "warning_abs_drop": 0.20,
             "critical_abs_drop": 0.10,
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_post_anomalies_funnel_rejects_overlapping_baseline_window() -> None:
+    response = TestClient(app).post(
+        "/anomalies/funnel",
+        json={
+            "project_id": "loopad-demo-shop",
+            "window_start": "2026-06-24T17:00:00+09:00",
+            "window_end": "2026-06-24T18:00:00+09:00",
+            "baseline_start": "2026-06-24T16:30:00+09:00",
+            "baseline_end": "2026-06-24T17:30:00+09:00",
+        },
+    )
+
+    assert response.status_code == 400
+
+
+def test_post_anomalies_funnel_rejects_volume_warning_threshold_above_critical() -> None:
+    response = TestClient(app).post(
+        "/anomalies/funnel",
+        json={
+            "project_id": "loopad-demo-shop",
+            "window_start": "2026-06-24T17:00:00+09:00",
+            "window_end": "2026-06-24T18:00:00+09:00",
+            "warning_volume_relative_drop": 0.70,
+            "critical_volume_relative_drop": 0.50,
         },
     )
 
