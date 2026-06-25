@@ -5,6 +5,7 @@ from fastapi.responses import JSONResponse
 
 from app.anomalies.router import router as anomalies_router
 from app.metrics.router import router as metrics_router
+from app.root_causes.router import router as root_causes_router
 
 
 app = FastAPI(title="LoopAd AI Analysis Server")
@@ -28,3 +29,4 @@ def health_check() -> dict[str, str]:
 
 app.include_router(metrics_router)
 app.include_router(anomalies_router)
+app.include_router(root_causes_router)
