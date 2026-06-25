@@ -1,21 +1,7 @@
-from datetime import datetime
 from typing import Any
-from zoneinfo import ZoneInfo
 
-from app.db.clickhouse import ClickHouseClient
-from app.metrics.schemas import FunnelMetricFilters, FunnelMetricRequest, FunnelMetricResponse, FunnelMetrics
-
-KST = ZoneInfo("Asia/Seoul")
-FILTER_COLUMNS = {
-    "channel": "channel",
-    "campaign_id": "campaign_id",
-    "age_group": "age_group",
-    "gender": "gender",
-    "device": "device",
-    "category": "category",
-    "product_id": "product_id",
-    "inventory_status": "inventory_status",
-}
+from app.metrics.repository import FunnelMetricsRepository, build_segment, normalize_to_event_timezone
+from app.metrics.schemas import FunnelMetricRequest, FunnelMetricResponse, FunnelMetrics
 
 
 def calculate_rate(numerator: int, denominator: int) -> float | None:
@@ -28,79 +14,6 @@ def calculate_dropoff(rate: float | None) -> float | None:
     if rate is None:
         return None
     return 1 - rate
-
-
-def normalize_to_event_timezone(value: datetime) -> datetime:
-    return value.astimezone(KST)
-
-
-def format_clickhouse_datetime(value: datetime) -> str:
-    return normalize_to_event_timezone(value).isoformat(timespec="milliseconds")
-
-
-def build_segment(filters: FunnelMetricFilters | None) -> dict[str, str | None]:
-    values = filters.model_dump() if filters else {}
-    return {filter_key: values.get(filter_key) for filter_key in FILTER_COLUMNS}
-
-
-def build_funnel_query(filters: FunnelMetricFilters | None) -> tuple[str, dict[str, Any]]:
-    where_clauses = [
-        "project_id = {project_id:String}",
-        "event_time >= parseDateTime64BestEffort({window_start:String}, 3, 'Asia/Seoul')",
-        "event_time < parseDateTime64BestEffort({window_end:String}, 3, 'Asia/Seoul')",
-        "event_name IN ('product_view', 'add_to_cart', 'checkout_start', 'purchase')",
-    ]
-    parameters: dict[str, Any] = {}
-
-    if filters is not None:
-        for filter_key, filter_value in filters.model_dump(exclude_none=True).items():
-            column = FILTER_COLUMNS[filter_key]
-            parameter_name = f"filter_{filter_key}"
-            where_clauses.append(f"{column} = {{{parameter_name}:String}}")
-            parameters[parameter_name] = filter_value
-
-    where_sql = "\n      AND ".join(where_clauses)
-    query = f"""
-WITH session_funnel AS (
-    SELECT
-        project_id,
-        session_id,
-        minIf(toNullable(event_time), event_name = 'product_view') AS product_view_time,
-        minIf(toNullable(event_time), event_name = 'add_to_cart') AS add_to_cart_time,
-        minIf(toNullable(event_time), event_name = 'checkout_start') AS checkout_start_time,
-        minIf(toNullable(event_time), event_name = 'purchase') AS purchase_time
-    FROM events
-    WHERE {where_sql}
-    GROUP BY
-        project_id,
-        session_id
-)
-SELECT
-    countIf(product_view_time IS NOT NULL) AS product_view_sessions,
-    countIf(
-        product_view_time IS NOT NULL
-        AND add_to_cart_time IS NOT NULL
-        AND add_to_cart_time > product_view_time
-    ) AS add_to_cart_sessions,
-    countIf(
-        product_view_time IS NOT NULL
-        AND add_to_cart_time IS NOT NULL
-        AND checkout_start_time IS NOT NULL
-        AND add_to_cart_time > product_view_time
-        AND checkout_start_time > add_to_cart_time
-    ) AS checkout_start_sessions,
-    countIf(
-        product_view_time IS NOT NULL
-        AND add_to_cart_time IS NOT NULL
-        AND checkout_start_time IS NOT NULL
-        AND purchase_time IS NOT NULL
-        AND add_to_cart_time > product_view_time
-        AND checkout_start_time > add_to_cart_time
-        AND purchase_time > checkout_start_time
-    ) AS purchase_sessions
-FROM session_funnel
-""".strip()
-    return query, parameters
 
 
 def build_metrics(row: tuple[Any, ...]) -> FunnelMetrics:
@@ -129,22 +42,20 @@ def build_metrics(row: tuple[Any, ...]) -> FunnelMetrics:
     )
 
 
-def calculate_funnel_metrics(request: FunnelMetricRequest, client: ClickHouseClient) -> FunnelMetricResponse:
-    query, filter_parameters = build_funnel_query(request.filters)
-    parameters = {
-        "project_id": request.project_id,
-        "window_start": format_clickhouse_datetime(request.window_start),
-        "window_end": format_clickhouse_datetime(request.window_end),
-        **filter_parameters,
-    }
-
-    result = client.query(query, parameters=parameters)
-    row = result.result_rows[0] if result.result_rows else (0, 0, 0, 0)
-
+def calculate_funnel_metrics(
+    request: FunnelMetricRequest,
+    repository: FunnelMetricsRepository,
+) -> FunnelMetricResponse:
+    counts = repository.fetch_funnel_counts(
+        project_id=request.project_id,
+        window_start=request.window_start,
+        window_end=request.window_end,
+        filters=request.filters,
+    )
     return FunnelMetricResponse(
         project_id=request.project_id,
         window_start=normalize_to_event_timezone(request.window_start),
         window_end=normalize_to_event_timezone(request.window_end),
         segment=build_segment(request.filters),
-        metrics=build_metrics(row),
+        metrics=build_metrics(counts),
     )

@@ -1,28 +1,26 @@
-from datetime import datetime
-from zoneinfo import ZoneInfo
-
 from app.metrics.schemas import FunnelMetricFilters, FunnelMetricRequest
 from app.metrics.service import (
-    build_funnel_query,
     calculate_dropoff,
     calculate_funnel_metrics,
     calculate_rate,
 )
 
 
-class FakeResult:
-    result_rows = [(1000, 90, 50, 25)]
-
-
-class FakeClickHouseClient:
+class FakeFunnelMetricsRepository:
     def __init__(self) -> None:
-        self.query_text: str | None = None
-        self.parameters: dict[str, object] | None = None
+        self.project_id: str | None = None
+        self.filters: FunnelMetricFilters | None = None
 
-    def query(self, query: str, parameters: dict[str, object] | None = None) -> FakeResult:
-        self.query_text = query
-        self.parameters = parameters
-        return FakeResult()
+    def fetch_funnel_counts(
+        self,
+        project_id: str,
+        window_start: object,
+        window_end: object,
+        filters: FunnelMetricFilters | None,
+    ) -> tuple[int, int, int, int]:
+        self.project_id = project_id
+        self.filters = filters
+        return (1000, 90, 50, 25)
 
 
 def test_calculate_rate_returns_none_when_denominator_is_zero() -> None:
@@ -41,38 +39,19 @@ def test_calculate_dropoff_returns_inverse_rate() -> None:
     assert calculate_dropoff(0.09) == 0.91
 
 
-def test_build_funnel_query_only_adds_non_null_whitelisted_filters() -> None:
-    query, parameters = build_funnel_query(
-        FunnelMetricFilters(
-            channel="kakao",
-            campaign_id=None,
-            category="fresh_food",
-            product_id=None,
-        )
-    )
-
-    assert "channel = {filter_channel:String}" in query
-    assert "category = {filter_category:String}" in query
-    assert "campaign_id = {filter_campaign_id:String}" not in query
-    assert "product_id = {filter_product_id:String}" not in query
-    assert "event_name IN ('product_view', 'add_to_cart', 'checkout_start', 'purchase')" in query
-    assert parameters == {"filter_channel": "kakao", "filter_category": "fresh_food"}
-
-
-def test_calculate_funnel_metrics_normalizes_window_to_kst() -> None:
-    client = FakeClickHouseClient()
+def test_calculate_funnel_metrics_builds_response_from_repository_counts() -> None:
+    repository = FakeFunnelMetricsRepository()
     request = FunnelMetricRequest(
         project_id="loopad-demo-shop",
-        window_start=datetime(2026, 6, 24, 8, 0, tzinfo=ZoneInfo("UTC")),
-        window_end=datetime(2026, 6, 24, 9, 0, tzinfo=ZoneInfo("UTC")),
+        window_start="2026-06-24T08:00:00+00:00",
+        window_end="2026-06-24T09:00:00+00:00",
         filters=FunnelMetricFilters(channel="kakao"),
     )
 
-    response = calculate_funnel_metrics(request, client)
+    response = calculate_funnel_metrics(request, repository)
 
-    assert client.parameters is not None
-    assert client.parameters["window_start"] == "2026-06-24T17:00:00.000+09:00"
-    assert client.parameters["window_end"] == "2026-06-24T18:00:00.000+09:00"
+    assert repository.project_id == "loopad-demo-shop"
+    assert repository.filters == request.filters
     assert response.window_start.isoformat() == "2026-06-24T17:00:00+09:00"
     assert response.window_end.isoformat() == "2026-06-24T18:00:00+09:00"
     assert response.segment["channel"] == "kakao"

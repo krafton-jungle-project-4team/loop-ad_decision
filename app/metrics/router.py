@@ -3,6 +3,7 @@ from typing import Annotated
 from fastapi import APIRouter, Depends
 
 from app.db.clickhouse import ClickHouseClientFactory, get_clickhouse_client_factory
+from app.metrics.repository import FunnelMetricsRepository
 from app.metrics.schemas import FunnelMetricRequest, FunnelMetricResponse
 from app.metrics.service import calculate_funnel_metrics
 
@@ -15,4 +16,5 @@ def get_funnel_metrics(
     client_factory: Annotated[ClickHouseClientFactory, Depends(get_clickhouse_client_factory)],
 ) -> FunnelMetricResponse:
     with client_factory() as client:
-        return calculate_funnel_metrics(request, client)
+        repository = FunnelMetricsRepository(client)
+        return calculate_funnel_metrics(request, repository)
