@@ -247,3 +247,37 @@ def test_existing_root_cause_types_match_by_structured_fields() -> None:
     assert "recommend_alternative_product" in ids
     assert "adjust_landing_page" in ids
     assert "emphasize_reviews" in ids
+
+
+@pytest.mark.parametrize(
+    ("cause_type", "dimension", "value"),
+    [
+        ("product_specific_drop", "product_id", "sku-1"),
+        ("category_specific_drop", "category", "fresh_food"),
+        ("customer_segment_drop", "age_group", "30s"),
+    ],
+)
+def test_product_segment_view_to_purchase_does_not_fallback_to_manual_review(
+    cause_type: str,
+    dimension: str,
+    value: str,
+) -> None:
+    request = action_request(
+        [
+            root_cause_payload(
+                cause_type=cause_type,
+                dimension=dimension,
+                value=value,
+                metric="view_to_purchase_rate",
+                funnel_step="product_view_to_purchase",
+                message="structured root cause candidate",
+            )
+        ]
+    )
+
+    ids = recommendation_ids(request)
+
+    assert "manual_review" not in ids
+    assert "adjust_landing_page" in ids
+    assert "show_price_benefit" in ids
+    assert "improve_product_detail" in ids

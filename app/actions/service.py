@@ -25,18 +25,32 @@ CHANNEL_CAUSE_TYPES = {
     "campaign_specific_drop",
     "channel_specific_drop",
 }
+PRODUCT_SEGMENT_CAUSE_TYPES = {
+    "product_specific_drop",
+    "category_specific_drop",
+    "customer_segment_drop",
+    "device_specific_drop",
+}
 HIGH_PURCHASE_INTENT_CAUSE_TYPES = {"HIGH_PURCHASE_INTENT", "COUPON_WASTE_RISK"}
 
 VIEW_TO_CART_METRICS = {"view_to_cart_rate"}
 CART_TO_CHECKOUT_METRICS = {"cart_to_checkout_rate"}
 CHECKOUT_TO_PURCHASE_METRICS = {"checkout_to_purchase_rate"}
+VIEW_TO_PURCHASE_METRICS = {"view_to_purchase_rate"}
 
 VIEW_TO_CART_STEPS = {"product_view_to_add_to_cart"}
 CART_TO_CHECKOUT_STEPS = {"add_to_cart_to_checkout_start"}
 CHECKOUT_TO_PURCHASE_STEPS = {"checkout_start_to_purchase"}
+VIEW_TO_PURCHASE_STEPS = {"product_view_to_purchase"}
 
 CHANNEL_DIMENSIONS = {"channel", "campaign_id"}
+PRODUCT_SEGMENT_DIMENSIONS = {"product_id", "category", "age_group", "gender", "device"}
 OUT_OF_STOCK_VALUES = {"out_of_stock", "품절"}
+VIEW_TO_PURCHASE_ACTION_IDS = [
+    "adjust_landing_page",
+    "show_price_benefit",
+    "improve_product_detail",
+]
 
 
 def recommend_actions(request: ActionRecommendationRequest) -> ActionRecommendationResponse:
@@ -96,6 +110,8 @@ def match_actions_for_cause(
         action_ids.extend(CART_TO_CHECKOUT_ACTION_IDS)
     if matches_checkout_to_purchase(cause):
         action_ids.extend(CHECKOUT_TO_PURCHASE_ACTION_IDS)
+    if matches_product_segment_view_to_purchase(cause):
+        action_ids.extend(VIEW_TO_PURCHASE_ACTION_IDS)
 
     if not action_ids:
         action_ids.extend(match_actions_by_text(cause))
@@ -161,6 +177,19 @@ def matches_checkout_to_purchase(cause: CauseCandidate) -> bool:
         or normalized_attribute(cause, "metric") in CHECKOUT_TO_PURCHASE_METRICS
         or normalized_affected_step(cause) in CHECKOUT_TO_PURCHASE_STEPS
     )
+
+
+def matches_product_segment_view_to_purchase(cause: CauseCandidate) -> bool:
+    dimension = normalized_attribute(cause, "dimension")
+    matches_purchase_path = (
+        normalized_attribute(cause, "metric") in VIEW_TO_PURCHASE_METRICS
+        or normalized_affected_step(cause) in VIEW_TO_PURCHASE_STEPS
+    )
+    matches_product_segment = (
+        cause.cause_type in PRODUCT_SEGMENT_CAUSE_TYPES
+        or dimension in PRODUCT_SEGMENT_DIMENSIONS
+    )
+    return matches_purchase_path and matches_product_segment
 
 
 def match_actions_by_text(cause: CauseCandidate) -> list[str]:
