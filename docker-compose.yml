@@ -4,6 +4,11 @@ services:
     ports:
       - "8123:8123"
       - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse-data:/var/lib/clickhouse
       - clickhouse-logs:/var/log/clickhouse-server
@@ -38,7 +43,7 @@ services:
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
-      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
       CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-false}
     healthcheck:
