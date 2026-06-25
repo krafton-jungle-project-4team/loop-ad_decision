@@ -1,12 +1,41 @@
 services:
-  ai-analysis-server:
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--spider",
+          "-q",
+          "http://127.0.0.1:8123/ping",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  decision:
     build:
       context: .
     image: loopad-ai-analysis-server:local
+    depends_on:
+      clickhouse:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
-      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-host.docker.internal}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
@@ -24,3 +53,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
