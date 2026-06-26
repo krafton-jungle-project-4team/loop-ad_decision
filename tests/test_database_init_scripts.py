@@ -1,5 +1,7 @@
 from pathlib import Path
 
+from app.persistence.models import AnalysisJob
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -55,9 +57,39 @@ def test_postgres_scripts_separate_schema_and_seed_data() -> None:
     assert "CREATE TABLE" not in seed_sql
 
 
+def test_postgres_init_analysis_jobs_matches_sqlalchemy_model() -> None:
+    init_sql = read_text("scripts/postgres/postgres-init.sql")
+    columns = AnalysisJob.__table__.columns
+
+    assert "CREATE TABLE IF NOT EXISTS analysis_jobs" in init_sql
+    assert "project_id VARCHAR(128) NOT NULL" in init_sql
+    assert "status VARCHAR(32) NOT NULL DEFAULT 'queued'" in init_sql
+    assert "request_json JSONB NOT NULL DEFAULT '{}'::jsonb" in init_sql
+    assert "REFERENCES recommendation_results(id) ON DELETE SET NULL" in init_sql
+    assert "error_message TEXT" in init_sql
+    assert "attempts BIGINT NOT NULL DEFAULT 0" in init_sql
+    assert "max_attempts BIGINT NOT NULL DEFAULT 1" in init_sql
+    assert "locked_at TIMESTAMPTZ" in init_sql
+    assert "started_at TIMESTAMPTZ" in init_sql
+    assert "finished_at TIMESTAMPTZ" in init_sql
+    assert "idx_analysis_jobs_project_id" in init_sql
+    assert "idx_analysis_jobs_status" in init_sql
+    assert "idx_analysis_jobs_recommendation_result" in init_sql
+    assert "idx_analysis_jobs_status_created" in init_sql
+
+    assert columns["project_id"].type.length == 128
+    assert columns["status"].type.length == 32
+    assert columns["status"].server_default.arg == "queued"
+    assert columns["attempts"].server_default.arg.text == "0"
+    assert columns["max_attempts"].server_default.arg.text == "1"
+    assert columns["recommendation_result_id"].foreign_keys
+
+
 def test_compose_mounts_database_init_and_csv_seed_paths() -> None:
     compose = read_text("docker-compose.yml")
 
     assert "./scripts/postgres:/docker-entrypoint-initdb.d:ro" in compose
     assert "./scripts/clickhouse:/docker-entrypoint-initdb.d:ro" in compose
     assert "./ga4_exports:/var/lib/clickhouse/user_files/ga4_exports:ro" in compose
+    assert "decision-worker:" in compose
+    assert 'command: ["python", "-m", "app.analysis.worker"]' in compose

@@ -92,6 +92,31 @@ services:
       retries: 3
       start_period: 10s
 
+  decision-worker:
+    build:
+      context: .
+    image: loopad-ai-analysis-server:local
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
+      CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-false}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:-loopad_decision}
+      POSTGRES_AUTO_CREATE_TABLES: ${POSTGRES_AUTO_CREATE_TABLES:-true}
+      ANALYSIS_WORKER_POLL_INTERVAL_SECONDS: ${ANALYSIS_WORKER_POLL_INTERVAL_SECONDS:-2.0}
+    command: ["python", "-m", "app.analysis.worker"]
+
 volumes:
   postgres-data:
   clickhouse-data:

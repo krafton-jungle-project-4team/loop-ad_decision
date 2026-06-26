@@ -1,12 +1,19 @@
 import hashlib
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.persistence.job_statuses import (
+    ANALYSIS_JOB_STATUS_DONE,
+    ANALYSIS_JOB_STATUS_FAILED,
+    ANALYSIS_JOB_STATUS_QUEUED,
+    ANALYSIS_JOB_STATUS_RUNNING,
+)
 from app.persistence.models import (
+    AnalysisJob,
     AutomationPolicy,
     Experiment,
     RecommendationResult,
@@ -126,6 +133,76 @@ class PostgresRepository:
             setattr(result, key, value)
         self.session.flush()
         return result
+
+    def create_analysis_job(
+        self,
+        project_id: str,
+        request_json: JsonObject,
+        status: str = ANALYSIS_JOB_STATUS_QUEUED,
+    ) -> AnalysisJob:
+        job = AnalysisJob(
+            project_id=project_id,
+            status=status,
+            request_json=request_json,
+        )
+        self.session.add(job)
+        self.session.flush()
+        return job
+
+    def get_analysis_job(self, job_id: int) -> AnalysisJob | None:
+        return self.session.get(AnalysisJob, job_id)
+
+    def claim_next_analysis_job(self) -> AnalysisJob | None:
+        statement = (
+            select(AnalysisJob)
+            .where(AnalysisJob.status == ANALYSIS_JOB_STATUS_QUEUED)
+            .order_by(AnalysisJob.created_at)
+            .with_for_update(skip_locked=True)
+            .limit(1)
+        )
+        job = self.session.scalar(statement)
+        if job is None:
+            return None
+
+        now = datetime.now(UTC)
+        job.status = ANALYSIS_JOB_STATUS_RUNNING
+        job.attempts = (job.attempts or 0) + 1
+        job.locked_at = now
+        job.started_at = now
+        job.error_message = None
+        self.session.flush()
+        return job
+
+    def mark_analysis_job_done(
+        self,
+        job_id: int,
+        recommendation_result_id: int,
+    ) -> AnalysisJob | None:
+        job = self.get_analysis_job(job_id)
+        if job is None:
+            return None
+
+        job.status = ANALYSIS_JOB_STATUS_DONE
+        job.recommendation_result_id = recommendation_result_id
+        job.error_message = None
+        job.finished_at = datetime.now(UTC)
+        self.session.flush()
+        return job
+
+    def mark_analysis_job_failed(
+        self,
+        job_id: int,
+        error_message: str,
+    ) -> AnalysisJob | None:
+        job = self.get_analysis_job(job_id)
+        if job is None:
+            return None
+
+        job.status = ANALYSIS_JOB_STATUS_FAILED
+        job.error_message = error_message
+        job.finished_at = datetime.now(UTC)
+        self.session.flush()
+        return job
 
     def create_experiment(
         self,

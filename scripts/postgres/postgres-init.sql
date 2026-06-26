@@ -346,7 +346,50 @@ BEFORE UPDATE ON recommendation_results
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- =========================================================
--- 11. Experiments
+-- 11. Analysis Jobs
+-- 비동기 통합 분석 요청과 worker 처리 상태
+-- =========================================================
+
+CREATE TABLE IF NOT EXISTS analysis_jobs (
+    id BIGSERIAL PRIMARY KEY,
+    project_id VARCHAR(128) NOT NULL,
+    status VARCHAR(32) NOT NULL DEFAULT 'queued',
+    request_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    recommendation_result_id BIGINT
+        REFERENCES recommendation_results(id) ON DELETE SET NULL,
+
+    error_message TEXT,
+    attempts BIGINT NOT NULL DEFAULT 0,
+    max_attempts BIGINT NOT NULL DEFAULT 1,
+
+    locked_at TIMESTAMPTZ,
+    started_at TIMESTAMPTZ,
+    finished_at TIMESTAMPTZ,
+
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_project_id
+ON analysis_jobs (project_id);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status
+ON analysis_jobs (status);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_recommendation_result
+ON analysis_jobs (recommendation_result_id);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_jobs_status_created
+ON analysis_jobs (status, created_at);
+
+DROP TRIGGER IF EXISTS trg_analysis_jobs_updated_at ON analysis_jobs;
+CREATE TRIGGER trg_analysis_jobs_updated_at
+BEFORE UPDATE ON analysis_jobs
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =========================================================
+-- 12. Experiments
 -- =========================================================
 
 CREATE TABLE IF NOT EXISTS experiments (
@@ -394,7 +437,7 @@ BEFORE UPDATE ON experiments
 FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- =========================================================
--- 12. Segment Ad Mappings
+-- 13. Segment Ad Mappings
 -- 추천 서버가 쓰고, 광고 서버가 직접 읽는 핵심 테이블
 -- =========================================================
 

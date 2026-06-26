@@ -1,3 +1,5 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.actions.schemas import RecommendedAction
@@ -25,5 +27,27 @@ class FunnelRecommendationAnalysisResponse(BaseModel):
     created_experiment_ids: list[int]
     created_segment_ad_mapping_ids: list[int]
     policy_decision: PolicyDecision | None = None
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AnalysisJobCreateResponse(BaseModel):
+    job_id: int
+    status: str
+    recommendation_result_id: int | None = None
+    polling_url: str
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AnalysisJobStatusResponse(BaseModel):
+    job_id: int
+    status: str
+    recommendation_result_id: int | None = None
+    error_message: str | None = None
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
 
     model_config = ConfigDict(extra="forbid")
