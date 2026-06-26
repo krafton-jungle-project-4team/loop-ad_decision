@@ -7,7 +7,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     loopad_env: str = Field(alias="LOOPAD_ENV")
     loopad_service_id: str = Field(alias="LOOPAD_SERVICE_ID")
-    loopad_runtime: str = Field(alias="LOOPAD_RUNTIME")
     port: int = Field(alias="PORT")
 
     loopad_aurora_host: str = Field(alias="LOOPAD_AURORA_HOST")
@@ -41,7 +40,6 @@ class Settings(BaseSettings):
     @field_validator(
         "loopad_env",
         "loopad_service_id",
-        "loopad_runtime",
         "loopad_aurora_host",
         "loopad_aurora_database",
         "loopad_aurora_username",
@@ -61,13 +59,6 @@ class Settings(BaseSettings):
     def validate_service_id(cls, value: str) -> str:
         if value != "decision-api":
             raise ValueError("LOOPAD_SERVICE_ID must be decision-api")
-        return value
-
-    @field_validator("loopad_runtime")
-    @classmethod
-    def validate_runtime(cls, value: str) -> str:
-        if value != "go":
-            raise ValueError("LOOPAD_RUNTIME must be go")
         return value
 
     @field_validator("loopad_clickhouse_url")

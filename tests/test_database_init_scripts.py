@@ -106,6 +106,8 @@ def test_server_env_contract_uses_loopad_env_without_fallbacks() -> None:
     assert "POSTGRES_PASSWORD" not in env_example
     assert "LOOPAD_ENV" in env_example
     assert "LOOPAD_SERVICE_ID=decision-api" in env_example
+    assert "LOOPAD_RUNTIME" not in env_example
+    assert "LOOPAD_RUNTIME" not in compose
     assert "LOOPAD_CLICKHOUSE_URL=http://clickhouse:8123" in env_example
     assert 'os.environ[\\"PORT\\"]' in dockerfile
     assert 'CMD ["python", "-m", "app.main"]' in dockerfile

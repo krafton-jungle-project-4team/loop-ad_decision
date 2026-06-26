@@ -10,7 +10,6 @@ def settings_with_required_env(**overrides: object) -> Settings:
     values: dict[str, object] = {
         "loopad_env": "local",
         "loopad_service_id": "decision-api",
-        "loopad_runtime": "go",
         "port": 8000,
         "loopad_aurora_host": "postgres",
         "loopad_aurora_port": 5432,

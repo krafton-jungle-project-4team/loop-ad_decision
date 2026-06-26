@@ -68,7 +68,6 @@ services:
     environment:
       LOOPAD_ENV: ${LOOPAD_ENV:?LOOPAD_ENV is required}
       LOOPAD_SERVICE_ID: ${LOOPAD_SERVICE_ID:?LOOPAD_SERVICE_ID is required}
-      LOOPAD_RUNTIME: ${LOOPAD_RUNTIME:?LOOPAD_RUNTIME is required}
       PORT: ${PORT:?PORT is required}
       LOOPAD_AURORA_HOST: ${LOOPAD_AURORA_HOST:?LOOPAD_AURORA_HOST is required}
       LOOPAD_AURORA_PORT: ${LOOPAD_AURORA_PORT:?LOOPAD_AURORA_PORT is required}
@@ -107,7 +106,6 @@ services:
     environment:
       LOOPAD_ENV: ${LOOPAD_ENV:?LOOPAD_ENV is required}
       LOOPAD_SERVICE_ID: ${LOOPAD_SERVICE_ID:?LOOPAD_SERVICE_ID is required}
-      LOOPAD_RUNTIME: ${LOOPAD_RUNTIME:?LOOPAD_RUNTIME is required}
       PORT: ${PORT:?PORT is required}
       LOOPAD_AURORA_HOST: ${LOOPAD_AURORA_HOST:?LOOPAD_AURORA_HOST is required}
       LOOPAD_AURORA_PORT: ${LOOPAD_AURORA_PORT:?LOOPAD_AURORA_PORT is required}
