@@ -14,6 +14,10 @@ from app.automation.router import router as automation_router
 from app.core.config import get_settings
 from app.db.postgres import create_postgres_tables
 from app.metrics.router import router as metrics_router
+from app.recommendations.router import (
+    ad_mappings_router,
+    recommendations_router,
+)
 from app.root_causes.router import router as root_causes_router
 
 logger = logging.getLogger(__name__)
@@ -55,3 +59,5 @@ app.include_router(root_causes_router)
 app.include_router(actions_router)
 app.include_router(automation_router)
 app.include_router(analysis_router)
+app.include_router(recommendations_router)
+app.include_router(ad_mappings_router)

@@ -179,12 +179,17 @@ class PostgresRepository:
         self,
         *,
         project_id: str | None = None,
+        recommendation_result_id: int | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[Experiment]:
         statement = select(Experiment).order_by(Experiment.created_at.desc())
         if project_id is not None:
             statement = statement.where(Experiment.project_id == project_id)
+        if recommendation_result_id is not None:
+            statement = statement.where(
+                Experiment.recommendation_result_id == recommendation_result_id
+            )
         if status is not None:
             statement = statement.where(Experiment.status == status)
         return list(self.session.scalars(statement.limit(limit)))
@@ -248,12 +253,17 @@ class PostgresRepository:
         self,
         *,
         project_id: str | None = None,
+        recommendation_result_id: int | None = None,
         status: str | None = None,
         limit: int = 100,
     ) -> list[SegmentAdMapping]:
         statement = select(SegmentAdMapping).order_by(SegmentAdMapping.created_at.desc())
         if project_id is not None:
             statement = statement.where(SegmentAdMapping.project_id == project_id)
+        if recommendation_result_id is not None:
+            statement = statement.where(
+                SegmentAdMapping.recommendation_result_id == recommendation_result_id
+            )
         if status is not None:
             statement = statement.where(SegmentAdMapping.status == status)
         return list(self.session.scalars(statement.limit(limit)))
