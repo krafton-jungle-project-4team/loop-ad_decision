@@ -182,13 +182,13 @@ def run_worker_loop(
     clickhouse_client_factory: ClickHouseClientFactory = get_clickhouse_client,
 ) -> None:
     resolved_settings = settings or get_settings()
-    if resolved_settings.postgres_auto_create_tables:
+    if resolved_settings.loopad_postgres_auto_create_tables:
         try:
             create_postgres_tables(resolved_settings)
         except Exception:
             logger.warning("PostgreSQL table auto-create skipped.", exc_info=True)
     resolved_session_factory = session_factory or get_postgres_sessionmaker(resolved_settings)
-    poll_interval = resolved_settings.analysis_worker_poll_interval_seconds
+    poll_interval = resolved_settings.loopad_analysis_worker_poll_interval_seconds
 
     while True:
         try:

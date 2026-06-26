@@ -1,6 +1,7 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
+import uvicorn
 
 from fastapi import FastAPI, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -26,7 +27,7 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    if settings.postgres_auto_create_tables:
+    if settings.loopad_postgres_auto_create_tables:
         try:
             create_postgres_tables(settings)
         except Exception:
@@ -61,3 +62,16 @@ app.include_router(automation_router)
 app.include_router(analysis_router)
 app.include_router(recommendations_router)
 app.include_router(ad_mappings_router)
+
+
+def main() -> None:
+    settings = get_settings()
+    uvicorn.run(
+        "app.main:app",
+        host="0.0.0.0",
+        port=settings.port,
+    )
+
+
+if __name__ == "__main__":
+    main()
