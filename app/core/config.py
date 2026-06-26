@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     postgres_password: str = "postgres"
     postgres_database: str = "loopad_decision"
     postgres_auto_create_tables: bool = True
+    analysis_worker_poll_interval_seconds: float = 2.0
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 
