@@ -1,6 +1,7 @@
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, ContextManager, Protocol
+from urllib.parse import urlparse
 
 from app.core.config import Settings, get_settings
 
@@ -21,13 +22,12 @@ def create_clickhouse_client(settings: Settings | None = None) -> ClickHouseClie
     import clickhouse_connect
 
     resolved_settings = settings or get_settings()
+    endpoint = urlparse(resolved_settings.loopad_clickhouse_url)
     return clickhouse_connect.get_client(
-        host=resolved_settings.clickhouse_host,
-        port=resolved_settings.clickhouse_port,
-        username=resolved_settings.clickhouse_user,
-        password=resolved_settings.clickhouse_password,
-        database=resolved_settings.clickhouse_database,
-        secure=resolved_settings.clickhouse_secure,
+        host=endpoint.hostname,
+        port=endpoint.port,
+        username=resolved_settings.loopad_clickhouse_username,
+        secure=endpoint.scheme == "https",
     )
 
 
