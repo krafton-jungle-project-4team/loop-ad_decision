@@ -7,6 +7,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
+from app.analysis.router import router as analysis_router
 from app.anomalies.router import router as anomalies_router
 from app.actions.router import router as actions_router
 from app.automation.router import router as automation_router
@@ -53,3 +54,4 @@ app.include_router(anomalies_router)
 app.include_router(root_causes_router)
 app.include_router(actions_router)
 app.include_router(automation_router)
+app.include_router(analysis_router)
