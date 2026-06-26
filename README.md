@@ -3,7 +3,7 @@ loop-ad 프로젝트 사용자 행동 분석 및 마케팅 액션 추천하는 A
 
 ## Docker Compose 실행
 
-AI 분석 서버와 로컬 ClickHouse를 함께 실행합니다.
+AI 분석 서버와 로컬 ClickHouse, PostgreSQL을 함께 실행합니다.
 
 ```bash
 docker compose up decision
@@ -22,3 +22,5 @@ docker compose ps
 curl http://localhost:8000/health
 curl http://localhost:8123/ping
 ```
+
+PostgreSQL 테이블은 `POSTGRES_AUTO_CREATE_TABLES=true`일 때 서버 시작 시 자동 생성됩니다.
