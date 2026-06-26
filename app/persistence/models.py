@@ -9,11 +9,15 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     String,
+    Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+from app.persistence.job_statuses import ANALYSIS_JOB_STATUS_QUEUED
 
 
 class Base(DeclarativeBase):
@@ -72,6 +76,51 @@ class RecommendationResult(TimestampMixin, Base):
     root_causes_json: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, default=dict)
     recommendations_json: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, default=dict)
     policy_decision_json: Mapped[JsonObject] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class AnalysisJob(TimestampMixin, Base):
+    __tablename__ = "analysis_jobs"
+    __table_args__ = (
+        Index("idx_analysis_jobs_project_id", "project_id"),
+        Index("idx_analysis_jobs_status", "status"),
+        Index("idx_analysis_jobs_recommendation_result", "recommendation_result_id"),
+        Index("idx_analysis_jobs_status_created", "status", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    project_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default=ANALYSIS_JOB_STATUS_QUEUED,
+        server_default=ANALYSIS_JOB_STATUS_QUEUED,
+    )
+    request_json: Mapped[JsonObject] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=text("'{}'::jsonb"),
+    )
+    recommendation_result_id: Mapped[int | None] = mapped_column(
+        ForeignKey("recommendation_results.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    attempts: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+    )
+    max_attempts: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+        server_default=text("1"),
+    )
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class Experiment(TimestampMixin, Base):
