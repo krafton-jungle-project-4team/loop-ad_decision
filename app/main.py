@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 
 from app.anomalies.router import router as anomalies_router
 from app.actions.router import router as actions_router
+from app.automation.router import router as automation_router
 from app.core.config import get_settings
 from app.db.postgres import create_postgres_tables
 from app.metrics.router import router as metrics_router
@@ -51,3 +52,4 @@ app.include_router(metrics_router)
 app.include_router(anomalies_router)
 app.include_router(root_causes_router)
 app.include_router(actions_router)
+app.include_router(automation_router)
