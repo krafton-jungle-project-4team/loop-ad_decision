@@ -53,15 +53,20 @@ class FakeAnalysisJobRepository:
 
 
 def test_post_analysis_funnel_recommend_rejects_invalid_top_n() -> None:
-    response = TestClient(app).post(
-        "/analysis/funnel/recommend",
-        json={
-            "project_id": "loopad-demo-shop",
-            "window_start": "2026-06-24T17:00:00+09:00",
-            "window_end": "2026-06-24T18:00:00+09:00",
-            "top_n": 0,
-        },
-    )
+    app.dependency_overrides[get_analysis_repository] = lambda: object()
+
+    try:
+        response = TestClient(app).post(
+            "/analysis/funnel/recommend",
+            json={
+                "project_id": "loopad-demo-shop",
+                "window_start": "2026-06-24T17:00:00+09:00",
+                "window_end": "2026-06-24T18:00:00+09:00",
+                "top_n": 0,
+            },
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 400
 

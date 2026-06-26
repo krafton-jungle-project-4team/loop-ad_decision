@@ -10,17 +10,15 @@ from app.core.config import Settings, get_settings
 
 def build_postgres_url(settings: Settings | None = None) -> str:
     resolved_settings = settings or get_settings()
-    if resolved_settings.postgres_url:
-        return resolved_settings.postgres_url
 
     return str(
         URL.create(
             drivername="postgresql+psycopg",
-            username=resolved_settings.postgres_user,
-            password=resolved_settings.postgres_password,
-            host=resolved_settings.postgres_host,
-            port=resolved_settings.postgres_port,
-            database=resolved_settings.postgres_database,
+            username=resolved_settings.loopad_aurora_username,
+            password=resolved_settings.loopad_aurora_password.get_secret_value(),
+            host=resolved_settings.loopad_aurora_host,
+            port=resolved_settings.loopad_aurora_port,
+            database=resolved_settings.loopad_aurora_database,
         )
     )
 

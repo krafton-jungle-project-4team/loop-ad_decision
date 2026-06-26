@@ -121,9 +121,15 @@ def test_put_automation_policy_upserts_and_commits() -> None:
 
 
 def test_put_automation_policy_rejects_invalid_ratio() -> None:
-    response = TestClient(app).put(
-        "/automation-policies/loopad-demo-shop",
-        json={"max_experiment_traffic_ratio": 1.2},
-    )
+    fake_repository = FakePolicyRepository()
+    app.dependency_overrides[get_automation_policy_repository] = lambda: fake_repository
+
+    try:
+        response = TestClient(app).put(
+            "/automation-policies/loopad-demo-shop",
+            json={"max_experiment_traffic_ratio": 1.2},
+        )
+    finally:
+        app.dependency_overrides.clear()
 
     assert response.status_code == 400
