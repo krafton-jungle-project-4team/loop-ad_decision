@@ -1,4 +1,25 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: ${POSTGRES_DATABASE:-loopad_decision}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER:-postgres} -d $${POSTGRES_DB:-loopad_decision}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     ports:
@@ -38,6 +59,8 @@ services:
     depends_on:
       clickhouse:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     ports:
       - "8000:8000"
     environment:
@@ -47,6 +70,12 @@ services:
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-password}
       CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-default}
       CLICKHOUSE_SECURE: ${CLICKHOUSE_SECURE:-false}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DATABASE: ${POSTGRES_DATABASE:-loopad_decision}
+      POSTGRES_AUTO_CREATE_TABLES: ${POSTGRES_AUTO_CREATE_TABLES:-true}
     healthcheck:
       test:
         [
@@ -61,5 +90,6 @@ services:
       start_period: 10s
 
 volumes:
+  postgres-data:
   clickhouse-data:
   clickhouse-logs:
