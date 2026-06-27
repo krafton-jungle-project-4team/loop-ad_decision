@@ -24,13 +24,6 @@ class Settings(BaseSettings):
     )
     loopad_openai_api_key: SecretStr = Field(alias="LOOPAD_OPENAI_API_KEY")
 
-    loopad_postgres_auto_create_tables: bool = Field(
-        alias="LOOPAD_POSTGRES_AUTO_CREATE_TABLES",
-    )
-    loopad_analysis_worker_poll_interval_seconds: float = Field(
-        alias="LOOPAD_ANALYSIS_WORKER_POLL_INTERVAL_SECONDS",
-    )
-
     model_config = SettingsConfigDict(
         env_file=".env.local",
         env_file_encoding="utf-8",

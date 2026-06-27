@@ -21,8 +21,6 @@ def settings_with_required_env(**overrides: object) -> Settings:
         "loopad_data_storage_bucket": "bucket",
         "loopad_genai_generated_assets_prefix": "genai/generated/",
         "loopad_openai_api_key": "sk-test",
-        "loopad_postgres_auto_create_tables": True,
-        "loopad_analysis_worker_poll_interval_seconds": 2.0,
     }
     values.update(overrides)
     return Settings(**values)
