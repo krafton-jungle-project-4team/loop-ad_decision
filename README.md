@@ -14,7 +14,7 @@ docker compose --env-file .env.local up decision
 
 ```bash
 docker compose ps
-curl http://localhost:8000/health
+curl http://localhost:8080/health
 ```
 
 서버는 `LOOPAD_*` env contract를 시작 시 검증합니다. 로컬 값은 `.env.local` 또는 개인 shell 환경에서 관리하고 commit하지 않습니다.
