@@ -1,68 +1,8 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    ports:
-      - "5432:5432"
-    environment:
-      POSTGRES_DB: ${LOOPAD_AURORA_DATABASE:?LOOPAD_AURORA_DATABASE is required}
-      POSTGRES_USER: ${LOOPAD_AURORA_USERNAME:?LOOPAD_AURORA_USERNAME is required}
-      POSTGRES_PASSWORD: ${LOOPAD_AURORA_PASSWORD:?LOOPAD_AURORA_PASSWORD is required}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-      - ./scripts/postgres:/docker-entrypoint-initdb.d:ro
-    healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  clickhouse:
-    image: clickhouse/clickhouse-server:latest
-    ports:
-      - "8123:8123"
-      - "9000:9000"
-    environment:
-      CLICKHOUSE_DB: default
-      CLICKHOUSE_USER: ${LOOPAD_CLICKHOUSE_USERNAME:?LOOPAD_CLICKHOUSE_USERNAME is required}
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
-    volumes:
-      - clickhouse-data:/var/lib/clickhouse
-      - clickhouse-logs:/var/log/clickhouse-server
-      - ./scripts/clickhouse:/docker-entrypoint-initdb.d:ro
-      - ./ga4_exports:/ga4_exports:ro
-      - ./ga4_exports:/var/lib/clickhouse/user_files/ga4_exports:ro
-    ulimits:
-      nofile:
-        soft: 262144
-        hard: 262144
-    healthcheck:
-      test:
-        [
-          "CMD",
-          "wget",
-          "--spider",
-          "-q",
-          "http://127.0.0.1:8123/ping",
-        ]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
   decision:
     build:
       context: .
     image: loopad-ai-analysis-server:local
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
     ports:
       - "${PORT:?PORT is required}:${PORT:?PORT is required}"
     environment:
@@ -98,11 +38,6 @@ services:
     build:
       context: .
     image: loopad-ai-analysis-server:local
-    depends_on:
-      clickhouse:
-        condition: service_healthy
-      postgres:
-        condition: service_healthy
     environment:
       LOOPAD_ENV: ${LOOPAD_ENV:?LOOPAD_ENV is required}
       LOOPAD_SERVICE_ID: ${LOOPAD_SERVICE_ID:?LOOPAD_SERVICE_ID is required}
@@ -120,8 +55,3 @@ services:
       LOOPAD_POSTGRES_AUTO_CREATE_TABLES: ${LOOPAD_POSTGRES_AUTO_CREATE_TABLES:?LOOPAD_POSTGRES_AUTO_CREATE_TABLES is required}
       LOOPAD_ANALYSIS_WORKER_POLL_INTERVAL_SECONDS: ${LOOPAD_ANALYSIS_WORKER_POLL_INTERVAL_SECONDS:?LOOPAD_ANALYSIS_WORKER_POLL_INTERVAL_SECONDS is required}
     command: ["python", "-m", "app.analysis.worker"]
-
-volumes:
-  postgres-data:
-  clickhouse-data:
-  clickhouse-logs:
