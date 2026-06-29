@@ -3,10 +3,15 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
+from app.analysis.anomaly import build_root_cause_candidates, detect_segment_anomalies
 from app.analysis.models import (
     AnalysisResult,
     AnalysisWindow,
+    BaselineMetrics,
+    RootCauseCandidate,
     SegmentAggregate,
+    SegmentAnomalyCandidate,
+    StoredAnomaly,
     StoredSegment,
     UserPrimarySegmentCandidate,
 )
@@ -68,6 +73,31 @@ class UserSegmentMembershipRepository(Protocol):
         ...
 
 
+class SegmentAnomalyRepository(Protocol):
+    def fetch_segment_metric_baselines(
+        self,
+        project_id: int,
+        analysis_date: date,
+        stored_segments: dict[str, StoredSegment],
+    ) -> dict[int, BaselineMetrics]:
+        ...
+
+    def upsert_segment_anomalies(
+        self,
+        project_id: int,
+        analysis_date: date,
+        anomalies: list[SegmentAnomalyCandidate],
+        run_id: int | None,
+    ) -> list[StoredAnomaly]:
+        ...
+
+    def upsert_root_cause_candidates(
+        self,
+        root_causes: list[RootCauseCandidate],
+    ) -> int:
+        ...
+
+
 class AnalysisService:
     def __init__(
         self,
@@ -76,12 +106,14 @@ class AnalysisService:
         segment_metrics_repository: SegmentMetricsRepository | None = None,
         user_primary_segment_repository: UserPrimarySegmentRepository | None = None,
         user_segment_membership_repository: UserSegmentMembershipRepository | None = None,
+        anomaly_repository: SegmentAnomalyRepository | None = None,
     ) -> None:
         self.project_repository = project_repository
         self.segment_aggregate_repository = segment_aggregate_repository
         self.segment_metrics_repository = segment_metrics_repository
         self.user_primary_segment_repository = user_primary_segment_repository
         self.user_segment_membership_repository = user_segment_membership_repository
+        self.anomaly_repository = anomaly_repository
 
     def run(
         self,
@@ -127,8 +159,38 @@ class AnalysisService:
                 stored_segments=stored_segments,
                 run_id=run_id,
             )
+        stored_anomalies: list[StoredAnomaly] = []
+        root_cause_count = 0
+        if self.anomaly_repository is not None and stored_segments:
+            baselines = self.anomaly_repository.fetch_segment_metric_baselines(
+                project_id=project_id,
+                analysis_date=analysis_date,
+                stored_segments=stored_segments,
+            )
+            anomaly_candidates = detect_segment_anomalies(
+                aggregates=aggregates,
+                stored_segments=stored_segments,
+                baselines=baselines,
+            )
+            stored_anomalies = self.anomaly_repository.upsert_segment_anomalies(
+                project_id=project_id,
+                analysis_date=analysis_date,
+                anomalies=anomaly_candidates,
+                run_id=run_id,
+            )
+            root_cause_count = self.anomaly_repository.upsert_root_cause_candidates(
+                build_root_cause_candidates(
+                    aggregates=aggregates,
+                    stored_segments=stored_segments,
+                    stored_anomalies=stored_anomalies,
+                )
+            )
         return AnalysisResult(
             segment_count=len(stored_segments),
             membership_count=membership_count,
             metric_count=metric_count,
+            anomaly_count=len(stored_anomalies),
+            root_cause_count=root_cause_count,
+            anomaly_segment_ids=[anomaly.segment_id for anomaly in stored_anomalies],
+            anomaly_ids=[anomaly.id for anomaly in stored_anomalies],
         )

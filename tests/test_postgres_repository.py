@@ -25,6 +25,11 @@ class FakeCursor:
     def fetchone(self) -> tuple[object, ...] | None:
         return self.rows.pop(0) if self.rows else None
 
+    def fetchall(self) -> list[tuple[object, ...]]:
+        rows = [row for row in self.rows if row is not None]
+        self.rows.clear()
+        return rows
+
 
 class FakeConnection:
     def __init__(self, rows: list[tuple[object, ...] | None]) -> None:
@@ -140,3 +145,79 @@ def test_upsert_user_segment_memberships_only_uses_stored_segments() -> None:
     assert "DELETE FROM user_segment_memberships" in delete_query
     assert "ON CONFLICT (project_id, external_user_id, segment_id, analysis_date)" in upsert_query
     assert upsert_parameters[-1] is None
+
+
+def test_fetch_segment_metric_baselines_uses_previous_seven_days_only() -> None:
+    connection = FakeConnection(rows=[(10, Decimal("0.06"))])
+    repository = PostgresAnalysisRepository(connection)
+
+    baselines = repository.fetch_segment_metric_baselines(
+        project_id=1,
+        analysis_date=date(2021, 1, 8),
+        stored_segments={"segment": type("Stored", (), {"id": 10})()},
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "analysis_date >= %s" in query
+    assert "analysis_date <= %s" in query
+    assert parameters[2] == date(2021, 1, 1)
+    assert parameters[3] == date(2021, 1, 7)
+    assert baselines[10].view_to_purchase_rate == Decimal("0.06")
+
+
+def test_upsert_segment_anomalies_and_root_causes_use_schema_keys() -> None:
+    connection = FakeConnection(rows=[(501, 10)])
+    repository = PostgresAnalysisRepository(connection)
+
+    stored_anomalies = repository.upsert_segment_anomalies(
+        project_id=1,
+        analysis_date=date(2021, 1, 8),
+        anomalies=[
+            type(
+                "Anomaly",
+                (),
+                {
+                    "segment_id": 10,
+                    "metric_name": "view_to_purchase_rate",
+                    "actual_value": Decimal("0.01"),
+                    "expected_value": Decimal("0.05"),
+                    "target_value": Decimal("0.05"),
+                    "difference_value": Decimal("0.04"),
+                    "difference_rate": Decimal("0.8"),
+                    "severity": "medium",
+                    "impact_score": Decimal("4"),
+                    "evidence_json": {},
+                },
+            )()
+        ],
+        run_id=None,
+    )
+
+    root_count = repository.upsert_root_cause_candidates(
+        [
+            type(
+                "RootCause",
+                (),
+                {
+                    "anomaly_id": 501,
+                    "cause_type": "funnel_step_drop",
+                    "cause_key": "view_to_cart",
+                    "title": "상품 조회 후 장바구니 전환 낮음",
+                    "description": "전환율이 가장 낮습니다.",
+                    "confidence_score": Decimal("0.7"),
+                    "impact_score": Decimal("0.9"),
+                    "rank_no": 1,
+                    "evidence_json": {},
+                },
+            )()
+        ]
+    )
+
+    anomaly_query, anomaly_parameters = connection.cursor_instance.executed[0]
+    root_query, _ = connection.cursor_instance.executed[1]
+    assert stored_anomalies[0].id == 501
+    assert stored_anomalies[0].segment_id == 10
+    assert anomaly_parameters[-1] is None
+    assert "ON CONFLICT (project_id, segment_id, analysis_date, metric_name)" in anomaly_query
+    assert "ON CONFLICT (anomaly_id, cause_type, cause_key)" in root_query
+    assert root_count == 1

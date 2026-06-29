@@ -3,9 +3,18 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from datetime import date
+from datetime import timedelta
 from typing import Any, Protocol
 
-from app.analysis.models import SegmentAggregate, StoredSegment, UserPrimarySegmentCandidate
+from app.analysis.models import (
+    BaselineMetrics,
+    RootCauseCandidate,
+    SegmentAggregate,
+    SegmentAnomalyCandidate,
+    StoredAnomaly,
+    StoredSegment,
+    UserPrimarySegmentCandidate,
+)
 from app.analysis.segments import is_default_segment_key
 
 
@@ -162,11 +171,103 @@ class PostgresAnalysisRepository:
                 membership_count += 1
         return membership_count
 
+    def fetch_segment_metric_baselines(
+        self,
+        project_id: int,
+        analysis_date: date,
+        stored_segments: dict[str, StoredSegment],
+    ) -> dict[int, BaselineMetrics]:
+        segment_ids = [segment.id for segment in stored_segments.values()]
+        if not segment_ids:
+            return {}
+        baseline_start = analysis_date - timedelta(days=7)
+        baseline_end = analysis_date - timedelta(days=1)
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                FETCH_SEGMENT_BASELINES_SQL,
+                (project_id, segment_ids, baseline_start, baseline_end),
+            )
+            rows = list(iter_cursor_rows(cursor))
+        return {
+            int(row[0]): BaselineMetrics(
+                segment_id=int(row[0]),
+                view_to_purchase_rate=row[1],
+            )
+            for row in rows
+        }
+
+    def upsert_segment_anomalies(
+        self,
+        project_id: int,
+        analysis_date: date,
+        anomalies: list[SegmentAnomalyCandidate],
+        run_id: int | None,
+    ) -> list[StoredAnomaly]:
+        stored_anomalies: list[StoredAnomaly] = []
+        with self.connection.cursor() as cursor:
+            for anomaly in anomalies:
+                cursor.execute(
+                    UPSERT_SEGMENT_ANOMALY_SQL,
+                    (
+                        project_id,
+                        anomaly.segment_id,
+                        analysis_date,
+                        anomaly.metric_name,
+                        anomaly.actual_value,
+                        anomaly.expected_value,
+                        anomaly.target_value,
+                        anomaly.difference_value,
+                        anomaly.difference_rate,
+                        anomaly.severity,
+                        anomaly.impact_score,
+                        json.dumps(anomaly.evidence_json, ensure_ascii=False, sort_keys=True),
+                        run_id,
+                    ),
+                )
+                row = cursor.fetchone()
+                if row is not None:
+                    stored_anomalies.append(StoredAnomaly(id=int(row[0]), segment_id=int(row[1])))
+        return stored_anomalies
+
+    def upsert_root_cause_candidates(
+        self,
+        root_causes: list[RootCauseCandidate],
+    ) -> int:
+        with self.connection.cursor() as cursor:
+            for root_cause in root_causes:
+                cursor.execute(
+                    UPSERT_ROOT_CAUSE_SQL,
+                    (
+                        root_cause.anomaly_id,
+                        root_cause.cause_type,
+                        root_cause.cause_key,
+                        root_cause.title,
+                        root_cause.description,
+                        root_cause.confidence_score,
+                        root_cause.impact_score,
+                        root_cause.rank_no,
+                        json.dumps(root_cause.evidence_json, ensure_ascii=False, sort_keys=True),
+                    ),
+                )
+        return len(root_causes)
+
 
 def build_segment_description(dimensions: Mapping[str, str]) -> str:
     return "Daily analysis segment: " + ", ".join(
         f"{key}={value}" for key, value in sorted(dimensions.items())
     )
+
+
+def iter_cursor_rows(cursor: Cursor):
+    fetchall = getattr(cursor, "fetchall", None)
+    if callable(fetchall):
+        yield from fetchall()
+        return
+    while True:
+        row = cursor.fetchone()
+        if row is None:
+            return
+        yield row
 
 
 UPSERT_SEGMENT_SQL = """
@@ -282,4 +383,75 @@ ON CONFLICT (project_id, external_user_id, segment_id, analysis_date) DO UPDATE 
     confidence = EXCLUDED.confidence,
     reason_json = EXCLUDED.reason_json,
     created_run_id = EXCLUDED.created_run_id
+""".strip()
+
+
+FETCH_SEGMENT_BASELINES_SQL = """
+SELECT
+    segment_id,
+    AVG(view_to_purchase_rate) AS baseline_view_to_purchase_rate
+FROM segment_daily_metrics
+WHERE project_id = %s
+  AND segment_id = ANY(%s)
+  AND analysis_date >= %s
+  AND analysis_date <= %s
+  AND view_to_purchase_rate IS NOT NULL
+GROUP BY segment_id
+""".strip()
+
+
+UPSERT_SEGMENT_ANOMALY_SQL = """
+INSERT INTO segment_anomalies (
+    project_id,
+    segment_id,
+    analysis_date,
+    metric_name,
+    actual_value,
+    expected_value,
+    target_value,
+    difference_value,
+    difference_rate,
+    severity,
+    impact_score,
+    evidence_json,
+    created_run_id
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+)
+ON CONFLICT (project_id, segment_id, analysis_date, metric_name) DO UPDATE SET
+    actual_value = EXCLUDED.actual_value,
+    expected_value = EXCLUDED.expected_value,
+    target_value = EXCLUDED.target_value,
+    difference_value = EXCLUDED.difference_value,
+    difference_rate = EXCLUDED.difference_rate,
+    severity = EXCLUDED.severity,
+    impact_score = EXCLUDED.impact_score,
+    status = 'detected',
+    evidence_json = EXCLUDED.evidence_json,
+    created_run_id = EXCLUDED.created_run_id
+RETURNING id, segment_id
+""".strip()
+
+
+UPSERT_ROOT_CAUSE_SQL = """
+INSERT INTO root_cause_candidates (
+    anomaly_id,
+    cause_type,
+    cause_key,
+    title,
+    description,
+    confidence_score,
+    impact_score,
+    rank_no,
+    evidence_json
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb
+)
+ON CONFLICT (anomaly_id, cause_type, cause_key) DO UPDATE SET
+    title = EXCLUDED.title,
+    description = EXCLUDED.description,
+    confidence_score = EXCLUDED.confidence_score,
+    impact_score = EXCLUDED.impact_score,
+    rank_no = EXCLUDED.rank_no,
+    evidence_json = EXCLUDED.evidence_json
 """.strip()
