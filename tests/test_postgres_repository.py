@@ -3,9 +3,11 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
+from app.analysis.models import BaselineMetrics
 from app.analysis.models import SegmentAggregate
 from app.analysis.models import UserPrimarySegmentCandidate
 from app.analysis.postgres_repository import PostgresAnalysisRepository
+import pytest
 
 
 class FakeCursor:
@@ -87,6 +89,21 @@ def test_upsert_segments_uses_schema_unique_key_and_nullable_run_id() -> None:
     assert stored_segments[aggregate().segment_key].id == 10
 
 
+def test_get_project_timezone_falls_back_to_seoul_when_empty() -> None:
+    connection = FakeConnection(rows=[("  ",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    assert repository.get_project_timezone(1) == "Asia/Seoul"
+
+
+def test_get_project_timezone_rejects_invalid_timezone_before_window_build() -> None:
+    connection = FakeConnection(rows=[("Mars/Seoul",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    with pytest.raises(ValueError, match="invalid timezone"):
+        repository.get_project_timezone(1)
+
+
 def test_upsert_segments_skips_default_segment_key() -> None:
     connection = FakeConnection(rows=[])
     repository = PostgresAnalysisRepository(connection)
@@ -163,6 +180,28 @@ def test_fetch_segment_metric_baselines_uses_previous_seven_days_only() -> None:
     assert parameters[2] == date(2021, 1, 1)
     assert parameters[3] == date(2021, 1, 7)
     assert baselines[10].view_to_purchase_rate == Decimal("0.06")
+
+
+def test_update_segment_daily_metric_baselines_updates_current_analysis_date_rows() -> None:
+    connection = FakeConnection(rows=[])
+    repository = PostgresAnalysisRepository(connection)
+
+    updated_count = repository.update_segment_daily_metric_baselines(
+        project_id=1,
+        analysis_date=date(2021, 1, 8),
+        baselines={
+            10: BaselineMetrics(
+                segment_id=10,
+                view_to_purchase_rate=Decimal("0.06"),
+            )
+        },
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert updated_count == 1
+    assert "UPDATE segment_daily_metrics" in query
+    assert "baseline_view_to_purchase_rate = %s" in query
+    assert parameters == (Decimal("0.06"), 1, 10, date(2021, 1, 8))
 
 
 def test_upsert_segment_anomalies_and_root_causes_use_schema_keys() -> None:
