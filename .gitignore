@@ -1,9 +1,0 @@
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.env
-.env.local
-.env.*.local
-.venv/
-venv/
-ga4_exports
