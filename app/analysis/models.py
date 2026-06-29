@@ -51,3 +51,9 @@ class SegmentAggregate:
     @property
     def is_valid_sample(self) -> bool:
         return self.product_view_count >= 100 or self.user_count >= 30
+
+
+@dataclass(frozen=True)
+class StoredSegment:
+    id: int
+    segment_key: str
