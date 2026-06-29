@@ -6,7 +6,7 @@ from datetime import date
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from app.analysis.models import SegmentAggregate, StoredSegment
+from app.analysis.models import SegmentAggregate, StoredSegment, UserPrimarySegmentCandidate
 from app.analysis.segments import is_default_segment_key
 
 DEFAULT_PROJECT_TIMEZONE = "Asia/Seoul"
@@ -136,6 +136,52 @@ class PostgresAnalysisRepository:
                 metric_count += 1
         return metric_count
 
+    def upsert_user_segment_memberships(
+        self,
+        project_id: int,
+        analysis_date: date,
+        candidates: list[UserPrimarySegmentCandidate],
+        stored_segments: dict[str, StoredSegment],
+        run_id: int | None,
+    ) -> int:
+        membership_count = 0
+        with self.connection.cursor() as cursor:
+            for candidate in candidates:
+                stored_segment = stored_segments.get(candidate.segment_key)
+                if stored_segment is None:
+                    continue
+                cursor.execute(
+                    DELETE_STALE_PRIMARY_MEMBERSHIP_SQL,
+                    (
+                        project_id,
+                        candidate.external_user_id,
+                        analysis_date,
+                        stored_segment.id,
+                    ),
+                )
+                cursor.execute(
+                    UPSERT_USER_SEGMENT_MEMBERSHIP_SQL,
+                    (
+                        project_id,
+                        candidate.external_user_id,
+                        stored_segment.id,
+                        analysis_date,
+                        True,
+                        candidate.confidence,
+                        json.dumps(
+                            {
+                                "segment_key": candidate.segment_key,
+                                "dimensions": candidate.dimensions,
+                            },
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        ),
+                        run_id,
+                    ),
+                )
+                membership_count += 1
+        return membership_count
+
 
 def build_segment_description(dimensions: Mapping[str, str]) -> str:
     return "Daily analysis segment: " + ", ".join(
@@ -242,5 +288,36 @@ ON CONFLICT (project_id, segment_id, analysis_date) DO UPDATE SET
     baseline_view_to_purchase_rate = EXCLUDED.baseline_view_to_purchase_rate,
     target_view_to_purchase_rate = EXCLUDED.target_view_to_purchase_rate,
     metric_json = EXCLUDED.metric_json,
+    created_run_id = EXCLUDED.created_run_id
+""".strip()
+
+
+DELETE_STALE_PRIMARY_MEMBERSHIP_SQL = """
+DELETE FROM user_segment_memberships
+WHERE project_id = %s
+  AND external_user_id = %s
+  AND analysis_date = %s
+  AND is_primary = true
+  AND segment_id <> %s
+""".strip()
+
+
+UPSERT_USER_SEGMENT_MEMBERSHIP_SQL = """
+INSERT INTO user_segment_memberships (
+    project_id,
+    external_user_id,
+    segment_id,
+    analysis_date,
+    is_primary,
+    confidence,
+    reason_json,
+    created_run_id
+) VALUES (
+    %s, %s, %s, %s, %s, %s, %s::jsonb, %s
+)
+ON CONFLICT (project_id, external_user_id, segment_id, analysis_date) DO UPDATE SET
+    is_primary = EXCLUDED.is_primary,
+    confidence = EXCLUDED.confidence,
+    reason_json = EXCLUDED.reason_json,
     created_run_id = EXCLUDED.created_run_id
 """.strip()

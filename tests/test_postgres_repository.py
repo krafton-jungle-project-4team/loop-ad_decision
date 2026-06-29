@@ -4,6 +4,7 @@ from datetime import date
 from decimal import Decimal
 
 from app.analysis.models import SegmentAggregate
+from app.analysis.models import UserPrimarySegmentCandidate
 from app.analysis.postgres_repository import PostgresAnalysisRepository
 import pytest
 
@@ -143,3 +144,35 @@ def test_upsert_segment_daily_metrics_uses_schema_unique_key() -> None:
     assert "ON CONFLICT (project_id, segment_id, analysis_date)" in query
     assert "baseline_view_to_purchase_rate" in query
     assert parameters[-1] is None
+
+
+def test_upsert_user_segment_memberships_only_uses_stored_segments() -> None:
+    connection = FakeConnection(rows=[(10, aggregate().segment_key)])
+    repository = PostgresAnalysisRepository(connection)
+    stored_segments = repository.upsert_segments(1, [aggregate()], run_id=7)
+
+    membership_count = repository.upsert_user_segment_memberships(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+        candidates=[
+            UserPrimarySegmentCandidate(
+                external_user_id="user-1",
+                segment_key=aggregate().segment_key,
+                dimensions=aggregate().dimensions,
+            ),
+            UserPrimarySegmentCandidate(
+                external_user_id="user-2",
+                segment_key="missing",
+                dimensions={},
+            ),
+        ],
+        stored_segments=stored_segments,
+        run_id=None,
+    )
+
+    delete_query, _ = connection.cursor_instance.executed[1]
+    upsert_query, upsert_parameters = connection.cursor_instance.executed[2]
+    assert membership_count == 1
+    assert "DELETE FROM user_segment_memberships" in delete_query
+    assert "ON CONFLICT (project_id, external_user_id, segment_id, analysis_date)" in upsert_query
+    assert upsert_parameters[-1] is None

@@ -4,7 +4,7 @@ from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
 from app.analysis.metrics import calculate_rate, decimal_or_zero
-from app.analysis.models import AnalysisWindow, SegmentAggregate
+from app.analysis.models import AnalysisWindow, SegmentAggregate, UserPrimarySegmentCandidate
 from app.analysis.segments import (
     build_segment_key,
     build_segment_name,
@@ -67,6 +67,33 @@ HAVING product_view_count >= {min_product_view_count:UInt64}
 """.strip()
 
 
+USER_PRIMARY_SEGMENT_QUERY = """
+SELECT
+    user_id AS external_user_id,
+    argMax(ifNull(age_group, ''), event_time) AS age_group,
+    argMax(ifNull(gender, ''), event_time) AS gender,
+    argMax(ifNull(device, ''), event_time) AS device_type,
+    argMax(ifNull(channel, ''), event_time) AS acquisition_channel,
+    argMax(ifNull(category, ''), event_time) AS primary_category
+FROM events
+WHERE project_id = {project_id:String}
+  AND event_time >= parseDateTime64BestEffort({window_start_utc:String}, 3, 'UTC')
+  AND event_time < parseDateTime64BestEffort({window_end_utc:String}, 3, 'UTC')
+  AND event_name IN (
+    'page_view',
+    'product_view',
+    'add_to_cart',
+    'checkout_start',
+    'purchase',
+    'ad_impression',
+    'ad_click'
+  )
+  AND user_id IS NOT NULL
+  AND user_id != ''
+GROUP BY user_id
+""".strip()
+
+
 class ClickHouseAnalysisRepository:
     def __init__(
         self,
@@ -84,13 +111,12 @@ class ClickHouseAnalysisRepository:
         project_id: int | str,
         window: AnalysisWindow,
     ) -> list[SegmentAggregate]:
-        parameters = {
-            "project_id": str(project_id),
-            "window_start_utc": window.window_start.astimezone(ZoneInfo("UTC")).isoformat(),
-            "window_end_utc": window.window_end.astimezone(ZoneInfo("UTC")).isoformat(),
-            "min_product_view_count": self.min_product_view_count,
-            "min_user_count": self.min_user_count,
-        }
+        parameters = build_window_parameters(
+            project_id=project_id,
+            window=window,
+            min_product_view_count=self.min_product_view_count,
+            min_user_count=self.min_user_count,
+        )
         result = self.client.query(SEGMENT_AGGREGATE_QUERY, parameters=parameters)
         aggregates = [
             build_segment_aggregate(project_id=project_id, row=row)
@@ -101,6 +127,39 @@ class ClickHouseAnalysisRepository:
             for aggregate in aggregates
             if aggregate.is_valid_sample and not is_default_segment_key(aggregate.segment_key)
         ]
+
+    def fetch_user_primary_segment_candidates(
+        self,
+        project_id: int | str,
+        window: AnalysisWindow,
+    ) -> list[UserPrimarySegmentCandidate]:
+        parameters = build_window_parameters(
+            project_id=project_id,
+            window=window,
+            min_product_view_count=self.min_product_view_count,
+            min_user_count=self.min_user_count,
+        )
+        result = self.client.query(USER_PRIMARY_SEGMENT_QUERY, parameters=parameters)
+        return [
+            build_user_primary_segment_candidate(row)
+            for row in result.result_rows
+            if row and row[0] is not None and str(row[0]).strip()
+        ]
+
+def build_window_parameters(
+    *,
+    project_id: int | str,
+    window: AnalysisWindow,
+    min_product_view_count: int,
+    min_user_count: int,
+) -> dict[str, object]:
+    return {
+        "project_id": str(project_id),
+        "window_start_utc": window.window_start.astimezone(ZoneInfo("UTC")).isoformat(),
+        "window_end_utc": window.window_end.astimezone(ZoneInfo("UTC")).isoformat(),
+        "min_product_view_count": min_product_view_count,
+        "min_user_count": min_user_count,
+    }
 
 
 def build_segment_aggregate(project_id: int | str, row: tuple[Any, ...]) -> SegmentAggregate:
@@ -144,4 +203,21 @@ def build_segment_aggregate(project_id: int | str, row: tuple[Any, ...]) -> Segm
         view_to_purchase_rate=calculate_rate(purchase_count, product_view_count),
         ctr=calculate_rate(ad_click_count, ad_impression_count),
         cvr=calculate_rate(purchase_count, product_view_count),
+    )
+
+
+def build_user_primary_segment_candidate(row: tuple[Any, ...]) -> UserPrimarySegmentCandidate:
+    dimensions = normalize_dimensions(
+        {
+            "age_group": row[1],
+            "gender": row[2],
+            "device_type": row[3],
+            "acquisition_channel": row[4],
+            "primary_category": row[5],
+        }
+    )
+    return UserPrimarySegmentCandidate(
+        external_user_id=str(row[0]),
+        segment_key=build_segment_key(dimensions),
+        dimensions=dimensions,
     )
