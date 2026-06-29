@@ -146,7 +146,6 @@ class ClickHouseAnalysisRepository:
             if row and row[0] is not None and str(row[0]).strip()
         ]
 
-
 def build_window_parameters(
     *,
     project_id: int | str,
