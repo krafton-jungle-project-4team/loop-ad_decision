@@ -51,8 +51,3 @@ def get_postgres_session() -> Iterator[Session]:
     with session_factory() as session:
         yield session
 
-
-def create_postgres_tables(settings: Settings | None = None) -> None:
-    from app.persistence.models import Base
-
-    Base.metadata.create_all(bind=get_postgres_engine(settings))

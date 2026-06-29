@@ -13,7 +13,7 @@ from app.analysis.schemas import FunnelRecommendationAnalysisRequest
 from app.analysis.service import run_funnel_recommendation_analysis
 from app.core.config import Settings, get_settings
 from app.db.clickhouse import ClickHouseClient, ClickHouseClientFactory, get_clickhouse_client
-from app.db.postgres import create_postgres_tables, get_postgres_sessionmaker
+from app.db.postgres import get_postgres_sessionmaker
 from app.metrics.repository import FunnelMetricsRepository
 from app.persistence.repository import PostgresRepository
 from app.root_causes.repository import RootCauseRepository
@@ -21,6 +21,7 @@ from app.root_causes.repository import RootCauseRepository
 logger = logging.getLogger(__name__)
 
 MAX_ANALYSIS_JOB_ERROR_MESSAGE_LENGTH = 1000
+ANALYSIS_WORKER_POLL_INTERVAL_SECONDS = 2.0
 
 SessionFactory = Callable[[], AbstractContextManager[Session]]
 RepositoryFactory = Callable[[Session], PostgresRepository]
@@ -182,13 +183,7 @@ def run_worker_loop(
     clickhouse_client_factory: ClickHouseClientFactory = get_clickhouse_client,
 ) -> None:
     resolved_settings = settings or get_settings()
-    if resolved_settings.loopad_postgres_auto_create_tables:
-        try:
-            create_postgres_tables(resolved_settings)
-        except Exception:
-            logger.warning("PostgreSQL table auto-create skipped.", exc_info=True)
     resolved_session_factory = session_factory or get_postgres_sessionmaker(resolved_settings)
-    poll_interval = resolved_settings.loopad_analysis_worker_poll_interval_seconds
 
     while True:
         try:
@@ -200,7 +195,7 @@ def run_worker_loop(
             logger.exception("Analysis worker loop iteration failed.")
             did_work = False
         if not did_work:
-            time.sleep(poll_interval)
+            time.sleep(ANALYSIS_WORKER_POLL_INTERVAL_SECONDS)
 
 
 def main() -> None:

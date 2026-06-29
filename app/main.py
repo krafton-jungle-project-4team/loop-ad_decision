@@ -1,6 +1,3 @@
-from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
-import logging
 import uvicorn
 
 from fastapi import FastAPI, Request, status
@@ -13,7 +10,6 @@ from app.anomalies.router import router as anomalies_router
 from app.actions.router import router as actions_router
 from app.automation.router import router as automation_router
 from app.core.config import get_settings
-from app.db.postgres import create_postgres_tables
 from app.metrics.router import router as metrics_router
 from app.recommendations.router import (
     ad_mappings_router,
@@ -21,21 +17,7 @@ from app.recommendations.router import (
 )
 from app.root_causes.router import router as root_causes_router
 
-logger = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    settings = get_settings()
-    if settings.loopad_postgres_auto_create_tables:
-        try:
-            create_postgres_tables(settings)
-        except Exception:
-            logger.warning("PostgreSQL table auto-create skipped.", exc_info=True)
-    yield
-
-
-app = FastAPI(title="LoopAd AI Analysis Server", lifespan=lifespan)
+app = FastAPI(title="LoopAd AI Analysis Server")
 
 
 @app.exception_handler(RequestValidationError)
