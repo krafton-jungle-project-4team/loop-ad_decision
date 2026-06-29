@@ -5,7 +5,7 @@ from typing import Any
 
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.persistence.job_statuses import (
@@ -500,11 +500,28 @@ class PostgresRepository:
         self,
         project_id: str,
     ) -> list[ActiveSegmentAdMappingRow]:
+        now = datetime.now(UTC)
         rows = self.session.execute(
             select(SegmentAdMapping, AdCreative)
             .outerjoin(AdCreative, SegmentAdMapping.creative_id == AdCreative.id)
             .where(SegmentAdMapping.project_id == project_id)
             .where(SegmentAdMapping.status == "active")
+            .where(
+                or_(
+                    SegmentAdMapping.expires_at.is_(None),
+                    SegmentAdMapping.expires_at > now,
+                )
+            )
+            .where(
+                or_(
+                    SegmentAdMapping.creative_id.is_(None),
+                    and_(
+                        AdCreative.id.is_not(None),
+                        AdCreative.status == "active",
+                        AdCreative.project_id == SegmentAdMapping.project_id,
+                    ),
+                )
+            )
             .order_by(SegmentAdMapping.created_at.desc())
         )
         return [
@@ -552,6 +569,7 @@ class PostgresRepository:
     ) -> list[BanditArmServingRow]:
         arms = self.list_bandit_arms_by_policy(bandit_policy_id)
         rows: list[BanditArmServingRow] = []
+        now = datetime.now(UTC)
         for arm in arms:
             result = self.session.execute(
                 select(SegmentAdMapping, AdCreative)
@@ -559,6 +577,22 @@ class PostgresRepository:
                 .where(SegmentAdMapping.bandit_policy_id == bandit_policy_id)
                 .where(SegmentAdMapping.bandit_arm_id == arm.id)
                 .where(SegmentAdMapping.status == "active")
+                .where(
+                    or_(
+                        SegmentAdMapping.expires_at.is_(None),
+                        SegmentAdMapping.expires_at > now,
+                    )
+                )
+                .where(
+                    or_(
+                        SegmentAdMapping.creative_id.is_(None),
+                        and_(
+                            AdCreative.id.is_not(None),
+                            AdCreative.status == "active",
+                            AdCreative.project_id == SegmentAdMapping.project_id,
+                        ),
+                    )
+                )
                 .order_by(SegmentAdMapping.created_at.desc())
                 .limit(1)
             ).first()

@@ -1,4 +1,5 @@
 import pytest
+from sqlalchemy.dialects import postgresql
 from pydantic import ValidationError
 
 from app.core.config import Settings
@@ -11,7 +12,20 @@ from app.persistence.models import (
     RecommendationResult,
     SegmentAdMapping,
 )
-from app.persistence.repository import build_segment_hash, canonical_segment_json
+from app.persistence.repository import (
+    PostgresRepository,
+    build_segment_hash,
+    canonical_segment_json,
+)
+
+
+class CapturingSession:
+    def __init__(self) -> None:
+        self.statement = None
+
+    def execute(self, statement):
+        self.statement = statement
+        return []
 
 
 def settings_with_required_env(**overrides: object) -> Settings:
@@ -156,3 +170,23 @@ def test_automation_policy_matches_contract_columns() -> None:
     ):
         assert column_name in columns
     assert columns["project_id"].unique is True
+
+
+def test_active_mapping_query_filters_expired_mappings_and_inactive_creatives() -> None:
+    session = CapturingSession()
+    repository = PostgresRepository(session)
+
+    assert repository.list_active_segment_ad_mappings_with_creatives("loopad-demo-shop") == []
+    compiled_sql = str(
+        session.statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "segment_ad_mappings.status = 'active'" in compiled_sql
+    assert "segment_ad_mappings.expires_at IS NULL" in compiled_sql
+    assert "segment_ad_mappings.expires_at >" in compiled_sql
+    assert "segment_ad_mappings.creative_id IS NULL" in compiled_sql
+    assert "ad_creatives.status = 'active'" in compiled_sql
+    assert "ad_creatives.project_id = segment_ad_mappings.project_id" in compiled_sql
