@@ -57,3 +57,11 @@ class SegmentAggregate:
 class StoredSegment:
     id: int
     segment_key: str
+
+
+@dataclass(frozen=True)
+class UserPrimarySegmentCandidate:
+    external_user_id: str
+    segment_key: str
+    dimensions: dict[str, str]
+    confidence: Decimal = Decimal("1.0")

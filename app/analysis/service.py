@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
-from app.analysis.models import AnalysisResult, AnalysisWindow, SegmentAggregate, StoredSegment
+from app.analysis.models import (
+    AnalysisResult,
+    AnalysisWindow,
+    SegmentAggregate,
+    StoredSegment,
+    UserPrimarySegmentCandidate,
+)
 from app.analysis.time_window import build_analysis_window
 
 
@@ -41,16 +47,41 @@ class SegmentMetricsRepository(Protocol):
         ...
 
 
+class UserPrimarySegmentRepository(Protocol):
+    def fetch_user_primary_segment_candidates(
+        self,
+        project_id: int,
+        window: AnalysisWindow,
+    ) -> list[UserPrimarySegmentCandidate]:
+        ...
+
+
+class UserSegmentMembershipRepository(Protocol):
+    def upsert_user_segment_memberships(
+        self,
+        project_id: int,
+        analysis_date: date,
+        candidates: list[UserPrimarySegmentCandidate],
+        stored_segments: dict[str, StoredSegment],
+        run_id: int | None,
+    ) -> int:
+        ...
+
+
 class AnalysisService:
     def __init__(
         self,
         project_repository: ProjectTimezoneRepository,
         segment_aggregate_repository: SegmentAggregateRepository | None = None,
         segment_metrics_repository: SegmentMetricsRepository | None = None,
+        user_primary_segment_repository: UserPrimarySegmentRepository | None = None,
+        user_segment_membership_repository: UserSegmentMembershipRepository | None = None,
     ) -> None:
         self.project_repository = project_repository
         self.segment_aggregate_repository = segment_aggregate_repository
         self.segment_metrics_repository = segment_metrics_repository
+        self.user_primary_segment_repository = user_primary_segment_repository
+        self.user_segment_membership_repository = user_segment_membership_repository
 
     def run(
         self,
@@ -80,7 +111,24 @@ class AnalysisService:
                 stored_segments=stored_segments,
                 run_id=run_id,
             )
+        membership_count = 0
+        if (
+            self.user_primary_segment_repository is not None
+            and self.user_segment_membership_repository is not None
+        ):
+            candidates = self.user_primary_segment_repository.fetch_user_primary_segment_candidates(
+                project_id,
+                window,
+            )
+            membership_count = self.user_segment_membership_repository.upsert_user_segment_memberships(
+                project_id=project_id,
+                analysis_date=analysis_date,
+                candidates=candidates,
+                stored_segments=stored_segments,
+                run_id=run_id,
+            )
         return AnalysisResult(
             segment_count=len(stored_segments),
+            membership_count=membership_count,
             metric_count=metric_count,
         )

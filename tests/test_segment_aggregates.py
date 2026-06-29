@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app.analysis.clickhouse_repository import ClickHouseAnalysisRepository
+from app.analysis.clickhouse_repository import (
+    ClickHouseAnalysisRepository,
+    SEGMENT_AGGREGATE_QUERY,
+    USER_PRIMARY_SEGMENT_QUERY,
+)
 from app.analysis.segments import build_segment_key, normalize_dimensions, normalize_dimension_value
 from app.analysis.time_window import build_analysis_window
 
@@ -114,3 +118,28 @@ def test_fetch_segment_aggregates_filters_invalid_samples() -> None:
     window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
 
     assert repository.fetch_segment_aggregates(project_id=1, window=window) == []
+
+
+def test_user_primary_segment_query_is_separate_and_uses_same_segment_key_rules() -> None:
+    client = FakeClickHouseClient(
+        [
+            (
+                "user-1",
+                "30s",
+                " Male ",
+                "Mobile Web",
+                "Kakao",
+                "Fresh Food",
+            )
+        ]
+    )
+    repository = ClickHouseAnalysisRepository(client)
+    window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
+
+    candidates = repository.fetch_user_primary_segment_candidates(project_id=1, window=window)
+
+    assert SEGMENT_AGGREGATE_QUERY != USER_PRIMARY_SEGMENT_QUERY
+    assert len(candidates) == 1
+    assert candidates[0].external_user_id == "user-1"
+    assert candidates[0].segment_key == "age_30s__gender_male__device_mobile_web__channel_kakao__category_fresh_food"
+    assert client.queries[0] == USER_PRIMARY_SEGMENT_QUERY

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app.analysis.models import SegmentAggregate, StoredSegment
+from app.analysis.models import SegmentAggregate, StoredSegment, UserPrimarySegmentCandidate
 from app.analysis.service import AnalysisService
 from app.analysis.time_window import build_analysis_window
 
@@ -48,6 +48,30 @@ class FakeSegmentMetricsRepository:
     ):
         self.metric_run_ids.append(run_id)
         return len(stored_segments)
+
+
+class FakeUserPrimarySegmentRepository:
+    def __init__(self, candidates: list[UserPrimarySegmentCandidate]) -> None:
+        self.candidates = candidates
+
+    def fetch_user_primary_segment_candidates(self, project_id, window):
+        return self.candidates
+
+
+class FakeUserSegmentMembershipRepository:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[UserPrimarySegmentCandidate], dict[str, StoredSegment], int | None]] = []
+
+    def upsert_user_segment_memberships(
+        self,
+        project_id,
+        analysis_date,
+        candidates,
+        stored_segments,
+        run_id,
+    ):
+        self.calls.append((candidates, stored_segments, run_id))
+        return sum(1 for candidate in candidates if candidate.segment_key in stored_segments)
 
 
 def segment_aggregate(segment_key: str = "age_30s__gender_male__device_mobile__channel_kakao__category_fresh") -> SegmentAggregate:
@@ -116,3 +140,32 @@ def test_analysis_service_stores_segments_and_metrics_with_nullable_run_id() -> 
     assert result.metric_count == 1
     assert metrics_repository.segment_run_ids == [None]
     assert metrics_repository.metric_run_ids == [None]
+
+
+def test_analysis_service_stores_memberships_after_valid_segments() -> None:
+    valid_aggregate = segment_aggregate()
+    invalid_candidate = UserPrimarySegmentCandidate(
+        external_user_id="user-2",
+        segment_key="age_40s__gender_male__device_mobile__channel_kakao__category_fresh",
+        dimensions={},
+    )
+    valid_candidate = UserPrimarySegmentCandidate(
+        external_user_id="user-1",
+        segment_key=valid_aggregate.segment_key,
+        dimensions=valid_aggregate.dimensions,
+    )
+    membership_repository = FakeUserSegmentMembershipRepository()
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([valid_aggregate]),
+        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        user_primary_segment_repository=FakeUserPrimarySegmentRepository(
+            [valid_candidate, invalid_candidate]
+        ),
+        user_segment_membership_repository=membership_repository,
+    )
+
+    result = service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert result.membership_count == 1
+    assert membership_repository.calls[0][2] == 77
