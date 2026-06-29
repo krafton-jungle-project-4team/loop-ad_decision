@@ -23,6 +23,17 @@ class Settings(BaseSettings):
         alias="LOOPAD_GENAI_GENERATED_ASSETS_PREFIX",
     )
     loopad_openai_api_key: SecretStr = Field(alias="LOOPAD_OPENAI_API_KEY")
+    loopad_public_asset_base_url: str | None = Field(
+        default=None,
+        alias="LOOPAD_PUBLIC_ASSET_BASE_URL",
+    )
+
+    image_provider: str = Field(default="mock", alias="IMAGE_PROVIDER")
+    gemini_api_key: SecretStr | None = Field(default=None, alias="GEMINI_API_KEY")
+    gemini_image_model: str = Field(
+        default="gemini-3.1-flash-image",
+        alias="GEMINI_IMAGE_MODEL",
+    )
 
     model_config = SettingsConfigDict(
         env_file=".env.local",
@@ -63,6 +74,14 @@ class Settings(BaseSettings):
         if parsed.scheme not in {"http", "https"} or parsed.hostname is None or parsed.port is None:
             raise ValueError("LOOPAD_CLICKHOUSE_URL must be http(s)://host:port")
         return value
+
+    @field_validator("image_provider")
+    @classmethod
+    def validate_image_provider(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"mock", "gemini"}:
+            raise ValueError("IMAGE_PROVIDER must be mock or gemini")
+        return normalized
 
 
 @lru_cache

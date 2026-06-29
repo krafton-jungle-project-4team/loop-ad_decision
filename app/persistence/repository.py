@@ -15,6 +15,7 @@ from app.persistence.job_statuses import (
     ANALYSIS_JOB_STATUS_RUNNING,
 )
 from app.persistence.models import (
+    ActionCatalog,
     AdCreative,
     AnalysisJob,
     AutomationPolicy,
@@ -34,6 +35,12 @@ JsonObject = dict[str, Any]
 class ActiveSegmentAdMappingRow:
     mapping: SegmentAdMapping
     creative: AdCreative | None = None
+
+
+@dataclass(frozen=True)
+class ContentGenerationTargetRow:
+    mapping: SegmentAdMapping
+    creative: AdCreative
 
 
 @dataclass(frozen=True)
@@ -214,6 +221,13 @@ class PostgresRepository:
             select(RecommendationAction)
             .where(RecommendationAction.recommendation_result_id == recommendation_result_id)
             .where(RecommendationAction.action_id == action_id)
+        )
+
+    def get_active_action_catalog_item(self, action_id: str) -> ActionCatalog | None:
+        return self.session.scalar(
+            select(ActionCatalog)
+            .where(ActionCatalog.action_id == action_id)
+            .where(ActionCatalog.status == "active")
         )
 
     def update_recommendation_action(
@@ -467,6 +481,36 @@ class PostgresRepository:
             .where(SegmentAdMapping.recommendation_action_id == recommendation_action_id)
         )
 
+    def get_content_generation_target(
+        self,
+        *,
+        recommendation_action_id: int,
+        project_id: str,
+    ) -> ContentGenerationTargetRow | None:
+        now = datetime.now(UTC)
+        result = self.session.execute(
+            select(SegmentAdMapping, AdCreative)
+            .join(AdCreative, SegmentAdMapping.creative_id == AdCreative.id)
+            .where(SegmentAdMapping.recommendation_action_id == recommendation_action_id)
+            .where(SegmentAdMapping.project_id == project_id)
+            .where(SegmentAdMapping.status == "active")
+            .where(
+                or_(
+                    SegmentAdMapping.expires_at.is_(None),
+                    SegmentAdMapping.expires_at > now,
+                )
+            )
+            .where(AdCreative.status == "active")
+            .where(AdCreative.project_id == SegmentAdMapping.project_id)
+            .order_by(SegmentAdMapping.created_at.desc())
+            .limit(1)
+        ).first()
+        if result is None:
+            return None
+
+        mapping, creative = result
+        return ContentGenerationTargetRow(mapping=mapping, creative=creative)
+
     def list_segment_ad_mappings(
         self,
         *,
@@ -605,6 +649,18 @@ class PostgresRepository:
 
     def get_ad_creative(self, creative_id: int) -> AdCreative | None:
         return self.session.get(AdCreative, creative_id)
+
+    def update_ad_creative_image_url(
+        self,
+        creative_id: int,
+        image_url: str,
+    ) -> AdCreative | None:
+        creative = self.get_ad_creative(creative_id)
+        if creative is None:
+            return None
+        creative.image_url = image_url
+        self.session.flush()
+        return creative
 
     def get_active_ad_creative_by_action(
         self,

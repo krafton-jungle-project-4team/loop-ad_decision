@@ -10,6 +10,7 @@ from app.anomalies.router import router as anomalies_router
 from app.actions.router import router as actions_router
 from app.automation.router import router as automation_router
 from app.bandit.router import router as bandit_router
+from app.contents.router import router as contents_router
 from app.core.config import get_settings
 from app.metrics.router import router as metrics_router
 from app.recommendations.router import (
@@ -46,6 +47,7 @@ app.include_router(analysis_router)
 app.include_router(bandit_router)
 app.include_router(recommendations_router)
 app.include_router(ad_mappings_router)
+app.include_router(contents_router)
 
 
 def main() -> None:

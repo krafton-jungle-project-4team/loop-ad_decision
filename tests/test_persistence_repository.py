@@ -25,7 +25,15 @@ class CapturingSession:
 
     def execute(self, statement):
         self.statement = statement
-        return []
+        return CapturingResult()
+
+
+class CapturingResult:
+    def __iter__(self):
+        return iter(())
+
+    def first(self):
+        return None
 
 
 def settings_with_required_env(**overrides: object) -> Settings:
@@ -188,5 +196,30 @@ def test_active_mapping_query_filters_expired_mappings_and_inactive_creatives() 
     assert "segment_ad_mappings.expires_at IS NULL" in compiled_sql
     assert "segment_ad_mappings.expires_at >" in compiled_sql
     assert "segment_ad_mappings.creative_id IS NULL" in compiled_sql
+    assert "ad_creatives.status = 'active'" in compiled_sql
+    assert "ad_creatives.project_id = segment_ad_mappings.project_id" in compiled_sql
+
+
+def test_content_generation_target_query_uses_active_mapping_and_active_creative() -> None:
+    session = CapturingSession()
+    repository = PostgresRepository(session)
+
+    assert repository.get_content_generation_target(
+        recommendation_action_id=10,
+        project_id="google-ga4-demo-commerce",
+    ) is None
+    compiled_sql = str(
+        session.statement.compile(
+            dialect=postgresql.dialect(),
+            compile_kwargs={"literal_binds": True},
+        )
+    )
+
+    assert "JOIN ad_creatives ON segment_ad_mappings.creative_id = ad_creatives.id" in compiled_sql
+    assert "segment_ad_mappings.recommendation_action_id = 10" in compiled_sql
+    assert "segment_ad_mappings.project_id = 'google-ga4-demo-commerce'" in compiled_sql
+    assert "segment_ad_mappings.status = 'active'" in compiled_sql
+    assert "segment_ad_mappings.expires_at IS NULL" in compiled_sql
+    assert "segment_ad_mappings.expires_at >" in compiled_sql
     assert "ad_creatives.status = 'active'" in compiled_sql
     assert "ad_creatives.project_id = segment_ad_mappings.project_id" in compiled_sql
