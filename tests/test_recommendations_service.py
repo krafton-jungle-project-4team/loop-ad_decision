@@ -12,6 +12,7 @@ from app.recommendations.schemas import (
 )
 from app.recommendations.service import (
     approve_recommendation_result,
+    get_recommendation_result_response,
     list_active_segment_ad_mappings,
     reject_recommendation_result,
 )
@@ -30,15 +31,20 @@ class FakeRecommendationRepository:
         existing_mapping: SimpleNamespace | None = None,
         mappings: list[SimpleNamespace] | None = None,
         experiments: list[SimpleNamespace] | None = None,
+        actions: list[SimpleNamespace] | None = None,
     ) -> None:
         self.result = result
         self.existing_experiment = existing_experiment
         self.existing_mapping = existing_mapping
         self.mappings = mappings or []
         self.experiments = experiments or []
+        self.actions = actions if actions is not None else (
+            [recommendation_action(result=result)] if result is not None else []
+        )
         self.created_experiments: list[SimpleNamespace] = []
         self.created_mappings: list[SimpleNamespace] = []
         self.updated_results: list[tuple[int, dict[str, object]]] = []
+        self.updated_actions: list[tuple[int, dict[str, object]]] = []
         self.updated_mappings: list[tuple[int, dict[str, object]]] = []
         self.updated_experiments: list[tuple[int, dict[str, object]]] = []
         self.committed = False
@@ -66,11 +72,34 @@ class FakeRecommendationRepository:
                 setattr(self.result, key, value)
         return self.result
 
-    def get_experiment_by_recommendation_action(
+    def list_recommendation_actions(
         self,
         *,
         recommendation_result_id: int,
-        action_id: str,
+    ) -> list[SimpleNamespace]:
+        return [
+            action
+            for action in self.actions
+            if action.recommendation_result_id == recommendation_result_id
+        ]
+
+    def update_recommendation_action(
+        self,
+        recommendation_action_id: int,
+        values: dict[str, object],
+    ) -> SimpleNamespace | None:
+        self.updated_actions.append((recommendation_action_id, values))
+        for action in self.actions:
+            if action.id == recommendation_action_id:
+                for key, value in values.items():
+                    setattr(action, key, value)
+                return action
+        return None
+
+    def get_experiment_by_recommendation_action(
+        self,
+        *,
+        recommendation_action_id: int,
     ) -> SimpleNamespace | None:
         return self.existing_experiment
 
@@ -82,8 +111,7 @@ class FakeRecommendationRepository:
     def get_segment_ad_mapping_by_recommendation_action(
         self,
         *,
-        recommendation_result_id: int,
-        action_id: str,
+        recommendation_action_id: int,
     ) -> SimpleNamespace | None:
         return self.existing_mapping
 
@@ -113,9 +141,9 @@ class FakeRecommendationRepository:
             values = [mapping for mapping in values if mapping.status == status]
         return values[:limit]
 
-    def list_active_segment_ad_mappings(self, project_id: str) -> list[SimpleNamespace]:
+    def list_active_segment_ad_mappings_with_creatives(self, project_id: str) -> list[SimpleNamespace]:
         return [
-            mapping
+            SimpleNamespace(mapping=mapping, creative=getattr(mapping, "creative", None))
             for mapping in self.mappings
             if mapping.project_id == project_id and mapping.status == "active"
         ]
@@ -194,7 +222,7 @@ def recommended_action(
 
 def recommendation_result(
     *,
-    status: str = "pending_review",
+    status: str = "pending_actions",
     actions: list[RecommendedAction] | None = None,
 ) -> SimpleNamespace:
     recommendations = actions or [recommended_action()]
@@ -217,6 +245,46 @@ def recommendation_result(
             ]
         },
         policy_decision_json={"policy_id": 1, "auto_execute_enabled": True, "actions": []},
+        created_at=WINDOW_START,
+        updated_at=WINDOW_START,
+    )
+
+
+def recommendation_action(
+    *,
+    result: SimpleNamespace | None = None,
+    action: RecommendedAction | None = None,
+    status: str = "pending_review",
+) -> SimpleNamespace:
+    result = result or recommendation_result()
+    action = action or recommended_action()
+    return SimpleNamespace(
+        id=10,
+        project_id=result.project_id,
+        recommendation_result_id=result.id,
+        action_id=action.action_id,
+        action_type=action.action_type,
+        title=action.title,
+        description=action.description,
+        target_step=action.target_step,
+        priority_score=action.priority_score,
+        expected_impact=action.expected_impact,
+        rationale=action.rationale,
+        triggered_by_json=action.triggered_by,
+        execution_hint_json=action.execution_hint,
+        experiment_json=action.experiment.model_dump(mode="json") if action.experiment else {},
+        policy_status=None,
+        policy_reasons_json=[],
+        policy_decision_json={},
+        selected_by_strategy="policy",
+        bandit_policy_id=None,
+        bandit_arm_id=None,
+        sampled_value=None,
+        status=status,
+        auto_executed_at=None,
+        reviewed_by=None,
+        reviewed_at=None,
+        review_reason=None,
         created_at=WINDOW_START,
         updated_at=WINDOW_START,
     )
@@ -263,7 +331,11 @@ def test_approve_rejects_unknown_action_id() -> None:
 
 
 def test_approve_rejects_invalid_status_transition() -> None:
-    repository = FakeRecommendationRepository(recommendation_result(status="no_action"))
+    result = recommendation_result()
+    repository = FakeRecommendationRepository(
+        result,
+        actions=[recommendation_action(result=result, status="stopped")],
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         approve_recommendation_result(
@@ -282,7 +354,11 @@ def test_approve_rejects_manual_review_action() -> None:
     manual_action = recommended_action(action_id="manual_review", action_type="REVIEW").model_copy(
         update={"experiment": None}
     )
-    repository = FakeRecommendationRepository(recommendation_result(actions=[manual_action]))
+    result = recommendation_result(actions=[manual_action])
+    repository = FakeRecommendationRepository(
+        result,
+        actions=[recommendation_action(result=result, action=manual_action)],
+    )
 
     with pytest.raises(HTTPException) as exc_info:
         approve_recommendation_result(
@@ -327,12 +403,14 @@ def test_reject_marks_result_mappings_and_experiments() -> None:
                 id=10,
                 project_id="loopad-demo-shop",
                 recommendation_result_id=1,
+                recommendation_action_id=10,
                 status="active",
             ),
             SimpleNamespace(
                 id=11,
                 project_id="loopad-demo-shop",
                 recommendation_result_id=1,
+                recommendation_action_id=10,
                 status="inactive",
             ),
         ],
@@ -341,6 +419,7 @@ def test_reject_marks_result_mappings_and_experiments() -> None:
                 id=20,
                 project_id="loopad-demo-shop",
                 recommendation_result_id=1,
+                recommendation_action_id=10,
                 status="running",
             )
         ],
@@ -355,12 +434,55 @@ def test_reject_marks_result_mappings_and_experiments() -> None:
         ),
     )
 
-    assert response.status == "rejected"
+    assert response.status == "dismissed"
+    assert response.rejected_action_ids == ["recommend_alternative_product"]
     assert response.inactivated_segment_ad_mapping_ids == [10]
     assert response.stopped_experiment_ids == [20]
     assert repository.mappings[0].status == "inactive"
     assert repository.experiments[0].status == "stopped"
-    assert repository.result.status == "rejected"
+    assert repository.result.status == "dismissed"
+
+
+def test_legacy_result_without_action_rows_cannot_be_approved_or_rejected() -> None:
+    repository = FakeRecommendationRepository(recommendation_result(), actions=[])
+
+    with pytest.raises(HTTPException) as approve_exc:
+        approve_recommendation_result(
+            repository=repository,
+            recommendation_result_id=1,
+            request=RecommendationApproveRequest(
+                approved_by="dashboard-user",
+                action_ids=["recommend_alternative_product"],
+            ),
+        )
+    with pytest.raises(HTTPException) as reject_exc:
+        reject_recommendation_result(
+            repository=repository,
+            recommendation_result_id=1,
+            request=RecommendationRejectRequest(rejected_by="dashboard-user"),
+        )
+
+    assert approve_exc.value.status_code == 409
+    assert reject_exc.value.status_code == 409
+    assert repository.actions == []
+
+
+def test_recommendation_detail_returns_actions_or_empty_legacy_actions() -> None:
+    result = recommendation_result()
+    repository = FakeRecommendationRepository(result)
+
+    response = get_recommendation_result_response(
+        repository=repository,
+        recommendation_result_id=1,
+    )
+
+    assert len(response.actions) == 1
+    legacy_repository = FakeRecommendationRepository(result, actions=[])
+    legacy_response = get_recommendation_result_response(
+        repository=legacy_repository,
+        recommendation_result_id=1,
+    )
+    assert legacy_response.actions == []
 
 
 def test_active_ad_mapping_response_only_includes_active_project_mappings() -> None:
@@ -376,8 +498,21 @@ def test_active_ad_mapping_response_only_includes_active_project_mappings() -> N
                 execution_hint_json={"slot": "product_detail"},
                 experiment_id=10,
                 recommendation_result_id=1,
+                recommendation_action_id=10,
+                bandit_policy_id=30,
+                bandit_arm_id=40,
+                bandit_decision_id=50,
+                campaign_id=60,
+                creative_id=70,
+                coupon_id=80,
                 source="manual_approval",
                 status="active",
+                creative=SimpleNamespace(
+                    image_url="https://cdn.example/ad.png",
+                    title="대체 상품",
+                    message="지금 확인해보세요",
+                    landing_url="https://shop.example/products/1",
+                ),
             ),
             SimpleNamespace(
                 id=2,
@@ -389,6 +524,13 @@ def test_active_ad_mapping_response_only_includes_active_project_mappings() -> N
                 execution_hint_json={},
                 experiment_id=11,
                 recommendation_result_id=2,
+                recommendation_action_id=11,
+                bandit_policy_id=None,
+                bandit_arm_id=None,
+                bandit_decision_id=None,
+                campaign_id=None,
+                creative_id=None,
+                coupon_id=None,
                 source="manual_approval",
                 status="inactive",
             ),
@@ -403,3 +545,8 @@ def test_active_ad_mapping_response_only_includes_active_project_mappings() -> N
     assert len(response) == 1
     assert response[0].mapping_id == 1
     assert response[0].status == "active"
+    assert response[0].recommendation_action_id == 10
+    assert response[0].bandit_policy_id == 30
+    assert response[0].content_url == "https://cdn.example/ad.png"
+    assert response[0].title == "대체 상품"
+    assert response[0].serving_weight is None
