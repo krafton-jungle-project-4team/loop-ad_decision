@@ -85,9 +85,14 @@ class FakeAnomalyRepository:
     def __init__(self, baselines: dict[int, BaselineMetrics] | None = None) -> None:
         self.baselines = baselines or {}
         self.anomaly_candidates: list[SegmentAnomalyCandidate] = []
+        self.baseline_update_calls: list[tuple[int, date, dict[int, BaselineMetrics]]] = []
 
     def fetch_segment_metric_baselines(self, project_id, analysis_date, stored_segments):
         return self.baselines
+
+    def update_segment_daily_metric_baselines(self, project_id, analysis_date, baselines):
+        self.baseline_update_calls.append((project_id, analysis_date, baselines))
+        return len(baselines)
 
     def upsert_segment_anomalies(self, project_id, analysis_date, anomalies, run_id):
         self.anomaly_candidates = anomalies
@@ -237,3 +242,26 @@ def test_analysis_service_detects_target_anomaly() -> None:
     assert result.anomaly_ids == [900]
     assert result.anomaly_segment_ids == [1]
     assert result.root_cause_count == 1
+
+
+def test_analysis_service_updates_current_metric_row_with_baseline() -> None:
+    aggregate = segment_aggregate()
+    baselines = {
+        1: BaselineMetrics(
+            segment_id=1,
+            view_to_purchase_rate=Decimal("0.08"),
+        )
+    }
+    anomaly_repository = FakeAnomalyRepository(baselines=baselines)
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([aggregate]),
+        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        anomaly_repository=anomaly_repository,
+    )
+
+    service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert anomaly_repository.baseline_update_calls == [
+        (1, date(2021, 1, 4), baselines)
+    ]
