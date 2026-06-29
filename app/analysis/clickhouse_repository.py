@@ -30,18 +30,10 @@ SEGMENT_AGGREGATE_QUERY = """
 SELECT
     ifNull(age_group, '') AS age_group,
     ifNull(gender, '') AS gender,
-    ifNull(device_type, '') AS device_type,
-    if(
-        acquisition_channel IS NOT NULL AND acquisition_channel != '',
-        acquisition_channel,
-        ifNull(utm_source, '')
-    ) AS acquisition_channel,
-    if(
-        primary_category IS NOT NULL AND primary_category != '',
-        primary_category,
-        ifNull(category, '')
-    ) AS primary_category,
-    uniqExact(external_user_id) AS user_count,
+    ifNull(device, '') AS device_type,
+    ifNull(channel, '') AS acquisition_channel,
+    ifNull(category, '') AS primary_category,
+    uniqExact(user_id) AS user_count,
     uniqExact(session_id) AS session_count,
     countIf(event_name = 'page_view') AS page_view_count,
     countIf(event_name = 'product_view') AS product_view_count,
@@ -52,7 +44,7 @@ SELECT
     countIf(event_name = 'ad_click') AS ad_click_count,
     sumIf(ifNull(revenue, 0), event_name = 'purchase') AS revenue
 FROM events
-WHERE project_id = {project_id:UInt64}
+WHERE project_id = {project_id:String}
   AND event_time >= parseDateTime64BestEffort({window_start_utc:String}, 3, 'UTC')
   AND event_time < parseDateTime64BestEffort({window_end_utc:String}, 3, 'UTC')
   AND event_name IN (
@@ -77,28 +69,14 @@ HAVING product_view_count >= {min_product_view_count:UInt64}
 
 USER_PRIMARY_SEGMENT_QUERY = """
 SELECT
-    external_user_id,
+    user_id AS external_user_id,
     argMax(ifNull(age_group, ''), event_time) AS age_group,
     argMax(ifNull(gender, ''), event_time) AS gender,
-    argMax(ifNull(device_type, ''), event_time) AS device_type,
-    argMax(
-        if(
-            acquisition_channel IS NOT NULL AND acquisition_channel != '',
-            acquisition_channel,
-            ifNull(utm_source, '')
-        ),
-        event_time
-    ) AS acquisition_channel,
-    argMax(
-        if(
-            primary_category IS NOT NULL AND primary_category != '',
-            primary_category,
-            ifNull(category, '')
-        ),
-        event_time
-    ) AS primary_category
+    argMax(ifNull(device, ''), event_time) AS device_type,
+    argMax(ifNull(channel, ''), event_time) AS acquisition_channel,
+    argMax(ifNull(category, ''), event_time) AS primary_category
 FROM events
-WHERE project_id = {project_id:UInt64}
+WHERE project_id = {project_id:String}
   AND event_time >= parseDateTime64BestEffort({window_start_utc:String}, 3, 'UTC')
   AND event_time < parseDateTime64BestEffort({window_end_utc:String}, 3, 'UTC')
   AND event_name IN (
@@ -110,9 +88,9 @@ WHERE project_id = {project_id:UInt64}
     'ad_impression',
     'ad_click'
   )
-  AND external_user_id IS NOT NULL
-  AND external_user_id != ''
-GROUP BY external_user_id
+  AND user_id IS NOT NULL
+  AND user_id != ''
+GROUP BY user_id
 """.strip()
 
 
@@ -130,7 +108,7 @@ class ClickHouseAnalysisRepository:
 
     def fetch_segment_aggregates(
         self,
-        project_id: int,
+        project_id: int | str,
         window: AnalysisWindow,
     ) -> list[SegmentAggregate]:
         parameters = build_window_parameters(
@@ -152,7 +130,7 @@ class ClickHouseAnalysisRepository:
 
     def fetch_user_primary_segment_candidates(
         self,
-        project_id: int,
+        project_id: int | str,
         window: AnalysisWindow,
     ) -> list[UserPrimarySegmentCandidate]:
         parameters = build_window_parameters(
@@ -171,13 +149,13 @@ class ClickHouseAnalysisRepository:
 
 def build_window_parameters(
     *,
-    project_id: int,
+    project_id: int | str,
     window: AnalysisWindow,
     min_product_view_count: int,
     min_user_count: int,
 ) -> dict[str, object]:
     return {
-        "project_id": project_id,
+        "project_id": str(project_id),
         "window_start_utc": window.window_start.astimezone(ZoneInfo("UTC")).isoformat(),
         "window_end_utc": window.window_end.astimezone(ZoneInfo("UTC")).isoformat(),
         "min_product_view_count": min_product_view_count,
@@ -185,7 +163,7 @@ def build_window_parameters(
     }
 
 
-def build_segment_aggregate(project_id: int, row: tuple[Any, ...]) -> SegmentAggregate:
+def build_segment_aggregate(project_id: int | str, row: tuple[Any, ...]) -> SegmentAggregate:
     dimensions = normalize_dimensions(
         {
             "age_group": row[0],
