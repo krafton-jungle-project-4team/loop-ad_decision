@@ -18,15 +18,18 @@ from app.analysis.models import (
 from app.analysis.time_window import build_analysis_window
 
 
-class ProjectTimezoneRepository(Protocol):
+class ProjectRepository(Protocol):
     def get_project_timezone(self, project_id: int) -> str:
+        ...
+
+    def get_project_key(self, project_id: int) -> str:
         ...
 
 
 class SegmentAggregateRepository(Protocol):
     def fetch_segment_aggregates(
         self,
-        project_id: int,
+        project_id: str,
         window: AnalysisWindow,
     ) -> list[SegmentAggregate]:
         ...
@@ -55,7 +58,7 @@ class SegmentMetricsRepository(Protocol):
 class UserPrimarySegmentRepository(Protocol):
     def fetch_user_primary_segment_candidates(
         self,
-        project_id: int,
+        project_id: str,
         window: AnalysisWindow,
     ) -> list[UserPrimarySegmentCandidate]:
         ...
@@ -109,7 +112,7 @@ class SegmentAnomalyRepository(Protocol):
 class AnalysisService:
     def __init__(
         self,
-        project_repository: ProjectTimezoneRepository,
+        project_repository: ProjectRepository,
         segment_aggregate_repository: SegmentAggregateRepository | None = None,
         segment_metrics_repository: SegmentMetricsRepository | None = None,
         user_primary_segment_repository: UserPrimarySegmentRepository | None = None,
@@ -130,9 +133,13 @@ class AnalysisService:
         run_id: int | None,
     ) -> AnalysisResult:
         timezone = self.project_repository.get_project_timezone(project_id)
+        clickhouse_project_id = self.project_repository.get_project_key(project_id)
         window = build_analysis_window(analysis_date, timezone)
         aggregates = (
-            self.segment_aggregate_repository.fetch_segment_aggregates(project_id, window)
+            self.segment_aggregate_repository.fetch_segment_aggregates(
+                clickhouse_project_id,
+                window,
+            )
             if self.segment_aggregate_repository is not None
             else []
         )
@@ -157,7 +164,7 @@ class AnalysisService:
             and self.user_segment_membership_repository is not None
         ):
             candidates = self.user_primary_segment_repository.fetch_user_primary_segment_candidates(
-                project_id,
+                clickhouse_project_id,
                 window,
             )
             membership_count = self.user_segment_membership_repository.upsert_user_segment_memberships(

@@ -16,20 +16,32 @@ from app.analysis.time_window import build_analysis_window
 
 
 class FakeProjectRepository:
-    def __init__(self, timezone: str = "Asia/Seoul") -> None:
+    def __init__(
+        self,
+        timezone: str = "Asia/Seoul",
+        project_key: str = "demo-shop",
+    ) -> None:
         self.timezone = timezone
-        self.project_ids: list[int] = []
+        self.project_key = project_key
+        self.timezone_project_ids: list[int] = []
+        self.key_project_ids: list[int] = []
 
     def get_project_timezone(self, project_id: int) -> str:
-        self.project_ids.append(project_id)
+        self.timezone_project_ids.append(project_id)
         return self.timezone
+
+    def get_project_key(self, project_id: int) -> str:
+        self.key_project_ids.append(project_id)
+        return self.project_key
 
 
 class FakeSegmentAggregateRepository:
     def __init__(self, aggregates: list[SegmentAggregate]) -> None:
         self.aggregates = aggregates
+        self.calls: list[tuple[str, object]] = []
 
     def fetch_segment_aggregates(self, project_id, window):
+        self.calls.append((project_id, window))
         return self.aggregates
 
 
@@ -37,8 +49,11 @@ class FakeSegmentMetricsRepository:
     def __init__(self) -> None:
         self.segment_run_ids: list[int | None] = []
         self.metric_run_ids: list[int | None] = []
+        self.segment_project_ids: list[int] = []
+        self.metric_project_ids: list[int] = []
 
     def upsert_segments(self, project_id, aggregates, run_id):
+        self.segment_project_ids.append(project_id)
         self.segment_run_ids.append(run_id)
         return {
             aggregate.segment_key: StoredSegment(index + 1, aggregate.segment_key)
@@ -53,6 +68,7 @@ class FakeSegmentMetricsRepository:
         stored_segments,
         run_id,
     ):
+        self.metric_project_ids.append(project_id)
         self.metric_run_ids.append(run_id)
         return len(stored_segments)
 
@@ -60,14 +76,17 @@ class FakeSegmentMetricsRepository:
 class FakeUserPrimarySegmentRepository:
     def __init__(self, candidates: list[UserPrimarySegmentCandidate]) -> None:
         self.candidates = candidates
+        self.calls: list[tuple[str, object]] = []
 
     def fetch_user_primary_segment_candidates(self, project_id, window):
+        self.calls.append((project_id, window))
         return self.candidates
 
 
 class FakeUserSegmentMembershipRepository:
     def __init__(self) -> None:
         self.calls: list[tuple[list[UserPrimarySegmentCandidate], dict[str, StoredSegment], int | None]] = []
+        self.project_ids: list[int] = []
 
     def upsert_user_segment_memberships(
         self,
@@ -77,6 +96,7 @@ class FakeUserSegmentMembershipRepository:
         stored_segments,
         run_id,
     ):
+        self.project_ids.append(project_id)
         self.calls.append((candidates, stored_segments, run_id))
         return sum(1 for candidate in candidates if candidate.segment_key in stored_segments)
 
@@ -85,9 +105,11 @@ class FakeAnomalyRepository:
     def __init__(self, baselines: dict[int, BaselineMetrics] | None = None) -> None:
         self.baselines = baselines or {}
         self.anomaly_candidates: list[SegmentAnomalyCandidate] = []
+        self.baseline_fetch_project_ids: list[int] = []
         self.baseline_update_calls: list[tuple[int, date, dict[int, BaselineMetrics]]] = []
 
     def fetch_segment_metric_baselines(self, project_id, analysis_date, stored_segments):
+        self.baseline_fetch_project_ids.append(project_id)
         return self.baselines
 
     def update_segment_daily_metric_baselines(self, project_id, analysis_date, baselines):
@@ -149,7 +171,8 @@ def test_analysis_service_accepts_run_id_none() -> None:
 
     result = service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=None)
 
-    assert project_repository.project_ids == [1]
+    assert project_repository.timezone_project_ids == [1]
+    assert project_repository.key_project_ids == [1]
     assert result.segment_count == 0
     assert result.membership_count == 0
     assert result.metric_count == 0
@@ -200,6 +223,40 @@ def test_analysis_service_stores_memberships_after_valid_segments() -> None:
 
     assert result.membership_count == 1
     assert membership_repository.calls[0][2] == 77
+
+
+def test_analysis_service_separates_clickhouse_project_key_from_postgres_project_id() -> None:
+    valid_aggregate = segment_aggregate()
+    valid_candidate = UserPrimarySegmentCandidate(
+        external_user_id="user-1",
+        segment_key=valid_aggregate.segment_key,
+        dimensions=valid_aggregate.dimensions,
+    )
+    project_repository = FakeProjectRepository(project_key="demo-shop")
+    aggregate_repository = FakeSegmentAggregateRepository([valid_aggregate])
+    metrics_repository = FakeSegmentMetricsRepository()
+    user_primary_repository = FakeUserPrimarySegmentRepository([valid_candidate])
+    membership_repository = FakeUserSegmentMembershipRepository()
+    anomaly_repository = FakeAnomalyRepository()
+    service = AnalysisService(
+        project_repository=project_repository,
+        segment_aggregate_repository=aggregate_repository,
+        segment_metrics_repository=metrics_repository,
+        user_primary_segment_repository=user_primary_repository,
+        user_segment_membership_repository=membership_repository,
+        anomaly_repository=anomaly_repository,
+    )
+
+    service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert project_repository.timezone_project_ids == [1]
+    assert project_repository.key_project_ids == [1]
+    assert aggregate_repository.calls[0][0] == "demo-shop"
+    assert user_primary_repository.calls[0][0] == "demo-shop"
+    assert metrics_repository.segment_project_ids == [1]
+    assert metrics_repository.metric_project_ids == [1]
+    assert membership_repository.project_ids == [1]
+    assert anomaly_repository.baseline_fetch_project_ids == [1]
 
 
 def test_analysis_service_returns_anomaly_ids_and_segment_ids() -> None:
