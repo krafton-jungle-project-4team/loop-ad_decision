@@ -123,7 +123,7 @@ def test_fetch_segment_aggregates_filters_invalid_samples() -> None:
     repository = ClickHouseAnalysisRepository(client)
     window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
 
-    assert repository.fetch_segment_aggregates(project_id=1, window=window) == []
+    assert repository.fetch_segment_aggregates(project_id="demo-shop", window=window) == []
 
 
 def test_user_primary_segment_query_is_separate_and_uses_same_segment_key_rules() -> None:
