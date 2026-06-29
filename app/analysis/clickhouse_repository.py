@@ -30,18 +30,10 @@ SEGMENT_AGGREGATE_QUERY = """
 SELECT
     ifNull(age_group, '') AS age_group,
     ifNull(gender, '') AS gender,
-    ifNull(device_type, '') AS device_type,
-    if(
-        acquisition_channel IS NOT NULL AND acquisition_channel != '',
-        acquisition_channel,
-        ifNull(utm_source, '')
-    ) AS acquisition_channel,
-    if(
-        primary_category IS NOT NULL AND primary_category != '',
-        primary_category,
-        ifNull(category, '')
-    ) AS primary_category,
-    uniqExact(external_user_id) AS user_count,
+    ifNull(device, '') AS device_type,
+    ifNull(channel, '') AS acquisition_channel,
+    ifNull(category, '') AS primary_category,
+    uniqExact(user_id) AS user_count,
     uniqExact(session_id) AS session_count,
     countIf(event_name = 'page_view') AS page_view_count,
     countIf(event_name = 'product_view') AS product_view_count,
@@ -52,7 +44,7 @@ SELECT
     countIf(event_name = 'ad_click') AS ad_click_count,
     sumIf(ifNull(revenue, 0), event_name = 'purchase') AS revenue
 FROM events
-WHERE project_id = {project_id:UInt64}
+WHERE project_id = {project_id:String}
   AND event_time >= parseDateTime64BestEffort({window_start_utc:String}, 3, 'UTC')
   AND event_time < parseDateTime64BestEffort({window_end_utc:String}, 3, 'UTC')
   AND event_name IN (
@@ -89,11 +81,11 @@ class ClickHouseAnalysisRepository:
 
     def fetch_segment_aggregates(
         self,
-        project_id: int,
+        project_id: int | str,
         window: AnalysisWindow,
     ) -> list[SegmentAggregate]:
         parameters = {
-            "project_id": project_id,
+            "project_id": str(project_id),
             "window_start_utc": window.window_start.astimezone(ZoneInfo("UTC")).isoformat(),
             "window_end_utc": window.window_end.astimezone(ZoneInfo("UTC")).isoformat(),
             "min_product_view_count": self.min_product_view_count,
@@ -111,7 +103,7 @@ class ClickHouseAnalysisRepository:
         ]
 
 
-def build_segment_aggregate(project_id: int, row: tuple[Any, ...]) -> SegmentAggregate:
+def build_segment_aggregate(project_id: int | str, row: tuple[Any, ...]) -> SegmentAggregate:
     dimensions = normalize_dimensions(
         {
             "age_group": row[0],

@@ -94,7 +94,7 @@ def test_fetch_segment_aggregates_calculates_metrics_and_null_rates() -> None:
     repository = ClickHouseAnalysisRepository(client)
     window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
 
-    aggregates = repository.fetch_segment_aggregates(project_id=1, window=window)
+    aggregates = repository.fetch_segment_aggregates(project_id="demo-shop", window=window)
 
     assert len(aggregates) == 1
     aggregate = aggregates[0]
@@ -104,6 +104,12 @@ def test_fetch_segment_aggregates_calculates_metrics_and_null_rates() -> None:
     assert aggregate.cart_to_checkout_rate is None
     assert aggregate.checkout_to_purchase_rate is None
     assert aggregate.ctr is None
+    assert aggregate.project_id == "demo-shop"
+    assert "project_id = {project_id:String}" in client.queries[0]
+    assert "{project_id:UInt64}" not in client.queries[0]
+    assert "ifNull(device_type" not in client.queries[0]
+    assert "external_user_id" not in client.queries[0]
+    assert client.parameters[0]["project_id"] == "demo-shop"
     assert client.parameters[0]["window_start_utc"] == "2021-01-03T15:00:00+00:00"
     assert client.parameters[0]["window_end_utc"] == "2021-01-04T15:00:00+00:00"
 
