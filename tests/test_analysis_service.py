@@ -31,10 +31,12 @@ class FakePersistenceRepository:
         *,
         existing_experiment: SimpleNamespace | None = None,
         existing_mapping: SimpleNamespace | None = None,
+        active_creative: SimpleNamespace | None = None,
     ) -> None:
         self.policy = policy
         self.existing_experiment = existing_experiment
         self.existing_mapping = existing_mapping
+        self.active_creative = active_creative
         self.recommendation_results: list[SimpleNamespace] = []
         self.recommendation_actions: list[SimpleNamespace] = []
         self.experiments: list[SimpleNamespace] = []
@@ -113,6 +115,28 @@ class FakePersistenceRepository:
         mapping = SimpleNamespace(id=200 + len(self.mappings), **values)
         self.mappings.append(mapping)
         return mapping
+
+    def get_ad_creative(self, creative_id: int) -> SimpleNamespace | None:
+        if self.active_creative is not None and self.active_creative.id == creative_id:
+            return self.active_creative
+        return None
+
+    def get_active_ad_creative_by_action(
+        self,
+        *,
+        project_id: str,
+        action_id: str,
+    ) -> SimpleNamespace | None:
+        creative = self.active_creative
+        if (
+            creative is not None
+            and creative.project_id == project_id
+            and creative.action_id == action_id
+            and creative.status == "active"
+            and creative.image_url
+        ):
+            return creative
+        return None
 
 
 def analysis_request() -> FunnelRecommendationAnalysisRequest:
@@ -283,6 +307,20 @@ def automation_policy(**overrides: object) -> SimpleNamespace:
     return SimpleNamespace(**values)
 
 
+def active_creative(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "id": 70,
+        "project_id": "loopad-demo-shop",
+        "action_id": "recommend_alternative_product",
+        "campaign_id": 60,
+        "coupon_id": 80,
+        "status": "active",
+        "image_url": "https://cdn.example/ad.png",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_no_anomaly_saves_no_action_result() -> None:
     repository = FakePersistenceRepository()
 
@@ -357,7 +395,10 @@ def test_policy_blocked_when_no_recommendations_auto_execute() -> None:
 
 
 def test_auto_executed_action_creates_experiment_and_mapping() -> None:
-    repository = FakePersistenceRepository(policy=automation_policy())
+    repository = FakePersistenceRepository(
+        policy=automation_policy(),
+        active_creative=active_creative(),
+    )
 
     response = run_funnel_recommendation_analysis(
         request=analysis_request(),
@@ -382,6 +423,9 @@ def test_auto_executed_action_creates_experiment_and_mapping() -> None:
     assert repository.mappings[0].source == "auto_policy"
     assert repository.mappings[0].status == "active"
     assert repository.mappings[0].recommendation_action_id == 300
+    assert repository.mappings[0].creative_id == 70
+    assert repository.mappings[0].campaign_id == 60
+    assert repository.mappings[0].coupon_id == 80
 
 
 def test_existing_experiment_and_mapping_are_reused_by_recommendation_action() -> None:

@@ -27,6 +27,7 @@ from app.anomalies.service import calculate_funnel_anomalies
 from app.automation.policy_engine import evaluate_recommendations
 from app.automation.schemas import ActionPolicyDecision, PolicyDecision
 from app.persistence.repository import PostgresRepository
+from app.recommendations.content_linking import resolve_mapping_content_ids
 from app.root_causes.schemas import (
     RootCauseAnalysisRequest,
     RootCauseAnalysisResponse,
@@ -400,6 +401,12 @@ def get_or_create_segment_ad_mapping(
     if existing is not None:
         return existing
 
+    content_ids = resolve_mapping_content_ids(
+        repository=persistence_repository,
+        project_id=project_id,
+        action_id=recommendation.action_id,
+        execution_hint_json=recommendation.execution_hint,
+    )
     return persistence_repository.create_segment_ad_mapping(
         project_id=project_id,
         recommendation_result_id=recommendation_result_id,
@@ -408,6 +415,9 @@ def get_or_create_segment_ad_mapping(
         experiment_id=experiment_id,
         bandit_policy_id=get_value(recommendation_action, "bandit_policy_id"),
         bandit_arm_id=get_value(recommendation_action, "bandit_arm_id"),
+        campaign_id=content_ids.campaign_id,
+        creative_id=content_ids.creative_id,
+        coupon_id=content_ids.coupon_id,
         action_id=recommendation.action_id,
         action_type=recommendation.action_type,
         execution_hint_json=recommendation.execution_hint,

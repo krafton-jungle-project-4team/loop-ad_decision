@@ -606,6 +606,22 @@ class PostgresRepository:
     def get_ad_creative(self, creative_id: int) -> AdCreative | None:
         return self.session.get(AdCreative, creative_id)
 
+    def get_active_ad_creative_by_action(
+        self,
+        *,
+        project_id: str,
+        action_id: str,
+    ) -> AdCreative | None:
+        return self.session.scalar(
+            select(AdCreative)
+            .where(AdCreative.project_id == project_id)
+            .where(AdCreative.action_id == action_id)
+            .where(AdCreative.status == "active")
+            .where(AdCreative.image_url.is_not(None))
+            .order_by(AdCreative.created_at.desc())
+            .limit(1)
+        )
+
     def create_bandit_decision(
         self,
         *,

@@ -6,6 +6,7 @@ from fastapi import HTTPException, status
 from app.analysis.service import serialize_model
 from app.persistence.models import RecommendationAction
 from app.persistence.repository import PostgresRepository
+from app.recommendations.content_linking import resolve_mapping_content_ids
 from app.recommendations.schemas import (
     ActiveSegmentAdMappingResponse,
     RecommendationApprovalResponse,
@@ -294,34 +295,39 @@ def list_active_segment_ad_mappings(
     project_id: str,
 ) -> list[ActiveSegmentAdMappingResponse]:
     mappings = repository.list_active_segment_ad_mappings_with_creatives(project_id)
-    return [
-        ActiveSegmentAdMappingResponse(
-            mapping_id=row.mapping.id,
-            project_id=row.mapping.project_id,
-            segment_json=row.mapping.segment_json,
-            segment_hash=row.mapping.segment_hash,
-            action_id=row.mapping.action_id,
-            action_type=row.mapping.action_type,
-            execution_hint_json=row.mapping.execution_hint_json,
-            experiment_id=row.mapping.experiment_id,
-            recommendation_result_id=row.mapping.recommendation_result_id,
-            recommendation_action_id=row.mapping.recommendation_action_id,
-            bandit_policy_id=row.mapping.bandit_policy_id,
-            bandit_arm_id=row.mapping.bandit_arm_id,
-            bandit_decision_id=row.mapping.bandit_decision_id,
-            campaign_id=row.mapping.campaign_id,
-            creative_id=row.mapping.creative_id,
-            coupon_id=row.mapping.coupon_id,
-            content_url=getattr(row.creative, "image_url", None),
-            title=getattr(row.creative, "title", None),
-            message=getattr(row.creative, "message", None),
-            landing_url=getattr(row.creative, "landing_url", None),
-            serving_weight=get_serving_weight(row.mapping.execution_hint_json),
-            source=row.mapping.source,
-            status=row.mapping.status,
+    responses: list[ActiveSegmentAdMappingResponse] = []
+    for row in mappings:
+        content_url = getattr(row.creative, "image_url", None)
+        if not content_url:
+            continue
+        responses.append(
+            ActiveSegmentAdMappingResponse(
+                mapping_id=row.mapping.id,
+                project_id=row.mapping.project_id,
+                segment_json=row.mapping.segment_json,
+                segment_hash=row.mapping.segment_hash,
+                action_id=row.mapping.action_id,
+                action_type=row.mapping.action_type,
+                execution_hint_json=row.mapping.execution_hint_json,
+                experiment_id=row.mapping.experiment_id,
+                recommendation_result_id=row.mapping.recommendation_result_id,
+                recommendation_action_id=row.mapping.recommendation_action_id,
+                bandit_policy_id=row.mapping.bandit_policy_id,
+                bandit_arm_id=row.mapping.bandit_arm_id,
+                bandit_decision_id=row.mapping.bandit_decision_id,
+                campaign_id=row.mapping.campaign_id,
+                creative_id=row.mapping.creative_id,
+                coupon_id=row.mapping.coupon_id,
+                content_url=content_url,
+                title=getattr(row.creative, "title", None),
+                message=getattr(row.creative, "message", None),
+                landing_url=getattr(row.creative, "landing_url", None),
+                serving_weight=get_serving_weight(row.mapping.execution_hint_json),
+                source=row.mapping.source,
+                status=row.mapping.status,
+            )
         )
-        for row in mappings
-    ]
+    return responses
 
 
 def validate_manual_approval_action(recommendation: RecommendationAction) -> None:
@@ -379,6 +385,12 @@ def get_or_create_manual_mapping(
     if existing is not None:
         return existing
 
+    content_ids = resolve_mapping_content_ids(
+        repository=repository,
+        project_id=result.project_id,
+        action_id=recommendation_action.action_id,
+        execution_hint_json=recommendation_action.execution_hint_json,
+    )
     return repository.create_segment_ad_mapping(
         project_id=result.project_id,
         recommendation_result_id=result.id,
@@ -387,6 +399,9 @@ def get_or_create_manual_mapping(
         experiment_id=experiment_id,
         bandit_policy_id=recommendation_action.bandit_policy_id,
         bandit_arm_id=recommendation_action.bandit_arm_id,
+        campaign_id=content_ids.campaign_id,
+        creative_id=content_ids.creative_id,
+        coupon_id=content_ids.coupon_id,
         action_id=recommendation_action.action_id,
         action_type=recommendation_action.action_type,
         execution_hint_json=recommendation_action.execution_hint_json,

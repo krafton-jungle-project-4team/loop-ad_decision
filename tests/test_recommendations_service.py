@@ -32,10 +32,12 @@ class FakeRecommendationRepository:
         mappings: list[SimpleNamespace] | None = None,
         experiments: list[SimpleNamespace] | None = None,
         actions: list[SimpleNamespace] | None = None,
+        active_creative: SimpleNamespace | None = None,
     ) -> None:
         self.result = result
         self.existing_experiment = existing_experiment
         self.existing_mapping = existing_mapping
+        self.active_creative = active_creative
         self.mappings = mappings or []
         self.experiments = experiments or []
         self.actions = actions if actions is not None else (
@@ -119,6 +121,28 @@ class FakeRecommendationRepository:
         mapping = SimpleNamespace(id=200 + len(self.created_mappings), **values)
         self.created_mappings.append(mapping)
         return mapping
+
+    def get_ad_creative(self, creative_id: int) -> SimpleNamespace | None:
+        if self.active_creative is not None and self.active_creative.id == creative_id:
+            return self.active_creative
+        return None
+
+    def get_active_ad_creative_by_action(
+        self,
+        *,
+        project_id: str,
+        action_id: str,
+    ) -> SimpleNamespace | None:
+        creative = self.active_creative
+        if (
+            creative is not None
+            and creative.project_id == project_id
+            and creative.action_id == action_id
+            and creative.status == "active"
+            and creative.image_url
+        ):
+            return creative
+        return None
 
     def list_segment_ad_mappings(
         self,
@@ -290,8 +314,25 @@ def recommendation_action(
     )
 
 
+def active_creative(**overrides: object) -> SimpleNamespace:
+    values: dict[str, object] = {
+        "id": 70,
+        "project_id": "loopad-demo-shop",
+        "action_id": "recommend_alternative_product",
+        "campaign_id": 60,
+        "coupon_id": 80,
+        "status": "active",
+        "image_url": "https://cdn.example/ad.png",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_approve_creates_manual_experiment_and_mapping() -> None:
-    repository = FakeRecommendationRepository(recommendation_result())
+    repository = FakeRecommendationRepository(
+        recommendation_result(),
+        active_creative=active_creative(),
+    )
 
     response = approve_recommendation_result(
         repository=repository,
@@ -309,6 +350,9 @@ def test_approve_creates_manual_experiment_and_mapping() -> None:
     assert response.created_segment_ad_mapping_ids == [200]
     assert repository.created_experiments[0].status == "running"
     assert repository.created_mappings[0].source == "manual_approval"
+    assert repository.created_mappings[0].creative_id == 70
+    assert repository.created_mappings[0].campaign_id == 60
+    assert repository.created_mappings[0].coupon_id == 80
     assert repository.result.status == "experiment_running"
     assert repository.committed is True
 
@@ -488,6 +532,27 @@ def test_recommendation_detail_returns_actions_or_empty_legacy_actions() -> None
 def test_active_ad_mapping_response_only_includes_active_project_mappings() -> None:
     repository = FakeRecommendationRepository(
         mappings=[
+            SimpleNamespace(
+                id=99,
+                project_id="loopad-demo-shop",
+                segment_json={"channel": "kakao"},
+                segment_hash="hash-empty-content",
+                action_id="recommend_alternative_product",
+                action_type="PRODUCT",
+                execution_hint_json={"slot": "product_detail"},
+                experiment_id=99,
+                recommendation_result_id=1,
+                recommendation_action_id=99,
+                bandit_policy_id=None,
+                bandit_arm_id=None,
+                bandit_decision_id=None,
+                campaign_id=None,
+                creative_id=None,
+                coupon_id=None,
+                source="manual_approval",
+                status="active",
+                creative=None,
+            ),
             SimpleNamespace(
                 id=1,
                 project_id="loopad-demo-shop",
