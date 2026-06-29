@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from time import perf_counter
 
+from app.contents.assets import ContentAssetService
 from app.contents.generators import ContentGenerator, PartialContentGenerationError
 from app.contents.repository import ContentRepository, GenerationLockUnavailable
 from app.contents.types import (
@@ -26,9 +27,11 @@ class ContentGenerationService:
         *,
         repository: ContentRepository,
         generator: ContentGenerator,
+        asset_service: ContentAssetService | None = None,
     ) -> None:
         self.repository = repository
         self.generator = generator
+        self.asset_service = asset_service
 
     def generate_for_actions(
         self,
@@ -114,6 +117,7 @@ class ContentGenerationService:
                             f"generated content for {variant_key} is missing required fields",
                             draft,
                         )
+                    draft = self._store_asset_if_configured(draft)
                     self.repository.upsert_generated_content(draft=draft, force=force)
                     if existing is None:
                         created.append(variant_key)
@@ -207,6 +211,11 @@ class ContentGenerationService:
         if draft is not None and draft.variant_key:
             return draft.variant_key
         return "unknown"
+
+    def _store_asset_if_configured(self, draft: GeneratedContentDraft) -> GeneratedContentDraft:
+        if self.asset_service is None:
+            return draft
+        return self.asset_service.store_banner(draft)
 
 
 def _with_created_run_id(

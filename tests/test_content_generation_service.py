@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from typing import Iterable
 
+from app.contents.assets import ContentAssetService, InMemoryAssetStorage
 from app.contents.generators import MockContentGenerator, PartialContentGenerationError
 from app.contents.prompt_builder import ContentPromptBuilder
 from app.contents.repository import GenerationLockUnavailable
@@ -171,10 +172,15 @@ def make_target(
     )
 
 
-def make_service(repository: FakeContentRepository, generator=None) -> ContentGenerationService:
+def make_service(
+    repository: FakeContentRepository,
+    generator=None,
+    asset_service=None,
+) -> ContentGenerationService:
     return ContentGenerationService(
         repository=repository,
         generator=generator or MockContentGenerator(),
+        asset_service=asset_service,
     )
 
 
@@ -462,3 +468,26 @@ def test_content_generated_actions_are_reprocessed_only_with_force_true() -> Non
     assert no_force.actions_seen == 0
     assert force.actions_seen == 1
     assert set(force.results[0].created_variant_keys) == set(VARIANT_KEYS)
+
+
+def test_asset_service_populates_image_url_and_media_key_before_upsert() -> None:
+    repository = FakeContentRepository([make_target()])
+    storage = InMemoryAssetStorage(public_base_url="https://cdn.example.com")
+    asset_service = ContentAssetService(storage=storage)
+    service = make_service(repository, asset_service=asset_service)
+
+    summary = service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+    )
+
+    control_draft = repository.drafts[("demo-shop", 10, "control")]
+    assert summary.variants_created == 2
+    assert control_draft.image_url == (
+        "https://cdn.example.com/generated-contents/projects/demo-shop/"
+        "actions/10/variants/control/banner.svg"
+    )
+    assert control_draft.media_s3_key == (
+        "generated-contents/projects/demo-shop/actions/10/variants/control/banner.svg"
+    )
+    assert storage.objects[control_draft.media_s3_key].content_type == "image/svg+xml"
