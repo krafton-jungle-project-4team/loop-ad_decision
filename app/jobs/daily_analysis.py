@@ -29,6 +29,12 @@ def run_daily_analysis_flow(
     analysis_service: AnalysisRunner,
     downstream_runner: DownstreamRunner | None = None,
 ) -> AnalysisResult:
+    """Run analysis and gate downstream work.
+
+    The API/CLI/daily orchestrator caller owns the database transaction
+    boundary and decision_runs status transitions. AnalysisService is called
+    inside that boundary and does not commit, rollback, or mark runs.
+    """
     result = analysis_service.run(
         project_id=project_id,
         analysis_date=analysis_date,

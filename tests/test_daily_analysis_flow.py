@@ -69,6 +69,15 @@ def test_daily_analysis_flow_passes_anomaly_ids_to_downstream() -> None:
     assert downstream.results == [analysis_result]
 
 
+def test_daily_analysis_flow_documents_caller_owned_transaction_boundary() -> None:
+    doc = run_daily_analysis_flow.__doc__ or ""
+
+    assert "transaction" in doc
+    assert "decision_runs" in doc
+    assert "does not commit" in doc
+    assert "rollback" in doc
+
+
 def test_public_analysis_or_serving_api_is_not_added() -> None:
     root = Path(__file__).resolve().parents[1]
     current_file = Path(__file__).resolve()
