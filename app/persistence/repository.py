@@ -3,7 +3,9 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import select
+from dataclasses import dataclass
+
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from app.persistence.job_statuses import (
@@ -13,14 +15,32 @@ from app.persistence.job_statuses import (
     ANALYSIS_JOB_STATUS_RUNNING,
 )
 from app.persistence.models import (
+    AdCreative,
     AnalysisJob,
     AutomationPolicy,
+    BanditArm,
+    BanditDecision,
+    BanditPolicy,
     Experiment,
+    RecommendationAction,
     RecommendationResult,
     SegmentAdMapping,
 )
 
 JsonObject = dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ActiveSegmentAdMappingRow:
+    mapping: SegmentAdMapping
+    creative: AdCreative | None = None
+
+
+@dataclass(frozen=True)
+class BanditArmServingRow:
+    arm: BanditArm
+    mapping: SegmentAdMapping | None = None
+    creative: AdCreative | None = None
 
 
 def canonical_segment_json(segment: JsonObject | None) -> str:
@@ -85,6 +105,8 @@ class PostgresRepository:
         root_causes_json: JsonObject | None = None,
         recommendations_json: JsonObject | None = None,
         policy_decision_json: JsonObject | None = None,
+        bandit_decision_summary_json: JsonObject | None = None,
+        summary_message: str | None = None,
     ) -> RecommendationResult:
         result = RecommendationResult(
             project_id=project_id,
@@ -99,10 +121,113 @@ class PostgresRepository:
             root_causes_json=root_causes_json or {},
             recommendations_json=recommendations_json or {},
             policy_decision_json=policy_decision_json or {},
+            bandit_decision_summary_json=bandit_decision_summary_json or {},
+            summary_message=summary_message,
         )
         self.session.add(result)
         self.session.flush()
         return result
+
+    def create_recommendation_action(
+        self,
+        *,
+        project_id: str,
+        recommendation_result_id: int,
+        action_id: str,
+        action_type: str,
+        title: str | None = None,
+        description: str | None = None,
+        target_step: str | None = None,
+        priority_score: float | None = None,
+        expected_impact: str | None = None,
+        rationale: str | None = None,
+        triggered_by_json: list[Any] | None = None,
+        execution_hint_json: JsonObject | None = None,
+        experiment_json: JsonObject | None = None,
+        policy_status: str | None = None,
+        policy_reasons_json: list[Any] | None = None,
+        policy_decision_json: JsonObject | None = None,
+        selected_by_strategy: str = "rule_based",
+        bandit_policy_id: int | None = None,
+        bandit_arm_id: int | None = None,
+        sampled_value: float | None = None,
+        status: str = "pending_review",
+        auto_executed_at: datetime | None = None,
+    ) -> RecommendationAction:
+        action = RecommendationAction(
+            project_id=project_id,
+            recommendation_result_id=recommendation_result_id,
+            action_id=action_id,
+            action_type=action_type,
+            title=title,
+            description=description,
+            target_step=target_step,
+            priority_score=priority_score,
+            expected_impact=expected_impact,
+            rationale=rationale,
+            triggered_by_json=triggered_by_json or [],
+            execution_hint_json=execution_hint_json or {},
+            experiment_json=experiment_json or {},
+            policy_status=policy_status,
+            policy_reasons_json=policy_reasons_json or [],
+            policy_decision_json=policy_decision_json or {},
+            selected_by_strategy=selected_by_strategy,
+            bandit_policy_id=bandit_policy_id,
+            bandit_arm_id=bandit_arm_id,
+            sampled_value=sampled_value,
+            status=status,
+            auto_executed_at=auto_executed_at,
+        )
+        self.session.add(action)
+        self.session.flush()
+        return action
+
+    def get_recommendation_action(self, recommendation_action_id: int) -> RecommendationAction | None:
+        return self.session.get(RecommendationAction, recommendation_action_id)
+
+    def list_recommendation_actions(
+        self,
+        *,
+        recommendation_result_id: int | None = None,
+        project_id: str | None = None,
+        status: str | None = None,
+        limit: int = 500,
+    ) -> list[RecommendationAction]:
+        statement = select(RecommendationAction).order_by(RecommendationAction.created_at)
+        if recommendation_result_id is not None:
+            statement = statement.where(
+                RecommendationAction.recommendation_result_id == recommendation_result_id
+            )
+        if project_id is not None:
+            statement = statement.where(RecommendationAction.project_id == project_id)
+        if status is not None:
+            statement = statement.where(RecommendationAction.status == status)
+        return list(self.session.scalars(statement.limit(limit)))
+
+    def get_recommendation_action_by_result_action(
+        self,
+        *,
+        recommendation_result_id: int,
+        action_id: str,
+    ) -> RecommendationAction | None:
+        return self.session.scalar(
+            select(RecommendationAction)
+            .where(RecommendationAction.recommendation_result_id == recommendation_result_id)
+            .where(RecommendationAction.action_id == action_id)
+        )
+
+    def update_recommendation_action(
+        self,
+        recommendation_action_id: int,
+        values: JsonObject,
+    ) -> RecommendationAction | None:
+        action = self.get_recommendation_action(recommendation_action_id)
+        if action is None:
+            return None
+        for key, value in values.items():
+            setattr(action, key, value)
+        self.session.flush()
+        return action
 
     def get_recommendation_result(self, recommendation_result_id: int) -> RecommendationResult | None:
         return self.session.get(RecommendationResult, recommendation_result_id)
@@ -209,9 +334,12 @@ class PostgresRepository:
         *,
         project_id: str,
         recommendation_result_id: int,
+        recommendation_action_id: int,
         action_id: str,
         action_type: str,
         status: str,
+        bandit_policy_id: int | None = None,
+        bandit_arm_id: int | None = None,
         segment_json: JsonObject | None = None,
         traffic_split_json: JsonObject | None = None,
         primary_metric: str | None = None,
@@ -222,6 +350,9 @@ class PostgresRepository:
         experiment = Experiment(
             project_id=project_id,
             recommendation_result_id=recommendation_result_id,
+            recommendation_action_id=recommendation_action_id,
+            bandit_policy_id=bandit_policy_id,
+            bandit_arm_id=bandit_arm_id,
             segment_json=segment_json or {},
             segment_hash=build_segment_hash(segment_json),
             action_id=action_id,
@@ -243,13 +374,11 @@ class PostgresRepository:
     def get_experiment_by_recommendation_action(
         self,
         *,
-        recommendation_result_id: int,
-        action_id: str,
+        recommendation_action_id: int,
     ) -> Experiment | None:
         return self.session.scalar(
             select(Experiment)
-            .where(Experiment.recommendation_result_id == recommendation_result_id)
-            .where(Experiment.action_id == action_id)
+            .where(Experiment.recommendation_action_id == recommendation_action_id)
         )
 
     def list_experiments(
@@ -285,12 +414,19 @@ class PostgresRepository:
         *,
         project_id: str,
         recommendation_result_id: int,
+        recommendation_action_id: int,
         action_id: str,
         action_type: str,
         status: str,
         source: str,
         segment_json: JsonObject | None = None,
         experiment_id: int | None = None,
+        bandit_policy_id: int | None = None,
+        bandit_arm_id: int | None = None,
+        bandit_decision_id: int | None = None,
+        campaign_id: int | None = None,
+        creative_id: int | None = None,
+        coupon_id: int | None = None,
         execution_hint_json: JsonObject | None = None,
         expires_at: datetime | None = None,
     ) -> SegmentAdMapping:
@@ -299,7 +435,14 @@ class PostgresRepository:
             segment_json=segment_json or {},
             segment_hash=build_segment_hash(segment_json),
             recommendation_result_id=recommendation_result_id,
+            recommendation_action_id=recommendation_action_id,
             experiment_id=experiment_id,
+            bandit_policy_id=bandit_policy_id,
+            bandit_arm_id=bandit_arm_id,
+            bandit_decision_id=bandit_decision_id,
+            campaign_id=campaign_id,
+            creative_id=creative_id,
+            coupon_id=coupon_id,
             action_id=action_id,
             action_type=action_type,
             execution_hint_json=execution_hint_json or {},
@@ -317,13 +460,11 @@ class PostgresRepository:
     def get_segment_ad_mapping_by_recommendation_action(
         self,
         *,
-        recommendation_result_id: int,
-        action_id: str,
+        recommendation_action_id: int,
     ) -> SegmentAdMapping | None:
         return self.session.scalar(
             select(SegmentAdMapping)
-            .where(SegmentAdMapping.recommendation_result_id == recommendation_result_id)
-            .where(SegmentAdMapping.action_id == action_id)
+            .where(SegmentAdMapping.recommendation_action_id == recommendation_action_id)
         )
 
     def list_segment_ad_mappings(
@@ -355,6 +496,39 @@ class PostgresRepository:
             )
         )
 
+    def list_active_segment_ad_mappings_with_creatives(
+        self,
+        project_id: str,
+    ) -> list[ActiveSegmentAdMappingRow]:
+        now = datetime.now(UTC)
+        rows = self.session.execute(
+            select(SegmentAdMapping, AdCreative)
+            .outerjoin(AdCreative, SegmentAdMapping.creative_id == AdCreative.id)
+            .where(SegmentAdMapping.project_id == project_id)
+            .where(SegmentAdMapping.status == "active")
+            .where(
+                or_(
+                    SegmentAdMapping.expires_at.is_(None),
+                    SegmentAdMapping.expires_at > now,
+                )
+            )
+            .where(
+                or_(
+                    SegmentAdMapping.creative_id.is_(None),
+                    and_(
+                        AdCreative.id.is_not(None),
+                        AdCreative.status == "active",
+                        AdCreative.project_id == SegmentAdMapping.project_id,
+                    ),
+                )
+            )
+            .order_by(SegmentAdMapping.created_at.desc())
+        )
+        return [
+            ActiveSegmentAdMappingRow(mapping=mapping, creative=creative)
+            for mapping, creative in rows
+        ]
+
     def update_segment_ad_mapping(
         self,
         mapping_id: int,
@@ -367,3 +541,99 @@ class PostgresRepository:
             setattr(mapping, key, value)
         self.session.flush()
         return mapping
+
+    def get_bandit_policy(self, bandit_policy_id: int) -> BanditPolicy | None:
+        return self.session.get(BanditPolicy, bandit_policy_id)
+
+    def get_bandit_arm(self, bandit_arm_id: int) -> BanditArm | None:
+        return self.session.get(BanditArm, bandit_arm_id)
+
+    def list_bandit_arms_by_policy(
+        self,
+        bandit_policy_id: int,
+        *,
+        status: str | None = "active",
+    ) -> list[BanditArm]:
+        statement = (
+            select(BanditArm)
+            .where(BanditArm.bandit_policy_id == bandit_policy_id)
+            .order_by(BanditArm.id)
+        )
+        if status is not None:
+            statement = statement.where(BanditArm.status == status)
+        return list(self.session.scalars(statement))
+
+    def list_bandit_arm_serving_rows(
+        self,
+        bandit_policy_id: int,
+    ) -> list[BanditArmServingRow]:
+        arms = self.list_bandit_arms_by_policy(bandit_policy_id)
+        rows: list[BanditArmServingRow] = []
+        now = datetime.now(UTC)
+        for arm in arms:
+            result = self.session.execute(
+                select(SegmentAdMapping, AdCreative)
+                .outerjoin(AdCreative, SegmentAdMapping.creative_id == AdCreative.id)
+                .where(SegmentAdMapping.bandit_policy_id == bandit_policy_id)
+                .where(SegmentAdMapping.bandit_arm_id == arm.id)
+                .where(SegmentAdMapping.status == "active")
+                .where(
+                    or_(
+                        SegmentAdMapping.expires_at.is_(None),
+                        SegmentAdMapping.expires_at > now,
+                    )
+                )
+                .where(
+                    or_(
+                        SegmentAdMapping.creative_id.is_(None),
+                        and_(
+                            AdCreative.id.is_not(None),
+                            AdCreative.status == "active",
+                            AdCreative.project_id == SegmentAdMapping.project_id,
+                        ),
+                    )
+                )
+                .order_by(SegmentAdMapping.created_at.desc())
+                .limit(1)
+            ).first()
+            if result is None:
+                rows.append(BanditArmServingRow(arm=arm))
+            else:
+                mapping, creative = result
+                rows.append(BanditArmServingRow(arm=arm, mapping=mapping, creative=creative))
+        return rows
+
+    def get_ad_creative(self, creative_id: int) -> AdCreative | None:
+        return self.session.get(AdCreative, creative_id)
+
+    def create_bandit_decision(
+        self,
+        *,
+        project_id: str,
+        bandit_policy_id: int,
+        selected_arm_id: int,
+        selected_action_id: str,
+        segment_hash: str,
+        segment_json: JsonObject | None = None,
+        sampled_values_json: JsonObject | None = None,
+        recommendation_result_id: int | None = None,
+        recommendation_action_id: int | None = None,
+        experiment_id: int | None = None,
+        selected_sampled_value: float | None = None,
+    ) -> BanditDecision:
+        decision = BanditDecision(
+            project_id=project_id,
+            bandit_policy_id=bandit_policy_id,
+            selected_arm_id=selected_arm_id,
+            recommendation_result_id=recommendation_result_id,
+            recommendation_action_id=recommendation_action_id,
+            experiment_id=experiment_id,
+            segment_json=segment_json or {},
+            segment_hash=segment_hash,
+            sampled_values_json=sampled_values_json or {},
+            selected_action_id=selected_action_id,
+            selected_sampled_value=selected_sampled_value,
+        )
+        self.session.add(decision)
+        self.session.flush()
+        return decision
