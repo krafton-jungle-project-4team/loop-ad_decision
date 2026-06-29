@@ -27,6 +27,7 @@ from app.anomalies.service import calculate_funnel_anomalies
 from app.automation.policy_engine import evaluate_recommendations
 from app.automation.schemas import ActionPolicyDecision, PolicyDecision
 from app.persistence.repository import PostgresRepository
+from app.recommendations.content_linking import resolve_mapping_content_ids
 from app.root_causes.schemas import (
     RootCauseAnalysisRequest,
     RootCauseAnalysisResponse,
@@ -40,8 +41,12 @@ ActionRecommender = Callable[[ActionRecommendationRequest], ActionRecommendation
 PolicyEvaluator = Callable[[Any, list[RecommendedAction], dict[str, str | None]], PolicyDecision]
 
 NO_ACTION = "no_action"
-PENDING_REVIEW = "pending_review"
-POLICY_BLOCKED = "policy_blocked"
+PENDING_ACTIONS = "pending_actions"
+PARTIALLY_EXECUTED = "partially_executed"
+DISMISSED = "dismissed"
+ACTION_PENDING_REVIEW = "pending_review"
+ACTION_POLICY_BLOCKED = "policy_blocked"
+ACTION_EXPERIMENT_RUNNING = "experiment_running"
 EXPERIMENT_RUNNING = "experiment_running"
 
 
@@ -144,16 +149,6 @@ def execute_funnel_recommendation_analysis(
         action_response.recommendations,
         action_response.segment,
     )
-    auto_executed_action_ids = [
-        action.action_id
-        for action in policy_decision.actions
-        if action.auto_executed
-    ]
-    status = resolve_recommendation_status(
-        policy=policy,
-        has_synthetic_cause=has_synthetic_cause,
-        auto_executed_action_ids=auto_executed_action_ids,
-    )
     result = persistence_repository.create_recommendation_result(
         project_id=request.project_id,
         window_start=anomaly_response.window_start,
@@ -161,11 +156,12 @@ def execute_funnel_recommendation_analysis(
         baseline_start=anomaly_response.baseline_start,
         baseline_end=anomaly_response.baseline_end,
         segment_json=anomaly_response.segment,
-        status=status,
+        status=PENDING_ACTIONS,
         anomaly_json=serialize_model(anomaly_response),
         root_causes_json=build_root_causes_payload(root_cause_response, causes, has_synthetic_cause),
         recommendations_json=serialize_model(action_response),
         policy_decision_json=policy_decision.model_dump(mode="json"),
+        summary_message=anomaly_response.summary_message,
     )
 
     created_experiment_ids: list[int] = []
@@ -174,28 +170,84 @@ def execute_funnel_recommendation_analysis(
         recommendation.action_id: recommendation
         for recommendation in action_response.recommendations
     }
+    action_decisions_by_id = {
+        action.action_id: action
+        for action in policy_decision.actions
+    }
+    stored_actions = []
+    now = datetime.now(UTC)
+    for recommendation in action_response.recommendations:
+        action_decision = action_decisions_by_id.get(recommendation.action_id)
+        action_status = resolve_recommendation_action_status(
+            policy=policy,
+            action_decision=action_decision,
+        )
+        stored_action = persistence_repository.create_recommendation_action(
+            project_id=request.project_id,
+            recommendation_result_id=result.id,
+            action_id=recommendation.action_id,
+            action_type=recommendation.action_type,
+            title=recommendation.title,
+            description=recommendation.description,
+            target_step=recommendation.target_step,
+            priority_score=recommendation.priority_score,
+            expected_impact=recommendation.expected_impact,
+            rationale=recommendation.rationale,
+            triggered_by_json=recommendation.triggered_by,
+            execution_hint_json=recommendation.execution_hint,
+            experiment_json=serialize_model(recommendation.experiment) or {},
+            policy_status=get_value(action_decision, "status"),
+            policy_reasons_json=get_value(action_decision, "reasons", []),
+            policy_decision_json=serialize_model(action_decision) or {},
+            status=action_status,
+            auto_executed_at=now if action_decision is not None and action_decision.auto_executed else None,
+        )
+        stored_actions.append(stored_action)
+
     for action_decision in policy_decision.actions:
         if not action_decision.auto_executed:
             continue
         recommendation = recommendations_by_id[action_decision.action_id]
+        stored_action = next(
+            action
+            for action in stored_actions
+            if action.action_id == recommendation.action_id
+        )
         experiment = get_or_create_experiment(
             persistence_repository=persistence_repository,
             recommendation_result_id=result.id,
+            recommendation_action_id=stored_action.id,
             project_id=request.project_id,
             recommendation=recommendation,
+            recommendation_action=stored_action,
             action_decision=action_decision,
             segment=anomaly_response.segment,
         )
         mapping = get_or_create_segment_ad_mapping(
             persistence_repository=persistence_repository,
             recommendation_result_id=result.id,
+            recommendation_action_id=stored_action.id,
             project_id=request.project_id,
             recommendation=recommendation,
+            recommendation_action=stored_action,
             experiment_id=experiment.id,
             segment=anomaly_response.segment,
         )
+        persistence_repository.update_recommendation_action(
+            stored_action.id,
+            {"status": ACTION_EXPERIMENT_RUNNING},
+        )
+        stored_action.status = ACTION_EXPERIMENT_RUNNING
         created_experiment_ids.append(experiment.id)
         created_mapping_ids.append(mapping.id)
+
+    status = resolve_recommendation_result_status([action.status for action in stored_actions])
+    persistence_repository.update_recommendation_result(result.id, {"status": status})
+    auto_executed_action_ids = [
+        action.action_id
+        for action in stored_actions
+        if action.status == ACTION_EXPERIMENT_RUNNING
+    ]
 
     return FunnelRecommendationAnalysisResponse(
         recommendation_result_id=result.id,
@@ -263,37 +315,53 @@ def build_unexplained_funnel_anomaly_cause(
     )
 
 
-def resolve_recommendation_status(
+def resolve_recommendation_action_status(
     *,
     policy: Any,
-    has_synthetic_cause: bool,
-    auto_executed_action_ids: list[str],
+    action_decision: ActionPolicyDecision | None,
 ) -> str:
-    if auto_executed_action_ids:
-        return EXPERIMENT_RUNNING
-    if has_synthetic_cause:
-        return PENDING_REVIEW
+    if action_decision is None:
+        return ACTION_PENDING_REVIEW
+    if "manual_review_action" in action_decision.reasons:
+        return ACTION_PENDING_REVIEW
+    if action_decision.auto_executed:
+        return ACTION_EXPERIMENT_RUNNING
     if policy is None:
-        return PENDING_REVIEW
+        return ACTION_PENDING_REVIEW
     if not bool(get_value(policy, "enabled", False)):
-        return PENDING_REVIEW
+        return ACTION_PENDING_REVIEW
     if not bool(get_value(policy, "auto_execute_enabled", False)):
-        return PENDING_REVIEW
-    return POLICY_BLOCKED
+        return ACTION_PENDING_REVIEW
+    return ACTION_POLICY_BLOCKED
+
+
+def resolve_recommendation_result_status(action_statuses: list[str]) -> str:
+    if not action_statuses:
+        return NO_ACTION
+    executable_statuses = {ACTION_EXPERIMENT_RUNNING, "auto_executed", "approved"}
+    if all(status == "rejected" for status in action_statuses):
+        return DISMISSED
+    executed_count = sum(1 for status in action_statuses if status in executable_statuses)
+    if executed_count == len(action_statuses):
+        return EXPERIMENT_RUNNING
+    if executed_count > 0:
+        return PARTIALLY_EXECUTED
+    return PENDING_ACTIONS
 
 
 def get_or_create_experiment(
     *,
     persistence_repository: PostgresRepository,
     recommendation_result_id: int,
+    recommendation_action_id: int,
     project_id: str,
     recommendation: RecommendedAction,
+    recommendation_action: Any,
     action_decision: ActionPolicyDecision,
     segment: dict[str, str | None],
 ) -> Any:
     existing = persistence_repository.get_experiment_by_recommendation_action(
-        recommendation_result_id=recommendation_result_id,
-        action_id=recommendation.action_id,
+        recommendation_action_id=recommendation_action_id,
     )
     if existing is not None:
         return existing
@@ -302,6 +370,9 @@ def get_or_create_experiment(
     return persistence_repository.create_experiment(
         project_id=project_id,
         recommendation_result_id=recommendation_result_id,
+        recommendation_action_id=recommendation_action_id,
+        bandit_policy_id=get_value(recommendation_action, "bandit_policy_id"),
+        bandit_arm_id=get_value(recommendation_action, "bandit_arm_id"),
         segment_json=segment,
         action_id=recommendation.action_id,
         action_type=recommendation.action_type,
@@ -317,23 +388,36 @@ def get_or_create_segment_ad_mapping(
     *,
     persistence_repository: PostgresRepository,
     recommendation_result_id: int,
+    recommendation_action_id: int,
     project_id: str,
     recommendation: RecommendedAction,
+    recommendation_action: Any,
     experiment_id: int,
     segment: dict[str, str | None],
 ) -> Any:
     existing = persistence_repository.get_segment_ad_mapping_by_recommendation_action(
-        recommendation_result_id=recommendation_result_id,
-        action_id=recommendation.action_id,
+        recommendation_action_id=recommendation_action_id,
     )
     if existing is not None:
         return existing
 
+    content_ids = resolve_mapping_content_ids(
+        repository=persistence_repository,
+        project_id=project_id,
+        action_id=recommendation.action_id,
+        execution_hint_json=recommendation.execution_hint,
+    )
     return persistence_repository.create_segment_ad_mapping(
         project_id=project_id,
         recommendation_result_id=recommendation_result_id,
+        recommendation_action_id=recommendation_action_id,
         segment_json=segment,
         experiment_id=experiment_id,
+        bandit_policy_id=get_value(recommendation_action, "bandit_policy_id"),
+        bandit_arm_id=get_value(recommendation_action, "bandit_arm_id"),
+        campaign_id=content_ids.campaign_id,
+        creative_id=content_ids.creative_id,
+        coupon_id=content_ids.coupon_id,
         action_id=recommendation.action_id,
         action_type=recommendation.action_type,
         execution_hint_json=recommendation.execution_hint,
