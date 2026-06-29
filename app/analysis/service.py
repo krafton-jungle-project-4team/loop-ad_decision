@@ -82,6 +82,14 @@ class SegmentAnomalyRepository(Protocol):
     ) -> dict[int, BaselineMetrics]:
         ...
 
+    def update_segment_daily_metric_baselines(
+        self,
+        project_id: int,
+        analysis_date: date,
+        baselines: dict[int, BaselineMetrics],
+    ) -> int:
+        ...
+
     def upsert_segment_anomalies(
         self,
         project_id: int,
@@ -166,6 +174,11 @@ class AnalysisService:
                 project_id=project_id,
                 analysis_date=analysis_date,
                 stored_segments=stored_segments,
+            )
+            self.anomaly_repository.update_segment_daily_metric_baselines(
+                project_id=project_id,
+                analysis_date=analysis_date,
+                baselines=baselines,
             )
             anomaly_candidates = detect_segment_anomalies(
                 aggregates=aggregates,
