@@ -2,6 +2,7 @@
 
 from app.contents.config import ContentGenerationConfig, build_content_generator
 from app.contents.generators import MockContentGenerator, OpenAIContentGenerator
+from app.contents.postgres_repository import PostgresContentRepository
 from app.contents.repository import GenerationLockUnavailable
 from app.contents.service import ContentGenerationService
 from app.contents.types import (
@@ -29,6 +30,7 @@ __all__ = [
     "GeneratedContentRecord",
     "MockContentGenerator",
     "OpenAIContentGenerator",
+    "PostgresContentRepository",
     "RecommendationActionTarget",
     "SegmentContext",
     "build_content_generator",
