@@ -104,6 +104,26 @@ def test_get_project_timezone_rejects_invalid_timezone_before_window_build() -> 
         repository.get_project_timezone(1)
 
 
+def test_get_project_key_returns_non_empty_key_for_clickhouse_lookup() -> None:
+    connection = FakeConnection(rows=[(" demo-shop ",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    project_key = repository.get_project_key(1)
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert project_key == "demo-shop"
+    assert "SELECT project_key FROM projects WHERE id = %s" in query
+    assert parameters == (1,)
+
+
+def test_get_project_key_rejects_empty_key() -> None:
+    connection = FakeConnection(rows=[(None,)])
+    repository = PostgresAnalysisRepository(connection)
+
+    with pytest.raises(ValueError, match="project_key is required"):
+        repository.get_project_key(1)
+
+
 def test_upsert_segments_skips_default_segment_key() -> None:
     connection = FakeConnection(rows=[])
     repository = PostgresAnalysisRepository(connection)
