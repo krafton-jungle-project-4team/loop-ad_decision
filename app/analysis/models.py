@@ -65,3 +65,42 @@ class UserPrimarySegmentCandidate:
     segment_key: str
     dimensions: dict[str, str]
     confidence: Decimal = Decimal("1.0")
+
+
+@dataclass(frozen=True)
+class BaselineMetrics:
+    segment_id: int
+    view_to_purchase_rate: Decimal | None
+
+
+@dataclass(frozen=True)
+class SegmentAnomalyCandidate:
+    segment_id: int
+    metric_name: str
+    actual_value: Decimal | None
+    expected_value: Decimal | None
+    target_value: Decimal
+    difference_value: Decimal | None
+    difference_rate: Decimal | None
+    severity: str
+    impact_score: Decimal
+    evidence_json: dict[str, object]
+
+
+@dataclass(frozen=True)
+class StoredAnomaly:
+    id: int
+    segment_id: int
+
+
+@dataclass(frozen=True)
+class RootCauseCandidate:
+    anomaly_id: int
+    cause_type: str
+    cause_key: str
+    title: str
+    description: str
+    confidence_score: Decimal
+    impact_score: Decimal
+    rank_no: int
+    evidence_json: dict[str, object]

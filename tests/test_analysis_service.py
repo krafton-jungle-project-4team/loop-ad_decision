@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app.analysis.models import SegmentAggregate, StoredSegment, UserPrimarySegmentCandidate
+from app.analysis.models import (
+    BaselineMetrics,
+    SegmentAggregate,
+    SegmentAnomalyCandidate,
+    StoredAnomaly,
+    StoredSegment,
+    UserPrimarySegmentCandidate,
+)
 from app.analysis.service import AnalysisService
 from app.analysis.time_window import build_analysis_window
 
@@ -72,6 +79,30 @@ class FakeUserSegmentMembershipRepository:
     ):
         self.calls.append((candidates, stored_segments, run_id))
         return sum(1 for candidate in candidates if candidate.segment_key in stored_segments)
+
+
+class FakeAnomalyRepository:
+    def __init__(self, baselines: dict[int, BaselineMetrics] | None = None) -> None:
+        self.baselines = baselines or {}
+        self.anomaly_candidates: list[SegmentAnomalyCandidate] = []
+        self.baseline_update_calls: list[tuple[int, date, dict[int, BaselineMetrics]]] = []
+
+    def fetch_segment_metric_baselines(self, project_id, analysis_date, stored_segments):
+        return self.baselines
+
+    def update_segment_daily_metric_baselines(self, project_id, analysis_date, baselines):
+        self.baseline_update_calls.append((project_id, analysis_date, baselines))
+        return len(baselines)
+
+    def upsert_segment_anomalies(self, project_id, analysis_date, anomalies, run_id):
+        self.anomaly_candidates = anomalies
+        return [
+            StoredAnomaly(id=900 + index, segment_id=anomaly.segment_id)
+            for index, anomaly in enumerate(anomalies)
+        ]
+
+    def upsert_root_cause_candidates(self, root_causes):
+        return len(root_causes)
 
 
 def segment_aggregate(segment_key: str = "age_30s__gender_male__device_mobile__channel_kakao__category_fresh") -> SegmentAggregate:
@@ -169,3 +200,68 @@ def test_analysis_service_stores_memberships_after_valid_segments() -> None:
 
     assert result.membership_count == 1
     assert membership_repository.calls[0][2] == 77
+
+
+def test_analysis_service_returns_anomaly_ids_and_segment_ids() -> None:
+    aggregate = segment_aggregate().model_copy if False else segment_aggregate()
+    anomaly_repository = FakeAnomalyRepository()
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([aggregate]),
+        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        anomaly_repository=anomaly_repository,
+    )
+
+    result = service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert result.anomaly_count == 0
+    assert result.anomaly_ids == []
+    assert result.anomaly_segment_ids == []
+
+
+def test_analysis_service_detects_target_anomaly() -> None:
+    aggregate = segment_aggregate()
+    aggregate = SegmentAggregate(
+        **{
+            **aggregate.__dict__,
+            "purchase_count": 1,
+            "view_to_purchase_rate": Decimal("0.01"),
+            "cvr": Decimal("0.01"),
+        }
+    )
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([aggregate]),
+        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        anomaly_repository=FakeAnomalyRepository(),
+    )
+
+    result = service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert result.anomaly_count == 1
+    assert result.anomaly_ids == [900]
+    assert result.anomaly_segment_ids == [1]
+    assert result.root_cause_count == 1
+
+
+def test_analysis_service_updates_current_metric_row_with_baseline() -> None:
+    aggregate = segment_aggregate()
+    baselines = {
+        1: BaselineMetrics(
+            segment_id=1,
+            view_to_purchase_rate=Decimal("0.08"),
+        )
+    }
+    anomaly_repository = FakeAnomalyRepository(baselines=baselines)
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([aggregate]),
+        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        anomaly_repository=anomaly_repository,
+    )
+
+    service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert anomaly_repository.baseline_update_calls == [
+        (1, date(2021, 1, 4), baselines)
+    ]
