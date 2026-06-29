@@ -26,7 +26,7 @@ class AnalysisResult:
 
 @dataclass(frozen=True)
 class SegmentAggregate:
-    project_id: int
+    project_id: int | str
     segment_key: str
     name: str
     dimensions: dict[str, str]
