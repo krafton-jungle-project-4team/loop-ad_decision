@@ -36,6 +36,7 @@ class FakePersistenceRepository:
         self.existing_experiment = existing_experiment
         self.existing_mapping = existing_mapping
         self.recommendation_results: list[SimpleNamespace] = []
+        self.recommendation_actions: list[SimpleNamespace] = []
         self.experiments: list[SimpleNamespace] = []
         self.mappings: list[SimpleNamespace] = []
         self.committed = False
@@ -55,11 +56,44 @@ class FakePersistenceRepository:
         self.recommendation_results.append(result)
         return result
 
+    def update_recommendation_result(
+        self,
+        recommendation_result_id: int,
+        values: dict[str, object],
+    ) -> SimpleNamespace | None:
+        for result in self.recommendation_results:
+            if result.id == recommendation_result_id:
+                for key, value in values.items():
+                    setattr(result, key, value)
+                return result
+        return None
+
+    def create_recommendation_action(self, **values: object) -> SimpleNamespace:
+        action = SimpleNamespace(
+            id=300 + len(self.recommendation_actions),
+            bandit_policy_id=None,
+            bandit_arm_id=None,
+            **values,
+        )
+        self.recommendation_actions.append(action)
+        return action
+
+    def update_recommendation_action(
+        self,
+        recommendation_action_id: int,
+        values: dict[str, object],
+    ) -> SimpleNamespace | None:
+        for action in self.recommendation_actions:
+            if action.id == recommendation_action_id:
+                for key, value in values.items():
+                    setattr(action, key, value)
+                return action
+        return None
+
     def get_experiment_by_recommendation_action(
         self,
         *,
-        recommendation_result_id: int,
-        action_id: str,
+        recommendation_action_id: int,
     ) -> SimpleNamespace | None:
         return self.existing_experiment
 
@@ -71,8 +105,7 @@ class FakePersistenceRepository:
     def get_segment_ad_mapping_by_recommendation_action(
         self,
         *,
-        recommendation_result_id: int,
-        action_id: str,
+        recommendation_action_id: int,
     ) -> SimpleNamespace | None:
         return self.existing_mapping
 
@@ -288,8 +321,10 @@ def test_anomaly_without_root_cause_uses_manual_review_and_pending_review() -> N
         action_recommender=action_recommender,
     )
 
-    assert response.status == "pending_review"
+    assert response.status == "pending_actions"
     assert response.recommended_actions[0].action_id == "manual_review"
+    assert repository.recommendation_actions[0].action_id == "manual_review"
+    assert repository.recommendation_actions[0].status == "pending_review"
     assert captured_action_request[0].causes[0].cause_type == "UNEXPLAINED_FUNNEL_ANOMALY"
     assert repository.recommendation_results[0].root_causes_json["synthetic_causes"][0][
         "cause_type"
@@ -311,8 +346,9 @@ def test_policy_blocked_when_no_recommendations_auto_execute() -> None:
         action_recommender=lambda request: action_response(recommended_action()),
     )
 
-    assert response.status == "policy_blocked"
+    assert response.status == "pending_actions"
     assert response.blocked_actions[0].action_id == "recommend_alternative_product"
+    assert repository.recommendation_actions[0].status == "policy_blocked"
     assert repository.recommendation_results[0].policy_decision_json["actions"][0][
         "status"
     ] == "blocked"
@@ -342,8 +378,10 @@ def test_auto_executed_action_creates_experiment_and_mapping() -> None:
         "status"
     ] == "auto_executed"
     assert repository.experiments[0].traffic_split_json == {"control": 0.8, "treatment": 0.2}
+    assert repository.experiments[0].recommendation_action_id == 300
     assert repository.mappings[0].source == "auto_policy"
     assert repository.mappings[0].status == "active"
+    assert repository.mappings[0].recommendation_action_id == 300
 
 
 def test_existing_experiment_and_mapping_are_reused_by_recommendation_action() -> None:
