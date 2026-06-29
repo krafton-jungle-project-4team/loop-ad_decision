@@ -5,6 +5,7 @@ from decimal import Decimal
 
 from app.analysis.models import SegmentAggregate
 from app.analysis.postgres_repository import PostgresAnalysisRepository
+import pytest
 
 
 class FakeCursor:
@@ -79,6 +80,21 @@ def test_upsert_segments_uses_schema_unique_key_and_nullable_run_id() -> None:
     assert "created_run_id" in query
     assert parameters[-1] is None
     assert stored_segments[aggregate().segment_key].id == 10
+
+
+def test_get_project_timezone_falls_back_to_seoul_when_empty() -> None:
+    connection = FakeConnection(rows=[("  ",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    assert repository.get_project_timezone(1) == "Asia/Seoul"
+
+
+def test_get_project_timezone_rejects_invalid_timezone_before_window_build() -> None:
+    connection = FakeConnection(rows=[("Mars/Seoul",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    with pytest.raises(ValueError, match="invalid timezone"):
+        repository.get_project_timezone(1)
 
 
 def test_upsert_segments_skips_default_segment_key() -> None:

@@ -4,9 +4,12 @@ import json
 from collections.abc import Mapping
 from datetime import date
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from app.analysis.models import SegmentAggregate, StoredSegment
 from app.analysis.segments import is_default_segment_key
+
+DEFAULT_PROJECT_TIMEZONE = "Asia/Seoul"
 
 
 class Cursor(Protocol):
@@ -23,6 +26,12 @@ class Connection(Protocol):
 
 
 class PostgresAnalysisRepository:
+    """PostgreSQL analysis writer.
+
+    This repository does not call commit() or rollback(). The caller owns the
+    transaction boundary around AnalysisService or the daily job.
+    """
+
     def __init__(self, connection: Connection) -> None:
         self.connection = connection
 
@@ -35,7 +44,7 @@ class PostgresAnalysisRepository:
             row = cursor.fetchone()
         if row is None:
             raise LookupError(f"project not found: {project_id}")
-        return str(row[0])
+        return normalize_project_timezone(row[0], project_id=project_id)
 
     def upsert_segments(
         self,
@@ -121,6 +130,17 @@ def build_segment_description(dimensions: Mapping[str, str]) -> str:
     return "Daily analysis segment: " + ", ".join(
         f"{key}={value}" for key, value in sorted(dimensions.items())
     )
+
+
+def normalize_project_timezone(value: object, *, project_id: int) -> str:
+    timezone = str(value).strip() if value is not None else ""
+    if not timezone:
+        return DEFAULT_PROJECT_TIMEZONE
+    try:
+        ZoneInfo(timezone)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"invalid timezone for project {project_id}: {timezone}") from exc
+    return timezone
 
 
 UPSERT_SEGMENT_SQL = """
