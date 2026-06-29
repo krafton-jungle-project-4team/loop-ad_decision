@@ -1,6 +1,7 @@
 import json
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +17,8 @@ ANALYSIS_DATE = date(2021, 1, 4)
 
 
 class RecordingContentGenerationService:
-    def __init__(self) -> None:
+    def __init__(self, calls: list[str] | None = None) -> None:
+        self.events = calls
         self.calls: list[dict[str, object]] = []
 
     def generate_for_actions(
@@ -27,6 +29,8 @@ class RecordingContentGenerationService:
         run_id: int | None = None,
         force: bool = False,
     ) -> ContentGenerationSummary:
+        if self.events is not None:
+            self.events.append("content_generation")
         self.calls.append(
             {
                 "project_id": project_id,
@@ -64,6 +68,30 @@ class FailingContentGenerationService:
     ) -> ContentGenerationSummary:
         del project_id, analysis_date, run_id, force
         raise RuntimeError("content database unavailable")
+
+
+class RecordingExperimentSyncService:
+    def __init__(self, calls: list[str] | None = None) -> None:
+        self.calls = calls if calls is not None else []
+        self.received: dict[str, object] | None = None
+
+    def sync_for_recommendation_actions(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        run_id: int,
+    ) -> list[object]:
+        self.calls.append("experiment_sync")
+        self.received = {
+            "project_id": project_id,
+            "analysis_date": analysis_date,
+            "run_id": run_id,
+        }
+        return [
+            SimpleNamespace(status="running"),
+            SimpleNamespace(status="draft"),
+        ]
 
 
 class FakeCursor:
@@ -134,7 +162,7 @@ def test_downstream_runner_creates_recommendations_without_immediate_experiment_
     assert repo.mappings == []
 
 
-def test_downstream_runner_generates_content_after_recommendations() -> None:
+def test_downstream_runner_generates_content_then_syncs_experiments() -> None:
     repo = InMemoryDecisionRepository()
     repo.add_all_action_catalog()
     repo.anomalies.append(
@@ -164,7 +192,9 @@ def test_downstream_runner_generates_content_after_recommendations() -> None:
             evidence_json={},
         )
     )
-    content_generation_service = RecordingContentGenerationService()
+    calls: list[str] = []
+    content_generation_service = RecordingContentGenerationService(calls)
+    experiment_sync_service = RecordingExperimentSyncService(calls)
 
     runner = _RecommendationExperimentRunner(
         repository=repo,
@@ -174,9 +204,11 @@ def test_downstream_runner_generates_content_after_recommendations() -> None:
         config=ExperimentConfig(),
         force=True,
         content_generation_service=content_generation_service,
+        experiment_sync_service=experiment_sync_service,
     )
     runner.run(AnalysisResult(anomaly_count=1))
 
+    assert calls == ["content_generation", "experiment_sync"]
     assert len(repo.actions) == 1
     assert content_generation_service.calls == [
         {
@@ -186,11 +218,22 @@ def test_downstream_runner_generates_content_after_recommendations() -> None:
             "force": True,
         }
     ]
+    assert experiment_sync_service.received == {
+        "project_id": 1,
+        "analysis_date": ANALYSIS_DATE,
+        "run_id": 77,
+    }
     assert runner.content_generation_metadata is not None
     assert runner.content_generation_metadata["status"] == "success"
     assert runner.content_generation_metadata["actions_seen"] == 1
     assert runner.content_generation_metadata["created_contents"] == 2
     assert runner.content_generation_metadata["mock_calls"] == 2
+    assert runner.experiment_sync_metadata == {
+        "status": "success",
+        "synced_experiments": 2,
+        "running_experiments": 1,
+        "draft_experiments": 1,
+    }
 
 
 def test_downstream_runner_propagates_content_generation_service_failure() -> None:
@@ -204,12 +247,14 @@ def test_downstream_runner_propagates_content_generation_service_failure() -> No
         run_id=77,
         config=ExperimentConfig(),
         content_generation_service=FailingContentGenerationService(),
+        experiment_sync_service=RecordingExperimentSyncService(),
     )
 
     with pytest.raises(RuntimeError, match="content database unavailable"):
         runner.run(AnalysisResult(anomaly_count=1))
 
     assert runner.content_generation_metadata is None
+    assert runner.experiment_sync_metadata is None
 
 
 def test_mark_success_stores_content_generation_metadata() -> None:
@@ -228,6 +273,12 @@ def test_mark_success_stores_content_generation_metadata() -> None:
             "created_contents": 2,
             "mock_calls": 2,
         },
+        experiment_sync_metadata={
+            "status": "success",
+            "synced_experiments": 1,
+            "running_experiments": 1,
+            "draft_experiments": 0,
+        },
     )
 
     query, parameters = connection.cursor_instance.executed[0]
@@ -240,4 +291,10 @@ def test_mark_success_stores_content_generation_metadata() -> None:
         "status": "success",
         "created_contents": 2,
         "mock_calls": 2,
+    }
+    assert metadata["experiment_sync"] == {
+        "status": "success",
+        "synced_experiments": 1,
+        "running_experiments": 1,
+        "draft_experiments": 0,
     }

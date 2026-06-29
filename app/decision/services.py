@@ -31,7 +31,7 @@ ACTION_BY_CAUSE_KEY = {
     "checkout_to_purchase": "checkout_coupon_banner",
 }
 STOCKOUT_ACTION_KEY = "alternative_product_banner"
-OBJECTIVE_METRIC = "click_to_purchase_rate"
+OBJECTIVE_METRIC = "view_to_purchase_rate"
 PLACEMENT_KEY = "main_banner"
 
 

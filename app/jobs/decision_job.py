@@ -26,6 +26,7 @@ from app.decision.repositories import (
 from app.decision.services import (
     ExperimentConfig,
     ExperimentResultUpdateService,
+    ExperimentService,
     RecommendationService,
     UserSegmentMatchingService,
 )
@@ -65,6 +66,17 @@ class ContentGenerationServiceLike(Protocol):
         run_id: int | None = None,
         force: bool = False,
     ) -> ContentGenerationSummary:
+        ...
+
+
+class ExperimentSyncServiceLike(Protocol):
+    def sync_for_recommendation_actions(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        run_id: int,
+    ) -> list[Any]:
         ...
 
 
@@ -212,6 +224,10 @@ class DailyDecisionJobService:
                         ),
                         generator=build_content_generator(),
                     ),
+                    experiment_sync_service=ExperimentService(
+                        decision_repository,
+                        config=experiment_config,
+                    ),
                 )
                 result = run_daily_analysis_flow(
                     project_id=run_context.project_id,
@@ -238,6 +254,7 @@ class DailyDecisionJobService:
                     run_id,
                     result,
                     content_generation_metadata=recommendation_runner.content_generation_metadata,
+                    experiment_sync_metadata=recommendation_runner.experiment_sync_metadata,
                 )
                 return result
         except Exception as exc:
@@ -285,6 +302,7 @@ class DailyDecisionJobService:
         result: AnalysisResult,
         *,
         content_generation_metadata: dict[str, Any] | None = None,
+        experiment_sync_metadata: dict[str, Any] | None = None,
     ) -> None:
         metadata = {
             "segment_count": result.segment_count,
@@ -295,6 +313,8 @@ class DailyDecisionJobService:
         }
         if content_generation_metadata is not None:
             metadata["content_generation"] = content_generation_metadata
+        if experiment_sync_metadata is not None:
+            metadata["experiment_sync"] = experiment_sync_metadata
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -365,6 +385,7 @@ class _RecommendationExperimentRunner:
         config: ExperimentConfig,
         force: bool = False,
         content_generation_service: ContentGenerationServiceLike | None = None,
+        experiment_sync_service: ExperimentSyncServiceLike | None = None,
     ) -> None:
         self.repository = repository
         self.project_id = project_id
@@ -373,7 +394,9 @@ class _RecommendationExperimentRunner:
         self.config = config
         self.force = force
         self.content_generation_service = content_generation_service
+        self.experiment_sync_service = experiment_sync_service
         self.content_generation_metadata: dict[str, Any] | None = None
+        self.experiment_sync_metadata: dict[str, Any] | None = None
 
     def run(self, result: AnalysisResult) -> None:
         RecommendationService(self.repository).create_for_anomalies(
@@ -394,12 +417,34 @@ class _RecommendationExperimentRunner:
             force=self.force,
         )
         self.content_generation_metadata = _content_generation_metadata(summary)
+        if self.experiment_sync_service is None:
+            self.experiment_sync_metadata = {
+                "status": "skipped",
+                "reason": "experiment_sync_service_not_configured",
+            }
+            return
+        synced = self.experiment_sync_service.sync_for_recommendation_actions(
+            project_id=self.project_id,
+            analysis_date=self.analysis_date,
+            run_id=self.run_id,
+        )
+        self.experiment_sync_metadata = _experiment_sync_metadata(synced)
 
 
 def _content_generation_metadata(summary: ContentGenerationSummary) -> dict[str, Any]:
     metadata = asdict(summary)
     metadata["status"] = "success"
     return metadata
+
+
+def _experiment_sync_metadata(experiments: list[Any]) -> dict[str, Any]:
+    statuses = [str(getattr(experiment, "status", "")) for experiment in experiments]
+    return {
+        "status": "success",
+        "synced_experiments": len(experiments),
+        "running_experiments": statuses.count("running"),
+        "draft_experiments": statuses.count("draft"),
+    }
 
 
 def build_daily_decision_job_service(settings: Settings) -> DailyDecisionJobService:

@@ -314,6 +314,7 @@ class PostgresDecisionRepository:
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (project_id, recommendation_action_id)
             WHERE recommendation_action_id IS NOT NULL
+              AND status IN ('draft', 'running', 'paused')
             DO UPDATE
             SET
                 segment_id = EXCLUDED.segment_id,
