@@ -46,6 +46,17 @@ class PostgresAnalysisRepository:
             raise LookupError(f"project not found: {project_id}")
         return normalize_project_timezone(row[0], project_id=project_id)
 
+    def get_project_key(self, project_id: int) -> str:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT project_key FROM projects WHERE id = %s",
+                (project_id,),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            raise LookupError(f"project not found: {project_id}")
+        return normalize_project_key(row[0], project_id=project_id)
+
     def upsert_segments(
         self,
         project_id: int,
@@ -141,6 +152,13 @@ def normalize_project_timezone(value: object, *, project_id: int) -> str:
     except ZoneInfoNotFoundError as exc:
         raise ValueError(f"invalid timezone for project {project_id}: {timezone}") from exc
     return timezone
+
+
+def normalize_project_key(value: object, *, project_id: int) -> str:
+    project_key = str(value).strip() if value is not None else ""
+    if not project_key:
+        raise ValueError(f"project_key is required for project {project_id}")
+    return project_key
 
 
 UPSERT_SEGMENT_SQL = """
