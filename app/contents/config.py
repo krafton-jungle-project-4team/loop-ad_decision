@@ -42,8 +42,8 @@ class ContentGenerationConfig:
         values = {
             "LOOPAD_ENV": _clean(os.getenv("LOOPAD_ENV")),
             "LOOPAD_DATA_STORAGE_BUCKET": _clean(os.getenv("LOOPAD_DATA_STORAGE_BUCKET")),
-            "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX": _clean(
-                os.getenv("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX")
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX": _clean(
+                os.getenv("LOOPAD_GENAI_ASSETS_BASE_PREFIX")
             ),
             "LOOPAD_OPENAI_API_KEY": _clean(os.getenv("LOOPAD_OPENAI_API_KEY")),
         }
@@ -53,7 +53,7 @@ class ContentGenerationConfig:
 
         app_env = values["LOOPAD_ENV"]
         data_storage_bucket = values["LOOPAD_DATA_STORAGE_BUCKET"]
-        assets_base_prefix = values["LOOPAD_GENAI_GENERATED_ASSETS_PREFIX"]
+        assets_base_prefix = values["LOOPAD_GENAI_ASSETS_BASE_PREFIX"]
         openai_api_key = values["LOOPAD_OPENAI_API_KEY"]
         if (
             app_env is None
@@ -153,10 +153,10 @@ def _clean(value: str | None) -> str | None:
 def _normalize_assets_base_prefix(value: str) -> str:
     stripped = value.strip().strip("/")
     if not stripped:
-        raise ValueError("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX must include an asset path prefix")
+        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must include an asset path prefix")
     path = Path(stripped)
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX must be a relative S3 key prefix")
+        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must be a relative S3 key prefix")
     return stripped
 
 

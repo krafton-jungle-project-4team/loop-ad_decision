@@ -28,7 +28,7 @@ def valid_env() -> dict[str, str]:
         "LOOPAD_CLICKHOUSE_USERNAME": "app",
         "LOOPAD_CLICKHOUSE_PASSWORD": "password",
         "LOOPAD_DATA_STORAGE_BUCKET": "example-data-storage-bucket",
-        "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX": "genai/",
+        "LOOPAD_GENAI_ASSETS_BASE_PREFIX": "genai/",
         "LOOPAD_OPENAI_API_KEY": "test-openai-key",
     }
 
@@ -116,7 +116,7 @@ def test_load_settings_loads_local_dotenv_when_no_explicit_environ(
             "LOOPAD_CLICKHOUSE_USERNAME=loopad_app",
             "LOOPAD_CLICKHOUSE_PASSWORD=loopad_local_password",
             "LOOPAD_DATA_STORAGE_BUCKET=local-data-storage-bucket",
-            "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX=genai/",
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX=genai/",
             "LOOPAD_OPENAI_API_KEY=local-openai-key",
             "AI_DECISION_ADMIN_TOKEN=legacy-local-secret",
         ]
@@ -174,7 +174,7 @@ def test_load_local_dotenv_does_not_override_existing_env(
                 "LOOPAD_CLICKHOUSE_USERNAME=loopad_app",
                 "LOOPAD_CLICKHOUSE_PASSWORD=loopad_local_password",
                 "LOOPAD_DATA_STORAGE_BUCKET=local-data-storage-bucket",
-                "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX=genai/",
+                "LOOPAD_GENAI_ASSETS_BASE_PREFIX=genai/",
                 "LOOPAD_OPENAI_API_KEY=local-openai-key",
             ]
         ),
