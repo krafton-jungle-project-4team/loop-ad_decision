@@ -7,6 +7,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.decision.models import Experiment, ExperimentVariant
+from app.decision.embedding import DEFAULT_EMBEDDING_VERSION
+from app.decision.models import DEFAULT_SIMILARITY_THRESHOLD
 from app.decision.repositories import (
     ClickHouseExperimentResultRepository,
     ClickHouseUserSegmentCandidateRepository,
@@ -182,6 +184,66 @@ def test_postgres_decision_repository_rejects_empty_project_key() -> None:
         repository.get_project_key(project_id=1)
 
 
+def test_postgres_decision_repository_uses_today_segment_matching_config_only() -> None:
+    connection = FakeConnection()
+    repository = PostgresDecisionRepository(connection)
+
+    config = repository.get_segment_matching_config(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "FROM segment_matching_configs" in query
+    assert "analysis_date = %s" in query
+    assert "analysis_date <" not in query
+    assert parameters == (1, date(2021, 1, 4))
+    assert config.embedding_version == DEFAULT_EMBEDDING_VERSION
+    assert config.similarity_threshold == DEFAULT_SIMILARITY_THRESHOLD
+
+
+def test_postgres_decision_repository_finds_active_non_default_nearest_centroid() -> None:
+    connection = FakeConnection(
+        row={
+            "segment_id": 10,
+            "segment_key": "segment-a",
+            "cosine_distance": Decimal("0.25"),
+        }
+    )
+    repository = PostgresDecisionRepository(connection)
+
+    nearest = repository.find_nearest_segment_centroid(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+        embedding_version="segment_match_v1",
+        user_vector=[1.0] + [0.0] * 63,
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "sc.centroid <=> %s::vector" in query
+    assert "s.is_default = false" in query
+    assert "s.status = 'active'" in query
+    assert parameters[0].startswith("[1")
+    assert parameters[1:] == (1, date(2021, 1, 4), "segment_match_v1")
+    assert nearest is not None
+    assert nearest.segment_id == 10
+    assert nearest.cosine_distance == Decimal("0.25")
+
+
+def test_postgres_decision_repository_gets_active_default_segment() -> None:
+    connection = FakeConnection(row={"id": 1, "segment_key": "default"})
+    repository = PostgresDecisionRepository(connection)
+
+    segment = repository.get_default_segment(project_id=1)
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "is_default = true" in query
+    assert "status = 'active'" in query
+    assert parameters == (1,)
+    assert segment is not None
+    assert segment.id == 1
+
+
 def test_postgres_decision_repository_lists_existing_segments_read_only() -> None:
     connection = FakeConnection(
         rows=[
@@ -268,11 +330,12 @@ def test_clickhouse_user_segment_candidates_use_real_event_columns_and_internal_
     assert "events.device_type" not in sql
     assert "events.acquisition_channel" not in sql
     assert "events.primary_category" not in sql
+    assert "INSERT INTO" not in sql
     assert candidates[0].dimensions == {
         "age_group": "30s",
-        "gender": "Male",
-        "device_type": "Mobile Web",
-        "acquisition_channel": "Kakao",
-        "primary_category": "Fresh Food",
+        "gender": "male",
+        "device_type": "mobile_web",
+        "acquisition_channel": "kakao",
+        "primary_category": "fresh_food",
     }
     assert parameters["project_id"] == "demo-shop"

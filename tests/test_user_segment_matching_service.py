@@ -3,22 +3,35 @@ from __future__ import annotations
 from datetime import date
 from decimal import Decimal
 
-from app.decision.models import ExistingSegment, UserSegmentCandidate
+from app.decision.models import (
+    ExistingSegment,
+    NearestSegmentCentroid,
+    SegmentMatchingConfig,
+    UserSegmentCandidate,
+)
 from app.decision.services import UserSegmentMatchingService
 
 
 ANALYSIS_DATE = date(2021, 1, 4)
-SEGMENT_KEY = "age_30s__gender_male__device_mobile_web__channel_kakao__category_fresh_food"
 
 
 class FakeMatchingRepository:
-    def __init__(self, existing_segments: dict[str, ExistingSegment]) -> None:
-        self.existing_segments = existing_segments
+    def __init__(self) -> None:
         self.memberships: list[dict[str, object]] = []
-        self.list_existing_project_ids: list[int] = []
         self.replace_calls: list[dict[str, object]] = []
+        self.nearest_calls: list[dict[str, object]] = []
         self.timezone = "Asia/Seoul"
         self.project_key = "demo-shop"
+        self.config = SegmentMatchingConfig(
+            embedding_version="segment_match_v1",
+            similarity_threshold=Decimal("0.7000"),
+        )
+        self.default_segment = ExistingSegment(id=1, segment_key="default")
+        self.nearest: NearestSegmentCentroid | None = NearestSegmentCentroid(
+            segment_id=10,
+            segment_key="age_30s__gender_male__device_mobile_web__channel_kakao__category_fresh_food",
+            cosine_distance=Decimal("0.20"),
+        )
 
     def get_project_timezone(self, *, project_id: int) -> str:
         return self.timezone
@@ -26,9 +39,34 @@ class FakeMatchingRepository:
     def get_project_key(self, *, project_id: int) -> str:
         return self.project_key
 
-    def list_existing_segments(self, *, project_id: int) -> dict[str, ExistingSegment]:
-        self.list_existing_project_ids.append(project_id)
-        return dict(self.existing_segments)
+    def get_segment_matching_config(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> SegmentMatchingConfig:
+        return self.config
+
+    def get_default_segment(self, *, project_id: int) -> ExistingSegment | None:
+        return self.default_segment
+
+    def find_nearest_segment_centroid(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        embedding_version: str,
+        user_vector: list[float],
+    ) -> NearestSegmentCentroid | None:
+        self.nearest_calls.append(
+            {
+                "project_id": project_id,
+                "analysis_date": analysis_date,
+                "embedding_version": embedding_version,
+                "user_vector": user_vector,
+            }
+        )
+        return self.nearest
 
     def replace_primary_membership(
         self,
@@ -63,23 +101,6 @@ class FakeMatchingRepository:
                 and membership["segment_id"] != segment_id
             )
         ]
-        existing = next(
-            (
-                membership
-                for membership in self.memberships
-                if membership["project_id"] == project_id
-                and membership["external_user_id"] == external_user_id
-                and membership["segment_id"] == segment_id
-                and membership["analysis_date"] == analysis_date
-            ),
-            None,
-        )
-        if existing is not None:
-            existing["is_primary"] = True
-            existing["confidence"] = confidence
-            existing["reason_json"] = reason_json
-            existing["run_id"] = run_id
-            return
         self.memberships.append(
             {
                 "project_id": project_id,
@@ -125,10 +146,8 @@ def candidate(
     )
 
 
-def test_existing_segment_key_creates_user_segment_membership() -> None:
-    repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
-    )
+def test_nearest_centroid_above_threshold_creates_segment_membership() -> None:
+    repository = FakeMatchingRepository()
     candidate_repository = FakeCandidateRepository([candidate()])
 
     result = UserSegmentMatchingService(repository, candidate_repository).run(
@@ -140,31 +159,103 @@ def test_existing_segment_key_creates_user_segment_membership() -> None:
     assert result.matched_count == 1
     assert result.skipped_count == 0
     assert repository.memberships[0]["segment_id"] == 10
-    assert repository.memberships[0]["is_primary"] is True
-    assert repository.replace_calls[0]["reason_json"]["segment_key"] == SEGMENT_KEY
+    assert repository.replace_calls[0]["confidence"] == Decimal("0.80")
+    assert repository.replace_calls[0]["reason_json"] == {
+        "matching_source": "embedding_ann",
+        "embedding_version": "segment_match_v1",
+        "similarity": 0.8,
+        "threshold": 0.7,
+        "nearest_segment_key": repository.nearest.segment_key,
+        "fallback_reason": None,
+    }
     assert candidate_repository.calls[0][0] == "demo-shop"
 
 
-def test_missing_segment_key_skips_membership_without_creating_segment() -> None:
-    repository = FakeMatchingRepository({})
-    candidate_repository = FakeCandidateRepository([candidate()])
-
-    result = UserSegmentMatchingService(repository, candidate_repository).run(
-        project_id=1,
-        analysis_date=ANALYSIS_DATE,
-        run_id=None,
+def test_distance_is_converted_to_similarity_before_threshold_comparison() -> None:
+    repository = FakeMatchingRepository()
+    repository.config = SegmentMatchingConfig(
+        embedding_version="segment_match_v1",
+        similarity_threshold=Decimal("0.7500"),
     )
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="segment",
+        cosine_distance=Decimal("0.20"),
+    )
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 10
+    assert repository.memberships[0]["confidence"] == Decimal("0.80")
+
+
+def test_below_threshold_falls_back_to_default_primary_membership() -> None:
+    repository = FakeMatchingRepository()
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="near-but-not-enough",
+        cosine_distance=Decimal("0.35"),
+    )
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
 
     assert result.matched_count == 0
     assert result.skipped_count == 1
-    assert repository.memberships == []
-    assert repository.existing_segments == {}
-    assert repository.replace_calls == []
+    assert repository.memberships[0]["segment_id"] == 1
+    assert repository.replace_calls[0]["confidence"] == Decimal("0.65")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == 0.65
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "below_threshold"
+    assert repository.replace_calls[0]["reason_json"]["nearest_segment_key"] == "near-but-not-enough"
 
 
-def test_replacing_primary_membership_leaves_one_primary_per_user_day() -> None:
-    repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
+def test_confidence_is_clamped_when_raw_similarity_is_negative() -> None:
+    repository = FakeMatchingRepository()
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="opposite-segment",
+        cosine_distance=Decimal("1.50"),
+    )
+
+    UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert repository.replace_calls[0]["confidence"] == Decimal("0")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == -0.5
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "below_threshold"
+
+
+def test_missing_centroid_candidate_writes_default_membership_with_zero_confidence() -> None:
+    repository = FakeMatchingRepository()
+    repository.nearest = None
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=None)
+
+    assert result.matched_count == 0
+    assert result.skipped_count == 1
+    assert repository.memberships[0]["segment_id"] == 1
+    assert repository.replace_calls[0]["confidence"] == Decimal("0")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] is None
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "no_candidate_segment"
+
+
+def test_fallback_replaces_existing_primary_membership_for_same_user_day() -> None:
+    repository = FakeMatchingRepository()
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="near-but-not-enough",
+        cosine_distance=Decimal("0.35"),
     )
     repository.memberships.append(
         {
@@ -192,23 +283,4 @@ def test_replacing_primary_membership_leaves_one_primary_per_user_day() -> None:
         and membership["is_primary"] is True
     ]
     assert len(primary_memberships) == 1
-    assert primary_memberships[0]["segment_id"] == 10
-
-
-def test_unmatched_user_remains_without_membership_for_default_fallback() -> None:
-    repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
-    )
-    candidate_repository = FakeCandidateRepository(
-        [candidate(external_user_id="user-2", age_group="40s")]
-    )
-
-    result = UserSegmentMatchingService(repository, candidate_repository).run(
-        project_id=1,
-        analysis_date=ANALYSIS_DATE,
-        run_id=77,
-    )
-
-    assert result.matched_count == 0
-    assert result.skipped_count == 1
-    assert repository.memberships == []
+    assert primary_memberships[0]["segment_id"] == 1
