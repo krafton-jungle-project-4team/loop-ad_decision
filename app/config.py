@@ -4,6 +4,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from dotenv import find_dotenv, load_dotenv
+
 
 DECISION_SERVICE_ID = "decision-api"
 
@@ -48,6 +50,8 @@ REQUIRED_ENV_NAMES = (
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
+    if environ is None:
+        load_local_dotenv()
     source = environ if environ is not None else os.environ
     missing = [name for name in REQUIRED_ENV_NAMES if not _read_required(source, name)]
     if missing:
@@ -75,6 +79,12 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         clickhouse_password=_read_required(source, "LOOPAD_CLICKHOUSE_PASSWORD"),
         legacy_admin_token=_read_optional(source, "AI_DECISION_ADMIN_TOKEN"),
     )
+
+
+def load_local_dotenv() -> None:
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
 def _read_required(source: Mapping[str, str], name: str) -> str:
