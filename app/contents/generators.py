@@ -176,8 +176,6 @@ def _load_response_json(response: Any) -> dict[str, Any]:
 
 
 def _content_type_for(target: RecommendationActionTarget) -> str:
-    if target.content_type:
-        return target.content_type
     if target.action_key in {"cart_coupon_banner", "checkout_coupon_banner"}:
         return "coupon_banner"
     if target.action_key == "alternative_product_banner":

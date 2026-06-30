@@ -67,24 +67,6 @@ class ContentRepository(Protocol):
     ) -> None:
         ...
 
-    def link_existing_experiment_variant(
-        self,
-        *,
-        recommendation_action_id: int,
-        variant_key: str,
-        generated_content_id: int,
-    ) -> int:
-        ...
-
-    def link_existing_segment_ad_mapping(
-        self,
-        *,
-        recommendation_action_id: int,
-        variant_key: str,
-        generated_content_id: int,
-    ) -> int:
-        ...
-
 
 def no_op_generation_lock() -> GenerationLock:
     return nullcontext()

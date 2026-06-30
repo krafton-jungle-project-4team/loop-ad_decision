@@ -29,8 +29,6 @@ class FakeContentRepository:
         self.action_statuses: dict[int, str] = {}
         self.action_errors: dict[int, dict[str, str]] = {}
         self.locked: list[tuple[int | str, int]] = []
-        self.linked_variants: list[tuple[int, str, int]] = []
-        self.linked_mappings: list[tuple[int, str, int]] = []
         self.next_id = 1
 
     def list_generation_targets(
@@ -78,6 +76,7 @@ class FakeContentRepository:
                 segment_id=draft.segment_id,
                 variant_key=draft.variant_key,
                 generation_status=draft.generation_status,
+                created_run_id=draft.created_run_id,
                 metadata=draft.metadata,
             )
             self.next_id += 1
@@ -91,6 +90,7 @@ class FakeContentRepository:
                 segment_id=existing.segment_id,
                 variant_key=existing.variant_key,
                 generation_status=draft.generation_status,
+                created_run_id=draft.created_run_id,
                 metadata=draft.metadata,
             )
             self.records[key] = record
@@ -112,26 +112,6 @@ class FakeContentRepository:
             "error_type": error_type,
             "error_message": error_message,
         }
-
-    def link_existing_experiment_variant(
-        self,
-        *,
-        recommendation_action_id: int,
-        variant_key: str,
-        generated_content_id: int,
-    ) -> int:
-        self.linked_variants.append((recommendation_action_id, variant_key, generated_content_id))
-        return 1
-
-    def link_existing_segment_ad_mapping(
-        self,
-        *,
-        recommendation_action_id: int,
-        variant_key: str,
-        generated_content_id: int,
-    ) -> int:
-        self.linked_mappings.append((recommendation_action_id, variant_key, generated_content_id))
-        return 1
 
 
 class FailingGenerator:
@@ -204,6 +184,20 @@ def test_mock_generator_creates_control_and_treatment_contents() -> None:
     assert repository.locked == [("demo-shop", 10)]
 
 
+def test_run_id_is_stored_on_generated_content_drafts() -> None:
+    repository = FakeContentRepository([make_target()])
+    service = make_service(repository)
+
+    service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+        run_id=123,
+    )
+
+    assert all(draft.created_run_id == 123 for draft in repository.drafts.values())
+    assert all(record.created_run_id == 123 for record in repository.records.values())
+
+
 def test_default_segment_is_never_processed() -> None:
     repository = FakeContentRepository([make_target(is_default=True)])
     service = make_service(repository)
@@ -220,7 +214,7 @@ def test_default_segment_is_never_processed() -> None:
     assert repository.action_statuses == {}
 
 
-def test_force_false_skips_existing_content_and_links_existing_rows() -> None:
+def test_force_false_skips_existing_content_without_mapping_side_effects() -> None:
     repository = FakeContentRepository([make_target()])
     repository.records[("demo-shop", 10, "control")] = GeneratedContentRecord(
         id=1,
@@ -250,8 +244,6 @@ def test_force_false_skips_existing_content_and_links_existing_rows() -> None:
     assert summary.variants_skipped == 2
     assert repository.drafts == {}
     assert repository.action_statuses[10] == ACTION_STATUS_CONTENT_GENERATED
-    assert len(repository.linked_variants) == 2
-    assert len(repository.linked_mappings) == 2
 
 
 def test_force_true_updates_existing_ai_generated_content() -> None:
@@ -327,6 +319,19 @@ def test_partial_failure_can_store_failed_content_when_required_fields_exist() -
     assert summary.actions_failed == 1
     assert repository.drafts[("demo-shop", 10, "control")].generation_status == "failed"
     assert repository.action_statuses[10] == ACTION_STATUS_FAILED
+
+
+def test_partial_failure_failed_content_keeps_run_id() -> None:
+    repository = FakeContentRepository([make_target()])
+    service = make_service(repository, PartialFailingGenerator())
+
+    service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+        run_id=456,
+    )
+
+    assert repository.drafts[("demo-shop", 10, "control")].created_run_id == 456
 
 
 def test_prompt_builder_removes_raw_event_and_pii_fields() -> None:

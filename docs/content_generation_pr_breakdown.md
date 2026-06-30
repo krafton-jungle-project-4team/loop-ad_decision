@@ -33,13 +33,13 @@ Goal: connect the PR 1 service to the real AI Decision schema.
 Includes:
 - target query for anomalous, non-default recommendation actions
 - `generated_contents` upsert by `recommendation_action_id + variant_key`
+- `generated_contents.created_run_id` persistence from `run_id`
 - advisory lock or `SELECT ... FOR UPDATE`
 - action status and metadata updates
-- helpers that link existing `experiment_variants.generated_content_id`
-- helpers that link existing `segment_ad_mappings.generated_content_id`
 
 Does not include:
 - creating new experiments or mappings
+- linking generated content into experiment variants or serving mappings
 - HTTP endpoint
 
 Acceptance:
@@ -66,18 +66,17 @@ Acceptance:
 - anomaly runs create content before experiment/mapping finalization
 - failed content actions do not fail the whole daily job
 
-## PR 4. Experiment and Mapping Linking
+## Deferred. Experiment and Mapping Linking
 
-Goal: ensure generated content becomes readable by the ad server contract.
+Goal: keep experiment and serving mapping creation in the recommendation/experiment ownership boundary.
 
-Includes:
-- ExperimentService or MappingService creates missing experiment/mapping rows
-- link generated content into variants and mappings
-- ensure `active_ad_serving_rules` can expose generated content
+Content generation does not create or update:
+- `experiments`
+- `experiment_variants`
+- `segment_ad_mappings`
 
-Acceptance:
-- generated content is reachable through serving queries
-- content generation still does not create experiments or mappings directly
+Those responsibilities should live in the recommendation/experiment flow, where schema constraints,
+traffic policy, and serving contracts are already owned.
 
 ## PR 5. Optional Internal Debug Trigger
 
@@ -91,4 +90,3 @@ Includes:
 Does not include:
 - public recommendation or ad-serving API
 - dashboard or advertisement server dependency on AI Decision
-

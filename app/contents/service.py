@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 from app.contents.generators import ContentGenerator, PartialContentGenerationError
 from app.contents.repository import ContentRepository
 from app.contents.types import (
@@ -34,7 +36,6 @@ class ContentGenerationService:
         run_id: int | None = None,
         force: bool = False,
     ) -> ContentGenerationSummary:
-        del run_id
         summary = ContentGenerationSummary()
         eligible_statuses = self._eligible_statuses(force)
         targets = list(
@@ -47,13 +48,12 @@ class ContentGenerationService:
         summary.actions_seen = len(targets)
 
         for target in targets:
-            result, linked_variants, linked_mappings = self._generate_for_target(
+            result = self._generate_for_target(
                 target=target,
+                run_id=run_id,
                 force=force,
                 eligible_statuses=eligible_statuses,
             )
-            summary.linked_experiment_variants += linked_variants
-            summary.linked_segment_ad_mappings += linked_mappings
             summary.add_result(result)
 
         return summary
@@ -62,25 +62,20 @@ class ContentGenerationService:
         self,
         *,
         target: RecommendationActionTarget,
+        run_id: int | None,
         force: bool,
         eligible_statuses: tuple[str, ...],
-    ) -> tuple[ContentGenerationActionResult, int, int]:
+    ) -> ContentGenerationActionResult:
         if target.segment.is_default or target.status not in eligible_statuses:
-            return (
-                ContentGenerationActionResult(
-                    recommendation_action_id=target.id,
-                    status="skipped",
-                    skipped_variant_keys=VARIANT_KEYS,
-                ),
-                0,
-                0,
+            return ContentGenerationActionResult(
+                recommendation_action_id=target.id,
+                status="skipped",
+                skipped_variant_keys=VARIANT_KEYS,
             )
 
         created: list[str] = []
         skipped: list[str] = []
         failed: list[str] = []
-        linked_variants = 0
-        linked_mappings = 0
 
         try:
             with self.repository.generation_lock(
@@ -98,72 +93,39 @@ class ContentGenerationService:
                         continue
                     if existing is not None and not force:
                         skipped.append(variant_key)
-                        linked_variants += self.repository.link_existing_experiment_variant(
-                            recommendation_action_id=target.id,
-                            variant_key=variant_key,
-                            generated_content_id=existing.id,
-                        )
-                        linked_mappings += self.repository.link_existing_segment_ad_mapping(
-                            recommendation_action_id=target.id,
-                            variant_key=variant_key,
-                            generated_content_id=existing.id,
-                        )
                         continue
 
                     draft = self.generator.generate(target=target, variant_key=variant_key)
+                    draft = _with_created_run_id(draft, run_id)
                     if not draft.has_required_fields():
                         raise PartialContentGenerationError(
                             f"generated content for {variant_key} is missing required fields",
                             draft,
                         )
-                    record = self.repository.upsert_generated_content(draft=draft, force=force)
+                    self.repository.upsert_generated_content(draft=draft, force=force)
                     created.append(variant_key)
-                    linked_variants += self.repository.link_existing_experiment_variant(
-                        recommendation_action_id=target.id,
-                        variant_key=variant_key,
-                        generated_content_id=record.id,
-                    )
-                    linked_mappings += self.repository.link_existing_segment_ad_mapping(
-                        recommendation_action_id=target.id,
-                        variant_key=variant_key,
-                        generated_content_id=record.id,
-                    )
 
                 if not failed:
                     self.repository.mark_action_content_generated(recommendation_action_id=target.id)
         except PartialContentGenerationError as exc:
             failed_variant = self._failed_variant_from_partial(exc.draft)
             if exc.draft is not None and exc.draft.has_required_fields():
-                failed_record = self.repository.upsert_generated_content(
-                    draft=_as_failed_draft(exc.draft),
+                self.repository.upsert_generated_content(
+                    draft=_as_failed_draft(exc.draft, run_id=run_id),
                     force=force,
-                )
-                linked_variants += self.repository.link_existing_experiment_variant(
-                    recommendation_action_id=target.id,
-                    variant_key=failed_record.variant_key,
-                    generated_content_id=failed_record.id,
-                )
-                linked_mappings += self.repository.link_existing_segment_ad_mapping(
-                    recommendation_action_id=target.id,
-                    variant_key=failed_record.variant_key,
-                    generated_content_id=failed_record.id,
                 )
             self.repository.mark_action_failed(
                 recommendation_action_id=target.id,
                 error_type=ERROR_TYPE_CONTENT_GENERATION_FAILED,
                 error_message=str(exc),
             )
-            return (
-                ContentGenerationActionResult(
-                    recommendation_action_id=target.id,
-                    status="failed",
-                    created_variant_keys=tuple(created),
-                    skipped_variant_keys=tuple(skipped),
-                    failed_variant_keys=(failed_variant,),
-                    error_message=str(exc),
-                ),
-                linked_variants,
-                linked_mappings,
+            return ContentGenerationActionResult(
+                recommendation_action_id=target.id,
+                status="failed",
+                created_variant_keys=tuple(created),
+                skipped_variant_keys=tuple(skipped),
+                failed_variant_keys=(failed_variant,),
+                error_message=str(exc),
             )
         except Exception as exc:
             self.repository.mark_action_failed(
@@ -171,33 +133,25 @@ class ContentGenerationService:
                 error_type=ERROR_TYPE_CONTENT_GENERATION_FAILED,
                 error_message=str(exc),
             )
-            return (
-                ContentGenerationActionResult(
-                    recommendation_action_id=target.id,
-                    status="failed",
-                    created_variant_keys=tuple(created),
-                    skipped_variant_keys=tuple(skipped),
-                    failed_variant_keys=tuple(
-                        key for key in VARIANT_KEYS if key not in created and key not in skipped
-                    )
-                    or VARIANT_KEYS,
-                    error_message=str(exc),
-                ),
-                linked_variants,
-                linked_mappings,
+            return ContentGenerationActionResult(
+                recommendation_action_id=target.id,
+                status="failed",
+                created_variant_keys=tuple(created),
+                skipped_variant_keys=tuple(skipped),
+                failed_variant_keys=tuple(
+                    key for key in VARIANT_KEYS if key not in created and key not in skipped
+                )
+                or VARIANT_KEYS,
+                error_message=str(exc),
             )
 
         status = "created" if created else "skipped"
-        return (
-            ContentGenerationActionResult(
-                recommendation_action_id=target.id,
-                status=status,
-                created_variant_keys=tuple(created),
-                skipped_variant_keys=tuple(skipped),
-                failed_variant_keys=tuple(failed),
-            ),
-            linked_variants,
-            linked_mappings,
+        return ContentGenerationActionResult(
+            recommendation_action_id=target.id,
+            status=status,
+            created_variant_keys=tuple(created),
+            skipped_variant_keys=tuple(skipped),
+            failed_variant_keys=tuple(failed),
         )
 
     def _eligible_statuses(self, force: bool) -> tuple[str, ...]:
@@ -215,7 +169,20 @@ class ContentGenerationService:
         return "unknown"
 
 
-def _as_failed_draft(draft: GeneratedContentDraft) -> GeneratedContentDraft:
+def _with_created_run_id(
+    draft: GeneratedContentDraft,
+    run_id: int | None,
+) -> GeneratedContentDraft:
+    if draft.created_run_id == run_id:
+        return draft
+    return replace(draft, created_run_id=run_id)
+
+
+def _as_failed_draft(
+    draft: GeneratedContentDraft,
+    *,
+    run_id: int | None,
+) -> GeneratedContentDraft:
     metadata = {
         **draft.metadata,
         "error_type": ERROR_TYPE_CONTENT_GENERATION_FAILED,
@@ -233,6 +200,7 @@ def _as_failed_draft(draft: GeneratedContentDraft) -> GeneratedContentDraft:
         image_prompt=draft.image_prompt,
         generation_model=draft.generation_model,
         generation_status=GENERATION_STATUS_FAILED,
+        created_run_id=run_id if run_id is not None else draft.created_run_id,
         image_url=draft.image_url,
         media_s3_key=draft.media_s3_key,
         metadata=metadata,

@@ -59,6 +59,7 @@ class GeneratedContentDraft:
     image_prompt: str
     generation_model: str
     generation_status: str = GENERATION_STATUS_GENERATED
+    created_run_id: int | None = None
     image_url: str | None = None
     media_s3_key: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -87,6 +88,7 @@ class GeneratedContentRecord:
     generation_status: str
     recommendation_action_id: int | None = None
     segment_id: int | None = None
+    created_run_id: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -113,8 +115,6 @@ class ContentGenerationSummary:
     variants_created: int = 0
     variants_skipped: int = 0
     variants_failed: int = 0
-    linked_experiment_variants: int = 0
-    linked_segment_ad_mappings: int = 0
     results: list[ContentGenerationActionResult] = field(default_factory=list)
 
     def add_result(self, result: ContentGenerationActionResult) -> None:
