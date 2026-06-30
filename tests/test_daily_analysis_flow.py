@@ -8,9 +8,10 @@ from app.jobs.daily_analysis import run_daily_analysis_flow
 
 
 class FakeAnalysisService:
-    def __init__(self, result: AnalysisResult) -> None:
+    def __init__(self, result: AnalysisResult, events: list[str] | None = None) -> None:
         self.result = result
         self.calls: list[tuple[int, date, int | None]] = []
+        self.events = events
 
     def run(
         self,
@@ -19,19 +20,59 @@ class FakeAnalysisService:
         run_id: int | None,
     ) -> AnalysisResult:
         self.calls.append((project_id, analysis_date, run_id))
+        if self.events is not None:
+            self.events.append("analysis")
         return self.result
 
 
 class DownstreamStub:
-    def __init__(self) -> None:
+    def __init__(self, events: list[str] | None = None) -> None:
         self.results: list[AnalysisResult] = []
+        self.events = events
 
     def run(self, result: AnalysisResult) -> None:
         self.results.append(result)
+        if self.events is not None:
+            self.events.append("downstream")
+
+
+class MatchingStub:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.calls: list[tuple[int, date, int | None]] = []
+        self.events = events
+
+    def run(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        run_id: int | None,
+    ) -> None:
+        self.calls.append((project_id, analysis_date, run_id))
+        if self.events is not None:
+            self.events.append("matching")
+
+
+class ExperimentUpdateStub:
+    def __init__(self, events: list[str] | None = None) -> None:
+        self.calls: list[tuple[int, date]] = []
+        self.events = events
+
+    def run(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> None:
+        self.calls.append((project_id, analysis_date))
+        if self.events is not None:
+            self.events.append("experiment_update")
 
 
 def test_daily_analysis_flow_skips_downstream_when_no_anomaly() -> None:
     analysis_service = FakeAnalysisService(AnalysisResult(anomaly_count=0))
+    matching = MatchingStub()
+    experiment_update = ExperimentUpdateStub()
     downstream = DownstreamStub()
 
     result = run_daily_analysis_flow(
@@ -39,11 +80,15 @@ def test_daily_analysis_flow_skips_downstream_when_no_anomaly() -> None:
         analysis_date=date(2021, 1, 4),
         run_id=None,
         analysis_service=analysis_service,
+        user_segment_matching_runner=matching,
+        experiment_result_update_runner=experiment_update,
         downstream_runner=downstream,
     )
 
     assert result.anomaly_count == 0
     assert analysis_service.calls == [(1, date(2021, 1, 4), None)]
+    assert matching.calls == [(1, date(2021, 1, 4), None)]
+    assert experiment_update.calls == [(1, date(2021, 1, 4))]
     assert downstream.results == []
 
 
@@ -67,6 +112,27 @@ def test_daily_analysis_flow_passes_anomaly_ids_to_downstream() -> None:
     assert result.anomaly_ids == [501]
     assert result.anomaly_segment_ids == [10]
     assert downstream.results == [analysis_result]
+
+
+def test_daily_analysis_flow_runs_matching_and_experiment_update_before_downstream() -> None:
+    events: list[str] = []
+    analysis_result = AnalysisResult(anomaly_count=1)
+    analysis_service = FakeAnalysisService(analysis_result, events)
+    matching = MatchingStub(events)
+    experiment_update = ExperimentUpdateStub(events)
+    downstream = DownstreamStub(events)
+
+    run_daily_analysis_flow(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+        run_id=77,
+        analysis_service=analysis_service,
+        user_segment_matching_runner=matching,
+        experiment_result_update_runner=experiment_update,
+        downstream_runner=downstream,
+    )
+
+    assert events == ["analysis", "matching", "experiment_update", "downstream"]
 
 
 def test_daily_analysis_flow_documents_caller_owned_transaction_boundary() -> None:

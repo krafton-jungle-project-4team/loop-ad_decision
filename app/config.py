@@ -4,6 +4,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+from dotenv import find_dotenv, load_dotenv
+
 
 DECISION_SERVICE_ID = "decision-api"
 
@@ -27,6 +29,9 @@ class Settings:
     clickhouse_database: str
     clickhouse_username: str
     clickhouse_password: str
+    data_storage_bucket: str
+    genai_assets_base_prefix: str
+    openai_api_key: str
     legacy_admin_token: str | None = None
 
 
@@ -44,10 +49,15 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_DATABASE",
     "LOOPAD_CLICKHOUSE_USERNAME",
     "LOOPAD_CLICKHOUSE_PASSWORD",
+    "LOOPAD_DATA_STORAGE_BUCKET",
+    "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_OPENAI_API_KEY",
 )
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
+    if environ is None:
+        load_local_dotenv()
     source = environ if environ is not None else os.environ
     missing = [name for name in REQUIRED_ENV_NAMES if not _read_required(source, name)]
     if missing:
@@ -73,8 +83,17 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         clickhouse_database=_read_required(source, "LOOPAD_CLICKHOUSE_DATABASE"),
         clickhouse_username=_read_required(source, "LOOPAD_CLICKHOUSE_USERNAME"),
         clickhouse_password=_read_required(source, "LOOPAD_CLICKHOUSE_PASSWORD"),
+        data_storage_bucket=_read_required(source, "LOOPAD_DATA_STORAGE_BUCKET"),
+        genai_assets_base_prefix=_read_required(source, "LOOPAD_GENAI_ASSETS_BASE_PREFIX"),
+        openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         legacy_admin_token=_read_optional(source, "AI_DECISION_ADMIN_TOKEN"),
     )
+
+
+def load_local_dotenv() -> None:
+    dotenv_path = find_dotenv(usecwd=True)
+    if dotenv_path:
+        load_dotenv(dotenv_path=dotenv_path, override=False)
 
 
 def _read_required(source: Mapping[str, str], name: str) -> str:
