@@ -267,22 +267,6 @@ class PostgresDecisionRepository:
         )
         return self._generated_content(row) if row is not None else None
 
-    def find_project_default_content(self, *, project_id: int) -> GeneratedContent | None:
-        row = self._fetchone(
-            """
-            SELECT *
-            FROM generated_contents
-            WHERE project_id = %s
-              AND recommendation_action_id IS NULL
-              AND variant_key = 'default'
-              AND generation_status IN ('generated', 'approved')
-            ORDER BY (generation_status = 'approved') DESC, updated_at DESC, id DESC
-            LIMIT 1
-            """,
-            (project_id,),
-        )
-        return self._generated_content(row) if row is not None else None
-
     def get_experiment_by_recommendation_action(
         self,
         *,

@@ -76,6 +76,26 @@ def add_default_content(repo: InMemoryDecisionRepository, *, content_id: int = 1
     )
 
 
+def add_action_content(
+    repo: InMemoryDecisionRepository,
+    action: RecommendationAction,
+    *,
+    content_id: int,
+    variant_key: str,
+    generation_status: str = "generated",
+) -> None:
+    repo.contents.append(
+        GeneratedContent(
+            id=content_id,
+            project_id=1,
+            segment_id=action.segment_id,
+            recommendation_action_id=action.id,
+            variant_key=variant_key,
+            generation_status=generation_status,
+        )
+    )
+
+
 def test_missing_treatment_content_creates_draft_and_only_deactivates_same_experiment() -> None:
     repo = InMemoryDecisionRepository()
     action = seed_action(repo)
@@ -141,6 +161,10 @@ def test_missing_treatment_content_creates_draft_and_only_deactivates_same_exper
 
     assert repo.experiments[0].status == "draft"
     assert repo.actions[0].status == "experiment_created"
+    control = next(variant for variant in repo.variants if variant.variant_key == "control")
+    treatment = next(variant for variant in repo.variants if variant.variant_key == "treatment_a")
+    assert control.generated_content_id is None
+    assert treatment.generated_content_id is None
     assert same_experiment_mapping.is_active is False
     assert default_mapping.is_active is True
     assert other_mapping.is_active is True
@@ -150,6 +174,7 @@ def test_content_ready_creates_running_experiment_variants_mappings_and_is_idemp
     repo = InMemoryDecisionRepository()
     action = seed_action(repo)
     add_default_content(repo, content_id=100)
+    add_action_content(repo, action, content_id=101, variant_key="control")
     repo.contents.append(
         GeneratedContent(
             id=200,
@@ -183,17 +208,38 @@ def test_content_ready_creates_running_experiment_variants_mappings_and_is_idemp
     assert len(repo.variants) == 2
     control = next(variant for variant in repo.variants if variant.variant_key == "control")
     treatment = next(variant for variant in repo.variants if variant.variant_key == "treatment_a")
-    assert control.generated_content_id == 100
+    assert control.generated_content_id == 101
     assert treatment.generated_content_id == 201
     assert len(repo.mappings) == 2
     assert all(mapping.is_active for mapping in repo.mappings)
     assert {mapping.traffic_weight for mapping in repo.mappings} == {Decimal("0.5")}
 
 
+def test_default_content_is_not_used_as_action_control_content() -> None:
+    repo = InMemoryDecisionRepository()
+    action = seed_action(repo)
+    add_default_content(repo, content_id=100)
+    add_action_content(repo, action, content_id=201, variant_key="treatment_a")
+
+    ExperimentService(repo).sync_for_recommendation_actions(
+        project_id=1,
+        analysis_date=ANALYSIS_DATE,
+        run_id=1,
+    )
+
+    control = next(variant for variant in repo.variants if variant.variant_key == "control")
+    treatment = next(variant for variant in repo.variants if variant.variant_key == "treatment_a")
+    assert repo.experiments[0].status == "draft"
+    assert control.generated_content_id is None
+    assert treatment.generated_content_id == 201
+    assert repo.mappings == []
+
+
 def test_experiment_service_does_not_write_segments() -> None:
     repo = SegmentWriteGuardRepository()
     action = seed_action(repo)
     add_default_content(repo, content_id=100)
+    add_action_content(repo, action, content_id=101, variant_key="control")
     repo.contents.append(
         GeneratedContent(
             id=201,

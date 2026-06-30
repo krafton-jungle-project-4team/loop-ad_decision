@@ -217,17 +217,6 @@ class InMemoryDecisionRepository:
         ]
         return matches[-1] if matches else None
 
-    def find_project_default_content(self, *, project_id: int) -> GeneratedContent | None:
-        matches = [
-            content
-            for content in self.contents
-            if content.project_id == project_id
-            and content.recommendation_action_id is None
-            and content.variant_key == "default"
-            and content.generation_status in {"generated", "approved"}
-        ]
-        return matches[-1] if matches else None
-
     def get_experiment_by_recommendation_action(
         self,
         *,

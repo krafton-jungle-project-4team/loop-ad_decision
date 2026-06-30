@@ -116,8 +116,6 @@ class DecisionRepository(Protocol):
         statuses: tuple[str, ...],
     ) -> GeneratedContent | None: ...
 
-    def find_project_default_content(self, *, project_id: int) -> GeneratedContent | None: ...
-
     def get_experiment_by_recommendation_action(
         self,
         *,
@@ -491,7 +489,12 @@ class ExperimentService:
             if existing is not None and existing.status == "winner_selected":
                 continue
 
-            control_content = self._resolve_control_content(project_id, action.id)
+            control_content = self.repository.find_action_content(
+                project_id=project_id,
+                recommendation_action_id=action.id,
+                variant_key="control",
+                statuses=("generated", "approved"),
+            )
             treatment_content = self.repository.find_action_content(
                 project_id=project_id,
                 recommendation_action_id=action.id,
@@ -552,21 +555,6 @@ class ExperimentService:
             synced.append(experiment)
 
         return synced
-
-    def _resolve_control_content(
-        self,
-        project_id: int,
-        recommendation_action_id: int,
-    ) -> GeneratedContent | None:
-        action_content = self.repository.find_action_content(
-            project_id=project_id,
-            recommendation_action_id=recommendation_action_id,
-            variant_key="control",
-            statuses=("generated", "approved"),
-        )
-        if action_content is not None:
-            return action_content
-        return self.repository.find_project_default_content(project_id=project_id)
 
     def _activate_running_experiment(
         self,
