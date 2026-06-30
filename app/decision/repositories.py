@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 
@@ -509,6 +509,15 @@ class PostgresDecisionRepository:
         row = self._fetchone("SELECT timezone FROM projects WHERE id = %s", (project_id,))
         return row["timezone"] if row is not None else "Asia/Seoul"
 
+    def get_project_key(self, *, project_id: int) -> str:
+        row = self._fetchone("SELECT project_key FROM projects WHERE id = %s", (project_id,))
+        if row is None:
+            raise LookupError(f"project not found: {project_id}")
+        project_key = str(row["project_key"]).strip() if row["project_key"] is not None else ""
+        if not project_key:
+            raise ValueError(f"project_key is required for project {project_id}")
+        return project_key
+
     def list_experiments_by_status(self, *, project_id: int, status: str) -> list[Experiment]:
         return [
             self._experiment(row)
@@ -813,7 +822,7 @@ class ClickHouseExperimentResultRepository:
     def fetch_variant_results(
         self,
         *,
-        project_id: int,
+        project_id: str,
         experiment: Experiment,
         variants: list[ExperimentVariant],
         window_start: datetime,
@@ -821,29 +830,30 @@ class ClickHouseExperimentResultRepository:
     ) -> dict[int, VariantPerformance]:
         if not variants:
             return {}
-        variants_by_id = {variant.id: variant for variant in variants}
+        variants_by_key = {variant.variant_key: variant for variant in variants}
         result = self.client.query(
             f"""
             SELECT
-                experiment_variant_id,
-                generated_content_id,
+                experiment_id,
+                variant_id,
                 countIf(event_name = 'ad_impression') AS ad_impression_count,
                 countIf(event_name = 'ad_click') AS ad_click_count,
                 countIf(event_name = 'purchase') AS purchase_count
             FROM {self.events_table}
-            WHERE project_id = %(project_id)s
-              AND experiment_id = %(experiment_id)s
-              AND experiment_variant_id IN %(variant_ids)s
-              AND event_time >= %(window_start)s
-              AND event_time < %(window_end)s
-            GROUP BY experiment_variant_id, generated_content_id
+            WHERE project_id = {{project_id:String}}
+              AND experiment_id = {{experiment_id:String}}
+              AND variant_id IN {{variant_ids:Array(String)}}
+              AND event_name IN ('ad_impression', 'ad_click', 'purchase')
+              AND event_time >= parseDateTime64BestEffort({{window_start_utc:String}}, 3, 'UTC')
+              AND event_time < parseDateTime64BestEffort({{window_end_utc:String}}, 3, 'UTC')
+            GROUP BY experiment_id, variant_id
             """,
             {
-                "project_id": project_id,
-                "experiment_id": experiment.id,
-                "variant_ids": tuple(variants_by_id),
-                "window_start": window_start,
-                "window_end": window_end,
+                "project_id": str(project_id),
+                "experiment_id": str(experiment.id),
+                "variant_ids": tuple(variants_by_key),
+                "window_start_utc": window_start.astimezone(timezone.utc).isoformat(),
+                "window_end_utc": window_end.astimezone(timezone.utc).isoformat(),
             },
         )
         rows = getattr(result, "result_rows", result)
@@ -857,20 +867,16 @@ class ClickHouseExperimentResultRepository:
             for variant in variants
         }
         for row in rows:
-            variant_id = int(row[0])
-            if variant_id not in variants_by_id:
+            if str(row[0]) != str(experiment.id):
                 continue
-            generated_content_id = row[1]
-            current = by_variant[variant_id]
-            variant = variants_by_id[variant_id]
-            purchase_count = int(row[4])
-            attributed_purchase_count = current.attributed_purchase_count
-            if variant.generated_content_id is None or generated_content_id == variant.generated_content_id:
-                attributed_purchase_count += purchase_count
-            by_variant[variant_id] = VariantPerformance(
-                experiment_variant_id=variant_id,
-                ad_impression_count=current.ad_impression_count + int(row[2]),
-                ad_click_count=current.ad_click_count + int(row[3]),
-                attributed_purchase_count=attributed_purchase_count,
+            variant = variants_by_key.get(str(row[1]))
+            if variant is None:
+                continue
+            current = by_variant[variant.id]
+            by_variant[variant.id] = VariantPerformance(
+                experiment_variant_id=variant.id,
+                ad_impression_count=current.ad_impression_count + int(row[2] or 0),
+                ad_click_count=current.ad_click_count + int(row[3] or 0),
+                attributed_purchase_count=current.attributed_purchase_count + int(row[4] or 0),
             )
         return by_variant

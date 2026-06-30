@@ -172,6 +172,8 @@ class DecisionRepository(Protocol):
 
     def get_project_timezone(self, *, project_id: int) -> str: ...
 
+    def get_project_key(self, *, project_id: int) -> str: ...
+
     def list_experiments_by_status(
         self,
         *,
@@ -205,7 +207,7 @@ class ExperimentResultRepository(Protocol):
     def fetch_variant_results(
         self,
         *,
-        project_id: int,
+        project_id: str,
         experiment: Experiment,
         variants: list[ExperimentVariant],
         window_start: datetime,
@@ -572,6 +574,7 @@ class ExperimentResultUpdateService:
             self.winner_service = WinnerDecisionService(config)
 
         timezone = ZoneInfo(self.repository.get_project_timezone(project_id=project_id))
+        clickhouse_project_id = self.repository.get_project_key(project_id=project_id)
         updated_experiments: list[Experiment] = []
         for experiment in self.repository.list_experiments_by_status(
             project_id=project_id,
@@ -585,7 +588,7 @@ class ExperimentResultUpdateService:
                 tzinfo=timezone,
             )
             performance_by_variant_id = self.result_repository.fetch_variant_results(
-                project_id=project_id,
+                project_id=clickhouse_project_id,
                 experiment=experiment,
                 variants=variants,
                 window_start=window_start,
@@ -642,4 +645,3 @@ def safe_rate(numerator: int, denominator: int) -> Decimal:
     if denominator == 0:
         return Decimal("0")
     return (Decimal(numerator) / Decimal(denominator)).quantize(Decimal("0.000001"))
-

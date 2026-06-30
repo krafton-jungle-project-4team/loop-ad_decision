@@ -151,6 +151,7 @@ def test_update_running_only_and_zero_denominators_are_zero() -> None:
     )
 
     assert [call[0] for call in clickhouse.calls] == [1]
+    assert clickhouse.project_ids == ["demo-shop"]
     assert control.ctr == Decimal("0")
     assert control.conversion_rate == Decimal("0")
     assert treatment.ctr == Decimal("0")

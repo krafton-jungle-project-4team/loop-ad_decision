@@ -20,6 +20,7 @@ from app.decision.models import (
 class InMemoryDecisionRepository:
     def __init__(self) -> None:
         self.timezone = "Asia/Seoul"
+        self.project_key = "demo-shop"
         self.anomalies: list[SegmentAnomaly] = []
         self.root_causes: list[RootCauseCandidate] = []
         self.action_catalog: dict[str, ActionCatalogItem] = {}
@@ -393,6 +394,9 @@ class InMemoryDecisionRepository:
     def get_project_timezone(self, *, project_id: int) -> str:
         return self.timezone
 
+    def get_project_key(self, *, project_id: int) -> str:
+        return self.project_key
+
     def list_experiments_by_status(self, *, project_id: int, status: str) -> list[Experiment]:
         return [
             experiment
@@ -454,17 +458,19 @@ class InMemoryDecisionRepository:
 class FakeExperimentResultRepository:
     def __init__(self) -> None:
         self.results: dict[int, VariantPerformance] = {}
+        self.project_ids: list[str] = []
         self.calls: list[tuple[int, datetime, datetime]] = []
 
     def fetch_variant_results(
         self,
         *,
-        project_id: int,
+        project_id: str,
         experiment,
         variants,
         window_start: datetime,
         window_end: datetime,
     ) -> dict[int, VariantPerformance]:
+        self.project_ids.append(project_id)
         self.calls.append((experiment.id, window_start, window_end))
         return {
             variant.id: self.results.get(
@@ -478,4 +484,3 @@ class FakeExperimentResultRepository:
             )
             for variant in variants
         }
-
