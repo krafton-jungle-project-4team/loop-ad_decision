@@ -3,12 +3,13 @@ from __future__ import annotations
 import html
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from app.contents.types import GeneratedContentDraft
 
 
 DEFAULT_ASSET_PREFIX = "generated-contents"
+DEFAULT_S3_CACHE_CONTROL = "public, max-age=31536000, immutable"
 SVG_CONTENT_TYPE = "image/svg+xml"
 
 
@@ -28,6 +29,11 @@ class StoredAsset:
 
 class AssetStorage(Protocol):
     def put_object(self, asset: AssetObject) -> StoredAsset:
+        ...
+
+
+class S3ClientLike(Protocol):
+    def put_object(self, **kwargs: Any) -> Any:
         ...
 
 
@@ -69,6 +75,56 @@ class LocalAssetStorage:
             public_url=_join_public_url(self.public_base_url, asset.key),
             content_type=asset.content_type,
         )
+
+
+class S3AssetStorage:
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        public_base_url: str,
+        client: S3ClientLike | None = None,
+        region_name: str | None = None,
+        endpoint_url: str | None = None,
+        cache_control: str | None = DEFAULT_S3_CACHE_CONTROL,
+    ) -> None:
+        normalized_bucket = bucket.strip()
+        if not normalized_bucket:
+            raise ValueError("S3 bucket must not be empty")
+        normalized_public_base_url = _normalize_base_url(public_base_url)
+        if normalized_public_base_url is None:
+            raise ValueError("S3 public base URL must not be empty")
+        self.bucket = normalized_bucket
+        self.public_base_url = normalized_public_base_url
+        self._client = client
+        self.region_name = _clean(region_name)
+        self.endpoint_url = _clean(endpoint_url)
+        self.cache_control = _clean(cache_control)
+
+    def put_object(self, asset: AssetObject) -> StoredAsset:
+        _validate_asset_key(asset.key)
+        params: dict[str, Any] = {
+            "Bucket": self.bucket,
+            "Key": asset.key,
+            "Body": asset.body,
+            "ContentType": asset.content_type,
+        }
+        if self.cache_control is not None:
+            params["CacheControl"] = self.cache_control
+        self._get_client().put_object(**params)
+        return StoredAsset(
+            key=asset.key,
+            public_url=_join_public_url(self.public_base_url, asset.key),
+            content_type=asset.content_type,
+        )
+
+    def _get_client(self) -> S3ClientLike:
+        if self._client is None:
+            self._client = _build_boto3_s3_client(
+                region_name=self.region_name,
+                endpoint_url=self.endpoint_url,
+            )
+        return self._client
 
 
 class SvgBannerRenderer:
@@ -176,15 +232,38 @@ def _safe_path_part(value: str) -> str:
 
 
 def _normalize_base_url(value: str | None) -> str | None:
-    if value is None:
+    cleaned = _clean(value)
+    if cleaned is None:
         return None
-    stripped = value.strip()
-    if not stripped:
-        return None
-    return stripped.rstrip("/")
+    return cleaned.rstrip("/")
 
 
 def _join_public_url(base_url: str | None, key: str) -> str | None:
     if base_url is None:
         return None
     return f"{base_url}/{key}"
+
+
+def _clean(value: str | None) -> str | None:
+    if value is None:
+        return None
+    stripped = value.strip()
+    return stripped or None
+
+
+def _build_boto3_s3_client(
+    *,
+    region_name: str | None,
+    endpoint_url: str | None,
+) -> S3ClientLike:
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("boto3 package is required for S3AssetStorage") from exc
+
+    kwargs: dict[str, str] = {}
+    if region_name is not None:
+        kwargs["region_name"] = region_name
+    if endpoint_url is not None:
+        kwargs["endpoint_url"] = endpoint_url
+    return boto3.client("s3", **kwargs)

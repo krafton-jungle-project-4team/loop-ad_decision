@@ -4,7 +4,7 @@ from typing import Any, Protocol
 
 from psycopg.rows import dict_row
 
-from app.contents.assets import ContentAssetService
+from app.contents.assets import ContentAssetService, S3ClientLike
 from app.contents.config import (
     ContentGenerationConfig,
     build_content_asset_service,
@@ -57,6 +57,7 @@ def build_content_generation_service(
     config: ContentGenerationConfig | None = None,
     generator: ContentGenerator | None = None,
     asset_service: ContentAssetService | None = None,
+    s3_client: S3ClientLike | None = None,
 ) -> ContentGenerationService:
     """Build the content generation service used by DailyDecisionJobService.
 
@@ -68,5 +69,9 @@ def build_content_generation_service(
     return ContentGenerationService(
         repository=PostgresContentRepository(_DictRowConnectionAdapter(connection)),
         generator=generator or build_content_generator(content_config),
-        asset_service=asset_service or build_content_asset_service(content_config),
+        asset_service=asset_service
+        or build_content_asset_service(
+            content_config,
+            s3_client=s3_client,
+        ),
     )

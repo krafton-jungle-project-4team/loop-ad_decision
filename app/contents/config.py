@@ -6,9 +6,12 @@ from pathlib import Path
 
 from app.contents.assets import (
     DEFAULT_ASSET_PREFIX,
+    DEFAULT_S3_CACHE_CONTROL,
     ContentAssetService,
     InMemoryAssetStorage,
     LocalAssetStorage,
+    S3AssetStorage,
+    S3ClientLike,
 )
 from app.contents.generators import ContentGenerator, MockContentGenerator, OpenAIContentGenerator
 
@@ -22,6 +25,10 @@ class ContentGenerationConfig:
     content_asset_local_dir: str | None = None
     content_asset_prefix: str = DEFAULT_ASSET_PREFIX
     content_asset_public_base_url: str | None = None
+    content_asset_s3_bucket: str | None = None
+    content_asset_s3_region: str | None = None
+    content_asset_s3_endpoint_url: str | None = None
+    content_asset_s3_cache_control: str | None = DEFAULT_S3_CACHE_CONTROL
 
     @classmethod
     def from_env(cls) -> "ContentGenerationConfig":
@@ -33,6 +40,12 @@ class ContentGenerationConfig:
             content_asset_local_dir=_clean(os.getenv("CONTENT_ASSET_LOCAL_DIR")),
             content_asset_prefix=_clean(os.getenv("CONTENT_ASSET_PREFIX")) or DEFAULT_ASSET_PREFIX,
             content_asset_public_base_url=_clean(os.getenv("CONTENT_ASSET_PUBLIC_BASE_URL")),
+            content_asset_s3_bucket=_clean(os.getenv("CONTENT_ASSET_S3_BUCKET")),
+            content_asset_s3_region=_clean(os.getenv("CONTENT_ASSET_S3_REGION")),
+            content_asset_s3_endpoint_url=_clean(os.getenv("CONTENT_ASSET_S3_ENDPOINT_URL")),
+            content_asset_s3_cache_control=(
+                _clean(os.getenv("CONTENT_ASSET_S3_CACHE_CONTROL")) or DEFAULT_S3_CACHE_CONTROL
+            ),
         )
 
 
@@ -48,6 +61,8 @@ def build_content_generator(config: ContentGenerationConfig | None = None) -> Co
 
 def build_content_asset_service(
     config: ContentGenerationConfig | None = None,
+    *,
+    s3_client: S3ClientLike | None = None,
 ) -> ContentAssetService:
     config = config or ContentGenerationConfig.from_env()
     storage_name = _resolve_content_asset_storage(config)
@@ -59,7 +74,18 @@ def build_content_asset_service(
             public_base_url=config.content_asset_public_base_url,
         )
     elif storage_name == "s3":
-        raise NotImplementedError("S3 asset storage is intentionally deferred to a later PR")
+        if config.content_asset_s3_bucket is None:
+            raise ValueError("CONTENT_ASSET_S3_BUCKET is required when CONTENT_ASSET_STORAGE=s3")
+        if config.content_asset_public_base_url is None:
+            raise ValueError("CONTENT_ASSET_PUBLIC_BASE_URL is required when CONTENT_ASSET_STORAGE=s3")
+        storage = S3AssetStorage(
+            bucket=config.content_asset_s3_bucket,
+            public_base_url=config.content_asset_public_base_url,
+            client=s3_client,
+            region_name=config.content_asset_s3_region,
+            endpoint_url=config.content_asset_s3_endpoint_url,
+            cache_control=config.content_asset_s3_cache_control,
+        )
     else:
         raise ValueError("CONTENT_ASSET_STORAGE must be memory, local, or s3")
 
