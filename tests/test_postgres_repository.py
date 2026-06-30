@@ -40,6 +40,142 @@ class FakeConnection:
         return self.cursor_instance
 
 
+class StatefulCentroidCursor:
+    def __init__(self, connection: "StatefulCentroidConnection") -> None:
+        self.connection = connection
+        self.rows: list[tuple[object, ...]] = []
+        self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+    def __enter__(self) -> "StatefulCentroidCursor":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        return None
+
+    def execute(self, query: str, parameters: tuple[object, ...] = ()) -> None:
+        self.executed.append((query, parameters))
+        self.connection.executed.append((query, parameters))
+        if "FROM segment_matching_configs" in query:
+            self.rows = [(self.connection.embedding_version,)]
+            return
+        if "FROM segments" in query:
+            project_id = parameters[0]
+            self.rows = [
+                (segment["id"], segment["rule_json"])
+                for segment in self.connection.segments
+                if segment["project_id"] == project_id
+                and segment["is_default"] is False
+                and segment["status"] == "active"
+            ]
+            return
+        if "INSERT INTO segment_centroids" in query:
+            project_id, segment_id, analysis_date, embedding_version, centroid = parameters
+            key = {
+                "project_id": project_id,
+                "segment_id": segment_id,
+                "analysis_date": analysis_date,
+                "embedding_version": embedding_version,
+            }
+            existing = next(
+                (
+                    row
+                    for row in self.connection.centroids
+                    if all(row[field] == value for field, value in key.items())
+                ),
+                None,
+            )
+            if existing is None:
+                self.connection.centroids.append({**key, "centroid": centroid})
+            else:
+                existing["centroid"] = centroid
+            self.rows = []
+            return
+        if "DELETE FROM segment_centroids" in query and "NOT (segment_id = ANY(%s))" in query:
+            project_id, analysis_date, embedding_version, active_segment_ids = parameters
+            self.connection.centroids = [
+                row
+                for row in self.connection.centroids
+                if not (
+                    row["project_id"] == project_id
+                    and row["analysis_date"] == analysis_date
+                    and row["embedding_version"] == embedding_version
+                    and row["segment_id"] not in active_segment_ids
+                )
+            ]
+            self.rows = []
+            return
+        if "DELETE FROM segment_centroids" in query:
+            project_id, analysis_date, embedding_version = parameters
+            self.connection.centroids = [
+                row
+                for row in self.connection.centroids
+                if not (
+                    row["project_id"] == project_id
+                    and row["analysis_date"] == analysis_date
+                    and row["embedding_version"] == embedding_version
+                )
+            ]
+            self.rows = []
+            return
+        self.rows = []
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        return self.rows.pop(0) if self.rows else None
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        rows = self.rows
+        self.rows = []
+        return rows
+
+
+class StatefulCentroidConnection:
+    def __init__(
+        self,
+        *,
+        embedding_version: str,
+        segments: list[dict[str, object]],
+        centroids: list[dict[str, object]],
+    ) -> None:
+        self.embedding_version = embedding_version
+        self.segments = segments
+        self.centroids = centroids
+        self.executed: list[tuple[str, tuple[object, ...]]] = []
+
+    def cursor(self) -> StatefulCentroidCursor:
+        return StatefulCentroidCursor(self)
+
+
+def active_segment(segment_id: int, *, status: str = "active") -> dict[str, object]:
+    return {
+        "id": segment_id,
+        "project_id": 1,
+        "is_default": False,
+        "status": status,
+        "rule_json": {
+            "age_group": "30s",
+            "gender": "male",
+            "device_type": "mobile",
+            "acquisition_channel": "kakao",
+            "primary_category": "fresh",
+        },
+    }
+
+
+def centroid_row(
+    *,
+    segment_id: int,
+    embedding_version: str,
+    analysis_date: date = date(2021, 1, 4),
+) -> dict[str, object]:
+    return {
+        "project_id": 1,
+        "segment_id": segment_id,
+        "analysis_date": analysis_date,
+        "embedding_version": embedding_version,
+        "centroid": "[stale]",
+    }
+
+
 def aggregate(segment_key: str = "age_30s__gender_male__device_mobile__channel_kakao__category_fresh") -> SegmentAggregate:
     return SegmentAggregate(
         project_id=1,
@@ -243,6 +379,103 @@ def test_refresh_segment_centroids_removes_today_version_rows_when_segment_becom
     assert refreshed_count == 0
     assert "AND NOT (segment_id = ANY(%s))" not in cleanup_query
     assert cleanup_parameters == (1, date(2021, 1, 4), "segment_match_v1")
+
+
+def test_cleanup_for_v1_run_does_not_delete_v2_centroid_for_same_project_date_segment() -> None:
+    connection = StatefulCentroidConnection(
+        embedding_version="v1",
+        segments=[active_segment(10)],
+        centroids=[
+            centroid_row(segment_id=10, embedding_version="v2"),
+            centroid_row(segment_id=99, embedding_version="v1"),
+        ],
+    )
+    repository = PostgresAnalysisRepository(connection)
+
+    repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    keys = {
+        (row["segment_id"], row["embedding_version"])
+        for row in connection.centroids
+        if row["analysis_date"] == date(2021, 1, 4)
+    }
+    assert (10, "v2") in keys
+    assert (10, "v1") in keys
+    assert (99, "v1") not in keys
+
+
+def test_cleanup_does_not_delete_active_centroid_upserted_in_same_run() -> None:
+    connection = StatefulCentroidConnection(
+        embedding_version="v1",
+        segments=[active_segment(10)],
+        centroids=[],
+    )
+    repository = PostgresAnalysisRepository(connection)
+
+    repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    assert any(
+        row["segment_id"] == 10
+        and row["analysis_date"] == date(2021, 1, 4)
+        and row["embedding_version"] == "v1"
+        for row in connection.centroids
+    )
+    assert "FROM segment_matching_configs" in connection.executed[0][0]
+    assert "FROM segments" in connection.executed[1][0]
+    assert "INSERT INTO segment_centroids" in connection.executed[2][0]
+    assert "DELETE FROM segment_centroids" in connection.executed[3][0]
+
+
+def test_cleanup_removes_today_same_version_centroid_after_segment_becomes_inactive() -> None:
+    connection = StatefulCentroidConnection(
+        embedding_version="v1",
+        segments=[active_segment(10, status="inactive")],
+        centroids=[centroid_row(segment_id=10, embedding_version="v1")],
+    )
+    repository = PostgresAnalysisRepository(connection)
+
+    repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    assert not any(
+        row["segment_id"] == 10
+        and row["analysis_date"] == date(2021, 1, 4)
+        and row["embedding_version"] == "v1"
+        for row in connection.centroids
+    )
+
+
+def test_cleanup_with_zero_active_segments_deletes_today_version_only() -> None:
+    connection = StatefulCentroidConnection(
+        embedding_version="v1",
+        segments=[active_segment(10, status="inactive")],
+        centroids=[
+            centroid_row(segment_id=10, embedding_version="v1"),
+            centroid_row(segment_id=10, embedding_version="v2"),
+        ],
+    )
+    repository = PostgresAnalysisRepository(connection)
+
+    repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    keys = {
+        (row["segment_id"], row["embedding_version"])
+        for row in connection.centroids
+        if row["analysis_date"] == date(2021, 1, 4)
+    }
+    assert (10, "v1") not in keys
+    assert (10, "v2") in keys
 
 
 def test_fetch_segment_metric_baselines_uses_previous_seven_days_only() -> None:

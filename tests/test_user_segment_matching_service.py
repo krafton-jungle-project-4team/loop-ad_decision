@@ -193,6 +193,81 @@ def test_distance_is_converted_to_similarity_before_threshold_comparison() -> No
     assert repository.memberships[0]["confidence"] == Decimal("0.80")
 
 
+def test_distance_0_1_becomes_similarity_0_9_and_matches_nearest_segment() -> None:
+    repository = FakeMatchingRepository()
+    repository.config = SegmentMatchingConfig(
+        embedding_version="segment_match_v1",
+        similarity_threshold=Decimal("0.7000"),
+    )
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="distance-0-1-segment",
+        cosine_distance=Decimal("0.10"),
+    )
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert result.matched_count == 1
+    assert result.skipped_count == 0
+    assert repository.memberships[0]["segment_id"] == 10
+    assert repository.replace_calls[0]["confidence"] == Decimal("0.90")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == 0.9
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] is None
+
+
+def test_distance_0_5_becomes_similarity_0_5_and_falls_back_to_default() -> None:
+    repository = FakeMatchingRepository()
+    repository.config = SegmentMatchingConfig(
+        embedding_version="segment_match_v1",
+        similarity_threshold=Decimal("0.7000"),
+    )
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="distance-0-5-segment",
+        cosine_distance=Decimal("0.50"),
+    )
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert result.matched_count == 0
+    assert result.skipped_count == 1
+    assert repository.memberships[0]["segment_id"] == 1
+    assert repository.replace_calls[0]["confidence"] == Decimal("0.50")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == 0.5
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "below_threshold"
+
+
+def test_distance_0_3_similarity_0_7_matches_threshold_inclusive() -> None:
+    repository = FakeMatchingRepository()
+    repository.config = SegmentMatchingConfig(
+        embedding_version="segment_match_v1",
+        similarity_threshold=Decimal("0.7000"),
+    )
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="distance-0-3-segment",
+        cosine_distance=Decimal("0.30"),
+    )
+
+    result = UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert result.matched_count == 1
+    assert result.skipped_count == 0
+    assert repository.memberships[0]["segment_id"] == 10
+    assert repository.replace_calls[0]["confidence"] == Decimal("0.70")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == 0.7
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] is None
+
+
 def test_below_threshold_falls_back_to_default_primary_membership() -> None:
     repository = FakeMatchingRepository()
     repository.nearest = NearestSegmentCentroid(
@@ -230,6 +305,24 @@ def test_confidence_is_clamped_when_raw_similarity_is_negative() -> None:
 
     assert repository.replace_calls[0]["confidence"] == Decimal("0")
     assert repository.replace_calls[0]["reason_json"]["similarity"] == -0.5
+    assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "below_threshold"
+
+
+def test_negative_0_2_raw_similarity_clamps_confidence_but_remains_in_reason_json() -> None:
+    repository = FakeMatchingRepository()
+    repository.nearest = NearestSegmentCentroid(
+        segment_id=10,
+        segment_key="negative-similarity-segment",
+        cosine_distance=Decimal("1.20"),
+    )
+
+    UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository([candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+    assert repository.replace_calls[0]["confidence"] == Decimal("0")
+    assert repository.replace_calls[0]["reason_json"]["similarity"] == -0.2
     assert repository.replace_calls[0]["reason_json"]["fallback_reason"] == "below_threshold"
 
 
