@@ -6,9 +6,13 @@ from decimal import Decimal
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
+from app.analysis.models import AnalysisWindow
+from app.analysis.segments import build_segment_key
+from app.analysis.time_window import build_analysis_window
 from app.decision.errors import ConfigurationError
 from app.decision.models import (
     ActionCatalogItem,
+    ExistingSegment,
     Experiment,
     ExperimentVariant,
     GeneratedContent,
@@ -16,6 +20,7 @@ from app.decision.models import (
     RecommendationResult,
     RootCauseCandidate,
     SegmentAnomaly,
+    UserSegmentCandidate,
     VariantPerformance,
 )
 
@@ -213,6 +218,99 @@ class ExperimentResultRepository(Protocol):
         window_start: datetime,
         window_end: datetime,
     ) -> dict[int, VariantPerformance]: ...
+
+
+class UserSegmentMatchingRepository(Protocol):
+    def get_project_timezone(self, *, project_id: int) -> str: ...
+
+    def get_project_key(self, *, project_id: int) -> str: ...
+
+    def list_existing_segments(
+        self,
+        *,
+        project_id: int,
+    ) -> dict[str, ExistingSegment]: ...
+
+    def replace_primary_membership(
+        self,
+        *,
+        project_id: int,
+        external_user_id: str,
+        segment_id: int,
+        analysis_date: date,
+        confidence: Decimal,
+        reason_json: dict[str, object],
+        run_id: int | None,
+    ) -> None: ...
+
+
+class UserSegmentCandidateRepository(Protocol):
+    def fetch_user_segment_candidates(
+        self,
+        *,
+        project_id: str,
+        window: AnalysisWindow,
+    ) -> list[UserSegmentCandidate]: ...
+
+
+@dataclass(frozen=True, slots=True)
+class UserSegmentMatchingResult:
+    matched_count: int = 0
+    skipped_count: int = 0
+
+
+class UserSegmentMatchingService:
+    def __init__(
+        self,
+        repository: UserSegmentMatchingRepository,
+        candidate_repository: UserSegmentCandidateRepository,
+    ) -> None:
+        self.repository = repository
+        self.candidate_repository = candidate_repository
+
+    def run(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        run_id: int | None,
+    ) -> UserSegmentMatchingResult:
+        timezone = self.repository.get_project_timezone(project_id=project_id)
+        clickhouse_project_id = self.repository.get_project_key(project_id=project_id)
+        window = build_analysis_window(analysis_date, timezone)
+        existing_segments = self.repository.list_existing_segments(project_id=project_id)
+        candidates = self.candidate_repository.fetch_user_segment_candidates(
+            project_id=clickhouse_project_id,
+            window=window,
+        )
+
+        matched_count = 0
+        skipped_count = 0
+        for candidate in candidates:
+            segment_key = build_segment_key(candidate.dimensions)
+            segment = existing_segments.get(segment_key)
+            if segment is None:
+                skipped_count += 1
+                continue
+            self.repository.replace_primary_membership(
+                project_id=project_id,
+                external_user_id=candidate.external_user_id,
+                segment_id=segment.id,
+                analysis_date=analysis_date,
+                confidence=candidate.confidence,
+                reason_json={
+                    "segment_key": segment_key,
+                    "dimensions": candidate.dimensions,
+                    "matching_source": "user_segment_matching_service",
+                },
+                run_id=run_id,
+            )
+            matched_count += 1
+
+        return UserSegmentMatchingResult(
+            matched_count=matched_count,
+            skipped_count=skipped_count,
+        )
 
 
 class RecommendationService:

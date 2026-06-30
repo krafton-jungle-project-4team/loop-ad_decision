@@ -7,7 +7,11 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from app.decision.models import Experiment, ExperimentVariant
-from app.decision.repositories import ClickHouseExperimentResultRepository, PostgresDecisionRepository
+from app.decision.repositories import (
+    ClickHouseExperimentResultRepository,
+    ClickHouseUserSegmentCandidateRepository,
+    PostgresDecisionRepository,
+)
 
 
 class FakeClickHouseResult:
@@ -26,8 +30,13 @@ class FakeClickHouseClient:
 
 
 class FakeCursor:
-    def __init__(self, row: dict[str, object] | None) -> None:
+    def __init__(
+        self,
+        row: dict[str, object] | None = None,
+        rows: list[dict[str, object]] | None = None,
+    ) -> None:
         self.row = row
+        self.rows = rows or []
         self.executed: list[tuple[str, tuple[object, ...]]] = []
 
     def execute(self, query: str, parameters: tuple[object, ...]) -> None:
@@ -36,13 +45,20 @@ class FakeCursor:
     def fetchone(self) -> dict[str, object] | None:
         return self.row
 
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.rows
+
     def close(self) -> None:
         return None
 
 
 class FakeConnection:
-    def __init__(self, row: dict[str, object] | None) -> None:
-        self.cursor_instance = FakeCursor(row)
+    def __init__(
+        self,
+        row: dict[str, object] | None = None,
+        rows: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.cursor_instance = FakeCursor(row=row, rows=rows)
 
     def cursor(self) -> FakeCursor:
         return self.cursor_instance
@@ -140,3 +156,99 @@ def test_postgres_decision_repository_rejects_empty_project_key() -> None:
 
     with pytest.raises(ValueError, match="project_key is required"):
         repository.get_project_key(project_id=1)
+
+
+def test_postgres_decision_repository_lists_existing_segments_read_only() -> None:
+    connection = FakeConnection(
+        rows=[
+            {
+                "id": 10,
+                "segment_key": "age_30s__gender_male__device_mobile__channel_kakao__category_fresh",
+            }
+        ]
+    )
+    repository = PostgresDecisionRepository(connection)
+
+    segments = repository.list_existing_segments(project_id=1)
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "SELECT id, segment_key" in query
+    assert "FROM segments" in query
+    assert "INSERT INTO segments" not in query
+    assert "UPDATE segments" not in query
+    assert "DELETE FROM segments" not in query
+    assert parameters == (1,)
+    assert segments["age_30s__gender_male__device_mobile__channel_kakao__category_fresh"].id == 10
+
+
+def test_postgres_decision_repository_replaces_primary_membership_in_one_transaction() -> None:
+    connection = FakeConnection()
+    repository = PostgresDecisionRepository(connection)
+
+    repository.replace_primary_membership(
+        project_id=1,
+        external_user_id="user-1",
+        segment_id=10,
+        analysis_date=date(2021, 1, 4),
+        confidence=Decimal("1.0"),
+        reason_json={"segment_key": "segment"},
+        run_id=None,
+    )
+
+    delete_query, delete_parameters = connection.cursor_instance.executed[0]
+    upsert_query, upsert_parameters = connection.cursor_instance.executed[1]
+    assert "DELETE FROM user_segment_memberships" in delete_query
+    assert "INSERT INTO user_segment_memberships" in upsert_query
+    assert "ON CONFLICT (project_id, external_user_id, segment_id, analysis_date)" in upsert_query
+    assert "INSERT INTO segments" not in delete_query + upsert_query
+    assert "UPDATE segments" not in delete_query + upsert_query
+    assert "DELETE FROM segments" not in delete_query + upsert_query
+    assert delete_parameters == (1, "user-1", date(2021, 1, 4), 10)
+    assert upsert_parameters[-1] is None
+
+
+def test_clickhouse_user_segment_candidates_use_real_event_columns_and_internal_names() -> None:
+    client = FakeClickHouseClient(
+        rows=[
+            (
+                "user-1",
+                "30s",
+                "Male",
+                "Mobile Web",
+                "Kakao",
+                "Fresh Food",
+            )
+        ]
+    )
+    repository = ClickHouseUserSegmentCandidateRepository(client)
+
+    candidates = repository.fetch_user_segment_candidates(
+        project_id="demo-shop",
+        window=type(
+            "Window",
+            (),
+            {
+                "window_start": datetime(2021, 1, 4, tzinfo=ZoneInfo("Asia/Seoul")),
+                "window_end": datetime(2021, 1, 5, tzinfo=ZoneInfo("Asia/Seoul")),
+            },
+        )(),
+    )
+
+    sql, parameters = client.queries[0]
+    assert "events.device" in sql
+    assert "events.channel" in sql
+    assert "events.category" in sql
+    assert "device_type" in sql
+    assert "acquisition_channel" in sql
+    assert "primary_category" in sql
+    assert "events.device_type" not in sql
+    assert "events.acquisition_channel" not in sql
+    assert "events.primary_category" not in sql
+    assert candidates[0].dimensions == {
+        "age_group": "30s",
+        "gender": "Male",
+        "device_type": "Mobile Web",
+        "acquisition_channel": "Kakao",
+        "primary_category": "Fresh Food",
+    }
+    assert parameters["project_id"] == "demo-shop"

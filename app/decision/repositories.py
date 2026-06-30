@@ -6,8 +6,10 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Protocol
 
+from app.analysis.models import AnalysisWindow
 from app.decision.models import (
     ActionCatalogItem,
+    ExistingSegment,
     Experiment,
     ExperimentVariant,
     GeneratedContent,
@@ -15,6 +17,7 @@ from app.decision.models import (
     RecommendationResult,
     RootCauseCandidate,
     SegmentAnomaly,
+    UserSegmentCandidate,
     VariantPerformance,
 )
 
@@ -518,6 +521,82 @@ class PostgresDecisionRepository:
             raise ValueError(f"project_key is required for project {project_id}")
         return project_key
 
+    def list_existing_segments(self, *, project_id: int) -> dict[str, ExistingSegment]:
+        rows = self._fetchall(
+            """
+            SELECT id, segment_key
+            FROM segments
+            WHERE project_id = %s
+              AND status = 'active'
+              AND is_default = false
+            """,
+            (project_id,),
+        )
+        return {
+            str(row["segment_key"]): ExistingSegment(
+                id=int(row["id"]),
+                segment_key=str(row["segment_key"]),
+            )
+            for row in rows
+        }
+
+    def replace_primary_membership(
+        self,
+        *,
+        project_id: int,
+        external_user_id: str,
+        segment_id: int,
+        analysis_date: date,
+        confidence: Decimal,
+        reason_json: dict[str, object],
+        run_id: int | None,
+    ) -> None:
+        cursor = self.connection.cursor()
+        try:
+            cursor.execute(
+                """
+                DELETE FROM user_segment_memberships
+                WHERE project_id = %s
+                  AND external_user_id = %s
+                  AND analysis_date = %s
+                  AND is_primary = true
+                  AND segment_id <> %s
+                """,
+                (project_id, external_user_id, analysis_date, segment_id),
+            )
+            cursor.execute(
+                """
+                INSERT INTO user_segment_memberships (
+                    project_id,
+                    external_user_id,
+                    segment_id,
+                    analysis_date,
+                    is_primary,
+                    confidence,
+                    reason_json,
+                    created_run_id
+                )
+                VALUES (%s, %s, %s, %s, true, %s, %s::jsonb, %s)
+                ON CONFLICT (project_id, external_user_id, segment_id, analysis_date)
+                DO UPDATE SET
+                    is_primary = true,
+                    confidence = EXCLUDED.confidence,
+                    reason_json = EXCLUDED.reason_json,
+                    created_run_id = EXCLUDED.created_run_id
+                """,
+                (
+                    project_id,
+                    external_user_id,
+                    segment_id,
+                    analysis_date,
+                    confidence,
+                    self._json(reason_json),
+                    run_id,
+                ),
+            )
+        finally:
+            cursor.close()
+
     def list_experiments_by_status(self, *, project_id: int, status: str) -> list[Experiment]:
         return [
             self._experiment(row)
@@ -880,3 +959,71 @@ class ClickHouseExperimentResultRepository:
                 attributed_purchase_count=current.attributed_purchase_count + int(row[4] or 0),
             )
         return by_variant
+
+
+class ClickHouseUserSegmentCandidateRepository:
+    """Fetch latest user attributes for matching to already-defined segments."""
+
+    def __init__(self, client: QueryClient, *, events_table: str = "events") -> None:
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*", events_table):
+            raise ValueError("events_table must be a safe SQL identifier")
+        self.client = client
+        self.events_table = events_table
+
+    def fetch_user_segment_candidates(
+        self,
+        *,
+        project_id: str,
+        window: AnalysisWindow,
+    ) -> list[UserSegmentCandidate]:
+        result = self.client.query(
+            f"""
+            SELECT
+                events.user_id AS external_user_id,
+                argMax(ifNull(events.age_group, ''), events.event_time) AS age_group,
+                argMax(ifNull(events.gender, ''), events.event_time) AS gender,
+                argMax(ifNull(events.device, ''), events.event_time) AS device_type,
+                argMax(ifNull(events.channel, ''), events.event_time) AS acquisition_channel,
+                argMax(ifNull(events.category, ''), events.event_time) AS primary_category
+            FROM {self.events_table} AS events
+            WHERE events.project_id = {{project_id:String}}
+              AND events.event_time >= parseDateTime64BestEffort({{window_start_utc:String}}, 3, 'UTC')
+              AND events.event_time < parseDateTime64BestEffort({{window_end_utc:String}}, 3, 'UTC')
+              AND events.event_name IN (
+                'page_view',
+                'product_view',
+                'add_to_cart',
+                'checkout_start',
+                'purchase',
+                'ad_impression',
+                'ad_click'
+              )
+              AND events.user_id IS NOT NULL
+              AND events.user_id != ''
+            GROUP BY events.user_id
+            """,
+            {
+                "project_id": str(project_id),
+                "window_start_utc": window.window_start.astimezone(timezone.utc).isoformat(),
+                "window_end_utc": window.window_end.astimezone(timezone.utc).isoformat(),
+            },
+        )
+        rows = getattr(result, "result_rows", result)
+        return [
+            build_user_segment_candidate(row)
+            for row in rows
+            if row and row[0] is not None and str(row[0]).strip()
+        ]
+
+
+def build_user_segment_candidate(row: tuple[Any, ...]) -> UserSegmentCandidate:
+    return UserSegmentCandidate(
+        external_user_id=str(row[0]),
+        dimensions={
+            "age_group": row[1],
+            "gender": row[2],
+            "device_type": row[3],
+            "acquisition_channel": row[4],
+            "primary_category": row[5],
+        },
+    )

@@ -16,6 +16,19 @@ class Project:
     timezone: str
 
 
+@dataclass(frozen=True, slots=True)
+class ExistingSegment:
+    id: int
+    segment_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class UserSegmentCandidate:
+    external_user_id: str
+    dimensions: JsonObject
+    confidence: Decimal = Decimal("1.0")
+
+
 @dataclass(slots=True)
 class SegmentAnomaly:
     id: int
@@ -156,4 +169,3 @@ class ExperimentResultWindow:
     variants: list[ExperimentVariant]
     window_start: datetime
     window_end: datetime
-
