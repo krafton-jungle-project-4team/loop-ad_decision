@@ -60,14 +60,6 @@ class StoredSegment:
 
 
 @dataclass(frozen=True)
-class UserPrimarySegmentCandidate:
-    external_user_id: str
-    segment_key: str
-    dimensions: dict[str, str]
-    confidence: Decimal = Decimal("1.0")
-
-
-@dataclass(frozen=True)
 class BaselineMetrics:
     segment_id: int
     view_to_purchase_rate: Decimal | None

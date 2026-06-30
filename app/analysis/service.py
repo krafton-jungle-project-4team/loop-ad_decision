@@ -13,7 +13,6 @@ from app.analysis.models import (
     SegmentAnomalyCandidate,
     StoredAnomaly,
     StoredSegment,
-    UserPrimarySegmentCandidate,
 )
 from app.analysis.time_window import build_analysis_window
 
@@ -49,27 +48,6 @@ class SegmentMetricsRepository(Protocol):
         project_id: int,
         analysis_date: date,
         aggregates: list[SegmentAggregate],
-        stored_segments: dict[str, StoredSegment],
-        run_id: int | None,
-    ) -> int:
-        ...
-
-
-class UserPrimarySegmentRepository(Protocol):
-    def fetch_user_primary_segment_candidates(
-        self,
-        project_id: str,
-        window: AnalysisWindow,
-    ) -> list[UserPrimarySegmentCandidate]:
-        ...
-
-
-class UserSegmentMembershipRepository(Protocol):
-    def upsert_user_segment_memberships(
-        self,
-        project_id: int,
-        analysis_date: date,
-        candidates: list[UserPrimarySegmentCandidate],
         stored_segments: dict[str, StoredSegment],
         run_id: int | None,
     ) -> int:
@@ -115,15 +93,11 @@ class AnalysisService:
         project_repository: ProjectRepository,
         segment_aggregate_repository: SegmentAggregateRepository | None = None,
         segment_metrics_repository: SegmentMetricsRepository | None = None,
-        user_primary_segment_repository: UserPrimarySegmentRepository | None = None,
-        user_segment_membership_repository: UserSegmentMembershipRepository | None = None,
         anomaly_repository: SegmentAnomalyRepository | None = None,
     ) -> None:
         self.project_repository = project_repository
         self.segment_aggregate_repository = segment_aggregate_repository
         self.segment_metrics_repository = segment_metrics_repository
-        self.user_primary_segment_repository = user_primary_segment_repository
-        self.user_segment_membership_repository = user_segment_membership_repository
         self.anomaly_repository = anomaly_repository
 
     def run(
@@ -155,22 +129,6 @@ class AnalysisService:
                 project_id=project_id,
                 analysis_date=analysis_date,
                 aggregates=aggregates,
-                stored_segments=stored_segments,
-                run_id=run_id,
-            )
-        membership_count = 0
-        if (
-            self.user_primary_segment_repository is not None
-            and self.user_segment_membership_repository is not None
-        ):
-            candidates = self.user_primary_segment_repository.fetch_user_primary_segment_candidates(
-                clickhouse_project_id,
-                window,
-            )
-            membership_count = self.user_segment_membership_repository.upsert_user_segment_memberships(
-                project_id=project_id,
-                analysis_date=analysis_date,
-                candidates=candidates,
                 stored_segments=stored_segments,
                 run_id=run_id,
             )
@@ -207,7 +165,7 @@ class AnalysisService:
             )
         return AnalysisResult(
             segment_count=len(stored_segments),
-            membership_count=membership_count,
+            membership_count=0,
             metric_count=metric_count,
             anomaly_count=len(stored_anomalies),
             root_cause_count=root_cause_count,
