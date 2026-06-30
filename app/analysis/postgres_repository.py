@@ -16,6 +16,11 @@ from app.analysis.models import (
     StoredSegment,
 )
 from app.analysis.segments import is_default_segment_key
+from app.decision.embedding import (
+    DEFAULT_EMBEDDING_VERSION,
+    embed_segment,
+    to_pgvector_literal,
+)
 
 DEFAULT_PROJECT_TIMEZONE = "Asia/Seoul"
 
@@ -143,6 +148,78 @@ class PostgresAnalysisRepository:
                 )
                 metric_count += 1
         return metric_count
+
+    def refresh_segment_centroids(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> int:
+        embedding_version = self._get_today_embedding_version(
+            project_id=project_id,
+            analysis_date=analysis_date,
+        )
+        active_segments = self._list_active_segment_embedding_sources(project_id=project_id)
+        active_segment_ids = [segment_id for segment_id, _ in active_segments]
+        with self.connection.cursor() as cursor:
+            for segment_id, rule_json in active_segments:
+                cursor.execute(
+                    UPSERT_SEGMENT_CENTROID_SQL,
+                    (
+                        project_id,
+                        segment_id,
+                        analysis_date,
+                        embedding_version,
+                        to_pgvector_literal(embed_segment(rule_json)),
+                    ),
+                )
+            if active_segment_ids:
+                cursor.execute(
+                    CLEANUP_STALE_SEGMENT_CENTROIDS_SQL,
+                    (
+                        project_id,
+                        analysis_date,
+                        embedding_version,
+                        active_segment_ids,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    CLEANUP_ALL_SEGMENT_CENTROIDS_FOR_VERSION_SQL,
+                    (
+                        project_id,
+                        analysis_date,
+                        embedding_version,
+                    ),
+                )
+        return len(active_segment_ids)
+
+    def _get_today_embedding_version(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> str:
+        with self.connection.cursor() as cursor:
+            cursor.execute(
+                FETCH_TODAY_SEGMENT_MATCHING_CONFIG_SQL,
+                (project_id, analysis_date),
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return DEFAULT_EMBEDDING_VERSION
+        version = str(row[0]).strip() if row[0] is not None else ""
+        return version or DEFAULT_EMBEDDING_VERSION
+
+    def _list_active_segment_embedding_sources(
+        self,
+        *,
+        project_id: int,
+    ) -> list[tuple[int, Mapping[str, object]]]:
+        with self.connection.cursor() as cursor:
+            cursor.execute(FETCH_ACTIVE_SEGMENT_EMBEDDING_SOURCES_SQL, (project_id,))
+            rows = list(iter_cursor_rows(cursor))
+        return [(int(row[0]), _as_mapping(row[1])) for row in rows]
 
     def fetch_segment_metric_baselines(
         self,
@@ -282,6 +359,16 @@ def normalize_project_key(value: object, *, project_id: int) -> str:
     return project_key
 
 
+def _as_mapping(value: object) -> Mapping[str, object]:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, Mapping):
+            return parsed
+    return {}
+
+
 UPSERT_SEGMENT_SQL = """
 INSERT INTO segments (
     project_id,
@@ -387,6 +474,62 @@ SET baseline_view_to_purchase_rate = %s
 WHERE project_id = %s
   AND segment_id = %s
   AND analysis_date = %s
+""".strip()
+
+
+FETCH_TODAY_SEGMENT_MATCHING_CONFIG_SQL = """
+SELECT embedding_version
+FROM segment_matching_configs
+WHERE project_id = %s
+  AND analysis_date = %s
+LIMIT 1
+""".strip()
+
+
+FETCH_ACTIVE_SEGMENT_EMBEDDING_SOURCES_SQL = """
+SELECT id, rule_json
+FROM segments
+WHERE project_id = %s
+  AND is_default = false
+  AND status = 'active'
+ORDER BY id
+""".strip()
+
+
+UPSERT_SEGMENT_CENTROID_SQL = """
+INSERT INTO segment_centroids (
+    project_id,
+    segment_id,
+    analysis_date,
+    embedding_version,
+    centroid
+) VALUES (
+    %s,
+    %s,
+    %s,
+    %s,
+    %s::vector
+)
+ON CONFLICT (project_id, segment_id, analysis_date, embedding_version)
+DO UPDATE SET
+    centroid = EXCLUDED.centroid
+""".strip()
+
+
+CLEANUP_STALE_SEGMENT_CENTROIDS_SQL = """
+DELETE FROM segment_centroids
+WHERE project_id = %s
+  AND analysis_date = %s
+  AND embedding_version = %s
+  AND NOT (segment_id = ANY(%s))
+""".strip()
+
+
+CLEANUP_ALL_SEGMENT_CENTROIDS_FOR_VERSION_SQL = """
+DELETE FROM segment_centroids
+WHERE project_id = %s
+  AND analysis_date = %s
+  AND embedding_version = %s
 """.strip()
 
 
