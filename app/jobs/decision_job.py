@@ -6,17 +6,12 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Any, Protocol
 
-from psycopg.rows import dict_row
-
 from app.analysis.clickhouse_repository import ClickHouseAnalysisRepository
 from app.analysis.models import AnalysisResult
 from app.analysis.postgres_repository import PostgresAnalysisRepository
 from app.analysis.service import AnalysisService
 from app.analysis.time_window import build_analysis_window
 from app.config import Settings
-from app.contents.config import build_content_generator
-from app.contents.postgres_repository import PostgresContentRepository
-from app.contents.service import ContentGenerationService
 from app.contents.types import ContentGenerationSummary
 from app.decision.repositories import (
     ClickHouseExperimentResultRepository,
@@ -32,6 +27,7 @@ from app.decision.services import (
 )
 from app.dependencies import connect_clickhouse, connect_postgres
 from app.jobs.daily_analysis import run_daily_analysis_flow
+from app.jobs.wiring import build_content_generation_service
 
 
 class ProjectNotFoundError(LookupError):
@@ -78,37 +74,6 @@ class ExperimentSyncServiceLike(Protocol):
         run_id: int,
     ) -> list[Any]:
         ...
-
-
-class _BufferedDictCursor:
-    def __init__(self, rows: list[dict[str, Any]], rowcount: int) -> None:
-        self.rows = rows
-        self.rowcount = rowcount
-
-    def fetchone(self) -> dict[str, Any] | None:
-        if not self.rows:
-            return None
-        return self.rows.pop(0)
-
-    def fetchall(self) -> list[dict[str, Any]]:
-        rows = self.rows
-        self.rows = []
-        return rows
-
-
-class _DictRowConnectionAdapter:
-    def __init__(self, connection: Connection) -> None:
-        self.connection = connection
-
-    def execute(
-        self,
-        query: str,
-        params: dict[str, Any] | None = None,
-    ) -> _BufferedDictCursor:
-        with self.connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(query, params)
-            rows = cursor.fetchall() if cursor.description is not None else []
-            return _BufferedDictCursor(rows=list(rows), rowcount=cursor.rowcount)
 
 
 @dataclass(frozen=True)
@@ -218,11 +183,8 @@ class DailyDecisionJobService:
                     run_id=run_id,
                     config=experiment_config,
                     force=run_context.force,
-                    content_generation_service=ContentGenerationService(
-                        repository=PostgresContentRepository(
-                            _DictRowConnectionAdapter(connection)
-                        ),
-                        generator=build_content_generator(),
+                    content_generation_service=build_content_generation_service(
+                        connection=connection,
                     ),
                     experiment_sync_service=ExperimentService(
                         decision_repository,
