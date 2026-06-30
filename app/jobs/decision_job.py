@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, timedelta
-from typing import Protocol
+from typing import Any, Protocol
+
+from psycopg.rows import dict_row
 
 from app.analysis.clickhouse_repository import ClickHouseAnalysisRepository
 from app.analysis.models import AnalysisResult
@@ -12,6 +14,10 @@ from app.analysis.postgres_repository import PostgresAnalysisRepository
 from app.analysis.service import AnalysisService
 from app.analysis.time_window import build_analysis_window
 from app.config import Settings
+from app.contents.config import build_content_generator
+from app.contents.postgres_repository import PostgresContentRepository
+from app.contents.service import ContentGenerationService
+from app.contents.types import ContentGenerationSummary
 from app.decision.repositories import (
     ClickHouseExperimentResultRepository,
     ClickHouseUserSegmentCandidateRepository,
@@ -40,7 +46,7 @@ class Cursor(Protocol):
 
 
 class Connection(Protocol):
-    def cursor(self) -> object:
+    def cursor(self, *args: Any, **kwargs: Any) -> object:
         ...
 
     def commit(self) -> None:
@@ -48,6 +54,49 @@ class Connection(Protocol):
 
     def rollback(self) -> None:
         ...
+
+
+class ContentGenerationServiceLike(Protocol):
+    def generate_for_actions(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        run_id: int | None = None,
+        force: bool = False,
+    ) -> ContentGenerationSummary:
+        ...
+
+
+class _BufferedDictCursor:
+    def __init__(self, rows: list[dict[str, Any]], rowcount: int) -> None:
+        self.rows = rows
+        self.rowcount = rowcount
+
+    def fetchone(self) -> dict[str, Any] | None:
+        if not self.rows:
+            return None
+        return self.rows.pop(0)
+
+    def fetchall(self) -> list[dict[str, Any]]:
+        rows = self.rows
+        self.rows = []
+        return rows
+
+
+class _DictRowConnectionAdapter:
+    def __init__(self, connection: Connection) -> None:
+        self.connection = connection
+
+    def execute(
+        self,
+        query: str,
+        params: dict[str, Any] | None = None,
+    ) -> _BufferedDictCursor:
+        with self.connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, params)
+            rows = cursor.fetchall() if cursor.description is not None else []
+            return _BufferedDictCursor(rows=list(rows), rowcount=cursor.rowcount)
 
 
 @dataclass(frozen=True)
@@ -150,6 +199,20 @@ class DailyDecisionJobService:
                     anomaly_repository=postgres_analysis_repository,
                 )
                 experiment_config = ExperimentConfig.for_mode(run_context.mode)
+                recommendation_runner = _RecommendationExperimentRunner(
+                    repository=decision_repository,
+                    project_id=run_context.project_id,
+                    analysis_date=run_context.analysis_date,
+                    run_id=run_id,
+                    config=experiment_config,
+                    force=run_context.force,
+                    content_generation_service=ContentGenerationService(
+                        repository=PostgresContentRepository(
+                            _DictRowConnectionAdapter(connection)
+                        ),
+                        generator=build_content_generator(),
+                    ),
+                )
                 result = run_daily_analysis_flow(
                     project_id=run_context.project_id,
                     analysis_date=run_context.analysis_date,
@@ -168,15 +231,14 @@ class DailyDecisionJobService:
                         ),
                         config=experiment_config,
                     ),
-                    downstream_runner=_RecommendationExperimentRunner(
-                        repository=decision_repository,
-                        project_id=run_context.project_id,
-                        analysis_date=run_context.analysis_date,
-                        run_id=run_id,
-                        config=experiment_config,
-                    ),
+                    downstream_runner=recommendation_runner,
                 )
-                self._mark_success(connection, run_id, result)
+                self._mark_success(
+                    connection,
+                    run_id,
+                    result,
+                    content_generation_metadata=recommendation_runner.content_generation_metadata,
+                )
                 return result
         except Exception as exc:
             self._record_failure(run_id, exc)
@@ -196,13 +258,18 @@ class DailyDecisionJobService:
     def _get_run_context(self, connection: Connection, run_id: int) -> "_RunContext":
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT project_id, analysis_date, mode FROM decision_runs WHERE id = %s",
+                "SELECT project_id, analysis_date, mode, force FROM decision_runs WHERE id = %s",
                 (run_id,),
             )
             row = cursor.fetchone()
         if row is None:
             raise LookupError(f"decision run not found: {run_id}")
-        return _RunContext(project_id=int(row[0]), analysis_date=row[1], mode=str(row[2]))
+        return _RunContext(
+            project_id=int(row[0]),
+            analysis_date=row[1],
+            mode=str(row[2]),
+            force=bool(row[3]),
+        )
 
     def _mark_running(self, connection: Connection, run_id: int) -> None:
         with connection.cursor() as cursor:
@@ -216,6 +283,8 @@ class DailyDecisionJobService:
         connection: Connection,
         run_id: int,
         result: AnalysisResult,
+        *,
+        content_generation_metadata: dict[str, Any] | None = None,
     ) -> None:
         metadata = {
             "segment_count": result.segment_count,
@@ -224,6 +293,8 @@ class DailyDecisionJobService:
             "anomaly_count": result.anomaly_count,
             "root_cause_count": result.root_cause_count,
         }
+        if content_generation_metadata is not None:
+            metadata["content_generation"] = content_generation_metadata
         with connection.cursor() as cursor:
             cursor.execute(
                 """
@@ -258,6 +329,7 @@ class _RunContext:
     project_id: int
     analysis_date: date
     mode: str
+    force: bool
 
 
 class _ExperimentResultUpdateRunner:
@@ -291,12 +363,17 @@ class _RecommendationExperimentRunner:
         analysis_date: date,
         run_id: int,
         config: ExperimentConfig,
+        force: bool = False,
+        content_generation_service: ContentGenerationServiceLike | None = None,
     ) -> None:
         self.repository = repository
         self.project_id = project_id
         self.analysis_date = analysis_date
         self.run_id = run_id
         self.config = config
+        self.force = force
+        self.content_generation_service = content_generation_service
+        self.content_generation_metadata: dict[str, Any] | None = None
 
     def run(self, result: AnalysisResult) -> None:
         RecommendationService(self.repository).create_for_anomalies(
@@ -304,6 +381,25 @@ class _RecommendationExperimentRunner:
             analysis_date=self.analysis_date,
             run_id=self.run_id,
         )
+        if self.content_generation_service is None:
+            self.content_generation_metadata = {
+                "status": "skipped",
+                "reason": "content_generation_service_not_configured",
+            }
+            return
+        summary = self.content_generation_service.generate_for_actions(
+            project_id=self.project_id,
+            analysis_date=self.analysis_date,
+            run_id=self.run_id,
+            force=self.force,
+        )
+        self.content_generation_metadata = _content_generation_metadata(summary)
+
+
+def _content_generation_metadata(summary: ContentGenerationSummary) -> dict[str, Any]:
+    metadata = asdict(summary)
+    metadata["status"] = "success"
+    return metadata
 
 
 def build_daily_decision_job_service(settings: Settings) -> DailyDecisionJobService:
