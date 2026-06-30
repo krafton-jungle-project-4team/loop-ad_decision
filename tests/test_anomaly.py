@@ -4,6 +4,7 @@ from decimal import Decimal
 
 from app.analysis.anomaly import (
     build_root_cause_candidates,
+    derive_matching_weights,
     detect_segment_anomalies,
     select_lowest_non_null_funnel_step,
 )
@@ -88,3 +89,67 @@ def test_build_root_cause_candidates_uses_stored_anomaly_id() -> None:
     assert len(root_causes) == 1
     assert root_causes[0].anomaly_id == 99
     assert root_causes[0].cause_key == "view_to_cart"
+
+
+def test_derive_matching_weights_boosts_defined_dimensions_from_impact() -> None:
+    result = derive_matching_weights(
+        {
+            "primary_category": "fresh",
+            "acquisition_channel": "kakao",
+            "age_group": "30s",
+            "gender": "male",
+        },
+        0.875,
+    )
+
+    matching = result["matching"]
+    assert matching["dimension_weights"] == {
+        "primary_category": 6,
+        "acquisition_channel": 4,
+        "device_type": 1,
+        "age_group": 2,
+        "gender": 2,
+    }
+    assert matching["min_score"] == 2
+    assert matching["source"] == "anomaly_impact"
+
+
+def test_derive_matching_weights_uses_base_weights_without_impact() -> None:
+    expected_weights = {
+        "primary_category": 3,
+        "acquisition_channel": 2,
+        "device_type": 1,
+        "age_group": 1,
+        "gender": 1,
+    }
+
+    none_result = derive_matching_weights({"primary_category": "fresh"}, None)
+    zero_result = derive_matching_weights({"primary_category": "fresh"}, 0)
+
+    assert none_result["matching"]["dimension_weights"] == expected_weights
+    assert none_result["matching"]["min_score"] == 3
+    assert zero_result["matching"]["dimension_weights"] == expected_weights
+    assert zero_result["matching"]["min_score"] == 3
+
+
+def test_derive_matching_weights_never_boosts_absent_dimensions() -> None:
+    result = derive_matching_weights({"primary_category": "fresh"}, 0.875)
+
+    weights = result["matching"]["dimension_weights"]
+    assert weights["primary_category"] == 6
+    assert weights["acquisition_channel"] == 2
+    assert weights["device_type"] == 1
+    assert weights["age_group"] == 1
+    assert weights["gender"] == 1
+
+
+def test_derive_matching_weights_uses_base_weights_without_rule_json() -> None:
+    result = derive_matching_weights(None, 0.875)
+
+    assert result["matching"]["dimension_weights"] == {
+        "primary_category": 3,
+        "acquisition_channel": 2,
+        "device_type": 1,
+        "age_group": 1,
+        "gender": 1,
+    }

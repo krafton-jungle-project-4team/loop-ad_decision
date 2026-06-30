@@ -50,6 +50,7 @@ class FakeSegmentMetricsRepository:
         self.metric_run_ids: list[int | None] = []
         self.segment_project_ids: list[int] = []
         self.metric_project_ids: list[int] = []
+        self.matching_update_calls: list[tuple[int, date, dict[int, dict]]] = []
 
     def upsert_segments(self, project_id, aggregates, run_id):
         self.segment_project_ids.append(project_id)
@@ -70,6 +71,18 @@ class FakeSegmentMetricsRepository:
         self.metric_project_ids.append(project_id)
         self.metric_run_ids.append(run_id)
         return len(stored_segments)
+
+    def update_segment_daily_metric_matching(
+        self,
+        *,
+        project_id,
+        analysis_date,
+        matching_by_segment_id,
+    ):
+        self.matching_update_calls.append(
+            (project_id, analysis_date, dict(matching_by_segment_id))
+        )
+        return len(matching_by_segment_id)
 
 
 class FakeAnomalyRepository:
@@ -217,10 +230,11 @@ def test_analysis_service_detects_target_anomaly() -> None:
             "cvr": Decimal("0.01"),
         }
     )
+    metrics_repository = FakeSegmentMetricsRepository()
     service = AnalysisService(
         project_repository=FakeProjectRepository(),
         segment_aggregate_repository=FakeSegmentAggregateRepository([aggregate]),
-        segment_metrics_repository=FakeSegmentMetricsRepository(),
+        segment_metrics_repository=metrics_repository,
         anomaly_repository=FakeAnomalyRepository(),
     )
 
@@ -230,6 +244,22 @@ def test_analysis_service_detects_target_anomaly() -> None:
     assert result.anomaly_ids == [900]
     assert result.anomaly_segment_ids == [1]
     assert result.root_cause_count == 1
+    assert metrics_repository.matching_update_calls[0][2][1]["matching"]["source"] == "anomaly_impact"
+
+
+def test_analysis_service_does_not_update_matching_metadata_without_anomaly() -> None:
+    metrics_repository = FakeSegmentMetricsRepository()
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=FakeSegmentAggregateRepository([segment_aggregate()]),
+        segment_metrics_repository=metrics_repository,
+        anomaly_repository=FakeAnomalyRepository(),
+    )
+
+    result = service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert result.anomaly_count == 0
+    assert metrics_repository.matching_update_calls == []
 
 
 def test_analysis_service_updates_current_metric_row_with_baseline() -> None:

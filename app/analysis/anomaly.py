@@ -13,6 +13,13 @@ from app.analysis.models import (
 )
 
 BASELINE_DROP_THRESHOLD = Decimal("0.20")
+MATCHING_BASE_WEIGHTS = {
+    "primary_category": 3,
+    "acquisition_channel": 2,
+    "device_type": 1,
+    "age_group": 1,
+    "gender": 1,
+}
 
 ROOT_CAUSE_STEPS = (
     (
@@ -132,6 +139,25 @@ def build_root_cause_candidates(
             )
         )
     return root_causes
+
+
+def derive_matching_weights(rule_json: dict | None, impact_score: float | None) -> dict:
+    """Derive per-dimension matching weights from anomaly impact."""
+    score = impact_score or 0.0
+    boost = 1.0 + score
+    defined = set((rule_json or {}).keys())
+    weights = {
+        dim: round(base * boost) if dim in defined else base
+        for dim, base in MATCHING_BASE_WEIGHTS.items()
+    }
+    min_score = max(2, round(3 * (1 - score / 2)))
+    return {
+        "matching": {
+            "dimension_weights": weights,
+            "min_score": min_score,
+            "source": "anomaly_impact",
+        }
+    }
 
 
 def calculate_baseline_drop_rate(

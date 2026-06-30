@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import date
 from decimal import Decimal
 
@@ -13,6 +14,7 @@ class FakeCursor:
     def __init__(self, rows: list[tuple[object, ...] | None]) -> None:
         self.rows = rows
         self.executed: list[tuple[str, tuple[object, ...]]] = []
+        self.rowcount = 0
 
     def __enter__(self) -> "FakeCursor":
         return self
@@ -22,6 +24,7 @@ class FakeCursor:
 
     def execute(self, query: str, parameters: tuple[object, ...] = ()) -> None:
         self.executed.append((query, parameters))
+        self.rowcount = 1
 
     def fetchone(self) -> tuple[object, ...] | None:
         return self.rows.pop(0) if self.rows else None
@@ -189,6 +192,32 @@ def test_update_segment_daily_metric_baselines_updates_current_analysis_date_row
     assert "UPDATE segment_daily_metrics" in query
     assert "baseline_view_to_purchase_rate = %s" in query
     assert parameters == (Decimal("0.06"), 1, 10, date(2021, 1, 8))
+
+
+def test_update_segment_daily_metric_matching_merges_metric_json_patch() -> None:
+    connection = FakeConnection(rows=[])
+    repository = PostgresAnalysisRepository(connection)
+
+    updated_count = repository.update_segment_daily_metric_matching(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+        matching_by_segment_id={
+            10: {
+                "matching": {
+                    "dimension_weights": {"primary_category": 6},
+                    "min_score": 2,
+                    "source": "anomaly_impact",
+                }
+            }
+        },
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    payload = json.loads(parameters[0])
+    assert updated_count == 1
+    assert "SET metric_json = metric_json || %s::jsonb" in query
+    assert payload["matching"]["source"] == "anomaly_impact"
+    assert parameters[1:] == (1, 10, date(2021, 1, 4))
 
 
 def test_upsert_segment_anomalies_and_root_causes_use_schema_keys() -> None:

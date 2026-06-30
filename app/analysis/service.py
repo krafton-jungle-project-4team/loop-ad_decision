@@ -3,7 +3,11 @@ from __future__ import annotations
 from datetime import date
 from typing import Protocol
 
-from app.analysis.anomaly import build_root_cause_candidates, detect_segment_anomalies
+from app.analysis.anomaly import (
+    build_root_cause_candidates,
+    derive_matching_weights,
+    detect_segment_anomalies,
+)
 from app.analysis.models import (
     AnalysisResult,
     AnalysisWindow,
@@ -50,6 +54,15 @@ class SegmentMetricsRepository(Protocol):
         aggregates: list[SegmentAggregate],
         stored_segments: dict[str, StoredSegment],
         run_id: int | None,
+    ) -> int:
+        ...
+
+    def update_segment_daily_metric_matching(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        matching_by_segment_id: dict[int, dict],
     ) -> int:
         ...
 
@@ -156,13 +169,45 @@ class AnalysisService:
                 anomalies=anomaly_candidates,
                 run_id=run_id,
             )
-            root_cause_count = self.anomaly_repository.upsert_root_cause_candidates(
-                build_root_cause_candidates(
-                    aggregates=aggregates,
-                    stored_segments=stored_segments,
-                    stored_anomalies=stored_anomalies,
-                )
+            root_causes = build_root_cause_candidates(
+                aggregates=aggregates,
+                stored_segments=stored_segments,
+                stored_anomalies=stored_anomalies,
             )
+            root_cause_count = self.anomaly_repository.upsert_root_cause_candidates(
+                root_causes
+            )
+            if self.segment_metrics_repository is not None:
+                matching_by_segment_id = {}
+                segment_id_by_anomaly_id = {
+                    anomaly.id: anomaly.segment_id
+                    for anomaly in stored_anomalies
+                }
+                aggregate_by_segment_id = {
+                    stored_segments[aggregate.segment_key].id: aggregate
+                    for aggregate in aggregates
+                    if aggregate.segment_key in stored_segments
+                }
+                for root_cause in sorted(
+                    root_causes,
+                    key=lambda item: (item.rank_no, -item.impact_score),
+                ):
+                    segment_id = segment_id_by_anomaly_id.get(root_cause.anomaly_id)
+                    if segment_id is None or segment_id in matching_by_segment_id:
+                        continue
+                    aggregate = aggregate_by_segment_id.get(segment_id)
+                    if aggregate is None:
+                        continue
+                    matching_by_segment_id[segment_id] = derive_matching_weights(
+                        aggregate.dimensions,
+                        float(root_cause.impact_score),
+                    )
+                if matching_by_segment_id:
+                    self.segment_metrics_repository.update_segment_daily_metric_matching(
+                        project_id=project_id,
+                        analysis_date=analysis_date,
+                        matching_by_segment_id=matching_by_segment_id,
+                    )
         return AnalysisResult(
             segment_count=len(stored_segments),
             membership_count=0,

@@ -190,6 +190,30 @@ class PostgresAnalysisRepository:
                 )
         return len(baselines)
 
+    def update_segment_daily_metric_matching(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        matching_by_segment_id: Mapping[int, dict[str, Any]],
+    ) -> int:
+        if not matching_by_segment_id:
+            return 0
+        updated_count = 0
+        with self.connection.cursor() as cursor:
+            for segment_id, matching_json in matching_by_segment_id.items():
+                cursor.execute(
+                    UPDATE_SEGMENT_DAILY_METRIC_MATCHING_SQL,
+                    (
+                        json.dumps(matching_json, ensure_ascii=False, sort_keys=True),
+                        project_id,
+                        segment_id,
+                        analysis_date,
+                    ),
+                )
+                updated_count += cursor.rowcount
+        return updated_count
+
     def upsert_segment_anomalies(
         self,
         project_id: int,
@@ -384,6 +408,15 @@ GROUP BY segment_id
 UPDATE_SEGMENT_DAILY_METRIC_BASELINE_SQL = """
 UPDATE segment_daily_metrics
 SET baseline_view_to_purchase_rate = %s
+WHERE project_id = %s
+  AND segment_id = %s
+  AND analysis_date = %s
+""".strip()
+
+
+UPDATE_SEGMENT_DAILY_METRIC_MATCHING_SQL = """
+UPDATE segment_daily_metrics
+SET metric_json = metric_json || %s::jsonb
 WHERE project_id = %s
   AND segment_id = %s
   AND analysis_date = %s
