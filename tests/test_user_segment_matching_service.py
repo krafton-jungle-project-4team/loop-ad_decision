@@ -311,6 +311,53 @@ def test_equal_scores_use_highest_single_matched_weight_tie_break() -> None:
     assert selected_reason(repository)["selected_segment_key"] == "category"
 
 
+def test_segment_specific_weights_drive_highest_single_weight_tie_break() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="lower-id-channel-device",
+                dimensions={
+                    "acquisition_channel": "Kakao",
+                    "device_type": "Mobile Web",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "acquisition_channel": 2,
+                        "device_type": 2,
+                    },
+                    "min_score": 1,
+                },
+            ),
+            segment(
+                segment_id=20,
+                segment_key="higher-id-category-age",
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "age_group": "30s",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "primary_category": 3,
+                        "age_group": 1,
+                    },
+                    "min_score": 1,
+                },
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    reason = selected_reason(repository)
+    assert reason["selected_segment_key"] == "higher-id-category-age"
+    assert reason["score"] == 4
+    assert reason["dimension_weights"]["primary_category"] == 3
+    assert reason["dimension_weights"]["age_group"] == 1
+
+
 def test_equal_score_and_highest_weight_use_more_matched_dimensions_tie_break() -> None:
     repository = FakeMatchingRepository(
         [
@@ -533,6 +580,83 @@ def test_malformed_and_non_positive_overrides_fall_back_to_defaults() -> None:
     assert reason["dimension_weights"]["acquisition_channel"] == 2
 
 
+def test_malformed_dimension_weights_object_uses_default_weights_only() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+                matching_config={
+                    "dimension_weights": ["bad"],
+                    "min_score": 2,
+                },
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 3
+    assert reason["threshold"] == 2
+    assert reason["dimension_weights"] == DEFAULT_MATCHING_CONFIG["dimension_weights"]
+
+
+def test_malformed_min_score_keeps_valid_weight_overrides() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+                matching_config={
+                    "dimension_weights": {"primary_category": 5},
+                    "min_score": "bad",
+                },
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 5
+    assert reason["threshold"] == 3
+    assert reason["dimension_weights"]["primary_category"] == 5
+
+
+def test_only_malformed_dimension_weight_keys_fall_back_to_defaults() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "acquisition_channel": "Kakao",
+                    "device_type": "Mobile Web",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "primary_category": 0,
+                        "acquisition_channel": 4,
+                        "device_type": "bad",
+                    },
+                },
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 8
+    assert reason["dimension_weights"]["primary_category"] == 3
+    assert reason["dimension_weights"]["acquisition_channel"] == 4
+    assert reason["dimension_weights"]["device_type"] == 1
+
+
 def test_malformed_matching_config_uses_defaults() -> None:
     repository = FakeMatchingRepository(
         [
@@ -547,7 +671,10 @@ def test_malformed_matching_config_uses_defaults() -> None:
     result = run_service(repository)
 
     assert result.matched_count == 1
-    assert selected_reason(repository)["score"] == 3
+    reason = selected_reason(repository)
+    assert reason["score"] == 3
+    assert reason["threshold"] == 3
+    assert reason["dimension_weights"] == DEFAULT_MATCHING_CONFIG["dimension_weights"]
 
 
 def test_missing_metric_config_uses_defaults() -> None:
