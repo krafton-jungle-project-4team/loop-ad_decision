@@ -70,7 +70,17 @@ def test_load_settings_reads_loopad_contract_env() -> None:
     assert settings.data_storage_bucket == "example-data-storage-bucket"
     assert settings.genai_assets_base_prefix == "genai/"
     assert settings.openai_api_key == "test-openai-key"
+    assert settings.gemini_api_key is None
     assert settings.legacy_admin_token is None
+
+
+def test_load_settings_reads_optional_gemini_visual_env() -> None:
+    env = valid_env()
+    env["LOOPAD_GEMINI_API_KEY"] = "gemini-key"
+
+    settings = load_settings(env)
+
+    assert settings.gemini_api_key == "gemini-key"
 
 
 def test_load_settings_reads_optional_legacy_admin_token() -> None:
