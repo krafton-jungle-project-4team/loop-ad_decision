@@ -40,6 +40,18 @@ def make_draft():
     )
 
 
+def set_loopad_content_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
+    values = {
+        "LOOPAD_ENV": "dev",
+        "LOOPAD_DATA_STORAGE_BUCKET": "example-data-storage-bucket",
+        "LOOPAD_GENAI_ASSETS_BASE_PREFIX": "genai/",
+        "LOOPAD_OPENAI_API_KEY": "loopad-openai-key",
+    }
+    values.update(overrides)
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+
 def test_build_asset_key_is_stable_and_sanitized() -> None:
     assert build_asset_key(
         project_id="demo shop",
@@ -127,6 +139,27 @@ def test_s3_asset_storage_puts_object_without_presigned_url() -> None:
     assert stored.public_url == (
         "https://cdn.example.com/assets/generated-contents/projects/demo/actions/10/banner.svg"
     )
+
+
+def test_s3_asset_storage_can_strip_origin_path_prefix_from_public_url() -> None:
+    client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket="loop-assets",
+        public_base_url="https://assets.example.com",
+        public_url_strip_prefix="genai/generated/",
+        client=client,
+    )
+
+    stored = storage.put_object(
+        AssetObject(
+            key="genai/generated/projects/demo/actions/10/banner.svg",
+            body=b"<svg />",
+            content_type="image/svg+xml",
+        )
+    )
+
+    assert client.put_object_calls[0]["Key"] == "genai/generated/projects/demo/actions/10/banner.svg"
+    assert stored.public_url == "https://assets.example.com/projects/demo/actions/10/banner.svg"
 
 
 def test_s3_asset_storage_rejects_path_traversal() -> None:
@@ -235,36 +268,19 @@ def test_build_content_asset_service_supports_memory_and_local_without_s3(tmp_pa
     assert (tmp_path / local_draft.media_s3_key).exists()
 
 
-def test_build_content_asset_service_defaults_to_memory_outside_production() -> None:
-    service = build_content_asset_service(ContentGenerationConfig())
-
-    draft = service.store_banner(make_draft())
-
-    assert draft.media_s3_key is not None
-    assert draft.metadata["asset_storage"] == "InMemoryAssetStorage"
+def test_build_content_asset_service_requires_explicit_storage_config() -> None:
+    with pytest.raises(ValueError, match="content_asset_storage is required"):
+        build_content_asset_service(ContentGenerationConfig())
 
 
-def test_build_content_asset_service_requires_storage_in_production() -> None:
-    with pytest.raises(ValueError, match="CONTENT_ASSET_STORAGE is required"):
-        build_content_asset_service(ContentGenerationConfig(app_env="production"))
+def test_build_content_asset_service_requires_loopad_bucket_in_runtime_env(
+    monkeypatch,
+) -> None:
+    set_loopad_content_env(monkeypatch)
+    monkeypatch.setenv("CONTENT_ASSET_S3_BUCKET", "legacy-bucket")
+    monkeypatch.delenv("LOOPAD_DATA_STORAGE_BUCKET", raising=False)
 
-
-def test_build_content_asset_service_rejects_memory_in_production() -> None:
-    with pytest.raises(ValueError, match="memory is not allowed"):
-        build_content_asset_service(
-            ContentGenerationConfig(
-                app_env="production",
-                content_asset_storage="memory",
-            )
-        )
-
-
-def test_build_content_asset_service_treats_either_env_as_production(monkeypatch) -> None:
-    monkeypatch.setenv("APP_ENV", "local")
-    monkeypatch.setenv("ENV", "production")
-    monkeypatch.delenv("CONTENT_ASSET_STORAGE", raising=False)
-
-    with pytest.raises(ValueError, match="CONTENT_ASSET_STORAGE is required"):
+    with pytest.raises(ValueError, match="LOOPAD_DATA_STORAGE_BUCKET"):
         build_content_asset_service()
 
 
@@ -297,7 +313,7 @@ def test_build_content_asset_service_supports_s3_with_injected_client() -> None:
 
 
 def test_build_content_asset_service_requires_s3_bucket() -> None:
-    with pytest.raises(ValueError, match="CONTENT_ASSET_S3_BUCKET is required"):
+    with pytest.raises(ValueError, match="LOOPAD_DATA_STORAGE_BUCKET is required"):
         build_content_asset_service(
             ContentGenerationConfig(
                 content_asset_storage="s3",
@@ -308,7 +324,7 @@ def test_build_content_asset_service_requires_s3_bucket() -> None:
 
 
 def test_build_content_asset_service_requires_s3_public_base_url() -> None:
-    with pytest.raises(ValueError, match="CONTENT_ASSET_PUBLIC_BASE_URL is required"):
+    with pytest.raises(ValueError, match="content_asset_public_base_url is required"):
         build_content_asset_service(
             ContentGenerationConfig(
                 content_asset_storage="s3",
@@ -318,19 +334,110 @@ def test_build_content_asset_service_requires_s3_public_base_url() -> None:
         )
 
 
-def test_content_generation_config_reads_s3_env(monkeypatch) -> None:
+def test_content_generation_config_rejects_legacy_asset_env(monkeypatch) -> None:
+    monkeypatch.delenv("LOOPAD_ENV", raising=False)
+    monkeypatch.delenv("LOOPAD_DATA_STORAGE_BUCKET", raising=False)
+    monkeypatch.delenv("LOOPAD_GENAI_ASSETS_BASE_PREFIX", raising=False)
+    monkeypatch.delenv("LOOPAD_OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("CONTENT_ASSET_STORAGE", "s3")
     monkeypatch.setenv("CONTENT_ASSET_PUBLIC_BASE_URL", "https://cdn.example.com/assets")
     monkeypatch.setenv("CONTENT_ASSET_S3_BUCKET", "loop-assets")
-    monkeypatch.setenv("CONTENT_ASSET_S3_REGION", "ap-northeast-2")
-    monkeypatch.setenv("CONTENT_ASSET_S3_ENDPOINT_URL", "https://s3.example.com")
-    monkeypatch.setenv("CONTENT_ASSET_S3_CACHE_CONTROL", "public, max-age=60")
+    monkeypatch.setenv("CONTENT_ASSET_PREFIX", "genai/generated/")
+
+    with pytest.raises(ValueError, match="LOOPAD_ENV"):
+        ContentGenerationConfig.from_env()
+
+
+def test_content_generation_config_reads_loopad_infra_s3_env(monkeypatch) -> None:
+    set_loopad_content_env(monkeypatch)
 
     config = ContentGenerationConfig.from_env()
 
     assert config.content_asset_storage == "s3"
-    assert config.content_asset_public_base_url == "https://cdn.example.com/assets"
-    assert config.content_asset_s3_bucket == "loop-assets"
+    assert config.content_asset_s3_bucket == "example-data-storage-bucket"
     assert config.content_asset_s3_region == "ap-northeast-2"
-    assert config.content_asset_s3_endpoint_url == "https://s3.example.com"
-    assert config.content_asset_s3_cache_control == "public, max-age=60"
+    assert config.content_asset_prefix == "genai"
+    assert config.content_asset_public_base_url == (
+        "https://example-data-storage-bucket.s3.ap-northeast-2.amazonaws.com"
+    )
+    assert config.content_asset_public_url_strip_prefix is None
+
+    client = FakeS3Client()
+    service = build_content_asset_service(config, s3_client=client)
+    draft = service.store_banner(make_draft())
+
+    assert draft.media_s3_key == (
+        "genai/projects/demo-shop/actions/10/variants/control/banner.svg"
+    )
+    assert draft.image_url == (
+        "https://example-data-storage-bucket.s3.ap-northeast-2.amazonaws.com/"
+        "genai/projects/demo-shop/actions/10/variants/control/banner.svg"
+    )
+    assert client.put_object_calls[0]["Bucket"] == "example-data-storage-bucket"
+    assert client.put_object_calls[0]["Key"] == draft.media_s3_key
+
+
+def test_content_generation_config_uses_hardcoded_seoul_region(monkeypatch) -> None:
+    set_loopad_content_env(monkeypatch)
+
+    config = ContentGenerationConfig.from_env()
+
+    assert config.content_asset_s3_region == "ap-northeast-2"
+
+
+def test_content_generation_config_can_strip_explicit_prefix_for_injected_config() -> None:
+    service = build_content_asset_service(
+        ContentGenerationConfig(
+            content_asset_storage="s3",
+            content_asset_s3_bucket="example-data-storage-bucket",
+            content_asset_prefix="genai/generated/",
+            content_asset_public_base_url="https://assets.example.com",
+            content_asset_public_url_strip_prefix="genai/generated/",
+        ),
+        s3_client=FakeS3Client(),
+    )
+    draft = service.store_banner(make_draft())
+
+    assert draft.image_url == (
+        "https://assets.example.com/projects/demo-shop/actions/10/variants/control/banner.svg"
+    )
+
+
+def test_content_generation_config_reads_loopad_openai_key(monkeypatch) -> None:
+    set_loopad_content_env(monkeypatch)
+
+    config = ContentGenerationConfig.from_env()
+
+    assert config.openai_api_key == "loopad-openai-key"
+
+
+def test_content_generation_config_rejects_legacy_openai_key(monkeypatch) -> None:
+    set_loopad_content_env(monkeypatch)
+    monkeypatch.delenv("LOOPAD_OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "content-openai-key")
+
+    with pytest.raises(ValueError, match="LOOPAD_OPENAI_API_KEY"):
+        ContentGenerationConfig.from_env()
+
+
+def test_loopad_asset_env_takes_priority_over_legacy_content_env(monkeypatch) -> None:
+    set_loopad_content_env(
+        monkeypatch,
+        LOOPAD_DATA_STORAGE_BUCKET="loopad-bucket",
+    )
+    monkeypatch.setenv("CONTENT_ASSET_STORAGE", "s3")
+    monkeypatch.setenv("CONTENT_ASSET_S3_BUCKET", "content-bucket")
+    monkeypatch.setenv("CONTENT_ASSET_PREFIX", "content/generated")
+    monkeypatch.setenv("CONTENT_ASSET_PUBLIC_BASE_URL", "https://cdn.example.com")
+    monkeypatch.setenv("CONTENT_ASSET_PUBLIC_URL_STRIP_PREFIX", "content/generated")
+
+    config = ContentGenerationConfig.from_env()
+
+    assert config.content_asset_storage == "s3"
+    assert config.content_asset_s3_bucket == "loopad-bucket"
+    assert config.content_asset_s3_region == "ap-northeast-2"
+    assert config.content_asset_prefix == "genai"
+    assert config.content_asset_public_base_url == (
+        "https://loopad-bucket.s3.ap-northeast-2.amazonaws.com"
+    )
+    assert config.content_asset_public_url_strip_prefix is None

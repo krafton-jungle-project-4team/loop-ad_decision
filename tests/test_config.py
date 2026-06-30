@@ -27,6 +27,9 @@ def valid_env() -> dict[str, str]:
         "LOOPAD_CLICKHOUSE_DATABASE": "loopad",
         "LOOPAD_CLICKHOUSE_USERNAME": "app",
         "LOOPAD_CLICKHOUSE_PASSWORD": "password",
+        "LOOPAD_DATA_STORAGE_BUCKET": "example-data-storage-bucket",
+        "LOOPAD_GENAI_ASSETS_BASE_PREFIX": "genai/",
+        "LOOPAD_OPENAI_API_KEY": "test-openai-key",
     }
 
 
@@ -64,6 +67,9 @@ def test_load_settings_reads_loopad_contract_env() -> None:
     assert settings.aurora_host == "aurora.local"
     assert settings.aurora_port == 5432
     assert settings.clickhouse_url == "http://clickhouse.local:8123"
+    assert settings.data_storage_bucket == "example-data-storage-bucket"
+    assert settings.genai_assets_base_prefix == "genai/"
+    assert settings.openai_api_key == "test-openai-key"
     assert settings.legacy_admin_token is None
 
 
@@ -99,6 +105,9 @@ def test_load_settings_loads_local_dotenv_when_no_explicit_environ(
             "LOOPAD_CLICKHOUSE_DATABASE=loopad",
             "LOOPAD_CLICKHOUSE_USERNAME=loopad_app",
             "LOOPAD_CLICKHOUSE_PASSWORD=loopad_local_password",
+            "LOOPAD_DATA_STORAGE_BUCKET=local-data-storage-bucket",
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX=genai/",
+            "LOOPAD_OPENAI_API_KEY=local-openai-key",
             "AI_DECISION_ADMIN_TOKEN=legacy-local-secret",
         ]
     )
@@ -110,6 +119,9 @@ def test_load_settings_loads_local_dotenv_when_no_explicit_environ(
     assert settings.aurora_port == 15432
     assert settings.internal_api_key == "local-internal-secret"
     assert settings.clickhouse_url == "http://localhost:18123"
+    assert settings.data_storage_bucket == "local-data-storage-bucket"
+    assert settings.genai_assets_base_prefix == "genai/"
+    assert settings.openai_api_key == "local-openai-key"
     assert settings.legacy_admin_token == "legacy-local-secret"
 
 
@@ -151,6 +163,9 @@ def test_load_local_dotenv_does_not_override_existing_env(
                 "LOOPAD_CLICKHOUSE_DATABASE=loopad",
                 "LOOPAD_CLICKHOUSE_USERNAME=loopad_app",
                 "LOOPAD_CLICKHOUSE_PASSWORD=loopad_local_password",
+                "LOOPAD_DATA_STORAGE_BUCKET=local-data-storage-bucket",
+                "LOOPAD_GENAI_ASSETS_BASE_PREFIX=genai/",
+                "LOOPAD_OPENAI_API_KEY=local-openai-key",
             ]
         ),
         encoding="utf-8",

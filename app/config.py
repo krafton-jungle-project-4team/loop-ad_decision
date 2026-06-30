@@ -29,6 +29,9 @@ class Settings:
     clickhouse_database: str
     clickhouse_username: str
     clickhouse_password: str
+    data_storage_bucket: str
+    genai_assets_base_prefix: str
+    openai_api_key: str
     legacy_admin_token: str | None = None
 
 
@@ -46,6 +49,9 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_DATABASE",
     "LOOPAD_CLICKHOUSE_USERNAME",
     "LOOPAD_CLICKHOUSE_PASSWORD",
+    "LOOPAD_DATA_STORAGE_BUCKET",
+    "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_OPENAI_API_KEY",
 )
 
 
@@ -77,6 +83,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         clickhouse_database=_read_required(source, "LOOPAD_CLICKHOUSE_DATABASE"),
         clickhouse_username=_read_required(source, "LOOPAD_CLICKHOUSE_USERNAME"),
         clickhouse_password=_read_required(source, "LOOPAD_CLICKHOUSE_PASSWORD"),
+        data_storage_bucket=_read_required(source, "LOOPAD_DATA_STORAGE_BUCKET"),
+        genai_assets_base_prefix=_read_required(source, "LOOPAD_GENAI_ASSETS_BASE_PREFIX"),
+        openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         legacy_admin_token=_read_optional(source, "AI_DECISION_ADMIN_TOKEN"),
     )
 

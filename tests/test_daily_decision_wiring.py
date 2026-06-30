@@ -91,8 +91,8 @@ def test_build_content_generation_service_can_wire_s3_asset_storage() -> None:
     assert s3_client.put_object_calls[0]["Bucket"] == "loop-assets"
 
 
-def test_build_content_generation_service_enforces_production_storage_config() -> None:
-    with pytest.raises(ValueError, match="CONTENT_ASSET_STORAGE is required"):
+def test_build_content_generation_service_requires_asset_storage_config() -> None:
+    with pytest.raises(ValueError, match="content_asset_storage is required"):
         build_content_generation_service(
             connection=FakeConnection(cursors=[]),
             config=ContentGenerationConfig(app_env="production"),
