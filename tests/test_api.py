@@ -78,6 +78,8 @@ def test_internal_daily_decision_rejects_invalid_internal_key() -> None:
             "analysis_date": "2021-01-04",
             "mode": "demo",
             "force": True,
+            "min_product_view_count": 1,
+            "min_user_count": 1,
         },
     )
 
@@ -99,6 +101,8 @@ def test_internal_daily_decision_uses_loopad_internal_key_and_manual_api_run_typ
             "analysis_date": "2021-01-04",
             "mode": "demo",
             "force": True,
+            "min_product_view_count": 1,
+            "min_user_count": 1,
         },
     )
 
@@ -116,6 +120,8 @@ def test_internal_daily_decision_uses_loopad_internal_key_and_manual_api_run_typ
             analysis_date=date(2021, 1, 4),
             mode="demo",
             force=True,
+            min_product_view_count=1,
+            min_user_count=1,
             run_type="manual_api",
             trigger_source="api",
             requested_by="testclient",

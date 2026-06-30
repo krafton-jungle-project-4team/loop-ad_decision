@@ -7,7 +7,7 @@ from datetime import date
 from typing import Literal, Protocol
 
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.config import Settings, load_settings
 from app.jobs.decision_job import (
@@ -31,6 +31,8 @@ class RunDailyDecisionRequest(BaseModel):
     analysis_date: date
     mode: Literal["normal", "demo", "backfill"] = "normal"
     force: bool = False
+    min_product_view_count: int | None = Field(default=None, ge=1)
+    min_user_count: int | None = Field(default=None, ge=1)
 
 
 class RunDailyDecisionResponse(BaseModel):
@@ -100,6 +102,8 @@ def create_app(
                     analysis_date=payload.analysis_date,
                     mode=payload.mode,
                     force=payload.force,
+                    min_product_view_count=payload.min_product_view_count,
+                    min_user_count=payload.min_user_count,
                     run_type="manual_api",
                     trigger_source="api",
                     requested_by=x_loop_ad_requester or client_host,

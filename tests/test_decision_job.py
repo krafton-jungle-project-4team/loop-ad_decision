@@ -9,7 +9,13 @@ from app.analysis.models import AnalysisResult
 from app.contents.types import ContentGenerationActionResult, ContentGenerationSummary
 from app.decision.models import RootCauseCandidate, SegmentAnomaly
 from app.decision.services import ExperimentConfig
-from app.jobs.decision_job import DailyDecisionJobService, _RecommendationExperimentRunner
+from app.jobs.decision_job import (
+    DecisionRunRequest,
+    DailyDecisionJobService,
+    _RecommendationExperimentRunner,
+    _build_run_metadata,
+    _build_segment_aggregate_repository,
+)
 from tests.fakes import InMemoryDecisionRepository
 
 
@@ -95,8 +101,9 @@ class RecordingExperimentSyncService:
 
 
 class FakeCursor:
-    def __init__(self) -> None:
+    def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.executed: list[tuple[str, tuple[object, ...]]] = []
+        self.row = row
 
     def __enter__(self) -> "FakeCursor":
         return self
@@ -107,10 +114,13 @@ class FakeCursor:
     def execute(self, query: str, parameters: tuple[object, ...] = ()) -> None:
         self.executed.append((query, parameters))
 
+    def fetchone(self) -> tuple[object, ...] | None:
+        return self.row
+
 
 class FakeConnection:
-    def __init__(self) -> None:
-        self.cursor_instance = FakeCursor()
+    def __init__(self, row: tuple[object, ...] | None = None) -> None:
+        self.cursor_instance = FakeCursor(row=row)
 
     def cursor(self) -> FakeCursor:
         return self.cursor_instance
@@ -298,3 +308,67 @@ def test_mark_success_stores_content_generation_metadata() -> None:
         "running_experiments": 1,
         "draft_experiments": 0,
     }
+
+
+def test_build_run_metadata_stores_requested_analysis_sample_thresholds() -> None:
+    metadata = _build_run_metadata(
+        DecisionRunRequest(
+            project_key="demo-shop",
+            analysis_date=ANALYSIS_DATE,
+            mode="demo",
+            force=True,
+            run_type="manual_api",
+            trigger_source="api",
+            min_product_view_count=1,
+            min_user_count=1,
+        )
+    )
+
+    assert metadata["analysis_sample_thresholds"] == {
+        "min_product_view_count": 1,
+        "min_user_count": 1,
+    }
+
+
+def test_get_run_context_restores_requested_analysis_sample_thresholds() -> None:
+    connection = FakeConnection(
+        row=(
+            1,
+            ANALYSIS_DATE,
+            "demo",
+            True,
+            {
+                "analysis_sample_thresholds": {
+                    "min_product_view_count": 1,
+                    "min_user_count": 1,
+                }
+            },
+        )
+    )
+    service = DailyDecisionJobService(
+        postgres_connection_factory=lambda: connection,
+        clickhouse_client_factory=lambda: object(),
+    )
+
+    context = service._get_run_context(connection, 77)
+
+    assert context.min_product_view_count == 1
+    assert context.min_user_count == 1
+
+
+def test_build_segment_aggregate_repository_uses_requested_analysis_sample_thresholds() -> None:
+    repository = _build_segment_aggregate_repository(
+        object(),
+        min_product_view_count=1,
+        min_user_count=1,
+    )
+
+    assert repository.min_product_view_count == 1
+    assert repository.min_user_count == 1
+
+
+def test_build_segment_aggregate_repository_keeps_default_analysis_sample_thresholds() -> None:
+    repository = _build_segment_aggregate_repository(object())
+
+    assert repository.min_product_view_count == 100
+    assert repository.min_user_count == 30

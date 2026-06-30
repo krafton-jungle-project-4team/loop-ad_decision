@@ -122,3 +122,19 @@ def test_fetch_segment_aggregates_filters_invalid_samples() -> None:
     window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
 
     assert repository.fetch_segment_aggregates(project_id="demo-shop", window=window) == []
+
+
+def test_fetch_segment_aggregates_uses_configured_demo_thresholds() -> None:
+    client = FakeClickHouseClient([aggregate_row(product_view_count=1, user_count=1)])
+    repository = ClickHouseAnalysisRepository(
+        client,
+        min_product_view_count=1,
+        min_user_count=1,
+    )
+    window = build_analysis_window(date(2021, 1, 4), "Asia/Seoul")
+
+    aggregates = repository.fetch_segment_aggregates(project_id="demo-shop", window=window)
+
+    assert len(aggregates) == 1
+    assert client.parameters[0]["min_product_view_count"] == 1
+    assert client.parameters[0]["min_user_count"] == 1

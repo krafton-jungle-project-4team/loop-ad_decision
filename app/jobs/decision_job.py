@@ -6,7 +6,11 @@ from dataclasses import asdict, dataclass
 from datetime import date, timedelta
 from typing import Any, Protocol
 
-from app.analysis.clickhouse_repository import ClickHouseAnalysisRepository
+from app.analysis.clickhouse_repository import (
+    DEFAULT_MIN_PRODUCT_VIEW_COUNT,
+    DEFAULT_MIN_USER_COUNT,
+    ClickHouseAnalysisRepository,
+)
 from app.analysis.models import AnalysisResult
 from app.analysis.postgres_repository import PostgresAnalysisRepository
 from app.analysis.service import AnalysisService
@@ -85,6 +89,8 @@ class DecisionRunRequest:
     run_type: str
     trigger_source: str
     requested_by: str | None = None
+    min_product_view_count: int | None = None
+    min_user_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -138,13 +144,7 @@ class DailyDecisionJobService:
                         window.window_end,
                         baseline_window.window_start,
                         window.window_start,
-                        json.dumps(
-                            {
-                                "project_key": request.project_key,
-                                "service": "decision-api",
-                            },
-                            sort_keys=True,
-                        ),
+                        json.dumps(_build_run_metadata(request), sort_keys=True),
                     ),
                 )
                 row = cursor.fetchone()
@@ -171,7 +171,11 @@ class DailyDecisionJobService:
 
                 analysis_service = AnalysisService(
                     project_repository=postgres_analysis_repository,
-                    segment_aggregate_repository=ClickHouseAnalysisRepository(clickhouse_client),
+                    segment_aggregate_repository=_build_segment_aggregate_repository(
+                        clickhouse_client,
+                        min_product_view_count=run_context.min_product_view_count,
+                        min_user_count=run_context.min_user_count,
+                    ),
                     segment_metrics_repository=postgres_analysis_repository,
                     anomaly_repository=postgres_analysis_repository,
                     segment_centroid_repository=postgres_analysis_repository,
@@ -238,17 +242,27 @@ class DailyDecisionJobService:
     def _get_run_context(self, connection: Connection, run_id: int) -> "_RunContext":
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT project_id, analysis_date, mode, force FROM decision_runs WHERE id = %s",
+                """
+                SELECT project_id, analysis_date, mode, force, metadata
+                FROM decision_runs
+                WHERE id = %s
+                """.strip(),
                 (run_id,),
             )
             row = cursor.fetchone()
         if row is None:
             raise LookupError(f"decision run not found: {run_id}")
+        metadata = _metadata_dict(row[4])
+        min_product_view_count, min_user_count = _analysis_sample_thresholds_from_metadata(
+            metadata
+        )
         return _RunContext(
             project_id=int(row[0]),
             analysis_date=row[1],
             mode=str(row[2]),
             force=bool(row[3]),
+            min_product_view_count=min_product_view_count,
+            min_user_count=min_user_count,
         )
 
     def _mark_running(self, connection: Connection, run_id: int) -> None:
@@ -313,6 +327,8 @@ class _RunContext:
     analysis_date: date
     mode: str
     force: bool
+    min_product_view_count: int
+    min_user_count: int
 
 
 class _ExperimentResultUpdateRunner:
@@ -415,6 +431,85 @@ def build_daily_decision_job_service(settings: Settings) -> DailyDecisionJobServ
         postgres_connection_factory=lambda: connect_postgres(settings),
         clickhouse_client_factory=lambda: connect_clickhouse(settings),
     )
+
+
+def _build_segment_aggregate_repository(
+    clickhouse_client: object,
+    *,
+    min_product_view_count: int = DEFAULT_MIN_PRODUCT_VIEW_COUNT,
+    min_user_count: int = DEFAULT_MIN_USER_COUNT,
+) -> ClickHouseAnalysisRepository:
+    return ClickHouseAnalysisRepository(
+        clickhouse_client,
+        min_product_view_count=min_product_view_count,
+        min_user_count=min_user_count,
+    )
+
+
+def _build_run_metadata(request: DecisionRunRequest) -> dict[str, Any]:
+    min_product_view_count, min_user_count = _analysis_sample_thresholds(
+        min_product_view_count=request.min_product_view_count,
+        min_user_count=request.min_user_count,
+    )
+    return {
+        "project_key": request.project_key,
+        "service": "decision-api",
+        "analysis_sample_thresholds": {
+            "min_product_view_count": min_product_view_count,
+            "min_user_count": min_user_count,
+        },
+    }
+
+
+def _metadata_dict(value: object) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        parsed = json.loads(value)
+        if isinstance(parsed, dict):
+            return parsed
+    return {}
+
+
+def _analysis_sample_thresholds_from_metadata(metadata: dict[str, Any]) -> tuple[int, int]:
+    thresholds = metadata.get("analysis_sample_thresholds")
+    if not isinstance(thresholds, dict):
+        return DEFAULT_MIN_PRODUCT_VIEW_COUNT, DEFAULT_MIN_USER_COUNT
+    return _analysis_sample_thresholds(
+        min_product_view_count=thresholds.get("min_product_view_count"),
+        min_user_count=thresholds.get("min_user_count"),
+    )
+
+
+def _analysis_sample_thresholds(
+    *,
+    min_product_view_count: object | None,
+    min_user_count: object | None,
+) -> tuple[int, int]:
+    return (
+        _positive_int_or_default(
+            min_product_view_count,
+            DEFAULT_MIN_PRODUCT_VIEW_COUNT,
+            "min_product_view_count",
+        ),
+        _positive_int_or_default(
+            min_user_count,
+            DEFAULT_MIN_USER_COUNT,
+            "min_user_count",
+        ),
+    )
+
+
+def _positive_int_or_default(value: object | None, default: int, name: str) -> int:
+    if value is None:
+        return default
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a positive integer") from exc
+    if resolved <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return resolved
 
 
 CREATE_DECISION_RUN_SQL = """

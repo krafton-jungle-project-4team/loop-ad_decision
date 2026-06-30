@@ -12,6 +12,9 @@ from app.analysis.segments import (
     normalize_dimensions,
 )
 
+DEFAULT_MIN_PRODUCT_VIEW_COUNT = 100
+DEFAULT_MIN_USER_COUNT = 30
+
 
 class ClickHouseQueryResult(Protocol):
     result_rows: list[tuple[Any, ...]]
@@ -72,8 +75,8 @@ class ClickHouseAnalysisRepository:
         self,
         client: ClickHouseClient,
         *,
-        min_product_view_count: int = 100,
-        min_user_count: int = 30,
+        min_product_view_count: int = DEFAULT_MIN_PRODUCT_VIEW_COUNT,
+        min_user_count: int = DEFAULT_MIN_USER_COUNT,
     ) -> None:
         self.client = client
         self.min_product_view_count = min_product_view_count
@@ -98,8 +101,15 @@ class ClickHouseAnalysisRepository:
         return [
             aggregate
             for aggregate in aggregates
-            if aggregate.is_valid_sample and not is_default_segment_key(aggregate.segment_key)
+            if self._is_valid_sample(aggregate)
+            and not is_default_segment_key(aggregate.segment_key)
         ]
+
+    def _is_valid_sample(self, aggregate: SegmentAggregate) -> bool:
+        return (
+            aggregate.product_view_count >= self.min_product_view_count
+            or aggregate.user_count >= self.min_user_count
+        )
 
 def build_window_parameters(
     *,
