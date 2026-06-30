@@ -1,3 +1,21 @@
+[project]
+name = "loop-ad-decision-api"
+version = "0.1.0"
+description = "Loop-Ad AI Decision API service"
+requires-python = ">=3.11"
+dependencies = [
+    "clickhouse-connect>=0.8.0",
+    "fastapi>=0.115.0",
+    "psycopg[binary]>=3.2.0",
+    "uvicorn[standard]>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "httpx>=0.27.0",
+    "pytest>=8.0.0",
+]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
