@@ -146,6 +146,7 @@ def make_target(
     action_id: int = 10,
     status: str = ACTION_STATUS_RECOMMENDED,
     is_default: bool = False,
+    root_cause: dict[str, object] | None = None,
 ) -> RecommendationActionTarget:
     segment = SegmentContext(
         id=1 if not is_default else 99,
@@ -168,7 +169,7 @@ def make_target(
         action_title="혜택 강조 배너",
         action_description="상품 조회 후 장바구니 전환율을 높이기 위한 혜택 노출",
         metrics={"view_to_purchase_rate": 0.03},
-        root_cause={"cause_key": "view_to_cart", "summary": "혜택 노출 부족"},
+        root_cause=root_cause or {"cause_key": "view_to_cart", "summary": "혜택 노출 부족"},
     )
 
 
@@ -209,6 +210,42 @@ def test_mock_generator_creates_control_and_treatment_contents() -> None:
     assert all(draft.generation_model == GENERATION_MODEL_MOCK for draft in repository.drafts.values())
     assert repository.action_statuses[10] == ACTION_STATUS_CONTENT_GENERATED
     assert repository.locked == [("demo-shop", 10)]
+
+
+def test_mock_generator_changes_banner_copy_by_root_cause_with_single_action() -> None:
+    generator = MockContentGenerator()
+
+    view_to_cart = generator.generate(
+        target=make_target(root_cause={"cause_key": "view_to_cart"}),
+        variant_key="treatment_a",
+    )
+    cart_to_checkout = generator.generate(
+        target=make_target(root_cause={"cause_key": "cart_to_checkout"}),
+        variant_key="treatment_a",
+    )
+    checkout_to_purchase = generator.generate(
+        target=make_target(root_cause={"cause_key": "checkout_to_purchase"}),
+        variant_key="treatment_a",
+    )
+    stockout = generator.generate(
+        target=make_target(root_cause={"cause_key": "stockout"}),
+        variant_key="treatment_a",
+    )
+
+    assert {view_to_cart.content_type, cart_to_checkout.content_type} == {"banner"}
+    assert view_to_cart.cta_label == "혜택 보기"
+    assert cart_to_checkout.cta_label == "쿠폰 받기"
+    assert checkout_to_purchase.cta_label == "지금 구매하기"
+    assert stockout.cta_label == "대체 상품 보기"
+    assert len(
+        {
+            view_to_cart.title,
+            cart_to_checkout.title,
+            checkout_to_purchase.title,
+            stockout.title,
+        }
+    ) == 4
+    assert "cart_to_checkout" in cart_to_checkout.image_prompt
 
 
 def test_run_id_is_stored_on_generated_content_drafts() -> None:

@@ -40,7 +40,7 @@ class MockContentGenerator:
     ) -> GeneratedContentDraft:
         content_type = _content_type_for(target)
         segment_name = target.segment.name or target.segment.segment_key
-        root_cause_key = str(target.root_cause.get("cause_key") or "")
+        root_cause_key = _root_cause_key(target)
         category = str(
             target.segment.attributes.get("primary_category")
             or target.segment.attributes.get("category")
@@ -51,18 +51,22 @@ class MockContentGenerator:
             title = f"{segment_name}을 위한 오늘의 추천"
             body = "지금 인기 상품과 혜택을 확인해보세요."
             cta_label = "상품 보러가기"
-        elif "coupon" in target.action_key:
-            title = "구매 전 마지막 혜택을 확인하세요"
-            body = f"{segment_name} 고객을 위해 준비한 쿠폰 혜택을 놓치지 마세요."
-            cta_label = "쿠폰 확인하기"
-        elif target.action_key == "alternative_product_banner" or "stock" in root_cause_key:
+        elif root_cause_key == "cart_to_checkout":
+            title = "장바구니 혜택을 지금 확인하세요"
+            body = f"{segment_name} 고객에게 결제 전 사용할 수 있는 혜택을 안내합니다."
+            cta_label = "쿠폰 받기"
+        elif root_cause_key == "checkout_to_purchase":
+            title = "구매 전 마지막 혜택"
+            body = "결제 직전 망설이는 고객에게 제한 시간 혜택을 보여줍니다."
+            cta_label = "지금 구매하기"
+        elif "stock" in root_cause_key:
             title = f"{category} 대체 추천 상품"
-            body = "품절되기 쉬운 상품 대신 바로 구매 가능한 추천 상품을 만나보세요."
+            body = "관심 상품이 부족할 때 바로 구매 가능한 대체 상품을 제안합니다."
             cta_label = "대체 상품 보기"
         else:
             title = f"{category} 혜택을 더 잘 보이게"
-            body = "장바구니에 담기 전, 핵심 혜택과 추천 상품을 확인해보세요."
-            cta_label = "혜택 상품 보기"
+            body = "무료배송, 리뷰, 할인 혜택을 한눈에 보여 장바구니 담기를 돕습니다."
+            cta_label = "혜택 보기"
 
         landing_url = str(
             target.metadata.get("landing_url")
@@ -70,7 +74,8 @@ class MockContentGenerator:
             or f"/segments/{target.segment.segment_key}"
         )
         image_prompt = (
-            f"clean ecommerce banner for {category}, segment {target.segment.segment_key}, "
+            f"clean ecommerce banner for {category}, root cause {root_cause_key}, "
+            f"segment {target.segment.segment_key}, "
             f"variant {variant_key}, no text, no logo, product-focused"
         )
 
@@ -174,6 +179,14 @@ def _load_response_json(response: Any) -> dict[str, Any]:
     if not isinstance(parsed, dict):
         raise ValueError("OpenAI response JSON must be an object")
     return parsed
+
+
+def _root_cause_key(target: RecommendationActionTarget) -> str:
+    cause_key = str(target.root_cause.get("cause_key") or "")
+    cause_type = str(target.root_cause.get("cause_type") or "")
+    if "stock" in cause_key or "stock" in cause_type:
+        return "stockout"
+    return cause_key
 
 
 def _content_type_for(target: RecommendationActionTarget) -> str:

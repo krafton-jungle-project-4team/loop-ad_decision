@@ -111,7 +111,7 @@ def test_recommendation_service_does_not_write_segments() -> None:
     assert repo.actions[0].segment_id == 10
 
 
-def test_stockout_evidence_selects_alternative_product_only() -> None:
+def test_stockout_evidence_selects_single_mvp_banner() -> None:
     repo = InMemoryDecisionRepository()
     repo.add_all_action_catalog()
     repo.anomalies.append(anomaly(evidence={"stockout": True}))
@@ -128,7 +128,23 @@ def test_stockout_evidence_selects_alternative_product_only() -> None:
         run_id=1,
     )
 
-    assert [action.action_key for action in repo.actions] == ["alternative_product_banner"]
+    assert [action.action_key for action in repo.actions] == ["highlight_benefit_banner"]
+
+
+def test_all_funnel_causes_select_single_mvp_banner() -> None:
+    for cause_key in ("view_to_cart", "cart_to_checkout", "checkout_to_purchase"):
+        repo = InMemoryDecisionRepository()
+        repo.add_action_catalog("highlight_benefit_banner")
+        repo.anomalies.append(anomaly())
+        repo.root_causes.append(root_cause(cause_key=cause_key))
+
+        RecommendationService(repo).create_for_anomalies(
+            project_id=1,
+            analysis_date=ANALYSIS_DATE,
+            run_id=1,
+        )
+
+        assert [action.action_key for action in repo.actions] == ["highlight_benefit_banner"]
 
 
 def test_missing_action_catalog_raises_configuration_error() -> None:

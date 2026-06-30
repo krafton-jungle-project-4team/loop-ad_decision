@@ -27,12 +27,13 @@ from app.decision.models import (
 )
 
 
+MVP_BANNER_ACTION_KEY = "highlight_benefit_banner"
 ACTION_BY_CAUSE_KEY = {
-    "view_to_cart": "highlight_benefit_banner",
-    "cart_to_checkout": "cart_coupon_banner",
-    "checkout_to_purchase": "checkout_coupon_banner",
+    "view_to_cart": MVP_BANNER_ACTION_KEY,
+    "cart_to_checkout": MVP_BANNER_ACTION_KEY,
+    "checkout_to_purchase": MVP_BANNER_ACTION_KEY,
 }
-STOCKOUT_ACTION_KEY = "alternative_product_banner"
+STOCKOUT_ACTION_KEY = MVP_BANNER_ACTION_KEY
 OBJECTIVE_METRIC = "click_to_purchase_rate"
 PLACEMENT_KEY = "main_banner"
 
