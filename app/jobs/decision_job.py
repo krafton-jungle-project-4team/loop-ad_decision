@@ -12,6 +12,17 @@ from app.analysis.postgres_repository import PostgresAnalysisRepository
 from app.analysis.service import AnalysisService
 from app.analysis.time_window import build_analysis_window
 from app.config import Settings
+from app.decision.repositories import (
+    ClickHouseExperimentResultRepository,
+    ClickHouseUserSegmentCandidateRepository,
+    PostgresDecisionRepository,
+)
+from app.decision.services import (
+    ExperimentConfig,
+    ExperimentResultUpdateService,
+    RecommendationService,
+    UserSegmentMatchingService,
+)
 from app.dependencies import connect_clickhouse, connect_postgres
 from app.jobs.daily_analysis import run_daily_analysis_flow
 
@@ -127,23 +138,43 @@ class DailyDecisionJobService:
             with connection:
                 run_context = self._get_run_context(connection, run_id)
                 self._mark_running(connection, run_id)
-                postgres_repository = PostgresAnalysisRepository(connection)
-                clickhouse_repository = ClickHouseAnalysisRepository(
-                    self.clickhouse_client_factory()
-                )
+
+                postgres_analysis_repository = PostgresAnalysisRepository(connection)
+                decision_repository = PostgresDecisionRepository(connection)
+                clickhouse_client = self.clickhouse_client_factory()
+
                 analysis_service = AnalysisService(
-                    project_repository=postgres_repository,
-                    segment_aggregate_repository=clickhouse_repository,
-                    segment_metrics_repository=postgres_repository,
-                    user_primary_segment_repository=clickhouse_repository,
-                    user_segment_membership_repository=postgres_repository,
-                    anomaly_repository=postgres_repository,
+                    project_repository=postgres_analysis_repository,
+                    segment_aggregate_repository=ClickHouseAnalysisRepository(clickhouse_client),
+                    segment_metrics_repository=postgres_analysis_repository,
+                    anomaly_repository=postgres_analysis_repository,
                 )
+                experiment_config = ExperimentConfig.for_mode(run_context.mode)
                 result = run_daily_analysis_flow(
                     project_id=run_context.project_id,
                     analysis_date=run_context.analysis_date,
                     run_id=run_id,
                     analysis_service=analysis_service,
+                    user_segment_matching_runner=UserSegmentMatchingService(
+                        repository=decision_repository,
+                        candidate_repository=ClickHouseUserSegmentCandidateRepository(
+                            clickhouse_client
+                        ),
+                    ),
+                    experiment_result_update_runner=_ExperimentResultUpdateRunner(
+                        repository=decision_repository,
+                        result_repository=ClickHouseExperimentResultRepository(
+                            clickhouse_client
+                        ),
+                        config=experiment_config,
+                    ),
+                    downstream_runner=_RecommendationExperimentRunner(
+                        repository=decision_repository,
+                        project_id=run_context.project_id,
+                        analysis_date=run_context.analysis_date,
+                        run_id=run_id,
+                        config=experiment_config,
+                    ),
                 )
                 self._mark_success(connection, run_id, result)
                 return result
@@ -165,13 +196,13 @@ class DailyDecisionJobService:
     def _get_run_context(self, connection: Connection, run_id: int) -> "_RunContext":
         with connection.cursor() as cursor:
             cursor.execute(
-                "SELECT project_id, analysis_date FROM decision_runs WHERE id = %s",
+                "SELECT project_id, analysis_date, mode FROM decision_runs WHERE id = %s",
                 (run_id,),
             )
             row = cursor.fetchone()
         if row is None:
             raise LookupError(f"decision run not found: {run_id}")
-        return _RunContext(project_id=int(row[0]), analysis_date=row[1])
+        return _RunContext(project_id=int(row[0]), analysis_date=row[1], mode=str(row[2]))
 
     def _mark_running(self, connection: Connection, run_id: int) -> None:
         with connection.cursor() as cursor:
@@ -226,6 +257,53 @@ class DailyDecisionJobService:
 class _RunContext:
     project_id: int
     analysis_date: date
+    mode: str
+
+
+class _ExperimentResultUpdateRunner:
+    def __init__(
+        self,
+        *,
+        repository: PostgresDecisionRepository,
+        result_repository: ClickHouseExperimentResultRepository,
+        config: ExperimentConfig,
+    ) -> None:
+        self.service = ExperimentResultUpdateService(
+            repository=repository,
+            result_repository=result_repository,
+        )
+        self.config = config
+
+    def run(self, *, project_id: int, analysis_date: date) -> object:
+        return self.service.update_running(
+            project_id=project_id,
+            analysis_date=analysis_date,
+            config=self.config,
+        )
+
+
+class _RecommendationExperimentRunner:
+    def __init__(
+        self,
+        *,
+        repository: PostgresDecisionRepository,
+        project_id: int,
+        analysis_date: date,
+        run_id: int,
+        config: ExperimentConfig,
+    ) -> None:
+        self.repository = repository
+        self.project_id = project_id
+        self.analysis_date = analysis_date
+        self.run_id = run_id
+        self.config = config
+
+    def run(self, result: AnalysisResult) -> None:
+        RecommendationService(self.repository).create_for_anomalies(
+            project_id=self.project_id,
+            analysis_date=self.analysis_date,
+            run_id=self.run_id,
+        )
 
 
 def build_daily_decision_job_service(settings: Settings) -> DailyDecisionJobService:
