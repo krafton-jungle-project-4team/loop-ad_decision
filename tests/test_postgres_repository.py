@@ -151,6 +151,100 @@ def test_upsert_segment_daily_metrics_uses_schema_unique_key() -> None:
     assert parameters[-1] is None
 
 
+def test_refresh_segment_centroids_reads_active_non_default_segments_then_cleans_stale_rows() -> None:
+    connection = FakeConnection(
+        rows=[
+            ("segment_match_v2",),
+            (
+                10,
+                {
+                    "age_group": "30s",
+                    "gender": "male",
+                    "device_type": "mobile",
+                    "acquisition_channel": "kakao",
+                    "primary_category": "fresh",
+                },
+            ),
+            (
+                20,
+                {
+                    "age_group": "40s",
+                    "gender": "female",
+                    "device_type": "pc",
+                    "acquisition_channel": "naver",
+                    "primary_category": "beauty",
+                },
+            ),
+        ]
+    )
+    repository = PostgresAnalysisRepository(connection)
+
+    refreshed_count = repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    config_query, config_parameters = connection.cursor_instance.executed[0]
+    source_query, source_parameters = connection.cursor_instance.executed[1]
+    first_upsert_query, first_upsert_parameters = connection.cursor_instance.executed[2]
+    cleanup_query, cleanup_parameters = connection.cursor_instance.executed[4]
+    assert refreshed_count == 2
+    assert "FROM segment_matching_configs" in config_query
+    assert "analysis_date = %s" in config_query
+    assert config_parameters == (1, date(2021, 1, 4))
+    assert "FROM segments" in source_query
+    assert "is_default = false" in source_query
+    assert "status = 'active'" in source_query
+    assert "INSERT INTO segments" not in source_query
+    assert source_parameters == (1,)
+    assert "INSERT INTO segment_centroids" in first_upsert_query
+    assert first_upsert_parameters[:4] == (
+        1,
+        10,
+        date(2021, 1, 4),
+        "segment_match_v2",
+    )
+    assert "DELETE FROM segment_centroids" in cleanup_query
+    assert "embedding_version = %s" in cleanup_query
+    assert "NOT (segment_id = ANY(%s))" in cleanup_query
+    assert cleanup_parameters == (
+        1,
+        date(2021, 1, 4),
+        "segment_match_v2",
+        [10, 20],
+    )
+
+
+def test_refresh_segment_centroids_does_not_delete_other_embedding_versions() -> None:
+    connection = FakeConnection(rows=[("segment_match_v2",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    cleanup_query, cleanup_parameters = connection.cursor_instance.executed[-1]
+    assert "DELETE FROM segment_centroids" in cleanup_query
+    assert "embedding_version = %s" in cleanup_query
+    assert cleanup_parameters == (1, date(2021, 1, 4), "segment_match_v2")
+
+
+def test_refresh_segment_centroids_removes_today_version_rows_when_segment_becomes_inactive() -> None:
+    connection = FakeConnection(rows=[("segment_match_v1",)])
+    repository = PostgresAnalysisRepository(connection)
+
+    refreshed_count = repository.refresh_segment_centroids(
+        project_id=1,
+        analysis_date=date(2021, 1, 4),
+    )
+
+    cleanup_query, cleanup_parameters = connection.cursor_instance.executed[-1]
+    assert refreshed_count == 0
+    assert "AND NOT (segment_id = ANY(%s))" not in cleanup_query
+    assert cleanup_parameters == (1, date(2021, 1, 4), "segment_match_v1")
+
+
 def test_fetch_segment_metric_baselines_uses_previous_seven_days_only() -> None:
     connection = FakeConnection(rows=[(10, Decimal("0.06"))])
     repository = PostgresAnalysisRepository(connection)

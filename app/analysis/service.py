@@ -87,6 +87,16 @@ class SegmentAnomalyRepository(Protocol):
         ...
 
 
+class SegmentCentroidRepository(Protocol):
+    def refresh_segment_centroids(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> int:
+        ...
+
+
 class AnalysisService:
     def __init__(
         self,
@@ -94,11 +104,13 @@ class AnalysisService:
         segment_aggregate_repository: SegmentAggregateRepository | None = None,
         segment_metrics_repository: SegmentMetricsRepository | None = None,
         anomaly_repository: SegmentAnomalyRepository | None = None,
+        segment_centroid_repository: SegmentCentroidRepository | None = None,
     ) -> None:
         self.project_repository = project_repository
         self.segment_aggregate_repository = segment_aggregate_repository
         self.segment_metrics_repository = segment_metrics_repository
         self.anomaly_repository = anomaly_repository
+        self.segment_centroid_repository = segment_centroid_repository
 
     def run(
         self,
@@ -131,6 +143,11 @@ class AnalysisService:
                 aggregates=aggregates,
                 stored_segments=stored_segments,
                 run_id=run_id,
+            )
+        if self.segment_centroid_repository is not None:
+            self.segment_centroid_repository.refresh_segment_centroids(
+                project_id=project_id,
+                analysis_date=analysis_date,
             )
         stored_anomalies: list[StoredAnomaly] = []
         root_cause_count = 0
