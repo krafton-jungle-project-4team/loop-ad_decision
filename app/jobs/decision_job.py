@@ -20,7 +20,6 @@ from app.decision.repositories import (
 from app.decision.services import (
     ExperimentConfig,
     ExperimentResultUpdateService,
-    ExperimentService,
     RecommendationService,
     UserSegmentMatchingService,
 )
@@ -301,11 +300,6 @@ class _RecommendationExperimentRunner:
 
     def run(self, result: AnalysisResult) -> None:
         RecommendationService(self.repository).create_for_anomalies(
-            project_id=self.project_id,
-            analysis_date=self.analysis_date,
-            run_id=self.run_id,
-        )
-        ExperimentService(self.repository, config=self.config).sync_for_recommendation_actions(
             project_id=self.project_id,
             analysis_date=self.analysis_date,
             run_id=self.run_id,

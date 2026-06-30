@@ -29,7 +29,11 @@ class SegmentWriteGuardRepository(InMemoryDecisionRepository):
         raise AssertionError("ExperimentService must not delete segments")
 
 
-def seed_action(repo: InMemoryDecisionRepository, *, status: str = "recommended") -> RecommendationAction:
+def seed_action(
+    repo: InMemoryDecisionRepository,
+    *,
+    status: str = "content_generated",
+) -> RecommendationAction:
     result = RecommendationResult(
         id=1,
         project_id=1,
@@ -61,6 +65,25 @@ def seed_action(repo: InMemoryDecisionRepository, *, status: str = "recommended"
     repo.actions.append(action)
     repo.next_ids["action"] = 2
     return action
+
+
+def test_recommended_action_is_not_synced_before_content_generation() -> None:
+    repo = InMemoryDecisionRepository()
+    action = seed_action(repo, status="recommended")
+    add_action_content(repo, action, content_id=101, variant_key="control")
+    add_action_content(repo, action, content_id=201, variant_key="treatment_a")
+
+    synced = ExperimentService(repo).sync_for_recommendation_actions(
+        project_id=1,
+        analysis_date=ANALYSIS_DATE,
+        run_id=1,
+    )
+
+    assert synced == []
+    assert repo.experiments == []
+    assert repo.variants == []
+    assert repo.mappings == []
+    assert action.status == "recommended"
 
 
 def add_default_content(repo: InMemoryDecisionRepository, *, content_id: int = 100) -> None:

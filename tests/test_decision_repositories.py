@@ -101,9 +101,10 @@ def variant(*, variant_id: int, variant_key: str) -> ExperimentVariant:
 def test_clickhouse_experiment_results_use_loopad_events_contract() -> None:
     client = FakeClickHouseClient(
         rows=[
-            ("42", "control", 410, 28, 1),
-            ("42", "unknown", 999, 999, 999),
-            ("999", "treatment_a", 999, 999, 999),
+            ("42", "11", "111", 410, 28, 1),
+            ("42", "12", "999", 999, 999, 999),
+            ("42", "unknown", "111", 999, 999, 999),
+            ("999", "11", "111", 999, 999, 999),
         ]
     )
     repository = ClickHouseExperimentResultRepository(client)
@@ -122,14 +123,15 @@ def test_clickhouse_experiment_results_use_loopad_events_contract() -> None:
     compact_sql = " ".join(sql.split())
     assert "experiment_variant_id" not in sql
     assert "generated_content_id" not in sql
+    assert "creative_id" in sql
     assert "project_id = {project_id:String}" in sql
     assert "experiment_id = {experiment_id:String}" in sql
     assert "variant_id IN {variant_ids:Array(String)}" in sql
     assert "event_name IN ('ad_impression', 'ad_click', 'purchase')" in compact_sql
-    assert "GROUP BY experiment_id, variant_id" in compact_sql
+    assert "GROUP BY experiment_id, variant_id, creative_id" in compact_sql
     assert parameters["project_id"] == "demo-shop"
     assert parameters["experiment_id"] == "42"
-    assert parameters["variant_ids"] == ("control", "treatment_a")
+    assert parameters["variant_ids"] == ("11", "12")
     assert parameters["window_start_utc"] == "2021-01-03T15:00:00+00:00"
     assert parameters["window_end_utc"] == "2021-01-04T15:00:00+00:00"
     assert results[control.id].ad_impression_count == 410
@@ -138,6 +140,28 @@ def test_clickhouse_experiment_results_use_loopad_events_contract() -> None:
     assert results[treatment.id].ad_impression_count == 0
     assert results[treatment.id].ad_click_count == 0
     assert results[treatment.id].attributed_purchase_count == 0
+
+
+def test_clickhouse_experiment_results_skip_variants_without_generated_content() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repository = ClickHouseExperimentResultRepository(client)
+    control = variant(variant_id=11, variant_key="control")
+    draft = variant(variant_id=12, variant_key="treatment_a")
+    draft.generated_content_id = None
+
+    results = repository.fetch_variant_results(
+        project_id="demo-shop",
+        experiment=experiment(),
+        variants=[control, draft],
+        window_start=datetime(2021, 1, 4, tzinfo=ZoneInfo("Asia/Seoul")),
+        window_end=datetime(2021, 1, 5, tzinfo=ZoneInfo("Asia/Seoul")),
+    )
+
+    _, parameters = client.queries[0]
+    assert parameters["variant_ids"] == ("11",)
+    assert results[draft.id].ad_impression_count == 0
+    assert results[draft.id].ad_click_count == 0
+    assert results[draft.id].attributed_purchase_count == 0
 
 
 def test_postgres_decision_repository_returns_project_key_for_clickhouse_lookup() -> None:

@@ -699,6 +699,8 @@ ORDER BY m.project_id, m.external_user_id, m.analysis_date DESC, m.created_at DE
 CREATE OR REPLACE VIEW active_ad_serving_rules AS
 SELECT
     m.project_id,
+    p.project_key,
+    m.id AS mapping_id,
     m.segment_id,
     s.segment_key,
     s.name AS segment_name,
@@ -726,6 +728,8 @@ SELECT
     m.valid_from,
     m.valid_until
 FROM segment_ad_mappings m
+JOIN projects p
+    ON p.id = m.project_id
 JOIN segments s
     ON s.id = m.segment_id
 LEFT JOIN experiment_variants ev

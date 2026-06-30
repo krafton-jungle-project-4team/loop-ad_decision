@@ -229,7 +229,6 @@ class PostgresDecisionRepository:
                 WHERE ra.project_id = %s
                   AND rr.analysis_date = %s
                   AND ra.status IN (
-                    'recommended',
                     'content_generated',
                     'experiment_created',
                     'running'
@@ -893,12 +892,29 @@ class ClickHouseExperimentResultRepository:
     ) -> dict[int, VariantPerformance]:
         if not variants:
             return {}
-        variants_by_key = {variant.variant_key: variant for variant in variants}
+        by_variant = {
+            variant.id: VariantPerformance(
+                experiment_variant_id=variant.id,
+                ad_impression_count=0,
+                ad_click_count=0,
+                attributed_purchase_count=0,
+            )
+            for variant in variants
+        }
+        variants_by_event_variant_id = {
+            str(variant.id): variant
+            for variant in variants
+            if variant.generated_content_id is not None
+        }
+        if not variants_by_event_variant_id:
+            return by_variant
+
         result = self.client.query(
             f"""
             SELECT
                 experiment_id,
                 variant_id,
+                creative_id,
                 countIf(event_name = 'ad_impression') AS ad_impression_count,
                 countIf(event_name = 'ad_click') AS ad_click_count,
                 countIf(event_name = 'purchase') AS purchase_count
@@ -909,38 +925,31 @@ class ClickHouseExperimentResultRepository:
               AND event_name IN ('ad_impression', 'ad_click', 'purchase')
               AND event_time >= parseDateTime64BestEffort({{window_start_utc:String}}, 3, 'UTC')
               AND event_time < parseDateTime64BestEffort({{window_end_utc:String}}, 3, 'UTC')
-            GROUP BY experiment_id, variant_id
+            GROUP BY experiment_id, variant_id, creative_id
             """,
             {
                 "project_id": str(project_id),
                 "experiment_id": str(experiment.id),
-                "variant_ids": tuple(variants_by_key),
+                "variant_ids": tuple(variants_by_event_variant_id),
                 "window_start_utc": window_start.astimezone(timezone.utc).isoformat(),
                 "window_end_utc": window_end.astimezone(timezone.utc).isoformat(),
             },
         )
         rows = getattr(result, "result_rows", result)
-        by_variant = {
-            variant.id: VariantPerformance(
-                experiment_variant_id=variant.id,
-                ad_impression_count=0,
-                ad_click_count=0,
-                attributed_purchase_count=0,
-            )
-            for variant in variants
-        }
         for row in rows:
             if str(row[0]) != str(experiment.id):
                 continue
-            variant = variants_by_key.get(str(row[1]))
+            variant = variants_by_event_variant_id.get(str(row[1]))
             if variant is None:
+                continue
+            if str(row[2]) != str(variant.generated_content_id):
                 continue
             current = by_variant[variant.id]
             by_variant[variant.id] = VariantPerformance(
                 experiment_variant_id=variant.id,
-                ad_impression_count=current.ad_impression_count + int(row[2] or 0),
-                ad_click_count=current.ad_click_count + int(row[3] or 0),
-                attributed_purchase_count=current.attributed_purchase_count + int(row[4] or 0),
+                ad_impression_count=current.ad_impression_count + int(row[3] or 0),
+                ad_click_count=current.ad_click_count + int(row[4] or 0),
+                attributed_purchase_count=current.attributed_purchase_count + int(row[5] or 0),
             )
         return by_variant
 

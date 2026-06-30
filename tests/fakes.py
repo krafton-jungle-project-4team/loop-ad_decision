@@ -192,7 +192,7 @@ class InMemoryDecisionRepository:
             action
             for action in self.actions
             if action.project_id == project_id
-            and action.status in {"recommended", "content_generated", "experiment_created", "running"}
+            and action.status in {"content_generated", "experiment_created", "running"}
             and result_by_id[action.recommendation_result_id].analysis_date == analysis_date
         ]
 
