@@ -12,6 +12,20 @@ from tests.fakes import InMemoryDecisionRepository
 ANALYSIS_DATE = date(2021, 1, 4)
 
 
+class SegmentWriteGuardRepository(InMemoryDecisionRepository):
+    def insert_segment(self, *args, **kwargs):
+        raise AssertionError("RecommendationService must not insert segments")
+
+    def upsert_segments(self, *args, **kwargs):
+        raise AssertionError("RecommendationService must not upsert segments")
+
+    def update_segment(self, *args, **kwargs):
+        raise AssertionError("RecommendationService must not update segments")
+
+    def delete_segment(self, *args, **kwargs):
+        raise AssertionError("RecommendationService must not delete segments")
+
+
 def anomaly(*, anomaly_id: int = 1, segment_id: int = 10, evidence: dict | None = None) -> SegmentAnomaly:
     return SegmentAnomaly(
         id=anomaly_id,
@@ -80,6 +94,21 @@ def test_funnel_action_is_primary_and_idempotent() -> None:
     assert len(repo.actions) == 1
     assert repo.actions[0].action_key == "highlight_benefit_banner"
     assert repo.actions[0].status == "recommended"
+
+
+def test_recommendation_service_does_not_write_segments() -> None:
+    repo = SegmentWriteGuardRepository()
+    repo.add_all_action_catalog()
+    repo.anomalies.append(anomaly())
+    repo.root_causes.append(root_cause(cause_key="view_to_cart"))
+
+    RecommendationService(repo).create_for_anomalies(
+        project_id=1,
+        analysis_date=ANALYSIS_DATE,
+        run_id=1,
+    )
+
+    assert repo.actions[0].segment_id == 10
 
 
 def test_stockout_evidence_selects_alternative_product_only() -> None:

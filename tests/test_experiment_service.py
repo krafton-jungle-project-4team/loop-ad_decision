@@ -15,6 +15,20 @@ from tests.fakes import InMemoryDecisionRepository
 ANALYSIS_DATE = date(2021, 1, 4)
 
 
+class SegmentWriteGuardRepository(InMemoryDecisionRepository):
+    def insert_segment(self, *args, **kwargs):
+        raise AssertionError("ExperimentService must not insert segments")
+
+    def upsert_segments(self, *args, **kwargs):
+        raise AssertionError("ExperimentService must not upsert segments")
+
+    def update_segment(self, *args, **kwargs):
+        raise AssertionError("ExperimentService must not update segments")
+
+    def delete_segment(self, *args, **kwargs):
+        raise AssertionError("ExperimentService must not delete segments")
+
+
 def seed_action(repo: InMemoryDecisionRepository, *, status: str = "recommended") -> RecommendationAction:
     result = RecommendationResult(
         id=1,
@@ -174,3 +188,27 @@ def test_content_ready_creates_running_experiment_variants_mappings_and_is_idemp
     assert len(repo.mappings) == 2
     assert all(mapping.is_active for mapping in repo.mappings)
     assert {mapping.traffic_weight for mapping in repo.mappings} == {Decimal("0.5")}
+
+
+def test_experiment_service_does_not_write_segments() -> None:
+    repo = SegmentWriteGuardRepository()
+    action = seed_action(repo)
+    add_default_content(repo, content_id=100)
+    repo.contents.append(
+        GeneratedContent(
+            id=201,
+            project_id=1,
+            segment_id=10,
+            recommendation_action_id=action.id,
+            variant_key="treatment_a",
+            generation_status="generated",
+        )
+    )
+
+    ExperimentService(repo).sync_for_recommendation_actions(
+        project_id=1,
+        analysis_date=ANALYSIS_DATE,
+        run_id=1,
+    )
+
+    assert repo.experiments[0].segment_id == 10
