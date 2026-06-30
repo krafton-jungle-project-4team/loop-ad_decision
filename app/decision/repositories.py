@@ -7,16 +7,21 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from app.analysis.models import AnalysisWindow
+from app.analysis.segments import normalize_dimensions
+from app.decision.embedding import DEFAULT_EMBEDDING_VERSION, to_pgvector_literal
 from app.decision.models import (
     ActionCatalogItem,
+    DEFAULT_SIMILARITY_THRESHOLD,
     ExistingSegment,
     Experiment,
     ExperimentVariant,
     GeneratedContent,
+    NearestSegmentCentroid,
     RecommendationAction,
     RecommendationResult,
     RootCauseCandidate,
     SegmentAnomaly,
+    SegmentMatchingConfig,
     UserSegmentCandidate,
     VariantPerformance,
 )
@@ -503,6 +508,97 @@ class PostgresDecisionRepository:
         if not project_key:
             raise ValueError(f"project_key is required for project {project_id}")
         return project_key
+
+    def get_segment_matching_config(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> SegmentMatchingConfig:
+        row = self._fetchone(
+            """
+            SELECT embedding_version, similarity_threshold
+            FROM segment_matching_configs
+            WHERE project_id = %s
+              AND analysis_date = %s
+            LIMIT 1
+            """,
+            (project_id, analysis_date),
+        )
+        if row is None:
+            return SegmentMatchingConfig(
+                embedding_version=DEFAULT_EMBEDDING_VERSION,
+                similarity_threshold=DEFAULT_SIMILARITY_THRESHOLD,
+            )
+        embedding_version = (
+            str(row["embedding_version"]).strip()
+            if row.get("embedding_version") is not None
+            else ""
+        )
+        return SegmentMatchingConfig(
+            embedding_version=embedding_version or DEFAULT_EMBEDDING_VERSION,
+            similarity_threshold=self._decimal(
+                row.get("similarity_threshold"),
+                str(DEFAULT_SIMILARITY_THRESHOLD),
+            ),
+        )
+
+    def get_default_segment(self, *, project_id: int) -> ExistingSegment | None:
+        row = self._fetchone(
+            """
+            SELECT id, segment_key
+            FROM segments
+            WHERE project_id = %s
+              AND is_default = true
+              AND status = 'active'
+            ORDER BY id
+            LIMIT 1
+            """,
+            (project_id,),
+        )
+        if row is None:
+            return None
+        return ExistingSegment(id=int(row["id"]), segment_key=str(row["segment_key"]))
+
+    def find_nearest_segment_centroid(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        embedding_version: str,
+        user_vector: list[float],
+    ) -> NearestSegmentCentroid | None:
+        row = self._fetchone(
+            """
+            SELECT
+                sc.segment_id,
+                s.segment_key,
+                (sc.centroid <=> %s::vector) AS cosine_distance
+            FROM segment_centroids sc
+            JOIN segments s
+              ON s.id = sc.segment_id
+            WHERE sc.project_id = %s
+              AND sc.analysis_date = %s
+              AND sc.embedding_version = %s
+              AND s.is_default = false
+              AND s.status = 'active'
+            ORDER BY cosine_distance ASC
+            LIMIT 1
+            """,
+            (
+                to_pgvector_literal(user_vector),
+                project_id,
+                analysis_date,
+                embedding_version,
+            ),
+        )
+        if row is None:
+            return None
+        return NearestSegmentCentroid(
+            segment_id=int(row["segment_id"]),
+            segment_key=str(row["segment_key"]),
+            cosine_distance=self._decimal(row["cosine_distance"]),
+        )
 
     def list_existing_segments(self, *, project_id: int) -> dict[str, ExistingSegment]:
         rows = self._fetchall(
@@ -1010,13 +1106,16 @@ class ClickHouseUserSegmentCandidateRepository:
 
 
 def build_user_segment_candidate(row: tuple[Any, ...]) -> UserSegmentCandidate:
-    return UserSegmentCandidate(
-        external_user_id=str(row[0]),
-        dimensions={
+    dimensions = normalize_dimensions(
+        {
             "age_group": row[1],
             "gender": row[2],
             "device_type": row[3],
             "acquisition_channel": row[4],
             "primary_category": row[5],
-        },
+        }
+    )
+    return UserSegmentCandidate(
+        external_user_id=str(row[0]),
+        dimensions=dimensions,
     )

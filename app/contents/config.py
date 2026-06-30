@@ -14,8 +14,10 @@ from app.contents.assets import (
     S3ClientLike,
 )
 from app.contents.generators import ContentGenerator, MockContentGenerator, OpenAIContentGenerator
+from app.contents.visuals import BannerVisualProvider, GeminiBannerVisualProvider
 
 AWS_SEOUL_REGION = "ap-northeast-2"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,8 @@ class ContentGenerationConfig:
     app_env: str | None = None
     openai_api_key: str | None = None
     openai_content_model: str | None = None
+    gemini_api_key: str | None = None
+    gemini_image_model: str = DEFAULT_GEMINI_IMAGE_MODEL
     content_asset_storage: str | None = None
     content_asset_local_dir: str | None = None
     content_asset_prefix: str = DEFAULT_ASSET_PREFIX
@@ -64,6 +68,7 @@ class ContentGenerationConfig:
             app_env=app_env,
             openai_api_key=openai_api_key,
             openai_content_model=_clean(os.getenv("LOOPAD_OPENAI_CONTENT_MODEL")),
+            gemini_api_key=_clean(os.getenv("LOOPAD_GEMINI_API_KEY")),
             content_asset_storage="s3",
             content_asset_prefix=asset_prefix,
             content_asset_public_base_url=_build_s3_public_base_url(data_storage_bucket),
@@ -82,10 +87,23 @@ def build_content_generator(config: ContentGenerationConfig | None = None) -> Co
     return MockContentGenerator()
 
 
+def build_banner_visual_provider(
+    config: ContentGenerationConfig | None = None,
+) -> BannerVisualProvider | None:
+    config = config or ContentGenerationConfig.from_env()
+    if config.gemini_api_key is None:
+        return None
+    return GeminiBannerVisualProvider(
+        api_key=config.gemini_api_key,
+        model=config.gemini_image_model,
+    )
+
+
 def build_content_asset_service(
     config: ContentGenerationConfig | None = None,
     *,
     s3_client: S3ClientLike | None = None,
+    visual_provider: BannerVisualProvider | None = None,
 ) -> ContentAssetService:
     config = config or ContentGenerationConfig.from_env()
     storage_name = _resolve_content_asset_storage(config)
@@ -113,8 +131,14 @@ def build_content_asset_service(
     else:
         raise ValueError("content_asset_storage must be memory, local, or s3")
 
+    resolved_visual_provider = (
+        visual_provider
+        if visual_provider is not None
+        else build_banner_visual_provider(config)
+    )
     return ContentAssetService(
         storage=storage,
+        visual_provider=resolved_visual_provider,
         asset_prefix=config.content_asset_prefix,
     )
 

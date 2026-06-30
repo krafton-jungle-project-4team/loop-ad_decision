@@ -7,6 +7,7 @@ from typing import Any
 
 
 JsonObject = dict[str, Any]
+DEFAULT_SIMILARITY_THRESHOLD = Decimal("0.7000")
 
 
 @dataclass(slots=True)
@@ -20,6 +21,19 @@ class Project:
 class ExistingSegment:
     id: int
     segment_key: str
+
+
+@dataclass(frozen=True, slots=True)
+class SegmentMatchingConfig:
+    embedding_version: str
+    similarity_threshold: Decimal
+
+
+@dataclass(frozen=True, slots=True)
+class NearestSegmentCentroid:
+    segment_id: int
+    segment_key: str
+    cosine_distance: Decimal
 
 
 @dataclass(frozen=True, slots=True)

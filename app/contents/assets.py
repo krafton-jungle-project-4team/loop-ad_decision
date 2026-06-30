@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import base64
 import html
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
 from app.contents.types import GeneratedContentDraft
+from app.contents.visuals import BannerVisual, BannerVisualProvider
 
 
 DEFAULT_ASSET_PREFIX = "generated-contents"
@@ -133,7 +135,10 @@ class S3AssetStorage:
 
 
 class SvgBannerRenderer:
-    def render(self, draft: GeneratedContentDraft) -> bytes:
+    def render(self, draft: GeneratedContentDraft, visual: BannerVisual | None = None) -> bytes:
+        if visual is not None:
+            return self._render_with_visual(draft, visual)
+
         title = html.escape(draft.title)
         body = html.escape(draft.body)
         cta = html.escape(draft.cta_label)
@@ -151,6 +156,26 @@ class SvgBannerRenderer:
 """
         return svg.encode("utf-8")
 
+    def _render_with_visual(self, draft: GeneratedContentDraft, visual: BannerVisual) -> bytes:
+        title = html.escape(draft.title)
+        body = html.escape(draft.body)
+        cta = html.escape(draft.cta_label)
+        variant = html.escape(draft.variant_key)
+        content_type = html.escape(draft.content_type)
+        visual_href = html.escape(_visual_data_uri(visual), quote=True)
+        svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="628" viewBox="0 0 1200 628" role="img">
+  <image href="{visual_href}" x="0" y="0" width="1200" height="628" preserveAspectRatio="xMidYMid slice"/>
+  <rect width="1200" height="628" fill="#0f172a" opacity=".28"/>
+  <rect x="64" y="76" width="620" height="476" rx="24" fill="#ffffff" opacity=".88"/>
+  <text x="104" y="142" font-family="Arial, sans-serif" font-size="28" fill="#1d4ed8">{variant} / {content_type}</text>
+  <text x="104" y="260" font-family="Arial, sans-serif" font-size="58" font-weight="700" fill="#111827">{title}</text>
+  <text x="104" y="344" font-family="Arial, sans-serif" font-size="32" fill="#374151">{body}</text>
+  <rect x="104" y="420" width="304" height="78" rx="39" fill="#2563eb"/>
+  <text x="146" y="470" font-family="Arial, sans-serif" font-size="30" font-weight="700" fill="#ffffff">{cta}</text>
+</svg>
+"""
+        return svg.encode("utf-8")
+
 
 class ContentAssetService:
     def __init__(
@@ -158,13 +183,16 @@ class ContentAssetService:
         *,
         storage: AssetStorage,
         renderer: SvgBannerRenderer | None = None,
+        visual_provider: BannerVisualProvider | None = None,
         asset_prefix: str = DEFAULT_ASSET_PREFIX,
     ) -> None:
         self.storage = storage
         self.renderer = renderer or SvgBannerRenderer()
+        self.visual_provider = visual_provider
         self.asset_prefix = asset_prefix.strip("/") or DEFAULT_ASSET_PREFIX
 
     def store_banner(self, draft: GeneratedContentDraft) -> GeneratedContentDraft:
+        visual = self.visual_provider.generate(draft) if self.visual_provider is not None else None
         asset_key = build_asset_key(
             project_id=draft.project_id,
             recommendation_action_id=draft.recommendation_action_id,
@@ -175,7 +203,7 @@ class ContentAssetService:
         stored = self.storage.put_object(
             AssetObject(
                 key=asset_key,
-                body=self.renderer.render(draft),
+                body=self.renderer.render(draft, visual=visual),
                 content_type=SVG_CONTENT_TYPE,
             )
         )
@@ -185,6 +213,14 @@ class ContentAssetService:
             "asset_content_type": stored.content_type,
             "asset_storage": type(self.storage).__name__,
         }
+        if visual is not None:
+            metadata.update(
+                {
+                    "visual_provider": visual.provider,
+                    "visual_model": visual.model,
+                    "visual_content_type": visual.content_type,
+                }
+            )
         return GeneratedContentDraft(
             project_id=draft.project_id,
             recommendation_action_id=draft.recommendation_action_id,
@@ -248,6 +284,11 @@ def _strip_key_prefix(key: str, prefix: str | None) -> str:
     if normalized_key.startswith(prefix_with_slash):
         return normalized_key[len(prefix_with_slash) :]
     return key
+
+
+def _visual_data_uri(visual: BannerVisual) -> str:
+    encoded = base64.b64encode(visual.body).decode("ascii")
+    return f"data:{visual.content_type};base64,{encoded}"
 
 
 def _safe_path_part(value: str) -> str:

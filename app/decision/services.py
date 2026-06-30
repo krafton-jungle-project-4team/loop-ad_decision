@@ -7,19 +7,21 @@ from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from app.analysis.models import AnalysisWindow
-from app.analysis.segments import build_segment_key
 from app.analysis.time_window import build_analysis_window
 from app.decision.errors import ConfigurationError
+from app.decision.embedding import embed_user, is_zero_vector
 from app.decision.models import (
     ActionCatalogItem,
     ExistingSegment,
     Experiment,
     ExperimentVariant,
     GeneratedContent,
+    NearestSegmentCentroid,
     RecommendationAction,
     RecommendationResult,
     RootCauseCandidate,
     SegmentAnomaly,
+    SegmentMatchingConfig,
     UserSegmentCandidate,
     VariantPerformance,
 )
@@ -223,11 +225,27 @@ class UserSegmentMatchingRepository(Protocol):
 
     def get_project_key(self, *, project_id: int) -> str: ...
 
-    def list_existing_segments(
+    def get_segment_matching_config(
         self,
         *,
         project_id: int,
-    ) -> dict[str, ExistingSegment]: ...
+        analysis_date: date,
+    ) -> SegmentMatchingConfig: ...
+
+    def get_default_segment(
+        self,
+        *,
+        project_id: int,
+    ) -> ExistingSegment | None: ...
+
+    def find_nearest_segment_centroid(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+        embedding_version: str,
+        user_vector: list[float],
+    ) -> NearestSegmentCentroid | None: ...
 
     def replace_primary_membership(
         self,
@@ -276,7 +294,13 @@ class UserSegmentMatchingService:
         timezone = self.repository.get_project_timezone(project_id=project_id)
         clickhouse_project_id = self.repository.get_project_key(project_id=project_id)
         window = build_analysis_window(analysis_date, timezone)
-        existing_segments = self.repository.list_existing_segments(project_id=project_id)
+        config = self.repository.get_segment_matching_config(
+            project_id=project_id,
+            analysis_date=analysis_date,
+        )
+        default_segment = self.repository.get_default_segment(project_id=project_id)
+        if default_segment is None:
+            raise ConfigurationError(f"default segment is required for project {project_id}")
         candidates = self.candidate_repository.fetch_user_segment_candidates(
             project_id=clickhouse_project_id,
             window=window,
@@ -285,30 +309,77 @@ class UserSegmentMatchingService:
         matched_count = 0
         skipped_count = 0
         for candidate in candidates:
-            segment_key = build_segment_key(candidate.dimensions)
-            segment = existing_segments.get(segment_key)
-            if segment is None:
+            user_vector = embed_user(candidate.dimensions)
+            nearest = (
+                None
+                if is_zero_vector(user_vector)
+                else self.repository.find_nearest_segment_centroid(
+                    project_id=project_id,
+                    analysis_date=analysis_date,
+                    embedding_version=config.embedding_version,
+                    user_vector=user_vector,
+                )
+            )
+            raw_similarity = _raw_similarity(nearest)
+            if nearest is None:
+                segment_id = default_segment.id
+                fallback_reason = "no_candidate_segment"
+                nearest_segment_key = None
+                confidence = Decimal("0")
                 skipped_count += 1
-                continue
+            elif raw_similarity is not None and raw_similarity >= config.similarity_threshold:
+                segment_id = nearest.segment_id
+                fallback_reason = None
+                nearest_segment_key = nearest.segment_key
+                confidence = _clamp_confidence(raw_similarity)
+                matched_count += 1
+            else:
+                segment_id = default_segment.id
+                fallback_reason = "below_threshold"
+                nearest_segment_key = nearest.segment_key
+                confidence = _clamp_confidence(raw_similarity)
+                skipped_count += 1
             self.repository.replace_primary_membership(
                 project_id=project_id,
                 external_user_id=candidate.external_user_id,
-                segment_id=segment.id,
+                segment_id=segment_id,
                 analysis_date=analysis_date,
-                confidence=candidate.confidence,
+                confidence=confidence,
                 reason_json={
-                    "segment_key": segment_key,
-                    "dimensions": candidate.dimensions,
-                    "matching_source": "user_segment_matching_service",
+                    "matching_source": "embedding_ann",
+                    "embedding_version": config.embedding_version,
+                    "similarity": _json_number(raw_similarity),
+                    "threshold": _json_number(config.similarity_threshold),
+                    "nearest_segment_key": nearest_segment_key,
+                    "fallback_reason": fallback_reason,
                 },
                 run_id=run_id,
             )
-            matched_count += 1
 
         return UserSegmentMatchingResult(
             matched_count=matched_count,
             skipped_count=skipped_count,
         )
+
+
+def _raw_similarity(nearest: NearestSegmentCentroid | None) -> Decimal | None:
+    if nearest is None:
+        return None
+    return Decimal("1") - Decimal(str(nearest.cosine_distance))
+
+
+def _clamp_confidence(similarity: Decimal | None) -> Decimal:
+    if similarity is None:
+        return Decimal("0")
+    if similarity < Decimal("0"):
+        return Decimal("0")
+    if similarity > Decimal("1"):
+        return Decimal("1")
+    return similarity
+
+
+def _json_number(value: Decimal | None) -> float | None:
+    return float(value) if value is not None else None
 
 
 class RecommendationService:

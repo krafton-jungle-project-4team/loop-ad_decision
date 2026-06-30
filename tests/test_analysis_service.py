@@ -98,6 +98,15 @@ class FakeAnomalyRepository:
         return len(root_causes)
 
 
+class FakeSegmentCentroidRepository:
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, date]] = []
+
+    def refresh_segment_centroids(self, *, project_id: int, analysis_date: date) -> int:
+        self.calls.append((project_id, analysis_date))
+        return 1
+
+
 def segment_aggregate(segment_key: str = "age_30s__gender_male__device_mobile__channel_kakao__category_fresh") -> SegmentAggregate:
     return SegmentAggregate(
         project_id=1,
@@ -165,6 +174,24 @@ def test_analysis_service_stores_segments_and_metrics_with_nullable_run_id() -> 
     assert result.metric_count == 1
     assert metrics_repository.segment_run_ids == [None]
     assert metrics_repository.metric_run_ids == [None]
+
+
+def test_analysis_service_refreshes_centroids_after_metrics_without_changing_upsert_signature() -> None:
+    aggregate_repository = FakeSegmentAggregateRepository([segment_aggregate()])
+    metrics_repository = FakeSegmentMetricsRepository()
+    centroid_repository = FakeSegmentCentroidRepository()
+    service = AnalysisService(
+        project_repository=FakeProjectRepository(),
+        segment_aggregate_repository=aggregate_repository,
+        segment_metrics_repository=metrics_repository,
+        segment_centroid_repository=centroid_repository,
+    )
+
+    service.run(project_id=1, analysis_date=date(2021, 1, 4), run_id=77)
+
+    assert metrics_repository.segment_run_ids == [77]
+    assert metrics_repository.metric_run_ids == [77]
+    assert centroid_repository.calls == [(1, date(2021, 1, 4))]
 
 
 def test_analysis_service_separates_clickhouse_project_key_from_postgres_project_id() -> None:

@@ -174,6 +174,7 @@ class DailyDecisionJobService:
                     segment_aggregate_repository=ClickHouseAnalysisRepository(clickhouse_client),
                     segment_metrics_repository=postgres_analysis_repository,
                     anomaly_repository=postgres_analysis_repository,
+                    segment_centroid_repository=postgres_analysis_repository,
                 )
                 experiment_config = ExperimentConfig.for_mode(run_context.mode)
                 recommendation_runner = _RecommendationExperimentRunner(
