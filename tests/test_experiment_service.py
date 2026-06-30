@@ -130,7 +130,7 @@ def test_missing_treatment_content_creates_draft_and_only_deactivates_same_exper
             segment_id=10,
             recommendation_action_id=action.id,
             name="old",
-            objective_metric="view_to_purchase_rate",
+            objective_metric="click_to_purchase_rate",
             target_value=Decimal("0.05"),
             allocation_policy="fixed_split",
             status="running",
@@ -225,7 +225,7 @@ def test_content_ready_creates_running_experiment_variants_mappings_and_is_idemp
 
     assert len(repo.experiments) == 1
     assert repo.experiments[0].status == "running"
-    assert repo.experiments[0].objective_metric == "view_to_purchase_rate"
+    assert repo.experiments[0].objective_metric == "click_to_purchase_rate"
     assert repo.results[0].status == "experiment_running"
     assert repo.actions[0].status == "running"
     assert len(repo.variants) == 2

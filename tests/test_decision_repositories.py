@@ -71,7 +71,7 @@ def experiment() -> Experiment:
         segment_id=10,
         recommendation_action_id=7,
         name="experiment",
-        objective_metric="view_to_purchase_rate",
+        objective_metric="click_to_purchase_rate",
         target_value=Decimal("0.05"),
         allocation_policy="fixed_split",
         status="running",
@@ -190,7 +190,7 @@ def test_postgres_decision_repository_upserts_experiment_with_active_partial_ind
             "segment_id": 10,
             "recommendation_action_id": 7,
             "name": "experiment",
-            "objective_metric": "view_to_purchase_rate",
+            "objective_metric": "click_to_purchase_rate",
             "target_value": Decimal("0.05"),
             "allocation_policy": "fixed_split",
             "status": "running",
@@ -205,7 +205,7 @@ def test_postgres_decision_repository_upserts_experiment_with_active_partial_ind
         segment_id=10,
         recommendation_action_id=7,
         name="experiment",
-        objective_metric="view_to_purchase_rate",
+        objective_metric="click_to_purchase_rate",
         target_value=Decimal("0.05"),
         allocation_policy="fixed_split",
         status="running",
@@ -216,13 +216,13 @@ def test_postgres_decision_repository_upserts_experiment_with_active_partial_ind
     query, parameters = connection.cursor_instance.executed[0]
     assert "ON CONFLICT (project_id, recommendation_action_id)" in query
     assert "WHERE recommendation_action_id IS NOT NULL" in query
-    assert "AND status IN ('draft', 'running', 'paused')" in query
+    assert "AND status IN ('draft', 'running', 'paused')" not in query
     assert parameters == (
         1,
         10,
         7,
         "experiment",
-        "view_to_purchase_rate",
+        "click_to_purchase_rate",
         Decimal("0.05"),
         "fixed_split",
         "running",

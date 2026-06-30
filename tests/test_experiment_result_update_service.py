@@ -59,7 +59,7 @@ def seed_running_experiment(
         segment_id=10,
         recommendation_action_id=action.id,
         name="experiment",
-        objective_metric="view_to_purchase_rate",
+        objective_metric="click_to_purchase_rate",
         target_value=Decimal("0.05"),
         allocation_policy="fixed_split",
         status=status,
