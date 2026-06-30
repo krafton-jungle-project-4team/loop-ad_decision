@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Protocol
 from zoneinfo import ZoneInfo
 
 from app.analysis.models import AnalysisWindow
-from app.analysis.segments import build_segment_key
+from app.analysis.segments import (
+    SEGMENT_DIMENSIONS,
+    UNKNOWN_VALUE,
+    normalize_dimensions,
+)
 from app.analysis.time_window import build_analysis_window
 from app.decision.errors import ConfigurationError
 from app.decision.models import (
@@ -33,6 +37,16 @@ ACTION_BY_CAUSE_KEY = {
 STOCKOUT_ACTION_KEY = "alternative_product_banner"
 OBJECTIVE_METRIC = "click_to_purchase_rate"
 PLACEMENT_KEY = "main_banner"
+WEIGHTED_MATCHING_SOURCE = "weighted_user_segment_matching_v1"
+DEFAULT_DIMENSION_WEIGHTS = {
+    "primary_category": Decimal("3"),
+    "acquisition_channel": Decimal("2"),
+    "device_type": Decimal("1"),
+    "age_group": Decimal("1"),
+    "gender": Decimal("1"),
+}
+DEFAULT_MIN_SCORE = Decimal("3")
+CONFIDENCE_QUANT = Decimal("0.0001")
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +241,8 @@ class UserSegmentMatchingRepository(Protocol):
         self,
         *,
         project_id: int,
-    ) -> dict[str, ExistingSegment]: ...
+        analysis_date: date,
+    ) -> list[ExistingSegment]: ...
 
     def replace_primary_membership(
         self,
@@ -257,6 +272,22 @@ class UserSegmentMatchingResult:
     skipped_count: int = 0
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentMatchScore:
+    segment: ExistingSegment
+    score: Decimal
+    threshold: Decimal
+    confidence: Decimal
+    matched_dimensions: list[str]
+    dimension_weights: dict[str, Decimal]
+
+    @property
+    def highest_matched_weight(self) -> Decimal:
+        if not self.matched_dimensions:
+            return Decimal("0")
+        return max(self.dimension_weights[dimension] for dimension in self.matched_dimensions)
+
+
 class UserSegmentMatchingService:
     def __init__(
         self,
@@ -276,7 +307,10 @@ class UserSegmentMatchingService:
         timezone = self.repository.get_project_timezone(project_id=project_id)
         clickhouse_project_id = self.repository.get_project_key(project_id=project_id)
         window = build_analysis_window(analysis_date, timezone)
-        existing_segments = self.repository.list_existing_segments(project_id=project_id)
+        existing_segments = self.repository.list_existing_segments(
+            project_id=project_id,
+            analysis_date=analysis_date,
+        )
         candidates = self.candidate_repository.fetch_user_segment_candidates(
             project_id=clickhouse_project_id,
             window=window,
@@ -285,22 +319,18 @@ class UserSegmentMatchingService:
         matched_count = 0
         skipped_count = 0
         for candidate in candidates:
-            segment_key = build_segment_key(candidate.dimensions)
-            segment = existing_segments.get(segment_key)
-            if segment is None:
+            candidate_dimensions = normalize_dimensions(candidate.dimensions)
+            selected = self._select_best_segment(candidate_dimensions, existing_segments)
+            if selected is None:
                 skipped_count += 1
                 continue
             self.repository.replace_primary_membership(
                 project_id=project_id,
                 external_user_id=candidate.external_user_id,
-                segment_id=segment.id,
+                segment_id=selected.segment.id,
                 analysis_date=analysis_date,
-                confidence=candidate.confidence,
-                reason_json={
-                    "segment_key": segment_key,
-                    "dimensions": candidate.dimensions,
-                    "matching_source": "user_segment_matching_service",
-                },
+                confidence=selected.confidence,
+                reason_json=self._reason_json(selected, candidate_dimensions),
                 run_id=run_id,
             )
             matched_count += 1
@@ -309,6 +339,120 @@ class UserSegmentMatchingService:
             matched_count=matched_count,
             skipped_count=skipped_count,
         )
+
+    def _select_best_segment(
+        self,
+        candidate_dimensions: dict[str, str],
+        existing_segments: list[ExistingSegment],
+    ) -> SegmentMatchScore | None:
+        scored: list[SegmentMatchScore] = []
+        for segment in existing_segments:
+            score = self._score_segment(candidate_dimensions, segment)
+            if score.score >= score.threshold:
+                scored.append(score)
+        if not scored:
+            return None
+        return max(
+            scored,
+            key=lambda score: (
+                score.score,
+                score.highest_matched_weight,
+                len(score.matched_dimensions),
+                -score.segment.id,
+            ),
+        )
+
+    def _score_segment(
+        self,
+        candidate_dimensions: dict[str, str],
+        segment: ExistingSegment,
+    ) -> SegmentMatchScore:
+        dimension_weights, min_score = _resolve_matching_config(segment.matching_config)
+        score = Decimal("0")
+        matched_dimensions: list[str] = []
+        for dimension in SEGMENT_DIMENSIONS:
+            if dimension not in segment.dimensions:
+                continue
+            user_value = candidate_dimensions.get(dimension, UNKNOWN_VALUE)
+            if user_value == UNKNOWN_VALUE:
+                continue
+            if user_value != segment.dimensions[dimension]:
+                continue
+            score += dimension_weights[dimension]
+            matched_dimensions.append(dimension)
+
+        max_possible_score = sum(dimension_weights.values(), Decimal("0"))
+        confidence = (score / max_possible_score).quantize(CONFIDENCE_QUANT)
+        confidence = min(confidence, Decimal("1.0000"))
+        return SegmentMatchScore(
+            segment=segment,
+            score=score,
+            threshold=min_score,
+            confidence=confidence,
+            matched_dimensions=matched_dimensions,
+            dimension_weights=dimension_weights,
+        )
+
+    def _reason_json(
+        self,
+        selected: SegmentMatchScore,
+        candidate_dimensions: dict[str, str],
+    ) -> dict[str, object]:
+        return {
+            "matching_source": WEIGHTED_MATCHING_SOURCE,
+            "selected_segment_key": selected.segment.segment_key,
+            "score": _decimal_to_json_number(selected.score),
+            "threshold": _decimal_to_json_number(selected.threshold),
+            "confidence": _decimal_to_json_number(selected.confidence),
+            "matched_dimensions": selected.matched_dimensions,
+            "dimension_weights": {
+                dimension: _decimal_to_json_number(weight)
+                for dimension, weight in selected.dimension_weights.items()
+            },
+            "candidate_dimensions": candidate_dimensions,
+        }
+
+
+def _resolve_matching_config(
+    matching_config: object,
+) -> tuple[dict[str, Decimal], Decimal]:
+    weights = dict(DEFAULT_DIMENSION_WEIGHTS)
+    min_score = DEFAULT_MIN_SCORE
+    if not isinstance(matching_config, dict):
+        return weights, min_score
+
+    override_weights = matching_config.get("dimension_weights")
+    if isinstance(override_weights, dict):
+        for dimension in SEGMENT_DIMENSIONS:
+            if dimension not in override_weights:
+                continue
+            override = _positive_decimal(override_weights[dimension])
+            if override is not None:
+                weights[dimension] = override
+
+    override_min_score = _positive_decimal(matching_config.get("min_score"))
+    if override_min_score is not None:
+        min_score = override_min_score
+
+    return weights, min_score
+
+
+def _positive_decimal(value: object) -> Decimal | None:
+    if value is None:
+        return None
+    try:
+        decimal_value = Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+    if not decimal_value.is_finite() or decimal_value <= 0:
+        return None
+    return decimal_value
+
+
+def _decimal_to_json_number(value: Decimal) -> int | float:
+    if value == value.to_integral_value():
+        return int(value)
+    return float(value)
 
 
 class RecommendationService:

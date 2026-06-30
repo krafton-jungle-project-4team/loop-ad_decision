@@ -2,20 +2,40 @@ from __future__ import annotations
 
 from datetime import date
 from decimal import Decimal
+from typing import Any
 
+import pytest
+
+from app.analysis.segments import SEGMENT_DIMENSIONS, normalize_dimension_value
 from app.decision.models import ExistingSegment, UserSegmentCandidate
 from app.decision.services import UserSegmentMatchingService
 
 
 ANALYSIS_DATE = date(2021, 1, 4)
-SEGMENT_KEY = "age_30s__gender_male__device_mobile_web__channel_kakao__category_fresh_food"
+FULL_DIMENSIONS = {
+    "age_group": "30s",
+    "gender": "Male",
+    "device_type": "Mobile Web",
+    "acquisition_channel": "Kakao",
+    "primary_category": "Fresh Food",
+}
+DEFAULT_MATCHING_CONFIG = {
+    "dimension_weights": {
+        "primary_category": 3,
+        "acquisition_channel": 2,
+        "device_type": 1,
+        "age_group": 1,
+        "gender": 1,
+    },
+    "min_score": 3,
+}
 
 
 class FakeMatchingRepository:
-    def __init__(self, existing_segments: dict[str, ExistingSegment]) -> None:
+    def __init__(self, existing_segments: list[ExistingSegment]) -> None:
         self.existing_segments = existing_segments
         self.memberships: list[dict[str, object]] = []
-        self.list_existing_project_ids: list[int] = []
+        self.list_existing_calls: list[tuple[int, date]] = []
         self.replace_calls: list[dict[str, object]] = []
         self.timezone = "Asia/Seoul"
         self.project_key = "demo-shop"
@@ -26,9 +46,14 @@ class FakeMatchingRepository:
     def get_project_key(self, *, project_id: int) -> str:
         return self.project_key
 
-    def list_existing_segments(self, *, project_id: int) -> dict[str, ExistingSegment]:
-        self.list_existing_project_ids.append(project_id)
-        return dict(self.existing_segments)
+    def list_existing_segments(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> list[ExistingSegment]:
+        self.list_existing_calls.append((project_id, analysis_date))
+        return list(self.existing_segments)
 
     def replace_primary_membership(
         self,
@@ -107,11 +132,11 @@ class FakeCandidateRepository:
 def candidate(
     *,
     external_user_id: str = "user-1",
-    age_group: str = "30s",
-    gender: str = " Male ",
-    device: str = "Mobile Web",
-    channel: str = "Kakao",
-    category: str = "Fresh Food",
+    age_group: object = "30s",
+    gender: object = " Male ",
+    device: object = "Mobile Web",
+    channel: object = "Kakao",
+    category: object = "Fresh Food",
 ) -> UserSegmentCandidate:
     return UserSegmentCandidate(
         external_user_id=external_user_id,
@@ -125,9 +150,54 @@ def candidate(
     )
 
 
-def test_existing_segment_key_creates_user_segment_membership() -> None:
+def segment(
+    *,
+    segment_id: int,
+    segment_key: str | None = None,
+    dimensions: dict[str, object] | None = None,
+    matching_config: Any | None = None,
+) -> ExistingSegment:
+    raw_dimensions = FULL_DIMENSIONS if dimensions is None else dimensions
+    return ExistingSegment(
+        id=segment_id,
+        segment_key=segment_key or f"segment-{segment_id}",
+        dimensions={
+            dimension: normalize_dimension_value(value)
+            for dimension, value in raw_dimensions.items()
+        },
+        matching_config=matching_config,
+    )
+
+
+def run_service(
+    repository: FakeMatchingRepository,
+    candidates: list[UserSegmentCandidate] | None = None,
+):
+    return UserSegmentMatchingService(
+        repository,
+        FakeCandidateRepository(candidates or [candidate()]),
+    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+
+
+def selected_reason(repository: FakeMatchingRepository) -> dict[str, object]:
+    return repository.replace_calls[0]["reason_json"]  # type: ignore[return-value]
+
+
+def test_exact_match_still_wins_and_writes_weighted_reason_json() -> None:
     repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
+        [
+            segment(
+                segment_id=20,
+                segment_key="category-only",
+                dimensions={"primary_category": "Fresh Food"},
+                matching_config=DEFAULT_MATCHING_CONFIG,
+            ),
+            segment(
+                segment_id=10,
+                segment_key="full-match",
+                matching_config=DEFAULT_MATCHING_CONFIG,
+            ),
+        ]
     )
     candidate_repository = FakeCandidateRepository([candidate()])
 
@@ -141,30 +211,372 @@ def test_existing_segment_key_creates_user_segment_membership() -> None:
     assert result.skipped_count == 0
     assert repository.memberships[0]["segment_id"] == 10
     assert repository.memberships[0]["is_primary"] is True
-    assert repository.replace_calls[0]["reason_json"]["segment_key"] == SEGMENT_KEY
+    assert repository.memberships[0]["confidence"] > Decimal("0.3750")
+    assert repository.list_existing_calls == [(1, ANALYSIS_DATE)]
     assert candidate_repository.calls[0][0] == "demo-shop"
+    reason = selected_reason(repository)
+    assert reason["matching_source"] == "weighted_user_segment_matching_v1"
+    assert reason["selected_segment_key"] == "full-match"
+    assert reason["score"] == 8
+    assert reason["dimension_weights"] == DEFAULT_MATCHING_CONFIG["dimension_weights"]
+    assert set(reason["matched_dimensions"]) == set(SEGMENT_DIMENSIONS)
 
 
-def test_missing_segment_key_skips_membership_without_creating_segment() -> None:
-    repository = FakeMatchingRepository({})
-    candidate_repository = FakeCandidateRepository([candidate()])
-
-    result = UserSegmentMatchingService(repository, candidate_repository).run(
-        project_id=1,
-        analysis_date=ANALYSIS_DATE,
-        run_id=None,
+def test_category_only_score_three_creates_membership() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+            )
+        ]
     )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 10
+    assert repository.memberships[0]["confidence"] == Decimal("0.3750")
+    reason = selected_reason(repository)
+    assert reason["score"] == 3
+    assert reason["threshold"] == 3
+    assert reason["confidence"] == 0.375
+    assert reason["matched_dimensions"] == ["primary_category"]
+
+
+def test_score_below_default_threshold_creates_no_membership() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"device_type": "Mobile Web"},
+            )
+        ]
+    )
+
+    result = run_service(repository)
 
     assert result.matched_count == 0
     assert result.skipped_count == 1
     assert repository.memberships == []
-    assert repository.existing_segments == {}
     assert repository.replace_calls == []
+
+
+def test_multiple_partial_matches_choose_higher_weighted_score() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="channel",
+                dimensions={"acquisition_channel": "Kakao"},
+            ),
+            segment(
+                segment_id=20,
+                segment_key="category",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    assert selected_reason(repository)["selected_segment_key"] == "category"
+
+
+def test_equal_scores_use_highest_single_matched_weight_tie_break() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="channel-device",
+                dimensions={
+                    "acquisition_channel": "Kakao",
+                    "device_type": "Mobile Web",
+                },
+            ),
+            segment(
+                segment_id=20,
+                segment_key="category",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    assert selected_reason(repository)["selected_segment_key"] == "category"
+
+
+def test_equal_score_and_highest_weight_use_more_matched_dimensions_tie_break() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="two-dimensions",
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "acquisition_channel": "Kakao",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "primary_category": 1,
+                        "acquisition_channel": 1,
+                    },
+                    "min_score": 1,
+                },
+            ),
+            segment(
+                segment_id=20,
+                segment_key="three-dimensions",
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "device_type": "Mobile Web",
+                    "age_group": "30s",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "primary_category": 1,
+                        "device_type": 0.5,
+                        "age_group": 0.5,
+                    },
+                    "min_score": 1,
+                },
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    assert selected_reason(repository)["selected_segment_key"] == "three-dimensions"
+
+
+def test_fully_equal_tie_break_uses_lower_segment_id() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=20,
+                segment_key="segment-20",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+            segment(
+                segment_id=10,
+                segment_key="segment-10",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 10
+    assert selected_reason(repository)["selected_segment_key"] == "segment-10"
+
+
+@pytest.mark.parametrize("category", [None, "", "unknown", "N/A"])
+def test_null_empty_and_unknown_values_add_no_score(category: object) -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+            )
+        ]
+    )
+
+    result = run_service(repository, [candidate(category=category)])
+
+    assert result.matched_count == 0
+    assert result.skipped_count == 1
+    assert repository.memberships == []
+
+
+def test_absent_segment_dimension_is_skipped_not_a_mismatch() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+            )
+        ]
+    )
+
+    result = run_service(
+        repository,
+        [
+            candidate(
+                age_group="60s",
+                gender="Female",
+                device="Desktop",
+                channel="Email",
+                category="Fresh Food",
+            )
+        ],
+    )
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 10
+    assert selected_reason(repository)["matched_dimensions"] == ["primary_category"]
+
+
+def test_adding_device_type_to_rule_json_starts_awarding_device_weight() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="category-only",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+            segment(
+                segment_id=20,
+                segment_key="category-device",
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "device_type": "Mobile Web",
+                },
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    assert selected_reason(repository)["score"] == 4
+    assert selected_reason(repository)["matched_dimensions"] == [
+        "device_type",
+        "primary_category",
+    ]
+
+
+def test_analysis_provided_weights_can_change_selected_segment() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                segment_key="category-default",
+                dimensions={"primary_category": "Fresh Food"},
+            ),
+            segment(
+                segment_id=20,
+                segment_key="channel-boosted",
+                dimensions={"acquisition_channel": "Kakao"},
+                matching_config={"dimension_weights": {"acquisition_channel": 5}},
+            ),
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert repository.memberships[0]["segment_id"] == 20
+    assert selected_reason(repository)["selected_segment_key"] == "channel-boosted"
+    assert selected_reason(repository)["dimension_weights"]["acquisition_channel"] == 5
+
+
+def test_partial_weight_override_keeps_unlisted_defaults() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "acquisition_channel": "Kakao",
+                },
+                matching_config={"dimension_weights": {"primary_category": 5}},
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 7
+    assert reason["dimension_weights"]["primary_category"] == 5
+    assert reason["dimension_weights"]["acquisition_channel"] == 2
+
+
+def test_malformed_and_non_positive_overrides_fall_back_to_defaults() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={
+                    "primary_category": "Fresh Food",
+                    "acquisition_channel": "Kakao",
+                },
+                matching_config={
+                    "dimension_weights": {
+                        "primary_category": 0,
+                        "acquisition_channel": "not-a-number",
+                    },
+                    "min_score": -1,
+                },
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 5
+    assert reason["threshold"] == 3
+    assert reason["dimension_weights"]["primary_category"] == 3
+    assert reason["dimension_weights"]["acquisition_channel"] == 2
+
+
+def test_malformed_matching_config_uses_defaults() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+                matching_config=["malformed"],
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    assert selected_reason(repository)["score"] == 3
+
+
+def test_missing_metric_config_uses_defaults() -> None:
+    repository = FakeMatchingRepository(
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+                matching_config=None,
+            )
+        ]
+    )
+
+    result = run_service(repository)
+
+    assert result.matched_count == 1
+    reason = selected_reason(repository)
+    assert reason["score"] == 3
+    assert reason["threshold"] == 3
 
 
 def test_replacing_primary_membership_leaves_one_primary_per_user_day() -> None:
     repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
+        [
+            segment(
+                segment_id=10,
+                dimensions={"primary_category": "Fresh Food"},
+            )
+        ]
     )
     repository.memberships.append(
         {
@@ -179,10 +591,7 @@ def test_replacing_primary_membership_leaves_one_primary_per_user_day() -> None:
         }
     )
 
-    UserSegmentMatchingService(
-        repository,
-        FakeCandidateRepository([candidate()]),
-    ).run(project_id=1, analysis_date=ANALYSIS_DATE, run_id=77)
+    result = run_service(repository)
 
     primary_memberships = [
         membership
@@ -191,24 +600,6 @@ def test_replacing_primary_membership_leaves_one_primary_per_user_day() -> None:
         and membership["analysis_date"] == ANALYSIS_DATE
         and membership["is_primary"] is True
     ]
+    assert result.matched_count == 1
     assert len(primary_memberships) == 1
     assert primary_memberships[0]["segment_id"] == 10
-
-
-def test_unmatched_user_remains_without_membership_for_default_fallback() -> None:
-    repository = FakeMatchingRepository(
-        {SEGMENT_KEY: ExistingSegment(id=10, segment_key=SEGMENT_KEY)}
-    )
-    candidate_repository = FakeCandidateRepository(
-        [candidate(external_user_id="user-2", age_group="40s")]
-    )
-
-    result = UserSegmentMatchingService(repository, candidate_repository).run(
-        project_id=1,
-        analysis_date=ANALYSIS_DATE,
-        run_id=77,
-    )
-
-    assert result.matched_count == 0
-    assert result.skipped_count == 1
-    assert repository.memberships == []

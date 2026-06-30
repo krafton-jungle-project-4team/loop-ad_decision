@@ -188,21 +188,48 @@ def test_postgres_decision_repository_lists_existing_segments_read_only() -> Non
             {
                 "id": 10,
                 "segment_key": "age_30s__gender_male__device_mobile__channel_kakao__category_fresh",
+                "rule_json": {
+                    "age_group": "30s",
+                    "device_type": "Mobile Web",
+                    "primary_category": "Fresh Food",
+                },
+                "matching_config": {
+                    "dimension_weights": {"primary_category": 5},
+                    "min_score": 2,
+                    "source": "anomaly_impact",
+                },
             }
         ]
     )
     repository = PostgresDecisionRepository(connection)
 
-    segments = repository.list_existing_segments(project_id=1)
+    segments = repository.list_existing_segments(project_id=1, analysis_date=date(2021, 1, 4))
 
     query, parameters = connection.cursor_instance.executed[0]
-    assert "SELECT id, segment_key" in query
-    assert "FROM segments" in query
+    assert "s.rule_json" in query
+    assert "sdm.metric_json->'matching' AS matching_config" in query
+    assert "FROM segments s" in query
+    assert "LEFT JOIN segment_daily_metrics sdm" in query
+    assert "sdm.analysis_date = %s" in query
     assert "INSERT INTO segments" not in query
     assert "UPDATE segments" not in query
     assert "DELETE FROM segments" not in query
-    assert parameters == (1,)
-    assert segments["age_30s__gender_male__device_mobile__channel_kakao__category_fresh"].id == 10
+    assert parameters == (date(2021, 1, 4), 1)
+    assert len(segments) == 1
+    assert segments[0].id == 10
+    assert segments[0].segment_key == (
+        "age_30s__gender_male__device_mobile__channel_kakao__category_fresh"
+    )
+    assert segments[0].dimensions == {
+        "age_group": "30s",
+        "device_type": "mobile_web",
+        "primary_category": "fresh_food",
+    }
+    assert segments[0].matching_config == {
+        "dimension_weights": {"primary_category": 5},
+        "min_score": 2,
+        "source": "anomaly_impact",
+    }
 
 
 def test_postgres_decision_repository_replaces_primary_membership_in_one_transaction() -> None:

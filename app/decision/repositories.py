@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Protocol
 
 from app.analysis.models import AnalysisWindow
+from app.analysis.segments import SEGMENT_DIMENSIONS, normalize_dimension_value
 from app.decision.models import (
     ActionCatalogItem,
     ExistingSegment,
@@ -504,24 +505,44 @@ class PostgresDecisionRepository:
             raise ValueError(f"project_key is required for project {project_id}")
         return project_key
 
-    def list_existing_segments(self, *, project_id: int) -> dict[str, ExistingSegment]:
+    def list_existing_segments(
+        self,
+        *,
+        project_id: int,
+        analysis_date: date,
+    ) -> list[ExistingSegment]:
         rows = self._fetchall(
             """
-            SELECT id, segment_key
-            FROM segments
-            WHERE project_id = %s
-              AND status = 'active'
-              AND is_default = false
+            SELECT
+                s.id,
+                s.segment_key,
+                s.rule_json,
+                sdm.metric_json->'matching' AS matching_config
+            FROM segments s
+            LEFT JOIN segment_daily_metrics sdm
+              ON sdm.project_id = s.project_id
+             AND sdm.segment_id = s.id
+             AND sdm.analysis_date = %s
+            WHERE s.project_id = %s
+              AND s.status = 'active'
+              AND s.is_default = false
+            ORDER BY s.id
             """,
-            (project_id,),
+            (analysis_date, project_id),
         )
-        return {
-            str(row["segment_key"]): ExistingSegment(
+        return [
+            ExistingSegment(
                 id=int(row["id"]),
                 segment_key=str(row["segment_key"]),
+                dimensions=self._segment_dimensions(row.get("rule_json")),
+                matching_config=(
+                    row.get("matching_config")
+                    if isinstance(row.get("matching_config"), dict)
+                    else None
+                ),
             )
             for row in rows
-        }
+        ]
 
     def replace_primary_membership(
         self,
@@ -754,6 +775,15 @@ class PostgresDecisionRepository:
         if value is None:
             return Decimal(default)
         return Decimal(str(value))
+
+    def _segment_dimensions(self, rule_json: Any) -> dict[str, str]:
+        if not isinstance(rule_json, dict):
+            return {}
+        return {
+            dimension: normalize_dimension_value(rule_json[dimension])
+            for dimension in SEGMENT_DIMENSIONS
+            if dimension in rule_json
+        }
 
     def _anomaly(self, row: dict[str, Any]) -> SegmentAnomaly:
         return SegmentAnomaly(

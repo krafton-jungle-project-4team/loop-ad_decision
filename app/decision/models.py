@@ -20,6 +20,8 @@ class Project:
 class ExistingSegment:
     id: int
     segment_key: str
+    dimensions: JsonObject = field(default_factory=dict)
+    matching_config: JsonObject | None = None
 
 
 @dataclass(frozen=True, slots=True)
