@@ -13,6 +13,7 @@ from app.contents.config import (
 from app.contents.generators import ContentGenerator
 from app.contents.postgres_repository import PostgresContentRepository
 from app.contents.service import ContentGenerationService
+from app.contents.visuals import BannerVisualProvider
 
 
 class ConnectionLike(Protocol):
@@ -58,11 +59,12 @@ def build_content_generation_service(
     generator: ContentGenerator | None = None,
     asset_service: ContentAssetService | None = None,
     s3_client: S3ClientLike | None = None,
+    visual_provider: BannerVisualProvider | None = None,
 ) -> ContentGenerationService:
     """Build the content generation service used by DailyDecisionJobService.
 
     The caller owns the database connection lifecycle and transaction boundary.
-    This creates no external API route, scheduler, S3 client, or Gemini client.
+    This creates no external API route or scheduler.
     """
 
     content_config = config or ContentGenerationConfig.from_env()
@@ -73,5 +75,6 @@ def build_content_generation_service(
         or build_content_asset_service(
             content_config,
             s3_client=s3_client,
+            visual_provider=visual_provider,
         ),
     )

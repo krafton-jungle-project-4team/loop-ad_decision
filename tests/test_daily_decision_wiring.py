@@ -10,6 +10,7 @@ from app.contents.config import ContentGenerationConfig
 from app.contents.generators import MockContentGenerator
 from app.contents.postgres_repository import PostgresContentRepository
 from app.contents.service import ContentGenerationService
+from app.contents.visuals import MockBannerVisualProvider
 from app.jobs.wiring import build_content_generation_service
 
 
@@ -89,6 +90,21 @@ def test_build_content_generation_service_can_wire_s3_asset_storage() -> None:
         )
     )
     assert s3_client.put_object_calls[0]["Bucket"] == "loop-assets"
+
+
+def test_build_content_generation_service_passes_visual_provider_to_asset_service() -> None:
+    visual_provider = MockBannerVisualProvider(model="mock-visual-test")
+
+    service = build_content_generation_service(
+        connection=FakeConnection(cursors=[]),
+        config=ContentGenerationConfig(
+            content_asset_storage="memory",
+            content_asset_public_base_url="https://cdn.example.com",
+        ),
+        visual_provider=visual_provider,
+    )
+
+    assert service.asset_service.visual_provider is visual_provider
 
 
 def test_build_content_generation_service_requires_asset_storage_config() -> None:

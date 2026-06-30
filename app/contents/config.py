@@ -14,8 +14,10 @@ from app.contents.assets import (
     S3ClientLike,
 )
 from app.contents.generators import ContentGenerator, MockContentGenerator, OpenAIContentGenerator
+from app.contents.visuals import BannerVisualProvider, GeminiBannerVisualProvider
 
 AWS_SEOUL_REGION = "ap-northeast-2"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,8 @@ class ContentGenerationConfig:
     app_env: str | None = None
     openai_api_key: str | None = None
     openai_content_model: str | None = None
+    gemini_api_key: str | None = None
+    gemini_image_model: str = DEFAULT_GEMINI_IMAGE_MODEL
     content_asset_storage: str | None = None
     content_asset_local_dir: str | None = None
     content_asset_prefix: str = DEFAULT_ASSET_PREFIX
@@ -38,8 +42,8 @@ class ContentGenerationConfig:
         values = {
             "LOOPAD_ENV": _clean(os.getenv("LOOPAD_ENV")),
             "LOOPAD_DATA_STORAGE_BUCKET": _clean(os.getenv("LOOPAD_DATA_STORAGE_BUCKET")),
-            "LOOPAD_GENAI_ASSETS_BASE_PREFIX": _clean(
-                os.getenv("LOOPAD_GENAI_ASSETS_BASE_PREFIX")
+            "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX": _clean(
+                os.getenv("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX")
             ),
             "LOOPAD_OPENAI_API_KEY": _clean(os.getenv("LOOPAD_OPENAI_API_KEY")),
         }
@@ -49,7 +53,7 @@ class ContentGenerationConfig:
 
         app_env = values["LOOPAD_ENV"]
         data_storage_bucket = values["LOOPAD_DATA_STORAGE_BUCKET"]
-        assets_base_prefix = values["LOOPAD_GENAI_ASSETS_BASE_PREFIX"]
+        assets_base_prefix = values["LOOPAD_GENAI_GENERATED_ASSETS_PREFIX"]
         openai_api_key = values["LOOPAD_OPENAI_API_KEY"]
         if (
             app_env is None
@@ -64,6 +68,7 @@ class ContentGenerationConfig:
             app_env=app_env,
             openai_api_key=openai_api_key,
             openai_content_model=_clean(os.getenv("LOOPAD_OPENAI_CONTENT_MODEL")),
+            gemini_api_key=_clean(os.getenv("LOOPAD_GEMINI_API_KEY")),
             content_asset_storage="s3",
             content_asset_prefix=asset_prefix,
             content_asset_public_base_url=_build_s3_public_base_url(data_storage_bucket),
@@ -82,10 +87,23 @@ def build_content_generator(config: ContentGenerationConfig | None = None) -> Co
     return MockContentGenerator()
 
 
+def build_banner_visual_provider(
+    config: ContentGenerationConfig | None = None,
+) -> BannerVisualProvider | None:
+    config = config or ContentGenerationConfig.from_env()
+    if config.gemini_api_key is None:
+        return None
+    return GeminiBannerVisualProvider(
+        api_key=config.gemini_api_key,
+        model=config.gemini_image_model,
+    )
+
+
 def build_content_asset_service(
     config: ContentGenerationConfig | None = None,
     *,
     s3_client: S3ClientLike | None = None,
+    visual_provider: BannerVisualProvider | None = None,
 ) -> ContentAssetService:
     config = config or ContentGenerationConfig.from_env()
     storage_name = _resolve_content_asset_storage(config)
@@ -113,8 +131,14 @@ def build_content_asset_service(
     else:
         raise ValueError("content_asset_storage must be memory, local, or s3")
 
+    resolved_visual_provider = (
+        visual_provider
+        if visual_provider is not None
+        else build_banner_visual_provider(config)
+    )
     return ContentAssetService(
         storage=storage,
+        visual_provider=resolved_visual_provider,
         asset_prefix=config.content_asset_prefix,
     )
 
@@ -129,10 +153,10 @@ def _clean(value: str | None) -> str | None:
 def _normalize_assets_base_prefix(value: str) -> str:
     stripped = value.strip().strip("/")
     if not stripped:
-        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must include an asset path prefix")
+        raise ValueError("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX must include an asset path prefix")
     path = Path(stripped)
     if path.is_absolute() or ".." in path.parts:
-        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must be a relative S3 key prefix")
+        raise ValueError("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX must be a relative S3 key prefix")
     return stripped
 
 

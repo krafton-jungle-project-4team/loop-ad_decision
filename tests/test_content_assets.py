@@ -44,7 +44,7 @@ def set_loopad_content_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) ->
     values = {
         "LOOPAD_ENV": "dev",
         "LOOPAD_DATA_STORAGE_BUCKET": "example-data-storage-bucket",
-        "LOOPAD_GENAI_ASSETS_BASE_PREFIX": "genai/",
+        "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX": "genai/",
         "LOOPAD_OPENAI_API_KEY": "loopad-openai-key",
     }
     values.update(overrides)
@@ -337,7 +337,7 @@ def test_build_content_asset_service_requires_s3_public_base_url() -> None:
 def test_content_generation_config_rejects_legacy_asset_env(monkeypatch) -> None:
     monkeypatch.delenv("LOOPAD_ENV", raising=False)
     monkeypatch.delenv("LOOPAD_DATA_STORAGE_BUCKET", raising=False)
-    monkeypatch.delenv("LOOPAD_GENAI_ASSETS_BASE_PREFIX", raising=False)
+    monkeypatch.delenv("LOOPAD_GENAI_GENERATED_ASSETS_PREFIX", raising=False)
     monkeypatch.delenv("LOOPAD_OPENAI_API_KEY", raising=False)
     monkeypatch.setenv("CONTENT_ASSET_STORAGE", "s3")
     monkeypatch.setenv("CONTENT_ASSET_PUBLIC_BASE_URL", "https://cdn.example.com/assets")

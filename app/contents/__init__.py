@@ -14,6 +14,7 @@ from app.contents.assets import (
 )
 from app.contents.config import (
     ContentGenerationConfig,
+    build_banner_visual_provider,
     build_content_asset_service,
     build_content_generator,
 )
@@ -32,6 +33,11 @@ from app.contents.types import (
     RecommendationActionTarget,
     SegmentContext,
 )
+from app.contents.visuals import (
+    BannerVisual,
+    GeminiBannerVisualProvider,
+    MockBannerVisualProvider,
+)
 
 __all__ = [
     "ContentGenerationActionResult",
@@ -39,16 +45,19 @@ __all__ = [
     "ContentGenerationService",
     "ContentGenerationSummary",
     "AssetObject",
+    "BannerVisual",
     "ContentAssetService",
     "DEFAULT_S3_CACHE_CONTROL",
     "GENERATION_MODEL_MANUAL",
     "GENERATION_MODEL_MOCK",
     "GENERATION_MODEL_SEED",
+    "GeminiBannerVisualProvider",
     "GenerationLockUnavailable",
     "GeneratedContentDraft",
     "GeneratedContentRecord",
     "InMemoryAssetStorage",
     "LocalAssetStorage",
+    "MockBannerVisualProvider",
     "MockContentGenerator",
     "OpenAIContentGenerator",
     "PostgresContentRepository",
@@ -59,6 +68,7 @@ __all__ = [
     "StoredAsset",
     "SvgBannerRenderer",
     "build_asset_key",
+    "build_banner_visual_provider",
     "build_content_asset_service",
     "build_content_generator",
 ]

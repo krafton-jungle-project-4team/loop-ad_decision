@@ -32,6 +32,7 @@ class Settings:
     data_storage_bucket: str
     genai_assets_base_prefix: str
     openai_api_key: str
+    gemini_api_key: str | None = None
     legacy_admin_token: str | None = None
 
 
@@ -50,7 +51,7 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_USERNAME",
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
-    "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX",
     "LOOPAD_OPENAI_API_KEY",
 )
 
@@ -68,7 +69,6 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         raise SettingsError(
             f"LOOPAD_SERVICE_ID must be {DECISION_SERVICE_ID!r}, got {service_id!r}"
         )
-
     return Settings(
         env=_read_required(source, "LOOPAD_ENV"),
         service_id=service_id,
@@ -84,8 +84,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         clickhouse_username=_read_required(source, "LOOPAD_CLICKHOUSE_USERNAME"),
         clickhouse_password=_read_required(source, "LOOPAD_CLICKHOUSE_PASSWORD"),
         data_storage_bucket=_read_required(source, "LOOPAD_DATA_STORAGE_BUCKET"),
-        genai_assets_base_prefix=_read_required(source, "LOOPAD_GENAI_ASSETS_BASE_PREFIX"),
+        genai_assets_base_prefix=_read_required(source, "LOOPAD_GENAI_GENERATED_ASSETS_PREFIX"),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
+        gemini_api_key=_read_optional(source, "LOOPAD_GEMINI_API_KEY"),
         legacy_admin_token=_read_optional(source, "AI_DECISION_ADMIN_TOKEN"),
     )
 
