@@ -24,6 +24,9 @@ def settings() -> Settings:
         clickhouse_database="loopad",
         clickhouse_username="app",
         clickhouse_password="password",
+        data_storage_bucket="example-data-storage-bucket",
+        genai_assets_base_prefix="genai/",
+        openai_api_key="test-openai-key",
         legacy_admin_token="legacy-secret",
     )
 

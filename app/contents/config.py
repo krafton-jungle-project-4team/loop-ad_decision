@@ -15,6 +15,8 @@ from app.contents.assets import (
 )
 from app.contents.generators import ContentGenerator, MockContentGenerator, OpenAIContentGenerator
 
+AWS_SEOUL_REGION = "ap-northeast-2"
+
 
 @dataclass(frozen=True)
 class ContentGenerationConfig:
@@ -29,23 +31,44 @@ class ContentGenerationConfig:
     content_asset_s3_region: str | None = None
     content_asset_s3_endpoint_url: str | None = None
     content_asset_s3_cache_control: str | None = DEFAULT_S3_CACHE_CONTROL
+    content_asset_public_url_strip_prefix: str | None = None
 
     @classmethod
     def from_env(cls) -> "ContentGenerationConfig":
-        return cls(
-            app_env=_resolve_app_env(),
-            openai_api_key=_clean(os.getenv("OPENAI_API_KEY")),
-            openai_content_model=_clean(os.getenv("OPENAI_CONTENT_MODEL")),
-            content_asset_storage=_clean(os.getenv("CONTENT_ASSET_STORAGE")),
-            content_asset_local_dir=_clean(os.getenv("CONTENT_ASSET_LOCAL_DIR")),
-            content_asset_prefix=_clean(os.getenv("CONTENT_ASSET_PREFIX")) or DEFAULT_ASSET_PREFIX,
-            content_asset_public_base_url=_clean(os.getenv("CONTENT_ASSET_PUBLIC_BASE_URL")),
-            content_asset_s3_bucket=_clean(os.getenv("CONTENT_ASSET_S3_BUCKET")),
-            content_asset_s3_region=_clean(os.getenv("CONTENT_ASSET_S3_REGION")),
-            content_asset_s3_endpoint_url=_clean(os.getenv("CONTENT_ASSET_S3_ENDPOINT_URL")),
-            content_asset_s3_cache_control=(
-                _clean(os.getenv("CONTENT_ASSET_S3_CACHE_CONTROL")) or DEFAULT_S3_CACHE_CONTROL
+        values = {
+            "LOOPAD_ENV": _clean(os.getenv("LOOPAD_ENV")),
+            "LOOPAD_DATA_STORAGE_BUCKET": _clean(os.getenv("LOOPAD_DATA_STORAGE_BUCKET")),
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX": _clean(
+                os.getenv("LOOPAD_GENAI_ASSETS_BASE_PREFIX")
             ),
+            "LOOPAD_OPENAI_API_KEY": _clean(os.getenv("LOOPAD_OPENAI_API_KEY")),
+        }
+        missing = [name for name, value in values.items() if value is None]
+        if missing:
+            raise ValueError("missing required env: " + ", ".join(missing))
+
+        app_env = values["LOOPAD_ENV"]
+        data_storage_bucket = values["LOOPAD_DATA_STORAGE_BUCKET"]
+        assets_base_prefix = values["LOOPAD_GENAI_ASSETS_BASE_PREFIX"]
+        openai_api_key = values["LOOPAD_OPENAI_API_KEY"]
+        if (
+            app_env is None
+            or data_storage_bucket is None
+            or assets_base_prefix is None
+            or openai_api_key is None
+        ):
+            raise ValueError("missing required LoopAd runtime env")
+        asset_prefix = _normalize_assets_base_prefix(assets_base_prefix)
+
+        return cls(
+            app_env=app_env,
+            openai_api_key=openai_api_key,
+            openai_content_model=_clean(os.getenv("LOOPAD_OPENAI_CONTENT_MODEL")),
+            content_asset_storage="s3",
+            content_asset_prefix=asset_prefix,
+            content_asset_public_base_url=_build_s3_public_base_url(data_storage_bucket),
+            content_asset_s3_bucket=data_storage_bucket,
+            content_asset_s3_region=AWS_SEOUL_REGION,
         )
 
 
@@ -75,19 +98,20 @@ def build_content_asset_service(
         )
     elif storage_name == "s3":
         if config.content_asset_s3_bucket is None:
-            raise ValueError("CONTENT_ASSET_S3_BUCKET is required when CONTENT_ASSET_STORAGE=s3")
+            raise ValueError("LOOPAD_DATA_STORAGE_BUCKET is required")
         if config.content_asset_public_base_url is None:
-            raise ValueError("CONTENT_ASSET_PUBLIC_BASE_URL is required when CONTENT_ASSET_STORAGE=s3")
+            raise ValueError("content_asset_public_base_url is required")
         storage = S3AssetStorage(
             bucket=config.content_asset_s3_bucket,
-            public_base_url=config.content_asset_public_base_url,
+            public_base_url=_resolve_s3_public_base_url(config),
             client=s3_client,
             region_name=config.content_asset_s3_region,
             endpoint_url=config.content_asset_s3_endpoint_url,
             cache_control=config.content_asset_s3_cache_control,
+            public_url_strip_prefix=config.content_asset_public_url_strip_prefix,
         )
     else:
-        raise ValueError("CONTENT_ASSET_STORAGE must be memory, local, or s3")
+        raise ValueError("content_asset_storage must be memory, local, or s3")
 
     return ContentAssetService(
         storage=storage,
@@ -102,26 +126,30 @@ def _clean(value: str | None) -> str | None:
     return stripped or None
 
 
+def _normalize_assets_base_prefix(value: str) -> str:
+    stripped = value.strip().strip("/")
+    if not stripped:
+        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must include an asset path prefix")
+    path = Path(stripped)
+    if path.is_absolute() or ".." in path.parts:
+        raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must be a relative S3 key prefix")
+    return stripped
+
+
+def _build_s3_public_base_url(bucket: str) -> str:
+    return f"https://{bucket}.s3.{AWS_SEOUL_REGION}.amazonaws.com"
+
+
 def _resolve_content_asset_storage(config: ContentGenerationConfig) -> str:
     storage_name = _clean(config.content_asset_storage)
     if storage_name is None:
-        if _is_production(config.app_env):
-            raise ValueError("CONTENT_ASSET_STORAGE is required in production")
-        return "memory"
+        raise ValueError("content_asset_storage is required")
 
     normalized = storage_name.lower()
-    if normalized == "memory" and _is_production(config.app_env):
-        raise ValueError("CONTENT_ASSET_STORAGE=memory is not allowed in production")
     return normalized
 
 
-def _is_production(app_env: str | None) -> bool:
-    return (app_env or "").strip().lower() == "production"
-
-
-def _resolve_app_env() -> str | None:
-    app_env = _clean(os.getenv("APP_ENV"))
-    env = _clean(os.getenv("ENV"))
-    if _is_production(app_env) or _is_production(env):
-        return "production"
-    return app_env or env
+def _resolve_s3_public_base_url(config: ContentGenerationConfig) -> str:
+    if config.content_asset_public_base_url is not None:
+        return config.content_asset_public_base_url
+    raise ValueError("content_asset_public_base_url is required")

@@ -87,6 +87,7 @@ class S3AssetStorage:
         region_name: str | None = None,
         endpoint_url: str | None = None,
         cache_control: str | None = DEFAULT_S3_CACHE_CONTROL,
+        public_url_strip_prefix: str | None = None,
     ) -> None:
         normalized_bucket = bucket.strip()
         if not normalized_bucket:
@@ -100,6 +101,7 @@ class S3AssetStorage:
         self.region_name = _clean(region_name)
         self.endpoint_url = _clean(endpoint_url)
         self.cache_control = _clean(cache_control)
+        self.public_url_strip_prefix = _normalize_key_prefix(public_url_strip_prefix)
 
     def put_object(self, asset: AssetObject) -> StoredAsset:
         _validate_asset_key(asset.key)
@@ -114,7 +116,10 @@ class S3AssetStorage:
         self._get_client().put_object(**params)
         return StoredAsset(
             key=asset.key,
-            public_url=_join_public_url(self.public_base_url, asset.key),
+            public_url=_join_public_url(
+                self.public_base_url,
+                _strip_key_prefix(asset.key, self.public_url_strip_prefix),
+            ),
             content_type=asset.content_type,
         )
 
@@ -224,6 +229,25 @@ def _validate_asset_key(key: str) -> None:
     path = Path(key)
     if path.is_absolute() or ".." in path.parts:
         raise ValueError("asset key must be a relative path without traversal")
+
+
+def _normalize_key_prefix(value: str | None) -> str | None:
+    cleaned = _clean(value)
+    if cleaned is None:
+        return None
+    return cleaned.strip("/") or None
+
+
+def _strip_key_prefix(key: str, prefix: str | None) -> str:
+    if prefix is None:
+        return key
+    normalized_key = key.strip("/")
+    if normalized_key == prefix:
+        return ""
+    prefix_with_slash = f"{prefix}/"
+    if normalized_key.startswith(prefix_with_slash):
+        return normalized_key[len(prefix_with_slash) :]
+    return key
 
 
 def _safe_path_part(value: str) -> str:
