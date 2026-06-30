@@ -7,6 +7,10 @@ from typing import Iterable, Protocol
 from app.contents.types import GeneratedContentDraft, GeneratedContentRecord, RecommendationActionTarget
 
 
+class GenerationLockUnavailable(RuntimeError):
+    """Raised when another worker is already generating content for the same action."""
+
+
 class GenerationLock(Protocol):
     def __enter__(self) -> None:
         ...

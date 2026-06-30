@@ -10,7 +10,10 @@ Includes:
 - optional `OpenAIContentGenerator` behind env/config
 - prompt sanitization that excludes raw events and user-level identifiers
 - force/default/status rules
+- `generation_model` source/model contract (`seed`, `mock`, `manual`, or LLM model name)
 - repository protocol and no-op lock boundary
+- `recommendation_action_id` scoped generation lock before generator calls
+- operational summary counters for created/updated/skipped/failed actions and contents
 - unit tests with an in-memory fake repository
 
 Does not include:
@@ -23,8 +26,11 @@ Acceptance:
 - recommended non-default actions generate `control` and `treatment_a`
 - default segment and seed/default content are protected
 - `force=false` skips existing content
-- `force=true` can regenerate AI-created content
+- `force=true` updates the existing generated content row and keeps its id stable
 - failures mark `recommendation_actions.status = failed`
+- lock acquisition failure skips the action before any LLM/mock generator call
+- `ContentGenerationSummary` can be stored in `decision_runs.metadata`
+- `DailyDecisionJob` only needs to call `ContentGenerationService.generate_for_actions(...)`
 
 ## PR 2. PostgreSQL Repository
 

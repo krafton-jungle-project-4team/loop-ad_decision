@@ -5,6 +5,7 @@ from typing import Any, Protocol
 
 from app.contents.prompt_builder import ContentPromptBuilder
 from app.contents.types import (
+    GENERATION_MODEL_MOCK,
     GENERATION_STATUS_GENERATED,
     GeneratedContentDraft,
     RecommendationActionTarget,
@@ -28,7 +29,7 @@ class PartialContentGenerationError(Exception):
 
 
 class MockContentGenerator:
-    def __init__(self, generation_model: str = "mock") -> None:
+    def __init__(self, generation_model: str = GENERATION_MODEL_MOCK) -> None:
         self.generation_model = generation_model
 
     def generate(

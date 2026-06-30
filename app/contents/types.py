@@ -16,6 +16,10 @@ GENERATION_STATUS_FAILED = "failed"
 
 ERROR_TYPE_CONTENT_GENERATION_FAILED = "content_generation_failed"
 
+GENERATION_MODEL_SEED = "seed"
+GENERATION_MODEL_MOCK = "mock"
+GENERATION_MODEL_MANUAL = "manual"
+
 
 @dataclass(frozen=True)
 class SegmentContext:
@@ -57,6 +61,7 @@ class GeneratedContentDraft:
     cta_label: str
     landing_url: str
     image_prompt: str
+    # Source/model contract: seed/mock/manual use those literal values; LLM content uses the model name.
     generation_model: str
     generation_status: str = GENERATION_STATUS_GENERATED
     created_run_id: int | None = None
@@ -101,8 +106,11 @@ class ContentGenerationActionResult:
     recommendation_action_id: int
     status: str
     created_variant_keys: tuple[str, ...] = ()
+    updated_variant_keys: tuple[str, ...] = ()
     skipped_variant_keys: tuple[str, ...] = ()
     failed_variant_keys: tuple[str, ...] = ()
+    mock_calls: int = 0
+    llm_calls: int = 0
     error_message: str | None = None
 
 
@@ -110,21 +118,47 @@ class ContentGenerationActionResult:
 class ContentGenerationSummary:
     actions_seen: int = 0
     actions_created: int = 0
+    actions_updated: int = 0
     actions_skipped: int = 0
     actions_failed: int = 0
+    created_actions: int = 0
+    updated_actions: int = 0
+    skipped_actions: int = 0
+    failed_actions: int = 0
     variants_created: int = 0
+    variants_updated: int = 0
     variants_skipped: int = 0
     variants_failed: int = 0
+    created_contents: int = 0
+    updated_contents: int = 0
+    skipped_contents: int = 0
+    failed_contents: int = 0
+    mock_calls: int = 0
+    llm_calls: int = 0
+    elapsed_ms: int = 0
     results: list[ContentGenerationActionResult] = field(default_factory=list)
 
     def add_result(self, result: ContentGenerationActionResult) -> None:
         self.results.append(result)
         if result.status == "failed":
             self.actions_failed += 1
+            self.failed_actions += 1
+        elif result.status == "updated":
+            self.actions_updated += 1
+            self.updated_actions += 1
         elif result.status == "skipped":
             self.actions_skipped += 1
+            self.skipped_actions += 1
         else:
             self.actions_created += 1
+            self.created_actions += 1
         self.variants_created += len(result.created_variant_keys)
+        self.variants_updated += len(result.updated_variant_keys)
         self.variants_skipped += len(result.skipped_variant_keys)
         self.variants_failed += len(result.failed_variant_keys)
+        self.created_contents += len(result.created_variant_keys)
+        self.updated_contents += len(result.updated_variant_keys)
+        self.skipped_contents += len(result.skipped_variant_keys)
+        self.failed_contents += len(result.failed_variant_keys)
+        self.mock_calls += result.mock_calls
+        self.llm_calls += result.llm_calls

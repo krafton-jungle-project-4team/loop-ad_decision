@@ -6,12 +6,14 @@ from typing import Iterable
 
 from app.contents.generators import MockContentGenerator, PartialContentGenerationError
 from app.contents.prompt_builder import ContentPromptBuilder
+from app.contents.repository import GenerationLockUnavailable
 from app.contents.service import ContentGenerationService
 from app.contents.types import (
     ACTION_STATUS_CONTENT_GENERATED,
     ACTION_STATUS_FAILED,
     ACTION_STATUS_RECOMMENDED,
     ERROR_TYPE_CONTENT_GENERATION_FAILED,
+    GENERATION_MODEL_MOCK,
     GENERATION_STATUS_GENERATED,
     VARIANT_KEYS,
     GeneratedContentDraft,
@@ -22,8 +24,14 @@ from app.contents.types import (
 
 
 class FakeContentRepository:
-    def __init__(self, targets: list[RecommendationActionTarget]) -> None:
+    def __init__(
+        self,
+        targets: list[RecommendationActionTarget],
+        *,
+        lock_available: bool = True,
+    ) -> None:
         self.targets = targets
+        self.lock_available = lock_available
         self.records: dict[tuple[int | str, int, str], GeneratedContentRecord] = {}
         self.drafts: dict[tuple[int | str, int, str], GeneratedContentDraft] = {}
         self.action_statuses: dict[int, str] = {}
@@ -48,6 +56,8 @@ class FakeContentRepository:
 
     @contextmanager
     def generation_lock(self, *, project_id: int | str, recommendation_action_id: int):
+        if not self.lock_available:
+            raise GenerationLockUnavailable("generation already in progress")
         self.locked.append((project_id, recommendation_action_id))
         yield
 
@@ -125,6 +135,11 @@ class PartialFailingGenerator:
         raise PartialContentGenerationError("partial failure", draft)
 
 
+class StaticModelGenerator(MockContentGenerator):
+    def __init__(self, generation_model: str) -> None:
+        super().__init__(generation_model=generation_model)
+
+
 def make_target(
     *,
     action_id: int = 10,
@@ -174,12 +189,18 @@ def test_mock_generator_creates_control_and_treatment_contents() -> None:
 
     assert summary.actions_seen == 1
     assert summary.actions_created == 1
+    assert summary.created_actions == 1
     assert summary.variants_created == 2
+    assert summary.created_contents == 2
+    assert summary.mock_calls == 2
+    assert summary.llm_calls == 0
+    assert summary.elapsed_ms >= 0
     assert set(repository.drafts) == {
         ("demo-shop", 10, "control"),
         ("demo-shop", 10, "treatment_a"),
     }
     assert all(draft.generation_status == GENERATION_STATUS_GENERATED for draft in repository.drafts.values())
+    assert all(draft.generation_model == GENERATION_MODEL_MOCK for draft in repository.drafts.values())
     assert repository.action_statuses[10] == ACTION_STATUS_CONTENT_GENERATED
     assert repository.locked == [("demo-shop", 10)]
 
@@ -246,7 +267,7 @@ def test_force_false_skips_existing_content_without_mapping_side_effects() -> No
     assert repository.action_statuses[10] == ACTION_STATUS_CONTENT_GENERATED
 
 
-def test_force_true_updates_existing_ai_generated_content() -> None:
+def test_force_true_updates_existing_ai_generated_content_row() -> None:
     repository = FakeContentRepository([make_target()])
     repository.records[("demo-shop", 10, "control")] = GeneratedContentRecord(
         id=1,
@@ -265,9 +286,78 @@ def test_force_true_updates_existing_ai_generated_content() -> None:
     )
 
     assert summary.actions_created == 1
-    assert summary.variants_created == 2
+    assert summary.created_actions == 1
+    assert summary.variants_created == 1
+    assert summary.variants_updated == 1
+    assert summary.created_contents == 1
+    assert summary.updated_contents == 1
     assert repository.records[("demo-shop", 10, "control")].id == 1
     assert ("demo-shop", 10, "control") in repository.drafts
+
+
+def test_force_true_with_only_existing_content_is_counted_as_update() -> None:
+    repository = FakeContentRepository([make_target()])
+    repository.records[("demo-shop", 10, "control")] = GeneratedContentRecord(
+        id=1,
+        project_id="demo-shop",
+        recommendation_action_id=10,
+        segment_id=1,
+        variant_key="control",
+        generation_status=GENERATION_STATUS_GENERATED,
+    )
+    repository.records[("demo-shop", 10, "treatment_a")] = GeneratedContentRecord(
+        id=2,
+        project_id="demo-shop",
+        recommendation_action_id=10,
+        segment_id=1,
+        variant_key="treatment_a",
+        generation_status=GENERATION_STATUS_GENERATED,
+    )
+    service = make_service(repository)
+
+    summary = service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+        force=True,
+    )
+
+    assert summary.actions_updated == 1
+    assert summary.updated_actions == 1
+    assert summary.updated_contents == 2
+    assert repository.records[("demo-shop", 10, "control")].id == 1
+    assert repository.records[("demo-shop", 10, "treatment_a")].id == 2
+
+
+def test_generation_lock_unavailable_skips_without_generator_call() -> None:
+    repository = FakeContentRepository([make_target()], lock_available=False)
+    service = make_service(repository, FailingGenerator())
+
+    summary = service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+    )
+
+    assert summary.actions_skipped == 1
+    assert summary.skipped_actions == 1
+    assert summary.mock_calls == 0
+    assert summary.llm_calls == 0
+    assert repository.drafts == {}
+    assert repository.action_statuses == {}
+    assert summary.results[0].error_message == "generation already in progress"
+
+
+def test_non_mock_generation_model_is_counted_as_llm_call() -> None:
+    repository = FakeContentRepository([make_target()])
+    service = make_service(repository, StaticModelGenerator("gpt-test"))
+
+    summary = service.generate_for_actions(
+        project_id="demo-shop",
+        analysis_date="2021-01-04",
+    )
+
+    assert summary.mock_calls == 0
+    assert summary.llm_calls == 2
+    assert all(draft.generation_model == "gpt-test" for draft in repository.drafts.values())
 
 
 def test_failed_actions_are_retried_only_with_force_true() -> None:
