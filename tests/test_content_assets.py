@@ -10,12 +10,27 @@ from app.contents.assets import (
     ContentAssetService,
     InMemoryAssetStorage,
     LocalAssetStorage,
+    S3AssetStorage,
     SvgBannerRenderer,
     build_asset_key,
 )
 from app.contents.config import ContentGenerationConfig, build_content_asset_service
 from app.contents.generators import MockContentGenerator
 from tests.test_content_generation_service import make_target
+
+
+class FakeS3Client:
+    def __init__(self) -> None:
+        self.put_object_calls: list[dict[str, object]] = []
+        self.presigned_url_calls: list[dict[str, object]] = []
+
+    def put_object(self, **kwargs):
+        self.put_object_calls.append(kwargs)
+        return {"ETag": "fake-etag"}
+
+    def generate_presigned_url(self, **kwargs):
+        self.presigned_url_calls.append(kwargs)
+        raise AssertionError("presigned URLs must not be used for generated content assets")
 
 
 def make_draft():
@@ -78,6 +93,72 @@ def test_local_asset_storage_rejects_path_traversal(tmp_path: Path) -> None:
                 body=b"<svg />",
                 content_type="image/svg+xml",
             )
+        )
+
+
+def test_s3_asset_storage_puts_object_without_presigned_url() -> None:
+    client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket="loop-assets",
+        public_base_url="https://cdn.example.com/assets",
+        client=client,
+        cache_control="public, max-age=60",
+    )
+
+    stored = storage.put_object(
+        AssetObject(
+            key="generated-contents/projects/demo/actions/10/banner.svg",
+            body=b"<svg />",
+            content_type="image/svg+xml",
+        )
+    )
+
+    assert client.put_object_calls == [
+        {
+            "Bucket": "loop-assets",
+            "Key": "generated-contents/projects/demo/actions/10/banner.svg",
+            "Body": b"<svg />",
+            "ContentType": "image/svg+xml",
+            "CacheControl": "public, max-age=60",
+        }
+    ]
+    assert client.presigned_url_calls == []
+    assert stored.key == "generated-contents/projects/demo/actions/10/banner.svg"
+    assert stored.public_url == (
+        "https://cdn.example.com/assets/generated-contents/projects/demo/actions/10/banner.svg"
+    )
+
+
+def test_s3_asset_storage_rejects_path_traversal() -> None:
+    storage = S3AssetStorage(
+        bucket="loop-assets",
+        public_base_url="https://cdn.example.com",
+        client=FakeS3Client(),
+    )
+
+    with pytest.raises(ValueError):
+        storage.put_object(
+            AssetObject(
+                key="../escape.svg",
+                body=b"<svg />",
+                content_type="image/svg+xml",
+            )
+        )
+
+
+def test_s3_asset_storage_requires_bucket_and_public_base_url() -> None:
+    with pytest.raises(ValueError):
+        S3AssetStorage(
+            bucket=" ",
+            public_base_url="https://cdn.example.com",
+            client=FakeS3Client(),
+        )
+
+    with pytest.raises(ValueError):
+        S3AssetStorage(
+            bucket="loop-assets",
+            public_base_url=" ",
+            client=FakeS3Client(),
         )
 
 
@@ -187,8 +268,69 @@ def test_build_content_asset_service_treats_either_env_as_production(monkeypatch
         build_content_asset_service()
 
 
-def test_build_content_asset_service_defers_s3_to_later_pr() -> None:
-    with pytest.raises(NotImplementedError):
+def test_build_content_asset_service_supports_s3_with_injected_client() -> None:
+    client = FakeS3Client()
+    service = build_content_asset_service(
+        ContentGenerationConfig(
+            content_asset_storage="s3",
+            content_asset_prefix="s3-prefix",
+            content_asset_public_base_url="https://cdn.example.com",
+            content_asset_s3_bucket="loop-assets",
+            content_asset_s3_region="ap-northeast-2",
+            content_asset_s3_endpoint_url="https://s3.ap-northeast-2.amazonaws.com",
+            content_asset_s3_cache_control="public, max-age=60",
+        ),
+        s3_client=client,
+    )
+
+    draft = service.store_banner(make_draft())
+
+    assert draft.media_s3_key == "s3-prefix/projects/demo-shop/actions/10/variants/control/banner.svg"
+    assert draft.image_url == (
+        "https://cdn.example.com/s3-prefix/projects/demo-shop/actions/10/variants/control/banner.svg"
+    )
+    assert client.put_object_calls[0]["Bucket"] == "loop-assets"
+    assert client.put_object_calls[0]["Key"] == draft.media_s3_key
+    assert client.put_object_calls[0]["ContentType"] == "image/svg+xml"
+    assert client.put_object_calls[0]["CacheControl"] == "public, max-age=60"
+    assert client.presigned_url_calls == []
+
+
+def test_build_content_asset_service_requires_s3_bucket() -> None:
+    with pytest.raises(ValueError, match="CONTENT_ASSET_S3_BUCKET is required"):
         build_content_asset_service(
-            ContentGenerationConfig(content_asset_storage="s3")
+            ContentGenerationConfig(
+                content_asset_storage="s3",
+                content_asset_public_base_url="https://cdn.example.com",
+            ),
+            s3_client=FakeS3Client(),
         )
+
+
+def test_build_content_asset_service_requires_s3_public_base_url() -> None:
+    with pytest.raises(ValueError, match="CONTENT_ASSET_PUBLIC_BASE_URL is required"):
+        build_content_asset_service(
+            ContentGenerationConfig(
+                content_asset_storage="s3",
+                content_asset_s3_bucket="loop-assets",
+            ),
+            s3_client=FakeS3Client(),
+        )
+
+
+def test_content_generation_config_reads_s3_env(monkeypatch) -> None:
+    monkeypatch.setenv("CONTENT_ASSET_STORAGE", "s3")
+    monkeypatch.setenv("CONTENT_ASSET_PUBLIC_BASE_URL", "https://cdn.example.com/assets")
+    monkeypatch.setenv("CONTENT_ASSET_S3_BUCKET", "loop-assets")
+    monkeypatch.setenv("CONTENT_ASSET_S3_REGION", "ap-northeast-2")
+    monkeypatch.setenv("CONTENT_ASSET_S3_ENDPOINT_URL", "https://s3.example.com")
+    monkeypatch.setenv("CONTENT_ASSET_S3_CACHE_CONTROL", "public, max-age=60")
+
+    config = ContentGenerationConfig.from_env()
+
+    assert config.content_asset_storage == "s3"
+    assert config.content_asset_public_base_url == "https://cdn.example.com/assets"
+    assert config.content_asset_s3_bucket == "loop-assets"
+    assert config.content_asset_s3_region == "ap-northeast-2"
+    assert config.content_asset_s3_endpoint_url == "https://s3.example.com"
+    assert config.content_asset_s3_cache_control == "public, max-age=60"

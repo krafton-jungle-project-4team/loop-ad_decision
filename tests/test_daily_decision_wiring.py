@@ -5,7 +5,7 @@ from typing import Any
 
 import pytest
 
-from app.contents.assets import ContentAssetService
+from app.contents.assets import AssetObject, ContentAssetService, S3AssetStorage
 from app.contents.config import ContentGenerationConfig
 from app.contents.generators import MockContentGenerator
 from app.contents.postgres_repository import PostgresContentRepository
@@ -20,6 +20,15 @@ class FakeConnection:
     def cursor(self, *args: Any, **kwargs: Any) -> object:
         del args, kwargs
         raise AssertionError("wiring tests should not execute database queries")
+
+
+class FakeS3Client:
+    def __init__(self) -> None:
+        self.put_object_calls: list[dict[str, object]] = []
+
+    def put_object(self, **kwargs):
+        self.put_object_calls.append(kwargs)
+        return {"ETag": "fake-etag"}
 
 
 def test_build_content_generation_service_wires_content_dependencies() -> None:
@@ -56,12 +65,30 @@ def test_build_content_generation_service_accepts_explicit_overrides() -> None:
     assert service.asset_service is asset_service
 
 
-def test_build_content_generation_service_keeps_s3_deferred() -> None:
-    with pytest.raises(NotImplementedError):
-        build_content_generation_service(
-            connection=FakeConnection(cursors=[]),
-            config=ContentGenerationConfig(content_asset_storage="s3"),
+def test_build_content_generation_service_can_wire_s3_asset_storage() -> None:
+    s3_client = FakeS3Client()
+
+    service = build_content_generation_service(
+        connection=FakeConnection(cursors=[]),
+        config=ContentGenerationConfig(
+            content_asset_storage="s3",
+            content_asset_public_base_url="https://cdn.example.com",
+            content_asset_s3_bucket="loop-assets",
+        ),
+        s3_client=s3_client,
+    )
+
+    assert isinstance(service.asset_service, ContentAssetService)
+    assert isinstance(service.asset_service.storage, S3AssetStorage)
+    assert service.asset_service.storage.bucket == "loop-assets"
+    service.asset_service.storage.put_object(
+        AssetObject(
+            key="generated-contents/banner.svg",
+            body=b"<svg />",
+            content_type="image/svg+xml",
         )
+    )
+    assert s3_client.put_object_calls[0]["Bucket"] == "loop-assets"
 
 
 def test_build_content_generation_service_enforces_production_storage_config() -> None:
