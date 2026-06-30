@@ -71,7 +71,7 @@ def experiment() -> Experiment:
         segment_id=10,
         recommendation_action_id=7,
         name="experiment",
-        objective_metric="click_to_purchase_rate",
+        objective_metric="view_to_purchase_rate",
         target_value=Decimal("0.05"),
         allocation_policy="fixed_split",
         status="running",
@@ -180,6 +180,55 @@ def test_postgres_decision_repository_rejects_empty_project_key() -> None:
 
     with pytest.raises(ValueError, match="project_key is required"):
         repository.get_project_key(project_id=1)
+
+
+def test_postgres_decision_repository_upserts_experiment_with_active_partial_index() -> None:
+    connection = FakeConnection(
+        {
+            "id": 42,
+            "project_id": 1,
+            "segment_id": 10,
+            "recommendation_action_id": 7,
+            "name": "experiment",
+            "objective_metric": "view_to_purchase_rate",
+            "target_value": Decimal("0.05"),
+            "allocation_policy": "fixed_split",
+            "status": "running",
+            "start_date": date(2021, 1, 4),
+            "winner_variant_id": None,
+        }
+    )
+    repository = PostgresDecisionRepository(connection)
+
+    repository.upsert_experiment(
+        project_id=1,
+        segment_id=10,
+        recommendation_action_id=7,
+        name="experiment",
+        objective_metric="view_to_purchase_rate",
+        target_value=Decimal("0.05"),
+        allocation_policy="fixed_split",
+        status="running",
+        start_date=date(2021, 1, 4),
+        run_id=100,
+    )
+
+    query, parameters = connection.cursor_instance.executed[0]
+    assert "ON CONFLICT (project_id, recommendation_action_id)" in query
+    assert "WHERE recommendation_action_id IS NOT NULL" in query
+    assert "AND status IN ('draft', 'running', 'paused')" in query
+    assert parameters == (
+        1,
+        10,
+        7,
+        "experiment",
+        "view_to_purchase_rate",
+        Decimal("0.05"),
+        "fixed_split",
+        "running",
+        date(2021, 1, 4),
+        100,
+    )
 
 
 def test_postgres_decision_repository_lists_existing_segments_read_only() -> None:
