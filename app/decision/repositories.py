@@ -1026,7 +1026,7 @@ class ClickHouseExperimentResultRepository:
             {
                 "project_id": str(project_id),
                 "experiment_id": str(experiment.id),
-                "variant_ids": tuple(variants_by_event_variant_id),
+                "variant_ids": list(variants_by_event_variant_id),
                 "window_start_utc": window_start.astimezone(timezone.utc).isoformat(),
                 "window_end_utc": window_end.astimezone(timezone.utc).isoformat(),
             },

@@ -133,7 +133,7 @@ def test_clickhouse_experiment_results_use_loopad_events_contract() -> None:
     assert "GROUP BY experiment_id, variant_id, creative_id" in compact_sql
     assert parameters["project_id"] == "demo-shop"
     assert parameters["experiment_id"] == "42"
-    assert parameters["variant_ids"] == ("11", "12")
+    assert parameters["variant_ids"] == ["11", "12"]
     assert parameters["window_start_utc"] == "2021-01-03T15:00:00+00:00"
     assert parameters["window_end_utc"] == "2021-01-04T15:00:00+00:00"
     assert results[control.id].ad_impression_count == 410
@@ -160,7 +160,7 @@ def test_clickhouse_experiment_results_skip_variants_without_generated_content()
     )
 
     _, parameters = client.queries[0]
-    assert parameters["variant_ids"] == ("11",)
+    assert parameters["variant_ids"] == ["11"]
     assert results[draft.id].ad_impression_count == 0
     assert results[draft.id].ad_click_count == 0
     assert results[draft.id].attributed_purchase_count == 0
