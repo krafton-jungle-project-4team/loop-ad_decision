@@ -357,10 +357,8 @@ def test_content_generation_config_reads_loopad_infra_s3_env(monkeypatch) -> Non
     assert config.content_asset_s3_bucket == "example-data-storage-bucket"
     assert config.content_asset_s3_region == "ap-northeast-2"
     assert config.content_asset_prefix == "genai"
-    assert config.content_asset_public_base_url == (
-        "https://example-data-storage-bucket.s3.ap-northeast-2.amazonaws.com"
-    )
-    assert config.content_asset_public_url_strip_prefix is None
+    assert config.content_asset_public_base_url == "https://gen-ai.asset.dev.loop-ad.org"
+    assert config.content_asset_public_url_strip_prefix == "genai"
 
     client = FakeS3Client()
     service = build_content_asset_service(config, s3_client=client)
@@ -370,8 +368,8 @@ def test_content_generation_config_reads_loopad_infra_s3_env(monkeypatch) -> Non
         "genai/projects/demo-shop/actions/10/variants/control/banner.svg"
     )
     assert draft.image_url == (
-        "https://example-data-storage-bucket.s3.ap-northeast-2.amazonaws.com/"
-        "genai/projects/demo-shop/actions/10/variants/control/banner.svg"
+        "https://gen-ai.asset.dev.loop-ad.org/"
+        "projects/demo-shop/actions/10/variants/control/banner.svg"
     )
     assert client.put_object_calls[0]["Bucket"] == "example-data-storage-bucket"
     assert client.put_object_calls[0]["Key"] == draft.media_s3_key
@@ -437,7 +435,5 @@ def test_loopad_asset_env_takes_priority_over_legacy_content_env(monkeypatch) ->
     assert config.content_asset_s3_bucket == "loopad-bucket"
     assert config.content_asset_s3_region == "ap-northeast-2"
     assert config.content_asset_prefix == "genai"
-    assert config.content_asset_public_base_url == (
-        "https://loopad-bucket.s3.ap-northeast-2.amazonaws.com"
-    )
-    assert config.content_asset_public_url_strip_prefix is None
+    assert config.content_asset_public_base_url == "https://gen-ai.asset.dev.loop-ad.org"
+    assert config.content_asset_public_url_strip_prefix == "genai"
