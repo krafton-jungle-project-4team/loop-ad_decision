@@ -233,9 +233,10 @@ def test_content_ready_creates_running_experiment_variants_mappings_and_is_idemp
     treatment = next(variant for variant in repo.variants if variant.variant_key == "treatment_a")
     assert control.generated_content_id == 101
     assert treatment.generated_content_id == 201
-    assert len(repo.mappings) == 2
+    assert len(repo.mappings) == 4
     assert all(mapping.is_active for mapping in repo.mappings)
     assert {mapping.traffic_weight for mapping in repo.mappings} == {Decimal("0.5")}
+    assert {mapping.placement_key for mapping in repo.mappings} == {"C1_MAIN_TOP", "W1_WING"}
 
 
 def test_default_content_is_not_used_as_action_control_content() -> None:

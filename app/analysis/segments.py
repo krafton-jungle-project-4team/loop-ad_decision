@@ -5,6 +5,7 @@ from collections.abc import Mapping
 
 
 SEGMENT_DIMENSIONS = (
+    "region",
     "age_group",
     "gender",
     "device_type",
@@ -39,6 +40,7 @@ def normalize_dimensions(values: Mapping[str, object]) -> dict[str, str]:
 def build_segment_key(dimensions: Mapping[str, object]) -> str:
     normalized = normalize_dimensions(dimensions)
     parts = [
+        f"region_{normalized['region']}",
         f"age_{normalized['age_group']}",
         f"gender_{normalized['gender']}",
         f"device_{normalized['device_type']}",

@@ -347,6 +347,7 @@ def test_clickhouse_user_segment_candidates_use_real_event_columns_and_internal_
         rows=[
             (
                 "user-1",
+                "서울",
                 "30s",
                 "Male",
                 "Mobile Web",
@@ -373,6 +374,8 @@ def test_clickhouse_user_segment_candidates_use_real_event_columns_and_internal_
     assert "events.device" in sql
     assert "events.channel" in sql
     assert "events.category" in sql
+    assert "JSONExtractString(events.properties_json, 'region')" in sql
+    assert "argMaxIf" in sql
     assert "device_type" in sql
     assert "acquisition_channel" in sql
     assert "primary_category" in sql
@@ -381,6 +384,7 @@ def test_clickhouse_user_segment_candidates_use_real_event_columns_and_internal_
     assert "events.primary_category" not in sql
     assert "INSERT INTO" not in sql
     assert candidates[0].dimensions == {
+        "region": "서울",
         "age_group": "30s",
         "gender": "male",
         "device_type": "mobile_web",

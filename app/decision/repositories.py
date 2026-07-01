@@ -1069,11 +1069,16 @@ class ClickHouseUserSegmentCandidateRepository:
             f"""
             SELECT
                 events.user_id AS external_user_id,
-                argMax(ifNull(events.age_group, ''), events.event_time) AS age_group,
-                argMax(ifNull(events.gender, ''), events.event_time) AS gender,
-                argMax(ifNull(events.device, ''), events.event_time) AS device_type,
-                argMax(ifNull(events.channel, ''), events.event_time) AS acquisition_channel,
-                argMax(ifNull(events.category, ''), events.event_time) AS primary_category
+                argMaxIf(
+                    ifNull(JSONExtractString(events.properties_json, 'region'), ''),
+                    events.event_time,
+                    ifNull(JSONExtractString(events.properties_json, 'region'), '') != ''
+                ) AS region,
+                argMaxIf(ifNull(events.age_group, ''), events.event_time, ifNull(events.age_group, '') != '') AS age_group,
+                argMaxIf(ifNull(events.gender, ''), events.event_time, ifNull(events.gender, '') != '') AS gender,
+                argMaxIf(ifNull(events.device, ''), events.event_time, ifNull(events.device, '') != '') AS device_type,
+                argMaxIf(ifNull(events.channel, ''), events.event_time, ifNull(events.channel, '') != '') AS acquisition_channel,
+                argMaxIf(ifNull(events.category, ''), events.event_time, ifNull(events.category, '') != '') AS primary_category
             FROM {self.events_table} AS events
             WHERE events.project_id = {{project_id:String}}
               AND events.event_time >= parseDateTime64BestEffort({{window_start_utc:String}}, 3, 'UTC')
@@ -1108,11 +1113,12 @@ class ClickHouseUserSegmentCandidateRepository:
 def build_user_segment_candidate(row: tuple[Any, ...]) -> UserSegmentCandidate:
     dimensions = normalize_dimensions(
         {
-            "age_group": row[1],
-            "gender": row[2],
-            "device_type": row[3],
-            "acquisition_channel": row[4],
-            "primary_category": row[5],
+            "region": row[1],
+            "age_group": row[2],
+            "gender": row[3],
+            "device_type": row[4],
+            "acquisition_channel": row[5],
+            "primary_category": row[6],
         }
     )
     return UserSegmentCandidate(

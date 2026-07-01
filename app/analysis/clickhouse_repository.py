@@ -31,6 +31,7 @@ class ClickHouseClient(Protocol):
 
 SEGMENT_AGGREGATE_QUERY = """
 SELECT
+    ifNull(JSONExtractString(properties_json, 'region'), '') AS region,
     ifNull(age_group, '') AS age_group,
     ifNull(gender, '') AS gender,
     ifNull(device, '') AS device_type,
@@ -60,6 +61,7 @@ WHERE project_id = {project_id:String}
     'ad_click'
   )
 GROUP BY
+    region,
     age_group,
     gender,
     device_type,
@@ -130,23 +132,24 @@ def build_window_parameters(
 def build_segment_aggregate(project_id: int | str, row: tuple[Any, ...]) -> SegmentAggregate:
     dimensions = normalize_dimensions(
         {
-            "age_group": row[0],
-            "gender": row[1],
-            "device_type": row[2],
-            "acquisition_channel": row[3],
-            "primary_category": row[4],
+            "region": row[0],
+            "age_group": row[1],
+            "gender": row[2],
+            "device_type": row[3],
+            "acquisition_channel": row[4],
+            "primary_category": row[5],
         }
     )
-    user_count = int(row[5] or 0)
-    session_count = int(row[6] or 0)
-    page_view_count = int(row[7] or 0)
-    product_view_count = int(row[8] or 0)
-    add_to_cart_count = int(row[9] or 0)
-    checkout_start_count = int(row[10] or 0)
-    purchase_count = int(row[11] or 0)
-    ad_impression_count = int(row[12] or 0)
-    ad_click_count = int(row[13] or 0)
-    revenue = decimal_or_zero(row[14])
+    user_count = int(row[6] or 0)
+    session_count = int(row[7] or 0)
+    page_view_count = int(row[8] or 0)
+    product_view_count = int(row[9] or 0)
+    add_to_cart_count = int(row[10] or 0)
+    checkout_start_count = int(row[11] or 0)
+    purchase_count = int(row[12] or 0)
+    ad_impression_count = int(row[13] or 0)
+    ad_click_count = int(row[14] or 0)
+    revenue = decimal_or_zero(row[15])
     return SegmentAggregate(
         project_id=project_id,
         segment_key=build_segment_key(dimensions),

@@ -35,7 +35,7 @@ ACTION_BY_CAUSE_KEY = {
 }
 STOCKOUT_ACTION_KEY = MVP_BANNER_ACTION_KEY
 OBJECTIVE_METRIC = "click_to_purchase_rate"
-PLACEMENT_KEY = "main_banner"
+PLACEMENT_KEYS = ("C1_MAIN_TOP", "W1_WING")
 
 
 @dataclass(frozen=True, slots=True)
@@ -647,32 +647,33 @@ class ExperimentService:
             action_id=action.id,
             status="running",
         )
-        self.repository.upsert_segment_ad_mapping(
-            project_id=action.project_id,
-            segment_id=action.segment_id,
-            placement_key=PLACEMENT_KEY,
-            experiment_id=experiment.id,
-            experiment_variant_id=control_variant.id,
-            generated_content_id=control_content.id,
-            traffic_weight=Decimal("0.5"),
-            is_active=True,
-            is_winner=False,
-            priority=100,
-            run_id=run_id,
-        )
-        self.repository.upsert_segment_ad_mapping(
-            project_id=action.project_id,
-            segment_id=action.segment_id,
-            placement_key=PLACEMENT_KEY,
-            experiment_id=experiment.id,
-            experiment_variant_id=treatment_variant.id,
-            generated_content_id=treatment_content.id,
-            traffic_weight=Decimal("0.5"),
-            is_active=True,
-            is_winner=False,
-            priority=100,
-            run_id=run_id,
-        )
+        for placement_key in PLACEMENT_KEYS:
+            self.repository.upsert_segment_ad_mapping(
+                project_id=action.project_id,
+                segment_id=action.segment_id,
+                placement_key=placement_key,
+                experiment_id=experiment.id,
+                experiment_variant_id=control_variant.id,
+                generated_content_id=control_content.id,
+                traffic_weight=Decimal("0.5"),
+                is_active=True,
+                is_winner=False,
+                priority=100,
+                run_id=run_id,
+            )
+            self.repository.upsert_segment_ad_mapping(
+                project_id=action.project_id,
+                segment_id=action.segment_id,
+                placement_key=placement_key,
+                experiment_id=experiment.id,
+                experiment_variant_id=treatment_variant.id,
+                generated_content_id=treatment_content.id,
+                traffic_weight=Decimal("0.5"),
+                is_active=True,
+                is_winner=False,
+                priority=100,
+                run_id=run_id,
+            )
 
 
 class WinnerDecisionService:
