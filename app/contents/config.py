@@ -17,6 +17,7 @@ from app.contents.generators import ContentGenerator, MockContentGenerator, Open
 from app.contents.visuals import BannerVisualProvider, GeminiBannerVisualProvider
 
 AWS_SEOUL_REGION = "ap-northeast-2"
+DEV_GENAI_ASSET_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 
 
@@ -71,9 +72,10 @@ class ContentGenerationConfig:
             gemini_api_key=_clean(os.getenv("LOOPAD_GEMINI_API_KEY")),
             content_asset_storage="s3",
             content_asset_prefix=asset_prefix,
-            content_asset_public_base_url=_build_s3_public_base_url(data_storage_bucket),
+            content_asset_public_base_url=DEV_GENAI_ASSET_PUBLIC_BASE_URL,
             content_asset_s3_bucket=data_storage_bucket,
             content_asset_s3_region=AWS_SEOUL_REGION,
+            content_asset_public_url_strip_prefix=asset_prefix,
         )
 
 
@@ -158,10 +160,6 @@ def _normalize_assets_base_prefix(value: str) -> str:
     if path.is_absolute() or ".." in path.parts:
         raise ValueError("LOOPAD_GENAI_ASSETS_BASE_PREFIX must be a relative S3 key prefix")
     return stripped
-
-
-def _build_s3_public_base_url(bucket: str) -> str:
-    return f"https://{bucket}.s3.{AWS_SEOUL_REGION}.amazonaws.com"
 
 
 def _resolve_content_asset_storage(config: ContentGenerationConfig) -> str:
