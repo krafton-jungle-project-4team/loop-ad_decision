@@ -14,6 +14,7 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
+from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisRequest
 from app.analysis.service import PromotionAnalysisService
 from app.analysis.vector_service import (
@@ -151,7 +152,25 @@ def valid_env() -> dict[str, str]:
 
 
 def make_client() -> TestClient:
-    return TestClient(create_app(settings=load_settings(valid_env())))
+    app = create_app(settings=load_settings(valid_env()))
+    app.dependency_overrides[get_analysis_service] = lambda: PromotionAnalysisService(
+        promotion_repository=FakePromotionRepository(promotion_record()),
+        segment_definition_repository=FakeSegmentDefinitionRepository(
+            [
+                segment_record(
+                    "seg_repeat_hotel_no_booking",
+                    segment_name="Repeat hotel viewers without booking",
+                    sample_size=1342,
+                )
+            ]
+        ),
+        hotel_profile_repository=FakeHotelProfileRepository(
+            [profile_record("seg_repeat_hotel_no_booking", event_count=5000)]
+        ),
+        promotion_analysis_repository=FakePromotionAnalysisRepository(),
+        segment_vector_service=FakeSegmentVectorService(),
+    )
+    return TestClient(app)
 
 
 def analysis_payload(**overrides: Any) -> dict[str, Any]:
@@ -183,6 +202,7 @@ def promotion_record() -> PromotionRecord:
 def segment_record(
     segment_id: str,
     *,
+    segment_name: str | None = None,
     source: str = "system_default",
     sample_size: int = 2000,
     sample_ratio: Decimal = Decimal("0.020000"),
@@ -191,7 +211,7 @@ def segment_record(
     return SegmentDefinitionRecord(
         segment_id=segment_id,
         project_id="hotel-client-a",
-        segment_name=segment_id.replace("_", " ").title(),
+        segment_name=segment_name or segment_id.replace("_", " ").title(),
         source=source,
         query_preview_id=None,
         natural_language_query=f"{segment_id} hotel booking audience",
@@ -285,7 +305,7 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
             {
                 "segment_id": "seg_repeat_hotel_no_booking",
                 "segment_name": "Repeat hotel viewers without booking",
-                "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
+                "segment_vector_id": "segvec_seg_repeat_hotel_no_booking_v1",
                 "estimated_size": 1342,
                 "content_brief": {
                     "message_direction": (

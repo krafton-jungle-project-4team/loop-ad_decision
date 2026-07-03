@@ -250,7 +250,10 @@ def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
     assert analysis_repository.saved.analysis == result.analysis
     assert analysis_repository.saved.target_segments == result.target_segments
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
-    assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+    assert (
+        result.target_segments[0].profile_json["hotel_profile"]["event_count"]
+        == 5000
+    )
 
 
 def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:

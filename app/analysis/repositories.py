@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
+from psycopg.types.json import Jsonb
+
 
 class PostgresExecutor(Protocol):
     def fetchone(
@@ -238,11 +240,15 @@ class PromotionAnalysisRepository:
                 analysis.campaign_id,
                 analysis.promotion_id,
                 analysis.status,
-                analysis.focus_segment_ids_json,
+                Jsonb(analysis.focus_segment_ids_json)
+                if analysis.focus_segment_ids_json is not None
+                else None,
                 analysis.operator_instruction,
-                analysis.input_snapshot_json,
-                analysis.profile_summary_json,
-                analysis.output_json,
+                Jsonb(analysis.input_snapshot_json),
+                Jsonb(analysis.profile_summary_json),
+                Jsonb(analysis.output_json)
+                if analysis.output_json is not None
+                else None,
             ),
         )
 
@@ -278,10 +284,10 @@ class PromotionAnalysisRepository:
                     segment.promotion_id,
                     segment.segment_id,
                     segment.segment_name,
-                    segment.rule_json,
-                    segment.profile_json,
-                    segment.content_brief_json,
-                    segment.data_evidence_json,
+                    Jsonb(segment.rule_json),
+                    Jsonb(segment.profile_json),
+                    Jsonb(segment.content_brief_json),
+                    Jsonb(segment.data_evidence_json),
                     segment.segment_vector_id,
                     segment.estimated_size,
                     segment.priority,
@@ -353,7 +359,7 @@ class SegmentVectorRepository:
                 vector.analysis_id,
                 vector.segment_id,
                 vector.vector_dim,
-                vector.vector_values,
+                Jsonb(vector.vector_values),
                 vector.vector_version,
                 vector.source,
             ),
