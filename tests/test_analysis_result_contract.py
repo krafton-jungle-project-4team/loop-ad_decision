@@ -1,0 +1,459 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Mapping, Sequence
+
+from fastapi.testclient import TestClient
+
+from app.analysis.repositories import (
+    HotelMarketingProfileRecord,
+    PromotionAnalysisWrite,
+    PromotionRecord,
+    PromotionTargetSegmentWrite,
+    SegmentDefinitionRecord,
+)
+from app.analysis.schemas import AnalysisRequest
+from app.analysis.service import PromotionAnalysisService
+from app.analysis.vector_service import (
+    SegmentVectorBuildRequest,
+    SegmentVectorBuildResult,
+)
+from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.main import create_app
+
+
+FORBIDDEN_PUBLIC_TERMS = tuple(
+    "".join(parts)
+    for parts in (
+        ("recom", "mendation"),
+        ("ano", "maly"),
+        ("root", "_cause"),
+        ("arm", "_id"),
+        ("ban", "dit"),
+        ("thomp", "son"),
+        ("experiment", "_id"),
+        ("variant", "_id"),
+        ("creative", "_id"),
+        ("pro", "duct"),
+        ("ca", "rt"),
+        ("pur", "chase"),
+    )
+)
+
+
+@dataclass
+class SavedAnalysis:
+    analysis: PromotionAnalysisWrite | None = None
+    target_segments: list[PromotionTargetSegmentWrite] | None = None
+
+
+class FakePromotionRepository:
+    def __init__(self, promotion: PromotionRecord) -> None:
+        self.promotion = promotion
+
+    def get_for_analysis(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+    ) -> PromotionRecord | None:
+        if (
+            project_id,
+            campaign_id,
+            promotion_id,
+        ) != (
+            self.promotion.project_id,
+            self.promotion.campaign_id,
+            self.promotion.promotion_id,
+        ):
+            return None
+        return self.promotion
+
+
+class FakeSegmentDefinitionRepository:
+    def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
+        self.segments = segments
+
+    def list_active(
+        self,
+        *,
+        project_id: str,
+        sources: Sequence[str] | None = None,
+    ) -> list[SegmentDefinitionRecord]:
+        return [
+            segment
+            for segment in self.segments
+            if segment.project_id == project_id and segment.status == "active"
+        ]
+
+
+class FakeHotelProfileRepository:
+    def __init__(self, profiles: list[HotelMarketingProfileRecord]) -> None:
+        self.profiles = profiles
+
+    def list_marketing_profiles(
+        self,
+        *,
+        project_id: str,
+    ) -> list[HotelMarketingProfileRecord]:
+        return [profile for profile in self.profiles if profile.project_id == project_id]
+
+
+class FakePromotionAnalysisRepository:
+    def __init__(self) -> None:
+        self.saved = SavedAnalysis()
+        self.events: list[str] = []
+
+    def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
+        self.saved.analysis = analysis
+        self.events.append("analysis")
+
+    def save_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        self.saved.target_segments = list(target_segments)
+        self.events.append("target_segments")
+
+
+class FakeSegmentVectorService:
+    def __init__(self) -> None:
+        self.calls: list[SegmentVectorBuildRequest] = []
+
+    def prepare_segment_vector(
+        self,
+        request: SegmentVectorBuildRequest,
+    ) -> SegmentVectorBuildResult:
+        self.calls.append(request)
+        return SegmentVectorBuildResult(
+            segment_id=request.segment_id,
+            segment_vector_id=f"segvec_{request.segment_id}_v1",
+            vector_values=[1.0, *([0.0] * 63)],
+            source="fixture",
+        )
+
+
+def valid_env() -> dict[str, str]:
+    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values.update(
+        {
+            "LOOPAD_ENV": "test",
+            "LOOPAD_SERVICE_ID": "decision-api",
+            "PORT": "8080",
+            "LOOPAD_AURORA_PORT": "15432",
+            "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
+        }
+    )
+    return values
+
+
+def make_client() -> TestClient:
+    return TestClient(create_app(settings=load_settings(valid_env())))
+
+
+def analysis_payload(**overrides: Any) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "operator_instruction": None,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def promotion_record() -> PromotionRecord:
+    return PromotionRecord(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        channel="onsite_banner",
+        goal_metric="booking_conversion_rate",
+        goal_target_value=Decimal("0.030000"),
+        goal_basis="all_segments",
+        min_sample_size=1000,
+        landing_url="https://demo-stay.example.com/hotel-detail",
+        message_brief="Drive hotel booking conversion for summer stays.",
+    )
+
+
+def segment_record(
+    segment_id: str,
+    *,
+    source: str = "system_default",
+    sample_size: int = 2000,
+    sample_ratio: Decimal = Decimal("0.020000"),
+    rule_json: Mapping[str, Any] | None = None,
+) -> SegmentDefinitionRecord:
+    return SegmentDefinitionRecord(
+        segment_id=segment_id,
+        project_id="hotel-client-a",
+        segment_name=segment_id.replace("_", " ").title(),
+        source=source,
+        query_preview_id=None,
+        natural_language_query=f"{segment_id} hotel booking audience",
+        generated_sql=None,
+        rule_json=rule_json or {"primary_segment": segment_id},
+        profile_json={"primary_segment": segment_id},
+        sample_size=sample_size,
+        total_eligible_user_count=74200,
+        sample_ratio=sample_ratio,
+        status="active",
+    )
+
+
+def profile_record(
+    profile_name: str,
+    *,
+    event_count: int,
+) -> HotelMarketingProfileRecord:
+    return HotelMarketingProfileRecord(
+        project_id="hotel-client-a",
+        profile_name=profile_name,
+        profile_json={
+            "event_count": event_count,
+            "booking_count": 120,
+            "mobile_ratio": 0.65,
+            "package_ratio": 0.25,
+            "avg_stay_nights": 2.4,
+            "avg_days_until_checkin": 14.2,
+        },
+    )
+
+
+def default_segments() -> list[SegmentDefinitionRecord]:
+    return [
+        segment_record("seg_family_trip", sample_size=2400),
+        segment_record(
+            "seg_mobile_user",
+            sample_size=2200,
+            rule_json={
+                "primary_segment": "seg_mobile_user",
+                "candidate_user_ids": ["user_001", "user_002"],
+            },
+        ),
+        segment_record("seg_repeat_hotel_no_booking", sample_size=1342),
+        segment_record("seg_near_checkin", sample_size=1800),
+        segment_record("seg_existing_all", sample_size=5000),
+    ]
+
+
+def collect_strings(value: Any) -> list[str]:
+    if isinstance(value, Mapping):
+        strings: list[str] = []
+        for key, child in value.items():
+            strings.append(str(key))
+            strings.extend(collect_strings(child))
+        return strings
+
+    if isinstance(value, list):
+        strings = []
+        for child in value:
+            strings.extend(collect_strings(child))
+        return strings
+
+    if isinstance(value, Enum):
+        return [value.value]
+
+    if isinstance(value, str):
+        return [value]
+
+    return []
+
+
+def assert_no_forbidden_public_terms(payload: Any) -> None:
+    response_text = " ".join(collect_strings(payload)).lower()
+    for term in FORBIDDEN_PUBLIC_TERMS:
+        assert term not in response_text
+
+
+def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
+    response = make_client().post(
+        "/decision/v1/promotions/promo_banner_001/analysis",
+        json=analysis_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "analysis_id": "analysis_promo_banner_001",
+        "promotion_id": "promo_banner_001",
+        "status": "completed",
+        "target_segments": [
+            {
+                "segment_id": "seg_repeat_hotel_no_booking",
+                "segment_name": "Repeat hotel viewers without booking",
+                "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
+                "estimated_size": 1342,
+                "content_brief": {
+                    "message_direction": (
+                        "Emphasize free cancellation, same-day availability, "
+                        "and breakfast benefits."
+                    ),
+                    "keywords": [
+                        "free cancellation",
+                        "same-day availability",
+                        "breakfast included",
+                    ],
+                },
+            }
+        ],
+    }
+    assert_no_forbidden_public_terms(response.json())
+
+
+def test_analysis_api_rejects_focus_segment_ids_contract() -> None:
+    response = make_client().post(
+        "/decision/v1/promotions/promo_banner_001/analysis",
+        json=analysis_payload(focus_segment_ids=["seg_near_checkin"]),
+    )
+
+    assert response.status_code == 422
+
+
+def test_analysis_service_persists_dashboard_db_contract() -> None:
+    analysis_repository = FakePromotionAnalysisRepository()
+    vector_service = FakeSegmentVectorService()
+    service = PromotionAnalysisService(
+        promotion_repository=FakePromotionRepository(promotion_record()),
+        segment_definition_repository=FakeSegmentDefinitionRepository(
+            default_segments()
+        ),
+        hotel_profile_repository=FakeHotelProfileRepository(
+            [
+                profile_record("seg_repeat_hotel_no_booking", event_count=5000),
+                profile_record("seg_family_trip", event_count=3000),
+            ]
+        ),
+        promotion_analysis_repository=analysis_repository,
+        segment_vector_service=vector_service,
+    )
+
+    result = service.analyze(
+        AnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            operator_instruction=None,
+        )
+    )
+
+    saved_analysis = analysis_repository.saved.analysis
+    saved_segments = analysis_repository.saved.target_segments
+    assert saved_analysis is not None
+    assert saved_segments is not None
+    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert saved_analysis == result.analysis
+    assert saved_segments == result.target_segments
+
+    expected_segment_ids = [
+        "seg_family_trip",
+        "seg_mobile_user",
+        "seg_repeat_hotel_no_booking",
+        "seg_near_checkin",
+    ]
+    assert [segment.segment_id for segment in saved_segments] == expected_segment_ids
+    assert len(saved_segments) == saved_analysis.output_json["target_segment_count"]
+    assert saved_analysis.output_json == {
+        "selected_segment_ids": expected_segment_ids,
+        "target_segment_count": 4,
+    }
+    assert saved_analysis.profile_summary_json == {
+        "total_eligible_users": 74200,
+        "candidate_segment_count": 5,
+        "selected_segment_count": 4,
+        "reason": (
+            "Selected hotel audience segments by channel, goal metric, "
+            "and active segment definitions."
+        ),
+    }
+    assert saved_analysis.focus_segment_ids_json is None
+    assert set(saved_analysis.input_snapshot_json) == {
+        "promotion",
+        "available_segment_definitions",
+        "operator_instruction",
+    }
+    assert saved_analysis.input_snapshot_json["promotion"] == {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "channel": "onsite_banner",
+        "goal_metric": "booking_conversion_rate",
+        "goal_target_value": "0.030000",
+        "goal_basis": "all_segments",
+        "min_sample_size": 1000,
+        "landing_url": "https://demo-stay.example.com/hotel-detail",
+        "message_brief": "Drive hotel booking conversion for summer stays.",
+    }
+    assert all(
+        segment["segment_id"].startswith("seg_")
+        for segment in saved_analysis.input_snapshot_json[
+            "available_segment_definitions"
+        ]
+    )
+
+    for rank, segment in enumerate(saved_segments):
+        assert segment.analysis_id == "analysis_promo_banner_001"
+        assert segment.project_id == "hotel-client-a"
+        assert segment.campaign_id == "camp_summer_2026"
+        assert segment.promotion_id == "promo_banner_001"
+        assert segment.segment_vector_id == f"segvec_{segment.segment_id}_v1"
+        assert segment.estimated_size >= 0
+        assert segment.status == "planned"
+        assert segment.priority == ("high" if rank < 2 else "medium")
+        assert set(segment.content_brief_json) == {
+            "message_direction",
+            "keywords",
+        }
+        assert isinstance(segment.content_brief_json["keywords"], list)
+        assert segment.data_evidence_json["source"] == "system_default"
+        assert segment.data_evidence_json["sample_size"] == segment.estimated_size
+        assert "sample_ratio" in segment.data_evidence_json
+        assert "total_eligible_user_count" in segment.data_evidence_json
+        assert segment.profile_json["primary_segment"] == segment.segment_id
+
+    family_segment = saved_segments[0]
+    repeat_hotel_segment = saved_segments[2]
+    assert family_segment.profile_json["hotel_profile"] == {
+        "event_count": 3000,
+        "booking_count": 120,
+        "mobile_ratio": 0.65,
+        "package_ratio": 0.25,
+        "avg_stay_nights": 2.4,
+        "avg_days_until_checkin": 14.2,
+    }
+    assert repeat_hotel_segment.data_evidence_json["hotel_profile"] == {
+        "event_count": 5000,
+        "booking_count": 120,
+        "mobile_ratio": 0.65,
+        "package_ratio": 0.25,
+        "avg_stay_nights": 2.4,
+        "avg_days_until_checkin": 14.2,
+    }
+
+    assert [call.segment_id for call in vector_service.calls] == expected_segment_ids
+    assert vector_service.calls[1].candidate_user_ids == [
+        "user_001",
+        "user_002",
+    ]
+    assert_no_forbidden_public_terms(saved_analysis.input_snapshot_json)
+    assert_no_forbidden_public_terms(saved_analysis.profile_summary_json)
+    assert_no_forbidden_public_terms(saved_analysis.output_json)
+    assert_no_forbidden_public_terms(
+        [
+            {
+                "segment_id": segment.segment_id,
+                "segment_name": segment.segment_name,
+                "rule_json": segment.rule_json,
+                "profile_json": segment.profile_json,
+                "content_brief_json": segment.content_brief_json,
+                "data_evidence_json": segment.data_evidence_json,
+                "segment_vector_id": segment.segment_vector_id,
+                "priority": segment.priority,
+                "status": segment.status,
+            }
+            for segment in saved_segments
+        ]
+    )
