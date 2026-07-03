@@ -92,6 +92,7 @@ def promotion_row() -> dict[str, Any]:
         "goal_metric": "booking_conversion_rate",
         "goal_target_value": Decimal("0.030000"),
         "goal_basis": "all_segments",
+        "min_sample_size": 1000,
         "landing_url": "https://demo-stay.example.com/summer",
         "message_brief": "Drive summer hotel booking.",
     }
@@ -117,6 +118,7 @@ def test_promotion_repository_get_for_analysis_success() -> None:
     assert "where project_id = %s" in sql
     assert "and campaign_id = %s" in sql
     assert "and promotion_id = %s" in sql
+    assert "min_sample_size" in sql
     assert call.params == (
         "hotel-client-a",
         "camp_summer_2026",

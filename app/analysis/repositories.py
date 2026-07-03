@@ -46,6 +46,7 @@ class PromotionRecord:
     goal_metric: str
     goal_target_value: Decimal
     goal_basis: str
+    min_sample_size: int
     landing_url: str | None
     message_brief: str | None
 
@@ -141,6 +142,7 @@ class PromotionRepository:
                 goal_metric,
                 goal_target_value,
                 goal_basis,
+                min_sample_size,
                 landing_url,
                 message_brief
             FROM promotions
