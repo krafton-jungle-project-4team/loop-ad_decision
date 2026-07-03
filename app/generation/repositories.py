@@ -10,14 +10,15 @@ from app.generation.schemas import ContentChannel, missing_channel_fields
 
 GENERATION_RUN_COLUMNS: tuple[str, ...] = (
     "generation_id",
+    "analysis_id",
     "project_id",
     "campaign_id",
     "promotion_id",
-    "analysis_id",
     "content_option_count",
     "operator_instruction",
-    "prompt_context_json",
-    "report_json",
+    "input_json",
+    "output_json",
+    "generation_report_json",
     "status",
     "created_at",
     "updated_at",
@@ -27,13 +28,12 @@ GENERATION_RUN_COLUMNS: tuple[str, ...] = (
 CONTENT_CANDIDATE_COLUMNS: tuple[str, ...] = (
     "content_id",
     "content_option_id",
+    "generation_id",
+    "analysis_id",
     "project_id",
     "campaign_id",
     "promotion_id",
-    "analysis_id",
-    "generation_id",
     "segment_id",
-    "segment_name",
     "channel",
     "subject",
     "preheader",
@@ -43,13 +43,12 @@ CONTENT_CANDIDATE_COLUMNS: tuple[str, ...] = (
     "message",
     "image_prompt",
     "landing_url",
+    "generation_prompt",
     "reason_summary",
     "data_evidence_json",
     "message_strategy",
-    "payload_json",
+    "metadata_json",
     "status",
-    "approved_at",
-    "approved_by",
     "created_at",
     "updated_at",
 )
@@ -74,29 +73,31 @@ class ConnectionProtocol(Protocol):
 @dataclass(frozen=True)
 class GenerationRunRecord:
     generation_id: str
+    analysis_id: str
     project_id: str
     campaign_id: str
     promotion_id: str
-    analysis_id: str
     content_option_count: int
     operator_instruction: str | None
     status: str
-    prompt_context_json: dict[str, Any] = field(default_factory=dict)
-    report_json: dict[str, Any] = field(default_factory=dict)
+    input_json: dict[str, Any] = field(default_factory=dict)
+    output_json: dict[str, Any] | None = None
+    generation_report_json: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
     def to_db_params(self) -> dict[str, Any]:
         return {
             "generation_id": self.generation_id,
+            "analysis_id": self.analysis_id,
             "project_id": self.project_id,
             "campaign_id": self.campaign_id,
             "promotion_id": self.promotion_id,
-            "analysis_id": self.analysis_id,
             "content_option_count": self.content_option_count,
             "operator_instruction": self.operator_instruction,
-            "prompt_context_json": Jsonb(self.prompt_context_json),
-            "report_json": Jsonb(self.report_json),
+            "input_json": Jsonb(self.input_json),
+            "output_json": Jsonb(self.output_json) if self.output_json is not None else None,
+            "generation_report_json": Jsonb(self.generation_report_json),
             "status": self.status,
         }
 
@@ -105,38 +106,41 @@ class GenerationRunRepository:
     INSERT_SQL = """
         INSERT INTO generation_runs (
             generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
             content_option_count,
             operator_instruction,
-            prompt_context_json,
-            report_json,
+            input_json,
+            output_json,
+            generation_report_json,
             status
         )
         VALUES (
             %(generation_id)s,
+            %(analysis_id)s,
             %(project_id)s,
             %(campaign_id)s,
             %(promotion_id)s,
-            %(analysis_id)s,
             %(content_option_count)s,
             %(operator_instruction)s,
-            %(prompt_context_json)s,
-            %(report_json)s,
+            %(input_json)s,
+            %(output_json)s,
+            %(generation_report_json)s,
             %(status)s
         )
         RETURNING
             generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
             content_option_count,
             operator_instruction,
-            prompt_context_json,
-            report_json,
+            input_json,
+            output_json,
+            generation_report_json,
             status,
             created_at,
             updated_at
@@ -145,14 +149,15 @@ class GenerationRunRepository:
     SELECT_BY_ID_SQL = """
         SELECT
             generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
             content_option_count,
             operator_instruction,
-            prompt_context_json,
-            report_json,
+            input_json,
+            output_json,
+            generation_report_json,
             status,
             created_at,
             updated_at
@@ -182,14 +187,13 @@ class GenerationRunRepository:
 class ContentCandidateRecord:
     content_id: str
     content_option_id: str
+    generation_id: str
+    analysis_id: str
     project_id: str
     campaign_id: str
     promotion_id: str
-    analysis_id: str
-    generation_id: str
     segment_id: str
     channel: ContentChannel
-    segment_name: str | None = None
     status: str = "draft"
     subject: str | None = None
     preheader: str | None = None
@@ -199,12 +203,11 @@ class ContentCandidateRecord:
     message: str | None = None
     image_prompt: str | None = None
     landing_url: str | None = None
+    generation_prompt: str | None = None
     reason_summary: str | None = None
     data_evidence_json: dict[str, Any] = field(default_factory=dict)
     message_strategy: str | None = None
-    payload_json: dict[str, Any] = field(default_factory=dict)
-    approved_at: datetime | None = None
-    approved_by: str | None = None
+    metadata_json: dict[str, Any] = field(default_factory=dict)
     created_at: datetime | None = None
     updated_at: datetime | None = None
 
@@ -244,13 +247,12 @@ class ContentCandidateRecord:
         return {
             "content_id": self.content_id,
             "content_option_id": self.content_option_id,
+            "generation_id": self.generation_id,
+            "analysis_id": self.analysis_id,
             "project_id": self.project_id,
             "campaign_id": self.campaign_id,
             "promotion_id": self.promotion_id,
-            "analysis_id": self.analysis_id,
-            "generation_id": self.generation_id,
             "segment_id": self.segment_id,
-            "segment_name": self.segment_name,
             "channel": self.channel.value,
             "subject": self.subject,
             "preheader": self.preheader,
@@ -260,13 +262,12 @@ class ContentCandidateRecord:
             "message": self.message,
             "image_prompt": self.image_prompt,
             "landing_url": self.landing_url,
+            "generation_prompt": self.generation_prompt,
             "reason_summary": self.reason_summary,
             "data_evidence_json": Jsonb(self.data_evidence_json),
             "message_strategy": self.message_strategy,
-            "payload_json": Jsonb(self.payload_json),
+            "metadata_json": Jsonb(self.metadata_json),
             "status": self.status,
-            "approved_at": self.approved_at,
-            "approved_by": self.approved_by,
         }
 
 
@@ -275,13 +276,12 @@ class ContentCandidateRepository:
         INSERT INTO content_candidates (
             content_id,
             content_option_id,
+            generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
-            generation_id,
             segment_id,
-            segment_name,
             channel,
             subject,
             preheader,
@@ -291,24 +291,22 @@ class ContentCandidateRepository:
             message,
             image_prompt,
             landing_url,
+            generation_prompt,
             reason_summary,
             data_evidence_json,
             message_strategy,
-            payload_json,
-            status,
-            approved_at,
-            approved_by
+            metadata_json,
+            status
         )
         VALUES (
             %(content_id)s,
             %(content_option_id)s,
+            %(generation_id)s,
+            %(analysis_id)s,
             %(project_id)s,
             %(campaign_id)s,
             %(promotion_id)s,
-            %(analysis_id)s,
-            %(generation_id)s,
             %(segment_id)s,
-            %(segment_name)s,
             %(channel)s,
             %(subject)s,
             %(preheader)s,
@@ -318,24 +316,22 @@ class ContentCandidateRepository:
             %(message)s,
             %(image_prompt)s,
             %(landing_url)s,
+            %(generation_prompt)s,
             %(reason_summary)s,
             %(data_evidence_json)s,
             %(message_strategy)s,
-            %(payload_json)s,
-            %(status)s,
-            %(approved_at)s,
-            %(approved_by)s
+            %(metadata_json)s,
+            %(status)s
         )
         RETURNING
             content_id,
             content_option_id,
+            generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
-            generation_id,
             segment_id,
-            segment_name,
             channel,
             subject,
             preheader,
@@ -345,13 +341,12 @@ class ContentCandidateRepository:
             message,
             image_prompt,
             landing_url,
+            generation_prompt,
             reason_summary,
             data_evidence_json,
             message_strategy,
-            payload_json,
+            metadata_json,
             status,
-            approved_at,
-            approved_by,
             created_at,
             updated_at
     """
@@ -360,13 +355,12 @@ class ContentCandidateRepository:
         SELECT
             content_id,
             content_option_id,
+            generation_id,
+            analysis_id,
             project_id,
             campaign_id,
             promotion_id,
-            analysis_id,
-            generation_id,
             segment_id,
-            segment_name,
             channel,
             subject,
             preheader,
@@ -376,13 +370,12 @@ class ContentCandidateRepository:
             message,
             image_prompt,
             landing_url,
+            generation_prompt,
             reason_summary,
             data_evidence_json,
             message_strategy,
-            payload_json,
+            metadata_json,
             status,
-            approved_at,
-            approved_by,
             created_at,
             updated_at
         FROM content_candidates
