@@ -3,10 +3,12 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.analysis.schemas import AnalysisStatus, Channel, GoalBasis, GoalMetric
 from app.main import create_app
+from app.server import get_port
 
 
 client = TestClient(create_app())
@@ -68,6 +70,19 @@ def test_health_returns_ok() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "service": "decision-api"}
+
+
+def test_server_port_comes_from_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PORT", "8080")
+
+    assert get_port() == 8080
+
+
+def test_server_port_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("PORT", raising=False)
+
+    with pytest.raises(RuntimeError, match="PORT environment variable is required"):
+        get_port()
 
 
 def test_analysis_returns_v1_6_contract_shape() -> None:
