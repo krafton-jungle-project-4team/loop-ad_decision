@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 
 class Channel(str, Enum):
@@ -28,10 +28,11 @@ class AnalysisStatus(str, Enum):
 
 
 class AnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     project_id: str
     campaign_id: str
     promotion_id: str
-    focus_segment_ids: list[str] | None = None
     operator_instruction: str | None = None
 
 
