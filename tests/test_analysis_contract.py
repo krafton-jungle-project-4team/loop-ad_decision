@@ -6,19 +6,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.analysis.repositories import (
-    PromotionAnalysisWrite,
-    PromotionTargetSegmentWrite,
-)
-from app.analysis.router import get_analysis_service
-from app.analysis.schemas import (
-    AnalysisRequest,
-    AnalysisStatus,
-    Channel,
-    GoalBasis,
-    GoalMetric,
-)
-from app.analysis.service import PromotionAnalysisResult
+from app.analysis.schemas import AnalysisStatus, Channel, GoalBasis, GoalMetric
 from app.config import REQUIRED_ENV_NAMES, SettingsError, load_settings
 from app.main import create_app
 
@@ -37,6 +25,8 @@ def valid_env() -> dict[str, str]:
     return values
 
 
+client = TestClient(create_app(settings=load_settings(valid_env())))
+
 FORBIDDEN_PUBLIC_TERMS = tuple(
     "".join(parts)
     for parts in (
@@ -54,14 +44,6 @@ FORBIDDEN_PUBLIC_TERMS = tuple(
         ("pur", "chase"),
     )
 )
-
-
-def make_client(service: "FakeAnalysisService | None" = None) -> TestClient:
-    app = create_app(settings=load_settings(valid_env()))
-    app.dependency_overrides[get_analysis_service] = (
-        lambda: service or FakeAnalysisService()
-    )
-    return TestClient(app)
 
 
 def analysis_payload(**overrides: Any) -> dict[str, Any]:
@@ -100,7 +82,7 @@ def enum_values(enum_type: type[Enum]) -> set[str]:
 
 
 def test_health_returns_ok() -> None:
-    response = make_client().get("/health")
+    response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -128,7 +110,7 @@ def test_server_port_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_analysis_returns_v1_6_contract_shape() -> None:
-    response = make_client().post(
+    response = client.post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(),
     )
@@ -160,7 +142,7 @@ def test_analysis_returns_v1_6_contract_shape() -> None:
 
 
 def test_analysis_requires_mandatory_fields() -> None:
-    response = make_client().post(
+    response = client.post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json={"project_id": "hotel-client-a"},
     )
@@ -169,7 +151,7 @@ def test_analysis_requires_mandatory_fields() -> None:
 
 
 def test_analysis_rejects_focus_segment_ids() -> None:
-    response = make_client().post(
+    response = client.post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(focus_segment_ids=["seg_family_trip"]),
     )
@@ -178,7 +160,7 @@ def test_analysis_rejects_focus_segment_ids() -> None:
 
 
 def test_analysis_rejects_promotion_id_mismatch() -> None:
-    response = make_client().post(
+    response = client.post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(promotion_id="promo_email_001"),
     )
@@ -190,7 +172,7 @@ def test_analysis_rejects_promotion_id_mismatch() -> None:
 
 
 def test_analysis_response_does_not_expose_forbidden_terms() -> None:
-    response = make_client().post(
+    response = client.post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(),
     )
@@ -215,56 +197,3 @@ def test_v1_6_enum_values() -> None:
         "completed",
         "failed",
     }
-
-
-class FakeAnalysisService:
-    def __init__(self) -> None:
-        self.requests: list[AnalysisRequest] = []
-
-    def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
-        self.requests.append(request)
-        return PromotionAnalysisResult(
-            analysis=PromotionAnalysisWrite(
-                analysis_id=f"analysis_{request.promotion_id}",
-                project_id=request.project_id,
-                campaign_id=request.campaign_id,
-                promotion_id=request.promotion_id,
-                status=AnalysisStatus.COMPLETED.value,
-                focus_segment_ids_json=None,
-                operator_instruction=request.operator_instruction,
-                input_snapshot_json={"promotion_id": request.promotion_id},
-                profile_summary_json={"selected_segment_count": 1},
-                output_json={
-                    "selected_segment_ids": ["seg_repeat_hotel_no_booking"],
-                    "target_segment_count": 1,
-                },
-            ),
-            target_segments=[
-                PromotionTargetSegmentWrite(
-                    analysis_id=f"analysis_{request.promotion_id}",
-                    project_id=request.project_id,
-                    campaign_id=request.campaign_id,
-                    promotion_id=request.promotion_id,
-                    segment_id="seg_repeat_hotel_no_booking",
-                    segment_name="Repeat hotel viewers without booking",
-                    rule_json={"segment_id": "seg_repeat_hotel_no_booking"},
-                    profile_json={"primary_segment": "seg_repeat_hotel_no_booking"},
-                    content_brief_json={
-                        "message_direction": (
-                            "Emphasize free cancellation, same-day availability, "
-                            "and breakfast benefits."
-                        ),
-                        "keywords": [
-                            "free cancellation",
-                            "same-day availability",
-                            "breakfast included",
-                        ],
-                    },
-                    data_evidence_json={"sample_size": 1342},
-                    segment_vector_id="segvec_repeat_hotel_no_booking_v1",
-                    estimated_size=1342,
-                    priority="high",
-                    status="planned",
-                )
-            ],
-        )
