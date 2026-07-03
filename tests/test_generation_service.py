@@ -1,3 +1,10 @@
+from app.generation.generator import GeneratedContent
+from app.generation.prompt_builder import (
+    GenerationPromptInput,
+    PromotionPromptInput,
+    PromptBuildResult,
+    TargetSegmentPromptInput,
+)
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
@@ -83,6 +90,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "content_candidate_count": 2,
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v1",
+        "content_generator": "dec-c3.deterministic.v1",
     }
 
     assert len(content_candidate_repository.saved) == 2
@@ -105,6 +113,10 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
     assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v1"
+    assert (
+        first_candidate.metadata_json["content_generator_version"]
+        == "dec-c3.deterministic.v1"
+    )
 
 
 def test_generation_service_can_generate_response_without_repositories() -> None:
@@ -116,4 +128,191 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     assert len(response.content_candidates) == 1
     assert response.content_candidates[0].content_option_id == (
         "banner_repeat_hotel_option_001"
+    )
+
+
+def test_generation_service_creates_candidates_for_each_segment_option() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                target_segment_input(index=1, content_slug="repeat_hotel"),
+                target_segment_input(index=2, content_slug="family_trip"),
+                target_segment_input(index=3, content_slug="weekday_business"),
+                target_segment_input(index=4, content_slug="spa_interest"),
+            ]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=3))
+
+    assert len(response.content_candidates) == 12
+    assert len(content_candidate_repository.saved) == 12
+    content_ids = {
+        candidate.content_id for candidate in content_candidate_repository.saved
+    }
+    option_ids = {
+        candidate.content_option_id for candidate in content_candidate_repository.saved
+    }
+    assert len(content_ids) == 12
+    assert len(option_ids) == 12
+    assert "content_banner_repeat_hotel_003" in content_ids
+    assert "content_banner_spa_interest_003" in content_ids
+
+
+def test_generation_service_creates_candidates_for_focus_segment_only() -> None:
+    service = GenerationService(
+        generation_input_builder=StaticGenerationInputBuilder(
+            [target_segment_input(index=9, content_slug="failed_focus")]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=3))
+
+    assert len(response.content_candidates) == 3
+    assert {
+        candidate.content_id for candidate in response.content_candidates
+    } == {
+        "content_banner_failed_focus_001",
+        "content_banner_failed_focus_002",
+        "content_banner_failed_focus_003",
+    }
+
+
+def test_generation_service_records_failed_run_when_generator_fails() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        content_generator=FailingContentGenerator(),
+    )
+
+    response = service.generate(generation_request(content_option_count=2))
+
+    assert response.status == "failed"
+    assert response.content_candidates == []
+    assert len(generation_run_repository.saved) == 1
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.status == "failed"
+    assert generation_run.output_json == {
+        "content_candidate_ids": [],
+        "error_code": "content_generation_failed",
+    }
+    assert generation_run.generation_report_json == {
+        "status": "failed",
+        "content_candidate_count": 0,
+        "target_segment_count": 1,
+        "prompt_builder": "dec-c2.v1",
+        "content_generator": "dec-c3.deterministic.v1",
+        "error_code": "content_generation_failed",
+    }
+    assert content_candidate_repository.saved == []
+    assert "secret" not in str(generation_run.output_json)
+    assert "secret" not in str(generation_run.generation_report_json)
+
+
+def test_generation_service_saves_channel_specific_fields() -> None:
+    email_service = GenerationService(
+        generation_input_builder=StaticGenerationInputBuilder(
+            [target_segment_input()],
+            channel=ContentChannel.EMAIL,
+        )
+    )
+    sms_service = GenerationService(
+        generation_input_builder=StaticGenerationInputBuilder(
+            [target_segment_input()],
+            channel=ContentChannel.SMS,
+        )
+    )
+
+    email_response = email_service.generate(generation_request(content_option_count=1))
+    sms_response = sms_service.generate(generation_request(content_option_count=1))
+
+    email_candidate = email_response.content_candidates[0]
+    assert email_candidate.subject
+    assert email_candidate.preheader
+    assert email_candidate.body
+    assert email_candidate.cta
+    assert email_candidate.landing_url
+
+    sms_candidate = sms_response.content_candidates[0]
+    assert sms_candidate.message
+    assert sms_candidate.landing_url
+
+
+class StaticGenerationInputBuilder:
+    def __init__(
+        self,
+        target_segments: list[TargetSegmentPromptInput],
+        *,
+        channel: ContentChannel = ContentChannel.ONSITE_BANNER,
+    ) -> None:
+        self._target_segments = target_segments
+        self._channel = channel
+
+    def build(
+        self,
+        *,
+        request: GenerationRequest,
+        promotion: PromotionPromptInput,
+        target_segments: list[TargetSegmentPromptInput],
+    ) -> list[GenerationPromptInput]:
+        del target_segments
+        return [
+            GenerationPromptInput(
+                request=request,
+                promotion=PromotionPromptInput(
+                    project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
+                    channel=self._channel,
+                    goal_metric=promotion.goal_metric,
+                    goal_target_value=promotion.goal_target_value,
+                    goal_basis=promotion.goal_basis,
+                    message_brief=promotion.message_brief,
+                    landing_url=promotion.landing_url,
+                ),
+                target_segment=target_segment,
+            )
+            for target_segment in self._target_segments
+        ]
+
+
+class FailingContentGenerator:
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index
+        raise RuntimeError("provider failed with secret-token-value")
+
+
+def target_segment_input(
+    *,
+    index: int = 1,
+    content_slug: str = "repeat_hotel",
+) -> TargetSegmentPromptInput:
+    return TargetSegmentPromptInput(
+        analysis_id="analysis_banner_001",
+        promotion_id="promo_banner_001",
+        segment_id=f"seg_{content_slug}_{index:03d}",
+        segment_name=f"Hotel audience segment {index}",
+        content_slug=content_slug,
+        content_brief_json={
+            "message_direction": "Highlight refundable hotel stays.",
+            "keywords": ["refundable stays", "hotel deals"],
+        },
+        segment_vector_id=f"segvec_{content_slug}_{index:03d}",
+        estimated_size=1000 + index,
+        priority="high",
+        natural_language_query="hotel visitors without booking",
+        generated_sql=None,
+        sample_ratio="0.018000",
+        source="system_default",
+        query_preview_id=None,
     )

@@ -3,6 +3,11 @@ from __future__ import annotations
 import re
 from typing import Any, Protocol, Sequence
 
+from app.generation.generator import (
+    CONTENT_GENERATOR_VERSION,
+    ContentGenerator,
+    DeterministicContentGenerator,
+)
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
@@ -48,6 +53,7 @@ class GenerationService:
         content_candidate_repository: ContentCandidateWriter | None = None,
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
+        content_generator: ContentGenerator | None = None,
     ) -> None:
         self._generation_run_repository = generation_run_repository
         self._content_candidate_repository = content_candidate_repository
@@ -55,20 +61,43 @@ class GenerationService:
             generation_input_builder or GenerationInputBuilder()
         )
         self._prompt_builder = prompt_builder or PromptBuilder()
+        self._content_generator = content_generator or DeterministicContentGenerator()
+        self._content_generator_version = _content_generator_version(
+            self._content_generator
+        )
 
     def generate(self, request: GenerationRequest) -> GenerationResponse:
         generation_id = _generation_id_from_promotion(request.promotion_id)
         prompt_inputs = self._build_prompt_inputs(request)
-        content_candidates = self._build_content_candidate_records(
-            request=request,
-            generation_id=generation_id,
-            prompt_inputs=prompt_inputs,
-        )
+        try:
+            content_candidates = self._build_content_candidate_records(
+                request=request,
+                generation_id=generation_id,
+                prompt_inputs=prompt_inputs,
+            )
+        except Exception as exc:
+            generation_run = self._build_generation_run_record(
+                request=request,
+                generation_id=generation_id,
+                prompt_inputs=prompt_inputs,
+                content_candidates=[],
+                status=GenerationStatus.FAILED,
+                error_code=_safe_generation_error_code(exc),
+            )
+            self._save_generation_run(generation_run)
+            return GenerationResponse(
+                generation_id=generation_id,
+                promotion_id=request.promotion_id,
+                status=GenerationStatus.FAILED,
+                content_candidates=[],
+            )
+
         generation_run = self._build_generation_run_record(
             request=request,
             generation_id=generation_id,
             prompt_inputs=prompt_inputs,
             content_candidates=content_candidates,
+            status=GenerationStatus.COMPLETED,
         )
         self._save_generation_run(generation_run)
         self._save_content_candidates(content_candidates)
@@ -90,7 +119,27 @@ class GenerationService:
         generation_id: str,
         prompt_inputs: Sequence[GenerationPromptInput],
         content_candidates: Sequence[ContentCandidateRecord],
+        status: GenerationStatus,
+        error_code: str | None = None,
     ) -> GenerationRunRecord:
+        output_json: dict[str, Any] = {
+            "content_candidate_ids": [
+                candidate.content_id for candidate in content_candidates
+            ],
+        }
+        if error_code:
+            output_json["error_code"] = error_code
+
+        generation_report_json: dict[str, Any] = {
+            "status": status.value,
+            "content_candidate_count": len(content_candidates),
+            "target_segment_count": len(prompt_inputs),
+            "prompt_builder": PROMPT_BUILDER_VERSION,
+            "content_generator": self._content_generator_version,
+        }
+        if error_code:
+            generation_report_json["error_code"] = error_code
+
         return GenerationRunRecord(
             generation_id=generation_id,
             analysis_id=request.analysis_id,
@@ -114,18 +163,9 @@ class GenerationService:
                 if prompt_inputs
                 else None,
             },
-            output_json={
-                "content_candidate_ids": [
-                    candidate.content_id for candidate in content_candidates
-                ],
-            },
-            generation_report_json={
-                "status": GenerationStatus.COMPLETED.value,
-                "content_candidate_count": len(content_candidates),
-                "target_segment_count": len(prompt_inputs),
-                "prompt_builder": PROMPT_BUILDER_VERSION,
-            },
-            status=GenerationStatus.COMPLETED.value,
+            output_json=output_json,
+            generation_report_json=generation_report_json,
+            status=status.value,
         )
 
     def _build_prompt_inputs(
@@ -170,14 +210,12 @@ class GenerationService:
         segment_name = prompt_input.target_segment.segment_name
         content_id = f"content_{channel_slug}_{segment_slug}_{index:03d}"
         content_option_id = f"{channel_slug}_{segment_slug}_option_{index:03d}"
-        title = "Book this weekend's rooms before they are gone"
-        body = (
-            "Show repeat hotel viewers a refundable summer offer while "
-            "rooms are still available."
+        generated_content = self._content_generator.generate(
+            prompt_input=prompt_input,
+            prompt_result=prompt_result,
+            option_index=index,
         )
-        cta = "View hotel deals"
-        image_prompt = "modern hotel room summer promotion banner, clean, bright, travel"
-        landing_url = "https://demo-stay.example.com/summer"
+        content_values = generated_content.to_record_values(channel)
 
         return ContentCandidateRecord(
             content_id=content_id,
@@ -189,11 +227,14 @@ class GenerationService:
             generation_id=generation_id,
             segment_id=segment_id,
             channel=channel,
-            title=title,
-            body=body,
-            cta=cta,
-            image_prompt=image_prompt,
-            landing_url=landing_url,
+            subject=content_values["subject"],
+            preheader=content_values["preheader"],
+            title=content_values["title"],
+            body=content_values["body"],
+            cta=content_values["cta"],
+            message=content_values["message"],
+            image_prompt=content_values["image_prompt"],
+            landing_url=content_values["landing_url"],
             generation_prompt=prompt_result.generation_prompt,
             reason_summary=prompt_result.reason_summary,
             data_evidence_json=prompt_result.data_evidence_json,
@@ -205,11 +246,8 @@ class GenerationService:
                 "segment_id": segment_id,
                 "segment_name": segment_name,
                 "channel": channel.value,
-                "title": title,
-                "body": body,
-                "cta": cta,
-                "image_prompt": image_prompt,
-                "landing_url": landing_url,
+                "content_generator_version": self._content_generator_version,
+                **content_values,
                 "status": ContentCandidateStatus.DRAFT.value,
             },
             status=ContentCandidateStatus.DRAFT.value,
@@ -294,3 +332,14 @@ def _segment_slug(target_segment: TargetSegmentPromptInput) -> str:
         return target_segment.content_slug
     segment_id = target_segment.segment_id.removeprefix("seg_")
     return re.sub(r"[^a-zA-Z0-9_]+", "_", segment_id).strip("_") or "segment"
+
+
+def _safe_generation_error_code(exc: Exception) -> str:
+    if isinstance(exc, ValueError):
+        return "content_generation_validation_failed"
+    return "content_generation_failed"
+
+
+def _content_generator_version(content_generator: ContentGenerator) -> str:
+    version = str(getattr(content_generator, "version", CONTENT_GENERATOR_VERSION))
+    return version.strip() or CONTENT_GENERATOR_VERSION
