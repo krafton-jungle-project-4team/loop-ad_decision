@@ -15,6 +15,7 @@ from app.analysis.repositories import (
     SegmentDefinitionRepository,
     SegmentVectorRecord,
     SegmentVectorRepository,
+    UserBehaviorVectorRepository,
 )
 
 
@@ -337,6 +338,61 @@ def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
         repo.save(vector)
 
     assert db.calls == []
+
+
+def test_user_behavior_vector_repository_queries_candidate_user_vectors() -> None:
+    vector_values = [0.1] * 64
+    client = FakeClickHouseClient(
+        rows=[
+            {
+                "project_id": "hotel-client-a",
+                "user_id": "user_001",
+                "vector_dim": 64,
+                "vector_values": vector_values,
+                "vector_version": "v1",
+                "source": "batch_profile",
+            }
+        ]
+    )
+    repo = UserBehaviorVectorRepository(client)
+
+    vectors = repo.list_by_user_ids(
+        project_id="hotel-client-a",
+        user_ids=["user_001", "user_002"],
+        vector_version="v1",
+    )
+
+    assert len(vectors) == 1
+    assert vectors[0].project_id == "hotel-client-a"
+    assert vectors[0].user_id == "user_001"
+    assert vectors[0].vector_dim == 64
+    assert vectors[0].vector_values == vector_values
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_behavior_vectors" in sql
+    assert "project_id = {project_id:string}" in sql
+    assert "vector_dim = {vector_dim:uint16}" in sql
+    assert "vector_version = {vector_version:string}" in sql
+    assert "user_id in {user_ids:array(string)}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_dim": 64,
+        "vector_version": "v1",
+        "user_ids": ["user_001", "user_002"],
+    }
+
+
+def test_user_behavior_vector_repository_skips_empty_user_ids() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    vectors = repo.list_by_user_ids(
+        project_id="hotel-client-a",
+        user_ids=[],
+    )
+
+    assert vectors == []
+    assert client.calls == []
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:

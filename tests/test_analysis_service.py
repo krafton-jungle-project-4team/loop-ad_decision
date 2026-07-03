@@ -19,6 +19,10 @@ from app.analysis.service import (
     PromotionNotFoundError,
     SegmentSelectionError,
 )
+from app.analysis.vector_service import (
+    SegmentVectorBuildRequest,
+    SegmentVectorBuildResult,
+)
 
 
 @dataclass
@@ -81,15 +85,35 @@ class FakeHotelProfileRepository:
 class FakePromotionAnalysisRepository:
     def __init__(self) -> None:
         self.saved = SavedAnalysis()
+        self.events: list[str] = []
 
     def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
         self.saved.analysis = analysis
+        self.events.append("analysis")
 
     def save_target_segments(
         self,
         target_segments: Sequence[PromotionTargetSegmentWrite],
     ) -> None:
         self.saved.target_segments = list(target_segments)
+        self.events.append("target_segments")
+
+
+class FakeSegmentVectorService:
+    def __init__(self) -> None:
+        self.calls: list[SegmentVectorBuildRequest] = []
+
+    def prepare_segment_vector(
+        self,
+        request: SegmentVectorBuildRequest,
+    ) -> SegmentVectorBuildResult:
+        self.calls.append(request)
+        return SegmentVectorBuildResult(
+            segment_id=request.segment_id,
+            segment_vector_id=f"segvec_{request.segment_id}_v1",
+            vector_values=[1.0, *([0.0] * 63)],
+            source="fixture",
+        )
 
 
 def promotion_record(
@@ -118,6 +142,7 @@ def segment_record(
     source: str = "system_default",
     sample_size: int = 2000,
     sample_ratio: Decimal = Decimal("0.020000"),
+    rule_json: Mapping[str, Any] | None = None,
 ) -> SegmentDefinitionRecord:
     return SegmentDefinitionRecord(
         segment_id=segment_id,
@@ -127,7 +152,7 @@ def segment_record(
         query_preview_id=None,
         natural_language_query=f"{segment_id} hotel audience",
         generated_sql=None,
-        rule_json={"segment_id": segment_id},
+        rule_json=rule_json or {"segment_id": segment_id},
         profile_json={"primary_segment": segment_id},
         sample_size=sample_size,
         total_eligible_user_count=74200,
@@ -175,6 +200,7 @@ def build_service(
     promotion: PromotionRecord | None,
     segments: list[SegmentDefinitionRecord],
     profiles: list[HotelMarketingProfileRecord] | None = None,
+    segment_vector_service: FakeSegmentVectorService | None = None,
 ) -> tuple[PromotionAnalysisService, FakePromotionAnalysisRepository]:
     analysis_repository = FakePromotionAnalysisRepository()
     service = PromotionAnalysisService(
@@ -182,6 +208,7 @@ def build_service(
         segment_definition_repository=FakeSegmentDefinitionRepository(segments),
         hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
         promotion_analysis_repository=analysis_repository,
+        segment_vector_service=segment_vector_service,
     )
     return service, analysis_repository
 
@@ -291,6 +318,42 @@ def test_service_limits_analysis_to_focus_segment_ids() -> None:
     assert result.analysis.focus_segment_ids_json == [
         "seg_near_checkin",
         "seg_mobile_user",
+    ]
+
+
+def test_service_populates_segment_vector_ids_when_vector_service_is_configured() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    vector_service = FakeSegmentVectorService()
+    service, analysis_repository = build_service(
+        promotion=promotion,
+        segments=[
+            segment_record(
+                "seg_mobile_user",
+                rule_json={
+                    "candidate_user_ids": ["user_001", "user_002"],
+                },
+            ),
+        ],
+        segment_vector_service=vector_service,
+    )
+
+    result = service.analyze(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_mobile_user"],
+        ),
+    )
+
+    assert result.target_segments[0].segment_vector_id == "segvec_seg_mobile_user_v1"
+    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert vector_service.calls == [
+        SegmentVectorBuildRequest(
+            project_id="hotel-client-a",
+            promotion_id=promotion.promotion_id,
+            analysis_id=f"analysis_{promotion.promotion_id}",
+            segment_id="seg_mobile_user",
+            candidate_user_ids=["user_001", "user_002"],
+        )
     ]
 
 
