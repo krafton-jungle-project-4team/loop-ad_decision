@@ -1,20 +1,63 @@
 from app.generation.repositories import (
     CONTENT_CANDIDATE_COLUMNS,
     GENERATION_RUN_COLUMNS,
+    ContentCandidateRecord,
+    ContentCandidateRepository,
+    GenerationRunRecord,
+    GenerationRunRepository,
 )
+from app.generation.schemas import ContentChannel
+
+
+class FakeCursor:
+    def __init__(
+        self,
+        *,
+        fetchone_result: dict[str, object] | None = None,
+        fetchall_result: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.fetchone_result = fetchone_result
+        self.fetchall_result = fetchall_result or []
+        self.executed: list[tuple[str, dict[str, object] | None]] = []
+
+    def __enter__(self) -> "FakeCursor":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, query: str, params: dict[str, object] | None = None) -> None:
+        self.executed.append((query, params))
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self.fetchone_result
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return self.fetchall_result
+
+
+class FakeConnection:
+    def __init__(self, cursor: FakeCursor) -> None:
+        self.cursor_instance = cursor
+        self.row_factories: list[object] = []
+
+    def cursor(self, *, row_factory: object = None) -> FakeCursor:
+        self.row_factories.append(row_factory)
+        return self.cursor_instance
 
 
 def test_generation_run_repository_columns_match_data_source_contract() -> None:
     assert GENERATION_RUN_COLUMNS == (
         "generation_id",
+        "analysis_id",
         "project_id",
         "campaign_id",
         "promotion_id",
-        "analysis_id",
         "content_option_count",
         "operator_instruction",
-        "prompt_context_json",
-        "report_json",
+        "input_json",
+        "output_json",
+        "generation_report_json",
         "status",
         "created_at",
         "updated_at",
@@ -25,13 +68,12 @@ def test_content_candidate_repository_columns_match_data_source_contract() -> No
     assert CONTENT_CANDIDATE_COLUMNS == (
         "content_id",
         "content_option_id",
+        "generation_id",
+        "analysis_id",
         "project_id",
         "campaign_id",
         "promotion_id",
-        "analysis_id",
-        "generation_id",
         "segment_id",
-        "segment_name",
         "channel",
         "subject",
         "preheader",
@@ -41,13 +83,95 @@ def test_content_candidate_repository_columns_match_data_source_contract() -> No
         "message",
         "image_prompt",
         "landing_url",
+        "generation_prompt",
         "reason_summary",
         "data_evidence_json",
         "message_strategy",
-        "payload_json",
+        "metadata_json",
         "status",
-        "approved_at",
-        "approved_by",
         "created_at",
         "updated_at",
     )
+
+
+def test_generation_run_repository_create_executes_insert() -> None:
+    cursor = FakeCursor(fetchone_result={"generation_id": "generation_banner_001"})
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result = repository.create(
+        GenerationRunRecord(
+            generation_id="generation_banner_001",
+            analysis_id="analysis_banner_001",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            content_option_count=2,
+            operator_instruction=None,
+            input_json={"analysis_id": "analysis_banner_001"},
+            output_json={"content_candidate_ids": ["content_banner_001"]},
+            generation_report_json={"content_candidate_count": 2},
+            status="completed",
+        )
+    )
+
+    assert result == {"generation_id": "generation_banner_001"}
+    query, params = cursor.executed[0]
+    assert "INSERT INTO generation_runs" in query
+    assert params is not None
+    assert params["generation_id"] == "generation_banner_001"
+    assert params["input_json"].obj == {"analysis_id": "analysis_banner_001"}
+    assert params["output_json"].obj == {
+        "content_candidate_ids": ["content_banner_001"]
+    }
+    assert params["generation_report_json"].obj == {"content_candidate_count": 2}
+
+
+def test_content_candidate_repository_create_executes_insert() -> None:
+    cursor = FakeCursor(fetchone_result={"content_id": "content_banner_001"})
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.create(
+        ContentCandidateRecord(
+            content_id="content_banner_001",
+            content_option_id="banner_option_001",
+            generation_id="generation_banner_001",
+            analysis_id="analysis_banner_001",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            segment_id="seg_repeat_hotel_no_booking",
+            channel=ContentChannel.ONSITE_BANNER,
+            title="Book this weekend's rooms",
+            body="Compare refundable summer offers before rooms run out.",
+            cta="View hotel deals",
+            image_prompt="bright modern hotel room, summer travel banner",
+            landing_url="https://demo-stay.example.com/summer",
+            generation_prompt="Create an onsite banner.",
+            data_evidence_json={"segment_id": "seg_repeat_hotel_no_booking"},
+            metadata_json={"content_id": "content_banner_001"},
+        )
+    )
+
+    assert result == {"content_id": "content_banner_001"}
+    query, params = cursor.executed[0]
+    assert "INSERT INTO content_candidates" in query
+    assert params is not None
+    assert params["content_id"] == "content_banner_001"
+    assert params["channel"] == "onsite_banner"
+    assert params["data_evidence_json"].obj == {
+        "segment_id": "seg_repeat_hotel_no_booking"
+    }
+    assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
+
+
+def test_content_candidate_repository_lists_by_generation() -> None:
+    rows = [{"content_id": "content_banner_001"}]
+    cursor = FakeCursor(fetchall_result=rows)
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.list_by_generation("generation_banner_001")
+
+    assert result == rows
+    query, params = cursor.executed[0]
+    assert "FROM content_candidates" in query
+    assert params == {"generation_id": "generation_banner_001"}
