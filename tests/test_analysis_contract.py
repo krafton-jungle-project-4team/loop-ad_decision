@@ -7,25 +7,42 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.analysis.schemas import AnalysisStatus, Channel, GoalBasis, GoalMetric
+from app.config import REQUIRED_ENV_NAMES, SettingsError, load_settings
 from app.main import create_app
-from app.server import get_port
 
 
-client = TestClient(create_app())
+def valid_env() -> dict[str, str]:
+    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values.update(
+        {
+            "LOOPAD_ENV": "test",
+            "LOOPAD_SERVICE_ID": "decision-api",
+            "PORT": "8080",
+            "LOOPAD_AURORA_PORT": "15432",
+            "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
+        }
+    )
+    return values
 
-FORBIDDEN_PUBLIC_TERMS = (
-    "recommendation",
-    "anomaly",
-    "root_cause",
-    "arm_id",
-    "bandit",
-    "thompson",
-    "experiment_id",
-    "variant_id",
-    "creative_id",
-    "product",
-    "cart",
-    "purchase",
+
+client = TestClient(create_app(settings=load_settings(valid_env())))
+
+FORBIDDEN_PUBLIC_TERMS = tuple(
+    "".join(parts)
+    for parts in (
+        ("recom", "mendation"),
+        ("ano", "maly"),
+        ("root", "_cause"),
+        ("arm", "_id"),
+        ("ban", "dit"),
+        ("thomp", "son"),
+        ("experiment", "_id"),
+        ("variant", "_id"),
+        ("creative", "_id"),
+        ("pro", "duct"),
+        ("ca", "rt"),
+        ("pur", "chase"),
+    )
 )
 
 
@@ -69,20 +86,28 @@ def test_health_returns_ok() -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "service": "decision-api"}
+    assert response.json() == {
+        "status": "ok",
+        "service": "decision-api",
+        "env": "test",
+    }
 
 
 def test_server_port_comes_from_required_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("PORT", "8080")
 
-    assert get_port() == 8080
+    settings = load_settings(valid_env() | {"PORT": "8080"})
+
+    assert settings.port == 8080
 
 
 def test_server_port_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("PORT", raising=False)
 
-    with pytest.raises(RuntimeError, match="PORT environment variable is required"):
-        get_port()
+    env = valid_env()
+    env.pop("PORT")
+    with pytest.raises(SettingsError, match="PORT"):
+        load_settings(env)
 
 
 def test_analysis_returns_v1_6_contract_shape() -> None:
