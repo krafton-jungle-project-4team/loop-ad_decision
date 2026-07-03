@@ -10,10 +10,12 @@ from app.generation.schemas import (
     GenerationResponse,
     GenerationStatus,
 )
+from app.generation.service import GenerationService
 from app.main import create_app
 
 
 FORBIDDEN_PUBLIC_KEYS = {"creative_id", "variant_id", "experiment_id"}
+DEFAULT_FETCHONE_RESULT = object()
 
 
 def valid_env() -> dict[str, str]:
@@ -29,8 +31,16 @@ def valid_env() -> dict[str, str]:
     return values
 
 
+def make_generation_client(service=None) -> TestClient:
+    app = create_app()
+    app.dependency_overrides[get_generation_service] = (
+        lambda: service or GenerationService()
+    )
+    return TestClient(app)
+
+
 def test_generation_api_returns_v1_6_final_names() -> None:
-    client = TestClient(create_app())
+    client = make_generation_client()
 
     response = client.post(
         "/decision/v1/promotions/promo_banner_001/generation",
@@ -67,7 +77,7 @@ def test_generation_api_returns_v1_6_final_names() -> None:
 
 
 def test_generation_api_rejects_path_body_promotion_mismatch() -> None:
-    client = TestClient(create_app())
+    client = make_generation_client()
 
     response = client.post(
         "/decision/v1/promotions/promo_banner_001/generation",
@@ -86,7 +96,7 @@ def test_generation_api_rejects_path_body_promotion_mismatch() -> None:
 
 
 def test_generation_api_rejects_non_positive_content_option_count() -> None:
-    client = TestClient(create_app())
+    client = make_generation_client()
 
     response = client.post(
         "/decision/v1/promotions/promo_banner_001/generation",
@@ -126,6 +136,84 @@ def test_generation_api_calls_generation_service() -> None:
     assert len(fake_service.requests) == 1
     assert fake_service.requests[0].analysis_id == "analysis_banner_001"
     assert fake_service.requests[0].operator_instruction == "Keep it short."
+
+
+def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "content_option_count": 2,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert len(connections) == 1
+    connection = connections[0]
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    assert connection.close_count == 1
+
+    executed_queries = [query for query, _params in connection.executed]
+    assert sum("INSERT INTO generation_runs" in query for query in executed_queries) == 1
+    assert (
+        sum("INSERT INTO content_candidates" in query for query in executed_queries)
+        == 2
+    )
+
+
+def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(fetchone_result=None)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert len(connections) == 1
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
 
 
 def test_health_returns_ok() -> None:
@@ -176,3 +264,54 @@ class FakeGenerationService:
                 )
             ],
         )
+
+
+class RecordingCursor:
+    def __init__(self, connection: "RecordingConnection") -> None:
+        self._connection = connection
+
+    def __enter__(self) -> "RecordingCursor":
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        return None
+
+    def execute(self, query: str, params: dict[str, object] | None = None) -> None:
+        self._connection.executed.append((query, params))
+
+    def fetchone(self) -> dict[str, object] | None:
+        return self._connection.fetchone_result
+
+    def fetchall(self) -> list[dict[str, object]]:
+        return []
+
+
+class RecordingConnection:
+    def __init__(
+        self,
+        *,
+        fetchone_result: dict[str, object] | None | object = DEFAULT_FETCHONE_RESULT,
+    ) -> None:
+        self.fetchone_result = (
+            {"ok": True}
+            if fetchone_result is DEFAULT_FETCHONE_RESULT
+            else fetchone_result
+        )
+        self.executed: list[tuple[str, dict[str, object] | None]] = []
+        self.row_factories: list[object] = []
+        self.commit_count = 0
+        self.rollback_count = 0
+        self.close_count = 0
+
+    def cursor(self, *, row_factory: object = None) -> RecordingCursor:
+        self.row_factories.append(row_factory)
+        return RecordingCursor(self)
+
+    def commit(self) -> None:
+        self.commit_count += 1
+
+    def rollback(self) -> None:
+        self.rollback_count += 1
+
+    def close(self) -> None:
+        self.close_count += 1
