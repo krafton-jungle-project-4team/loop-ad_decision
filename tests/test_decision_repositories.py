@@ -16,6 +16,9 @@ from app.decision.repositories import (
     PromotionRunRepository,
     PromotionRunWrite,
     PromotionTargetSegmentRepository,
+    SegmentVectorRepository,
+    UserBehaviorVectorRepository,
+    UserSegmentAssignmentRepository,
     UserSegmentAssignmentWrite,
 )
 from app.decision.schemas import (
@@ -69,6 +72,25 @@ class FakePostgresExecutor:
         params: Sequence[Any] | Mapping[str, Any] = (),
     ) -> None:
         self.calls.append(DbCall("execute", query, params))
+
+
+class FakeClickHouseResult:
+    def __init__(self, rows: list[Any]) -> None:
+        self.result_rows = rows
+
+
+class FakeClickHouseClient:
+    def __init__(self, rows: list[Any]) -> None:
+        self.rows = rows
+        self.calls: list[DbCall] = []
+
+    def query(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+    ) -> FakeClickHouseResult:
+        self.calls.append(DbCall("query", query, parameters or {}))
+        return FakeClickHouseResult(self.rows)
 
 
 def compact_sql(query: str) -> str:
@@ -404,6 +426,186 @@ def test_user_segment_assignment_write_carries_assignment_source() -> None:
     assert assignment.fallback is True
     assert assignment.assignment_source == AssignmentSource.FALLBACK.value
     assert assignment.assigned_at == assigned_at
+
+
+def test_segment_vector_repository_filters_run_context_and_version() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    vectors = repo.list_for_run_segments(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_ids=["seg_family_trip"],
+        vector_version="v1",
+    )
+
+    assert vectors[0].segment_id == "seg_family_trip"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from segment_vectors" in sql
+    assert "project_id = %s" in sql
+    assert "promotion_id = %s" in sql
+    assert "analysis_id = %s" in sql
+    assert "segment_id = any(%s)" in sql
+    assert "vector_version = %s" in sql
+    assert "vector_dim = %s" in sql
+    assert call.params == (
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        ["seg_family_trip"],
+        "v1",
+        64,
+    )
+
+
+def test_user_segment_assignment_repository_inserts_official_columns_only() -> None:
+    assigned_at = datetime(2026, 7, 3, tzinfo=UTC)
+    db = FakePostgresExecutor(fetchone_result={"id": 1})
+    repo = UserSegmentAssignmentRepository(db)
+
+    inserted_count = repo.insert_many(
+        [
+            UserSegmentAssignmentWrite(
+                project_id="hotel-client-a",
+                promotion_run_id="prun_banner_001_loop_1",
+                user_id="user_001",
+                segment_id="seg_existing_all",
+                ad_experiment_id="adexp_existing_all_001",
+                content_id="content_existing_all_001",
+                content_option_id="option_a",
+                similarity_score=Decimal("0.410000"),
+                fallback=True,
+                assignment_source=AssignmentSource.FALLBACK.value,
+                assigned_at=assigned_at,
+                expires_at=None,
+            )
+        ]
+    )
+
+    assert inserted_count == 1
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "insert into user_segment_assignments" in sql
+    assert "promotion_run_id" in sql
+    assert "user_id" in sql
+    assert "segment_id" in sql
+    assert "ad_experiment_id" in sql
+    assert "content_id" in sql
+    assert "content_option_id" in sql
+    assert "similarity_score" in sql
+    assert "fallback" in sql
+    assert "assignment_source" in sql
+    assert "assignment_status" not in sql
+    assert "on conflict (promotion_run_id, user_id) do nothing" in sql
+    assert "returning id" in sql
+
+
+def test_user_segment_assignment_repository_counts_final_assignments() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "segment_id": "seg_family_trip",
+                "assigned_user_count": 42,
+            }
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    counts = repo.count_by_run_segments(
+        promotion_run_id="prun_banner_001_loop_1",
+        segment_ids=["seg_family_trip", "seg_mobile_user"],
+    )
+
+    assert counts == {"seg_family_trip": 42}
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_segment_assignments" in sql
+    assert "where promotion_run_id = %s" in sql
+    assert "segment_id = any(%s)" in sql
+    assert "group by segment_id" in sql
+    assert call.params == (
+        "prun_banner_001_loop_1",
+        ["seg_family_trip", "seg_mobile_user"],
+    )
+
+
+def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> None:
+    client = FakeClickHouseClient(
+        rows=[
+            (
+                "hotel-client-a",
+                "user_001",
+                64,
+                [1.0] + [0.0] * 63,
+                "v1",
+                "batch_profile",
+            )
+        ]
+    )
+    repo = UserBehaviorVectorRepository(client)
+
+    vectors = repo.list_by_user_ids(
+        project_id="hotel-client-a",
+        user_ids=["user_001"],
+        vector_version="v1",
+    )
+
+    assert vectors[0].user_id == "user_001"
+    assert vectors[0].vector_values == [1.0] + [0.0] * 63
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "argmax(vector_values, updated_at)" in sql
+    assert "argmax(vector_dim, updated_at)" in sql
+    assert "from user_behavior_vectors" in sql
+    assert "group by project_id, user_id, vector_version" in sql
+    assert "user_id in {user_ids:array(string)}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v1",
+        "vector_dim": 64,
+        "user_ids": ["user_001"],
+    }
+
+
+def test_user_behavior_vector_repository_limits_project_scope() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    vectors = repo.list_for_project(
+        project_id="hotel-client-a",
+        vector_version="v1",
+        limit=500,
+    )
+
+    assert vectors == []
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "argmax(vector_values, updated_at)" in sql
+    assert "limit {limit:uint32}" in sql
+    assert "user_id in" not in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v1",
+        "vector_dim": 64,
+        "limit": 500,
+    }
 
 
 def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
