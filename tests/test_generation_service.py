@@ -69,6 +69,8 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "analysis_id": "analysis_banner_001",
         "content_option_count": 2,
         "operator_instruction": "Make the banner direct and concise.",
+        "target_segment_ids": ["seg_repeat_hotel_no_booking"],
+        "channel": "onsite_banner",
     }
     assert generation_run.output_json == {
         "content_candidate_ids": [
@@ -79,6 +81,8 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert generation_run.generation_report_json == {
         "status": "completed",
         "content_candidate_count": 2,
+        "target_segment_count": 1,
+        "prompt_builder": "dec-c2.v1",
     }
 
     assert len(content_candidate_repository.saved) == 2
@@ -89,8 +93,18 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.project_id == "hotel-client-a"
     assert first_candidate.channel == ContentChannel.ONSITE_BANNER
     assert first_candidate.generation_prompt
+    assert "Required output fields" in first_candidate.generation_prompt
+    assert "title, body, cta, image_prompt, landing_url" in (
+        first_candidate.generation_prompt
+    )
+    assert first_candidate.reason_summary
+    assert first_candidate.message_strategy
+    assert first_candidate.data_evidence_json["segment_id"] == (
+        "seg_repeat_hotel_no_booking"
+    )
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
+    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v1"
 
 
 def test_generation_service_can_generate_response_without_repositories() -> None:
