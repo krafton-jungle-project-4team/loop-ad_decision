@@ -1,9 +1,23 @@
 from fastapi.testclient import TestClient
 
+from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.main import create_app
 
 
 FORBIDDEN_PUBLIC_KEYS = {"creative_id", "variant_id", "experiment_id"}
+
+
+def valid_env() -> dict[str, str]:
+    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values.update(
+        {
+            "LOOPAD_ENV": "test",
+            "LOOPAD_SERVICE_ID": "decision-api",
+            "PORT": "8080",
+            "LOOPAD_AURORA_PORT": "15432",
+        }
+    )
+    return values
 
 
 def test_generation_api_returns_v1_6_final_names() -> None:
@@ -81,12 +95,16 @@ def test_generation_api_rejects_non_positive_content_option_count() -> None:
 
 
 def test_health_returns_ok() -> None:
-    client = TestClient(create_app())
+    client = TestClient(create_app(settings=load_settings(valid_env())))
 
     response = client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "service": "decision-api"}
+    assert response.json() == {
+        "status": "ok",
+        "service": "decision-api",
+        "env": "test",
+    }
 
 
 def assert_no_forbidden_public_keys(value) -> None:
