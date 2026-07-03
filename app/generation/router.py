@@ -1,9 +1,16 @@
+from collections.abc import Iterator
 from json import JSONDecodeError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
+from app.db import create_postgres_connection
+from app.dependencies import get_settings
+from app.generation.repositories import (
+    ContentCandidateRepository,
+    GenerationRunRepository,
+)
 from app.generation.schemas import (
     GenerationRequest,
     GenerationResponse,
@@ -17,8 +24,20 @@ router = APIRouter(
 )
 
 
-def get_generation_service() -> GenerationRequestHandler:
-    return GenerationService()
+def get_generation_service(request: Request) -> Iterator[GenerationRequestHandler]:
+    settings = get_settings(request)
+    connection = create_postgres_connection(settings)
+    try:
+        yield GenerationService(
+            generation_run_repository=GenerationRunRepository(connection),
+            content_candidate_repository=ContentCandidateRepository(connection),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 @router.post(
