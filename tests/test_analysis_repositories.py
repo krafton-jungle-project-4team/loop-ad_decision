@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from app.analysis.repositories import (
     HotelProfileRepository,
@@ -81,6 +82,11 @@ class FakeClickHouseClient:
 
 def compact_sql(query: str) -> str:
     return " ".join(query.split()).lower()
+
+
+def jsonb_obj(value: Any) -> Any:
+    assert isinstance(value, Jsonb)
+    return value.obj
 
 
 def promotion_row() -> dict[str, Any]:
@@ -207,18 +213,50 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     assert "input_snapshot_json" in sql
     assert "profile_summary_json" in sql
     assert "output_json" in sql
-    assert call.params == (
+    assert isinstance(call.params, tuple)
+    assert call.params[:5] == (
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "completed",
-        ["seg_repeat_hotel_no_booking"],
-        "Focus on users with booking intent.",
-        {"promotion": {"promotion_id": "promo_banner_001"}},
-        {"selected_segment_count": 1},
-        {"target_segment_count": 1},
     )
+    assert jsonb_obj(call.params[5]) == ["seg_repeat_hotel_no_booking"]
+    assert call.params[6] == "Focus on users with booking intent."
+    assert jsonb_obj(call.params[7]) == {
+        "promotion": {"promotion_id": "promo_banner_001"}
+    }
+    assert jsonb_obj(call.params[8]) == {"selected_segment_count": 1}
+    assert jsonb_obj(call.params[9]) == {"target_segment_count": 1}
+
+
+def test_promotion_analysis_repository_saves_analysis_without_focus_segments() -> None:
+    db = FakePostgresExecutor()
+    repo = PromotionAnalysisRepository(db)
+    analysis = PromotionAnalysisWrite(
+        analysis_id="analysis_banner_001",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        status="completed",
+        focus_segment_ids_json=None,
+        operator_instruction=None,
+        input_snapshot_json={"promotion": {"promotion_id": "promo_banner_001"}},
+        profile_summary_json={"selected_segment_count": 1},
+        output_json=None,
+    )
+
+    repo.save_analysis(analysis)
+
+    call = db.calls[0]
+    assert isinstance(call.params, tuple)
+    assert call.params[5] is None
+    assert call.params[6] is None
+    assert jsonb_obj(call.params[7]) == {
+        "promotion": {"promotion_id": "promo_banner_001"}
+    }
+    assert jsonb_obj(call.params[8]) == {"selected_segment_count": 1}
+    assert call.params[9] is None
 
 
 def test_promotion_analysis_repository_saves_target_segments() -> None:
@@ -251,17 +289,20 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
     assert "data_evidence_json" in sql
     assert "segment_vector_id" in sql
     assert "status" in sql
-    assert call.params == (
+    assert isinstance(call.params, tuple)
+    assert call.params[:6] == (
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "seg_repeat_hotel_no_booking",
         "Repeat hotel viewers without booking",
-        {"event_name": "hotel_detail_view"},
-        {"hotel_cluster": "seoul_center"},
-        {"keywords": ["free cancellation"]},
-        {"event_count": 120},
+    )
+    assert jsonb_obj(call.params[6]) == {"event_name": "hotel_detail_view"}
+    assert jsonb_obj(call.params[7]) == {"hotel_cluster": "seoul_center"}
+    assert jsonb_obj(call.params[8]) == {"keywords": ["free cancellation"]}
+    assert jsonb_obj(call.params[9]) == {"event_count": 120}
+    assert call.params[10:] == (
         "segvec_repeat_hotel_no_booking_v1",
         1342,
         "high",
@@ -303,7 +344,8 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "seg_repeat_hotel_no_booking",
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
-    assert insert_call.params == (
+    assert isinstance(insert_call.params, tuple)
+    assert insert_call.params[:7] == (
         "segvec_repeat_hotel_no_booking_v1",
         "hotel-client-a",
         "promo_banner_001",
@@ -311,7 +353,9 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "analysis_banner_001",
         "seg_repeat_hotel_no_booking",
         64,
-        vector_values,
+    )
+    assert jsonb_obj(insert_call.params[7]) == vector_values
+    assert insert_call.params[8:] == (
         "v1",
         "decision_analysis",
     )
@@ -379,7 +423,9 @@ def test_hotel_profile_repository_queries_marketing_profiles() -> None:
 
 
 def test_hotel_profile_repository_queries_expedia_event_profile() -> None:
-    client = FakeClickHouseClient(rows=[{"hotel_cluster": "seoul_center", "event_count": 42}])
+    client = FakeClickHouseClient(
+        rows=[{"hotel_cluster": "seoul_center", "event_count": 42}]
+    )
     repo = HotelProfileRepository(client)
 
     summary = repo.summarize_expedia_hotel_events(

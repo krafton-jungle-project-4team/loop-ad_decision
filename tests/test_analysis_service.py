@@ -12,6 +12,7 @@ from app.analysis.repositories import (
     PromotionRecord,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
+    SegmentVectorRecord,
 )
 from app.analysis.schemas import AnalysisRequest
 from app.analysis.service import (
@@ -90,6 +91,14 @@ class FakePromotionAnalysisRepository:
         target_segments: Sequence[PromotionTargetSegmentWrite],
     ) -> None:
         self.saved.target_segments = list(target_segments)
+
+
+class FakeSegmentVectorRepository:
+    def __init__(self) -> None:
+        self.saved: list[SegmentVectorRecord] = []
+
+    def save(self, vector: SegmentVectorRecord) -> None:
+        self.saved.append(vector)
 
 
 def promotion_record(
@@ -175,6 +184,7 @@ def build_service(
     promotion: PromotionRecord | None,
     segments: list[SegmentDefinitionRecord],
     profiles: list[HotelMarketingProfileRecord] | None = None,
+    segment_vector_repository: FakeSegmentVectorRepository | None = None,
 ) -> tuple[PromotionAnalysisService, FakePromotionAnalysisRepository]:
     analysis_repository = FakePromotionAnalysisRepository()
     service = PromotionAnalysisService(
@@ -182,6 +192,7 @@ def build_service(
         segment_definition_repository=FakeSegmentDefinitionRepository(segments),
         hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
         promotion_analysis_repository=analysis_repository,
+        segment_vector_repository=segment_vector_repository,
     )
     return service, analysis_repository
 
@@ -225,7 +236,10 @@ def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
     assert analysis_repository.saved.analysis == result.analysis
     assert analysis_repository.saved.target_segments == result.target_segments
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
-    assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+    assert (
+        result.target_segments[0].profile_json["hotel_profile"]["event_count"]
+        == 5000
+    )
 
 
 def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
@@ -310,6 +324,31 @@ def test_service_reflects_operator_instruction_in_content_brief() -> None:
     )
     assert result.target_segments[0].content_brief_json["operator_instruction"] == (
         "Emphasize breakfast and same-day availability."
+    )
+
+
+def test_service_saves_segment_vectors_when_repository_is_provided() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segment_vector_repository = FakeSegmentVectorRepository()
+    service, analysis_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_vector_repository=segment_vector_repository,
+    )
+
+    result = service.analyze(analysis_request(promotion_id=promotion.promotion_id))
+
+    assert len(segment_vector_repository.saved) == len(result.target_segments)
+    first_vector = segment_vector_repository.saved[0]
+    assert first_vector.segment_vector_id == "segvec_family_trip_v1"
+    assert first_vector.analysis_id == result.analysis.analysis_id
+    assert first_vector.promotion_id == promotion.promotion_id
+    assert first_vector.vector_dim == 64
+    assert len(first_vector.vector_values) == 64
+    assert first_vector.source == "decision_analysis"
+    assert analysis_repository.saved.target_segments is not None
+    assert analysis_repository.saved.target_segments[0].segment_vector_id == (
+        "segvec_family_trip_v1"
     )
 
 

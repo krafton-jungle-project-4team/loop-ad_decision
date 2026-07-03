@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import math
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
@@ -10,6 +12,7 @@ from app.analysis.repositories import (
     PromotionRecord,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
+    SegmentVectorRecord,
 )
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
 
@@ -145,6 +148,16 @@ class PromotionAnalysisWriter(Protocol):
         ...
 
 
+class SegmentVectorWriter(Protocol):
+    def save(self, vector: SegmentVectorRecord) -> None:
+        ...
+
+
+class AnalysisRequestHandler(Protocol):
+    def analyze(self, request: AnalysisRequest) -> "PromotionAnalysisResult":
+        ...
+
+
 @dataclass(frozen=True)
 class PromotionAnalysisResult:
     analysis: PromotionAnalysisWrite
@@ -181,12 +194,14 @@ class PromotionAnalysisService:
         segment_definition_repository: SegmentDefinitionReader,
         hotel_profile_repository: HotelProfileReader,
         promotion_analysis_repository: PromotionAnalysisWriter,
+        segment_vector_repository: SegmentVectorWriter | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._segment_definition_repository = segment_definition_repository
         self._hotel_profile_repository = hotel_profile_repository
         self._promotion_analysis_repository = promotion_analysis_repository
+        self._segment_vector_repository = segment_vector_repository
         self._max_default_target_segments = max_default_target_segments
 
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
@@ -204,7 +219,9 @@ class PromotionAnalysisService:
             candidates=candidates,
         )
         if not selected_candidates:
-            raise SegmentSelectionError("no active segment candidates matched analysis request")
+            raise SegmentSelectionError(
+                "no active segment candidates matched analysis request"
+            )
 
         analysis_id = f"analysis_{promotion.promotion_id}"
         target_segments = [
@@ -214,6 +231,9 @@ class PromotionAnalysisService:
                 candidate=candidate,
                 rank=rank,
                 operator_instruction=request.operator_instruction,
+                segment_vector_id=_segment_vector_id(candidate.segment_id)
+                if self._segment_vector_repository is not None
+                else None,
             )
             for rank, candidate in enumerate(selected_candidates)
         ]
@@ -227,6 +247,11 @@ class PromotionAnalysisService:
         )
 
         self._promotion_analysis_repository.save_analysis(analysis)
+        self._save_segment_vectors(
+            analysis_id=analysis_id,
+            promotion=promotion,
+            target_segments=target_segments,
+        )
         self._promotion_analysis_repository.save_target_segments(target_segments)
         return PromotionAnalysisResult(
             analysis=analysis,
@@ -250,7 +275,9 @@ class PromotionAnalysisService:
         segment_definitions: Sequence[SegmentDefinitionRecord],
         hotel_profiles: Sequence[HotelMarketingProfileRecord],
     ) -> dict[str, SegmentCandidate]:
-        profiles_by_segment = {profile.profile_name: profile for profile in hotel_profiles}
+        profiles_by_segment = {
+            profile.profile_name: profile for profile in hotel_profiles
+        }
         return {
             segment.segment_id: SegmentCandidate(
                 definition=segment,
@@ -285,7 +312,11 @@ class PromotionAnalysisService:
         ordered_ids.extend(
             profile.profile_name
             for profile in sorted(
-                (candidate.profile for candidate in candidates.values() if candidate.profile),
+                (
+                    candidate.profile
+                    for candidate in candidates.values()
+                    if candidate.profile
+                ),
                 key=lambda profile: (
                     -int(profile.profile_json.get("event_count", 0)),
                     profile.profile_name,
@@ -344,6 +375,7 @@ class PromotionAnalysisService:
         candidate: SegmentCandidate,
         rank: int,
         operator_instruction: str | None,
+        segment_vector_id: str | None,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
         content_brief_json = self._build_content_brief_json(
@@ -365,7 +397,7 @@ class PromotionAnalysisService:
             profile_json=profile_json,
             content_brief_json=content_brief_json,
             data_evidence_json=self._build_data_evidence_json(candidate),
-            segment_vector_id=None,
+            segment_vector_id=segment_vector_id,
             estimated_size=max(segment.sample_size, 0),
             priority=self._priority_for_segment(
                 estimated_size=segment.sample_size,
@@ -468,6 +500,33 @@ class PromotionAnalysisService:
             },
         )
 
+    def _save_segment_vectors(
+        self,
+        *,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        if self._segment_vector_repository is None:
+            return
+        for target_segment in target_segments:
+            if target_segment.segment_vector_id is None:
+                continue
+            self._segment_vector_repository.save(
+                SegmentVectorRecord(
+                    segment_vector_id=target_segment.segment_vector_id,
+                    project_id=promotion.project_id,
+                    promotion_id=promotion.promotion_id,
+                    promotion_run_id=None,
+                    analysis_id=analysis_id,
+                    segment_id=target_segment.segment_id,
+                    vector_dim=64,
+                    vector_values=_fixture_vector_values(target_segment.segment_id),
+                    vector_version="v1",
+                    source="decision_analysis",
+                )
+            )
+
 
 def _promotion_snapshot(promotion: PromotionRecord) -> dict[str, Any]:
     return {
@@ -506,3 +565,15 @@ def _total_eligible_users(
 
 def _json_decimal(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _segment_vector_id(segment_id: str) -> str:
+    segment_slug = segment_id.removeprefix("seg_")
+    return f"segvec_{segment_slug}_v1"
+
+
+def _fixture_vector_values(segment_id: str) -> list[float]:
+    digest = hashlib.sha256(segment_id.encode("utf-8")).digest()
+    raw_values = [(digest[index % len(digest)] / 255.0) - 0.5 for index in range(64)]
+    norm = math.sqrt(sum(value * value for value in raw_values)) or 1.0
+    return [round(value / norm, 8) for value in raw_values]
