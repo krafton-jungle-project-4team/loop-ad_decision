@@ -10,6 +10,7 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRepository,
     SegmentVectorRepository,
+    UserBehaviorVectorRepository,
 )
 from app.analysis.schemas import (
     AnalysisRequest,
@@ -25,6 +26,7 @@ from app.analysis.service import (
     PromotionNotFoundError,
     SegmentSelectionError,
 )
+from app.analysis.vector_service import SegmentVectorService
 from app.db import (
     PsycopgPostgresExecutor,
     create_clickhouse_client,
@@ -48,7 +50,12 @@ def get_analysis_service(request: Request) -> Iterator[AnalysisRequestHandler]:
             segment_definition_repository=SegmentDefinitionRepository(postgres),
             hotel_profile_repository=HotelProfileRepository(clickhouse_client),
             promotion_analysis_repository=PromotionAnalysisRepository(postgres),
-            segment_vector_repository=SegmentVectorRepository(postgres),
+            segment_vector_service=SegmentVectorService(
+                segment_vector_repository=SegmentVectorRepository(postgres),
+                user_behavior_vector_repository=UserBehaviorVectorRepository(
+                    clickhouse_client
+                ),
+            ),
         )
         postgres_connection.commit()
     except Exception:

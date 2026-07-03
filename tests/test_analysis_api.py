@@ -29,7 +29,6 @@ def analysis_payload(**overrides: Any) -> dict[str, Any]:
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "focus_segment_ids": ["seg_repeat_hotel_no_booking"],
         "operator_instruction": None,
     }
     payload.update(overrides)
@@ -109,9 +108,9 @@ def test_analysis_api_wires_data_repositories(monkeypatch) -> None:
     )
 
     assert response.status_code == 200
-    assert response.json()["target_segments"][0]["segment_vector_id"] == (
-        "segvec_repeat_hotel_no_booking_v1"
-    )
+    segment_vector_id = response.json()["target_segments"][0]["segment_vector_id"]
+    assert segment_vector_id.startswith("segvec_seg_repeat_hotel_no_booking_v1_")
+    assert len(segment_vector_id) <= 100
     assert len(connections) == 1
     connection = connections[0]
     assert connection.commit_count == 1

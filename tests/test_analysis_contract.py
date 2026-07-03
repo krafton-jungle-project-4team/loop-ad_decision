@@ -69,7 +69,6 @@ def analysis_payload(**overrides: Any) -> dict[str, Any]:
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "focus_segment_ids": None,
         "operator_instruction": None,
     }
     payload.update(overrides)
@@ -169,6 +168,15 @@ def test_analysis_requires_mandatory_fields() -> None:
     assert response.status_code == 422
 
 
+def test_analysis_rejects_focus_segment_ids() -> None:
+    response = make_client().post(
+        "/decision/v1/promotions/promo_banner_001/analysis",
+        json=analysis_payload(focus_segment_ids=["seg_family_trip"]),
+    )
+
+    assert response.status_code == 422
+
+
 def test_analysis_rejects_promotion_id_mismatch() -> None:
     response = make_client().post(
         "/decision/v1/promotions/promo_banner_001/analysis",
@@ -222,7 +230,7 @@ class FakeAnalysisService:
                 campaign_id=request.campaign_id,
                 promotion_id=request.promotion_id,
                 status=AnalysisStatus.COMPLETED.value,
-                focus_segment_ids_json=request.focus_segment_ids,
+                focus_segment_ids_json=None,
                 operator_instruction=request.operator_instruction,
                 input_snapshot_json={"promotion_id": request.promotion_id},
                 profile_summary_json={"selected_segment_count": 1},
