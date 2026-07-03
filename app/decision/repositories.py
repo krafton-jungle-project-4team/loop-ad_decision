@@ -32,6 +32,15 @@ class PostgresExecutor(Protocol):
         ...
 
 
+class ClickHouseClient(Protocol):
+    def query(
+        self,
+        query: str,
+        parameters: Mapping[str, Any] | None = None,
+    ) -> Any:
+        ...
+
+
 class PsycopgPostgresExecutor:
     def __init__(self, connection: Any) -> None:
         self._connection = connection
@@ -220,6 +229,30 @@ class AdExperimentWrite:
 
 
 @dataclass(frozen=True)
+class SegmentVectorRecord:
+    segment_vector_id: str
+    project_id: str
+    promotion_id: str | None
+    promotion_run_id: str | None
+    analysis_id: str | None
+    segment_id: str
+    vector_dim: int
+    vector_values: Any
+    vector_version: str
+    source: str
+
+
+@dataclass(frozen=True)
+class UserBehaviorVectorRecord:
+    project_id: str
+    user_id: str
+    vector_dim: int
+    vector_values: list[float]
+    vector_version: str
+    source: str
+
+
+@dataclass(frozen=True)
 class UserSegmentAssignmentWrite:
     project_id: str
     promotion_run_id: str
@@ -282,6 +315,15 @@ class PromotionTargetSegmentReader(Protocol):
     ) -> list[PromotionTargetSegmentRecord]:
         ...
 
+    def update_status(
+        self,
+        *,
+        analysis_id: str,
+        segment_id: str,
+        status: str,
+    ) -> None:
+        ...
+
 
 class GenerationRunReader(Protocol):
     def get_by_id(self, generation_id: str) -> GenerationRunRecord | None:
@@ -326,6 +368,55 @@ class AdExperimentWriter(Protocol):
         promotion_run_id: str,
         segment_id: str,
     ) -> bool:
+        ...
+
+    def update_status(self, *, ad_experiment_id: str, status: str) -> None:
+        ...
+
+
+class SegmentVectorReader(Protocol):
+    def list_for_run_segments(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+        vector_version: str,
+    ) -> list[SegmentVectorRecord]:
+        ...
+
+
+class UserBehaviorVectorReader(Protocol):
+    def list_by_user_ids(
+        self,
+        *,
+        project_id: str,
+        user_ids: Sequence[str],
+        vector_version: str,
+    ) -> list[UserBehaviorVectorRecord]:
+        ...
+
+    def list_for_project(
+        self,
+        *,
+        project_id: str,
+        vector_version: str,
+        limit: int,
+    ) -> list[UserBehaviorVectorRecord]:
+        ...
+
+
+class UserSegmentAssignmentWriter(Protocol):
+    def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
+        ...
+
+    def count_by_run_segments(
+        self,
+        *,
+        promotion_run_id: str,
+        segment_ids: Sequence[str],
+    ) -> dict[str, int]:
         ...
 
 
@@ -445,6 +536,23 @@ class PromotionTargetSegmentRepository:
             (analysis_id,),
         )
         return [PromotionTargetSegmentRecord(**row) for row in rows]
+
+    def update_status(
+        self,
+        *,
+        analysis_id: str,
+        segment_id: str,
+        status: str,
+    ) -> None:
+        self._db.execute(
+            """
+            UPDATE promotion_target_segments
+            SET status = %s
+            WHERE analysis_id = %s
+              AND segment_id = %s
+            """,
+            (status, analysis_id, segment_id),
+        )
 
 
 class GenerationRunRepository:
@@ -702,3 +810,243 @@ class AdExperimentRepository:
             (promotion_run_id, segment_id),
         )
         return row is not None
+
+    def update_status(self, *, ad_experiment_id: str, status: str) -> None:
+        self._db.execute(
+            """
+            UPDATE ad_experiments
+            SET status = %s,
+                updated_at = now()
+            WHERE ad_experiment_id = %s
+            """,
+            (status, ad_experiment_id),
+        )
+
+
+class SegmentVectorRepository:
+    VECTOR_DIM = 64
+
+    def __init__(self, db: PostgresExecutor) -> None:
+        self._db = db
+
+    def list_for_run_segments(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+        vector_version: str,
+    ) -> list[SegmentVectorRecord]:
+        if not segment_ids:
+            return []
+
+        rows = self._db.fetchall(
+            """
+            SELECT
+                segment_vector_id,
+                project_id,
+                promotion_id,
+                promotion_run_id,
+                analysis_id,
+                segment_id,
+                vector_dim,
+                vector_values,
+                vector_version,
+                source
+            FROM segment_vectors
+            WHERE project_id = %s
+              AND promotion_id = %s
+              AND analysis_id = %s
+              AND segment_id = ANY(%s)
+              AND vector_version = %s
+              AND vector_dim = %s
+            ORDER BY segment_id ASC, created_at DESC, segment_vector_id DESC
+            """,
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                list(segment_ids),
+                vector_version,
+                self.VECTOR_DIM,
+            ),
+        )
+        return [SegmentVectorRecord(**row) for row in rows]
+
+
+class UserSegmentAssignmentRepository:
+    def __init__(self, db: PostgresExecutor) -> None:
+        self._db = db
+
+    def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
+        inserted_count = 0
+        for assignment in assignments:
+            row = self._db.fetchone(
+                """
+                INSERT INTO user_segment_assignments (
+                    project_id,
+                    promotion_run_id,
+                    user_id,
+                    segment_id,
+                    ad_experiment_id,
+                    content_id,
+                    content_option_id,
+                    similarity_score,
+                    fallback,
+                    assignment_source,
+                    assigned_at,
+                    expires_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (promotion_run_id, user_id) DO NOTHING
+                RETURNING id
+                """,
+                (
+                    assignment.project_id,
+                    assignment.promotion_run_id,
+                    assignment.user_id,
+                    assignment.segment_id,
+                    assignment.ad_experiment_id,
+                    assignment.content_id,
+                    assignment.content_option_id,
+                    assignment.similarity_score,
+                    assignment.fallback,
+                    assignment.assignment_source,
+                    assignment.assigned_at,
+                    assignment.expires_at,
+                ),
+            )
+            if row is not None:
+                inserted_count += 1
+        return inserted_count
+
+    def count_by_run_segments(
+        self,
+        *,
+        promotion_run_id: str,
+        segment_ids: Sequence[str],
+    ) -> dict[str, int]:
+        if not segment_ids:
+            return {}
+
+        rows = self._db.fetchall(
+            """
+            SELECT
+                segment_id,
+                count(*) AS assigned_user_count
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+              AND segment_id = ANY(%s)
+            GROUP BY segment_id
+            """,
+            (promotion_run_id, list(segment_ids)),
+        )
+        return {
+            str(row["segment_id"]): int(row["assigned_user_count"])
+            for row in rows
+        }
+
+
+class UserBehaviorVectorRepository:
+    VECTOR_DIM = 64
+
+    def __init__(self, client: ClickHouseClient) -> None:
+        self._client = client
+
+    def list_by_user_ids(
+        self,
+        *,
+        project_id: str,
+        user_ids: Sequence[str],
+        vector_version: str,
+    ) -> list[UserBehaviorVectorRecord]:
+        if not user_ids:
+            return []
+
+        result = self._client.query(
+            """
+            SELECT
+                project_id,
+                user_id,
+                argMax(vector_dim, updated_at) AS vector_dim,
+                argMax(vector_values, updated_at) AS vector_values,
+                vector_version,
+                argMax(source, updated_at) AS source
+            FROM user_behavior_vectors
+            WHERE project_id = {project_id:String}
+              AND vector_version = {vector_version:String}
+              AND vector_dim = {vector_dim:UInt16}
+              AND user_id IN {user_ids:Array(String)}
+            GROUP BY project_id, user_id, vector_version
+            ORDER BY user_id ASC
+            """,
+            parameters={
+                "project_id": project_id,
+                "vector_version": vector_version,
+                "vector_dim": self.VECTOR_DIM,
+                "user_ids": list(user_ids),
+            },
+        )
+        return self._records_from_result(result)
+
+    def list_for_project(
+        self,
+        *,
+        project_id: str,
+        vector_version: str,
+        limit: int,
+    ) -> list[UserBehaviorVectorRecord]:
+        result = self._client.query(
+            """
+            SELECT
+                project_id,
+                user_id,
+                argMax(vector_dim, updated_at) AS vector_dim,
+                argMax(vector_values, updated_at) AS vector_values,
+                vector_version,
+                argMax(source, updated_at) AS source
+            FROM user_behavior_vectors
+            WHERE project_id = {project_id:String}
+              AND vector_version = {vector_version:String}
+              AND vector_dim = {vector_dim:UInt16}
+            GROUP BY project_id, user_id, vector_version
+            ORDER BY user_id ASC
+            LIMIT {limit:UInt32}
+            """,
+            parameters={
+                "project_id": project_id,
+                "vector_version": vector_version,
+                "vector_dim": self.VECTOR_DIM,
+                "limit": limit,
+            },
+        )
+        return self._records_from_result(result)
+
+    def _records_from_result(self, result: Any) -> list[UserBehaviorVectorRecord]:
+        return [
+            UserBehaviorVectorRecord(
+                project_id=_clickhouse_value(row, "project_id", 0),
+                user_id=_clickhouse_value(row, "user_id", 1),
+                vector_dim=int(_clickhouse_value(row, "vector_dim", 2)),
+                vector_values=[
+                    float(value)
+                    for value in _clickhouse_value(row, "vector_values", 3)
+                ],
+                vector_version=_clickhouse_value(row, "vector_version", 4),
+                source=_clickhouse_value(row, "source", 5),
+            )
+            for row in _clickhouse_rows(result)
+        ]
+
+
+def _clickhouse_rows(result: Any) -> list[Any]:
+    if hasattr(result, "named_results"):
+        return list(result.named_results())
+    return list(result.result_rows)
+
+
+def _clickhouse_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, Mapping):
+        return row[key]
+    return row[index]

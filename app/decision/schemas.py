@@ -1,7 +1,8 @@
 from enum import StrEnum
+from typing import Literal
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class Channel(StrEnum):
@@ -92,3 +93,28 @@ class RunCreateResponse(BaseModel):
     status: PromotionRunStatus
     goal_snapshot_json: dict[str, Any]
     ad_experiments: list[AdExperimentCreateResponse]
+
+
+class SegmentAssignmentBuildRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    user_ids: list[str] | None = None
+    eligible_user_limit: int | None = Field(default=None, ge=1)
+    vector_version: str = Field(default="v1", min_length=1)
+    expires_in_days: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def require_scope(self) -> "SegmentAssignmentBuildRequest":
+        if not self.user_ids and self.eligible_user_limit is None:
+            raise ValueError("eligible_user_limit is required when user_ids is omitted")
+        return self
+
+
+class SegmentAssignmentBuildResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    promotion_run_id: str = Field(min_length=1)
+    assignment_count: int = Field(ge=0)
+    fallback_count: int = Field(ge=0)
+    insufficient_segment_count: int = Field(ge=0)
+    status: Literal["completed"] = "completed"
