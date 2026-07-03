@@ -146,11 +146,6 @@ class PromotionAnalysisWriter(Protocol):
         ...
 
 
-class AnalysisRequestHandler(Protocol):
-    def analyze(self, request: AnalysisRequest) -> "PromotionAnalysisResult":
-        ...
-
-
 class SegmentVectorPreparer(Protocol):
     def prepare_segment_vector(
         self,
@@ -220,9 +215,7 @@ class PromotionAnalysisService:
             candidates=candidates,
         )
         if not selected_candidates:
-            raise SegmentSelectionError(
-                "no active segment candidates matched analysis request"
-            )
+            raise SegmentSelectionError("no active segment candidates matched analysis request")
 
         analysis_id = f"analysis_{promotion.promotion_id}"
         analysis = self._build_analysis(
@@ -275,9 +268,7 @@ class PromotionAnalysisService:
         segment_definitions: Sequence[SegmentDefinitionRecord],
         hotel_profiles: Sequence[HotelMarketingProfileRecord],
     ) -> dict[str, SegmentCandidate]:
-        profiles_by_segment = {
-            profile.profile_name: profile for profile in hotel_profiles
-        }
+        profiles_by_segment = {profile.profile_name: profile for profile in hotel_profiles}
         return {
             segment.segment_id: SegmentCandidate(
                 definition=segment,
@@ -305,11 +296,7 @@ class PromotionAnalysisService:
         ordered_ids.extend(
             profile.profile_name
             for profile in sorted(
-                (
-                    candidate.profile
-                    for candidate in candidates.values()
-                    if candidate.profile
-                ),
+                (candidate.profile for candidate in candidates.values() if candidate.profile),
                 key=lambda profile: (
                     -int(profile.profile_json.get("event_count", 0)),
                     profile.profile_name,
