@@ -125,6 +125,12 @@ class SegmentDefinitionReader(Protocol):
     ) -> list[SegmentDefinitionRecord]:
         ...
 
+    def save_ai_suggested(
+        self,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> None:
+        ...
+
 
 class HotelProfileReader(Protocol):
     def list_marketing_profiles(
@@ -151,6 +157,15 @@ class SegmentVectorPreparer(Protocol):
         self,
         request: SegmentVectorBuildRequest,
     ) -> SegmentVectorBuildResult:
+        ...
+
+
+class SegmentDefinitionSuggester(Protocol):
+    def suggest_segments(
+        self,
+        *,
+        promotion: PromotionRecord,
+    ) -> list[SegmentDefinitionRecord]:
         ...
 
 
@@ -191,6 +206,7 @@ class PromotionAnalysisService:
         hotel_profile_repository: HotelProfileReader,
         promotion_analysis_repository: PromotionAnalysisWriter,
         segment_vector_service: SegmentVectorPreparer | None = None,
+        segment_suggester: SegmentDefinitionSuggester | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
     ) -> None:
         self._promotion_repository = promotion_repository
@@ -198,6 +214,7 @@ class PromotionAnalysisService:
         self._hotel_profile_repository = hotel_profile_repository
         self._promotion_analysis_repository = promotion_analysis_repository
         self._segment_vector_service = segment_vector_service
+        self._segment_suggester = segment_suggester
         self._max_default_target_segments = max_default_target_segments
 
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
@@ -205,6 +222,15 @@ class PromotionAnalysisService:
         segment_definitions = self._segment_definition_repository.list_active(
             project_id=request.project_id,
         )
+        suggested_segment_definitions = self._suggest_segment_definitions(promotion)
+        if suggested_segment_definitions:
+            self._segment_definition_repository.save_ai_suggested(
+                suggested_segment_definitions
+            )
+            segment_definitions = _merge_segment_definitions(
+                segment_definitions,
+                suggested_segment_definitions,
+            )
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
@@ -251,6 +277,14 @@ class PromotionAnalysisService:
             target_segments=target_segments,
         )
 
+    def _suggest_segment_definitions(
+        self,
+        promotion: PromotionRecord,
+    ) -> list[SegmentDefinitionRecord]:
+        if self._segment_suggester is None:
+            return []
+        return self._segment_suggester.suggest_segments(promotion=promotion)
+
     def _get_promotion(self, request: AnalysisRequest) -> PromotionRecord:
         promotion = self._promotion_repository.get_for_analysis(
             project_id=request.project_id,
@@ -292,6 +326,18 @@ class PromotionAnalysisService:
             if self._is_related_custom_segment(candidate.definition, promotion):
                 ordered_ids.append(candidate.segment_id)
 
+        ordered_ids.extend(
+            candidate.segment_id
+            for candidate in sorted(
+                candidates.values(),
+                key=lambda candidate: (
+                    -_ai_segment_score(candidate.definition),
+                    -candidate.estimated_size,
+                    candidate.segment_id,
+                ),
+            )
+            if candidate.definition.source == "ai_suggested"
+        )
         ordered_ids.extend(DEFAULT_SEGMENT_IDS_BY_CHANNEL.get(promotion.channel, ()))
         ordered_ids.extend(
             profile.profile_name
@@ -524,6 +570,26 @@ def _segment_definition_snapshot(segment: SegmentDefinitionRecord) -> dict[str, 
         "sample_ratio": _json_decimal(segment.sample_ratio),
         "status": segment.status,
     }
+
+
+def _merge_segment_definitions(
+    stored_segments: Sequence[SegmentDefinitionRecord],
+    suggested_segments: Sequence[SegmentDefinitionRecord],
+) -> list[SegmentDefinitionRecord]:
+    merged = {segment.segment_id: segment for segment in stored_segments}
+    for segment in suggested_segments:
+        existing = merged.get(segment.segment_id)
+        if existing is None or existing.source == "ai_suggested":
+            merged[segment.segment_id] = segment
+    return list(merged.values())
+
+
+def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:
+    raw_score = segment.profile_json.get("cluster_score", 0.0)
+    try:
+        return float(raw_score)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _total_eligible_users(
