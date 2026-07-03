@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
@@ -57,6 +57,7 @@ class FakeSegmentDefinitionRepository:
     def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
         self.segments = segments
         self.calls: list[Mapping[str, Any]] = []
+        self.saved_ai_suggested: list[SegmentDefinitionRecord] = []
 
     def list_active(
         self,
@@ -66,6 +67,12 @@ class FakeSegmentDefinitionRepository:
     ) -> list[SegmentDefinitionRecord]:
         self.calls.append({"project_id": project_id, "sources": sources})
         return self.segments
+
+    def save_ai_suggested(
+        self,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> None:
+        self.saved_ai_suggested.extend(segments)
 
 
 class FakeHotelProfileRepository:
@@ -114,6 +121,20 @@ class FakeSegmentVectorService:
             vector_values=[1.0, *([0.0] * 63)],
             source="fixture",
         )
+
+
+class FakeSegmentSuggester:
+    def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
+        self.segments = segments
+        self.calls: list[PromotionRecord] = []
+
+    def suggest_segments(
+        self,
+        *,
+        promotion: PromotionRecord,
+    ) -> list[SegmentDefinitionRecord]:
+        self.calls.append(promotion)
+        return self.segments
 
 
 def promotion_record(
@@ -199,16 +220,23 @@ def build_service(
     segments: list[SegmentDefinitionRecord],
     profiles: list[HotelMarketingProfileRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
-) -> tuple[PromotionAnalysisService, FakePromotionAnalysisRepository]:
+    segment_suggester: FakeSegmentSuggester | None = None,
+) -> tuple[
+    PromotionAnalysisService,
+    FakePromotionAnalysisRepository,
+    FakeSegmentDefinitionRepository,
+]:
     analysis_repository = FakePromotionAnalysisRepository()
+    segment_definition_repository = FakeSegmentDefinitionRepository(segments)
     service = PromotionAnalysisService(
         promotion_repository=FakePromotionRepository(promotion),
-        segment_definition_repository=FakeSegmentDefinitionRepository(segments),
+        segment_definition_repository=segment_definition_repository,
         hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service,
+        segment_suggester=segment_suggester,
     )
-    return service, analysis_repository
+    return service, analysis_repository, segment_definition_repository
 
 
 def default_segments() -> list[SegmentDefinitionRecord]:
@@ -230,7 +258,7 @@ def segment_ids(
 
 def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
     promotion = promotion_record(channel="email")
-    service, analysis_repository = build_service(
+    service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=default_segments(),
         profiles=[profile_record("seg_mobile_user", event_count=5000)],
@@ -266,7 +294,7 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
         segment_record("seg_near_checkin"),
         segment_record("seg_existing_all"),
     ]
-    service, _ = build_service(promotion=promotion, segments=segments)
+    service, _, _ = build_service(promotion=promotion, segments=segments)
 
     result = service.analyze(
         analysis_request(promotion_id=promotion.promotion_id),
@@ -284,7 +312,7 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
 
 def test_service_applies_sms_default_segment_order() -> None:
     promotion = promotion_record(channel="sms")
-    service, _ = build_service(promotion=promotion, segments=default_segments())
+    service, _, _ = build_service(promotion=promotion, segments=default_segments())
 
     result = service.analyze(
         analysis_request(promotion_id=promotion.promotion_id),
@@ -301,7 +329,7 @@ def test_service_applies_sms_default_segment_order() -> None:
 def test_service_populates_segment_vector_ids_when_vector_service_is_configured() -> None:
     promotion = promotion_record(channel="onsite_banner")
     vector_service = FakeSegmentVectorService()
-    service, analysis_repository = build_service(
+    service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=[
             segment_record(
@@ -331,9 +359,99 @@ def test_service_populates_segment_vector_ids_when_vector_service_is_configured(
     ]
 
 
+def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    ai_segment = segment_record(
+        "seg_ai_cluster_promo_onsite_banner_001_1_abcdef1234",
+        source="ai_suggested",
+        sample_size=1800,
+        rule_json={
+            "source": "user_vector_clustering",
+            "candidate_user_ids": ["user_101", "user_102"],
+        },
+    )
+    ai_segment = replace(
+        ai_segment,
+        profile_json={
+            "primary_segment": ai_segment.segment_id,
+            "source": "user_vector_clustering",
+            "cluster_score": 0.99,
+        },
+    )
+    vector_service = FakeSegmentVectorService()
+    suggester = FakeSegmentSuggester([ai_segment])
+    service, analysis_repository, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_vector_service=vector_service,
+        segment_suggester=suggester,
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    expected_segment_ids = [
+        ai_segment.segment_id,
+        "seg_family_trip",
+        "seg_mobile_user",
+        "seg_repeat_hotel_no_booking",
+    ]
+    assert segment_ids(result.target_segments) == expected_segment_ids
+    assert segment_definition_repository.saved_ai_suggested == [ai_segment]
+    assert suggester.calls == [promotion]
+    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert result.analysis.output_json == {
+        "selected_segment_ids": expected_segment_ids,
+        "target_segment_count": 4,
+    }
+    assert result.analysis.profile_summary_json["candidate_segment_count"] == 7
+    assert result.analysis.input_snapshot_json["available_segment_definitions"][6] == {
+        "segment_id": ai_segment.segment_id,
+        "segment_name": ai_segment.segment_name,
+        "source": "ai_suggested",
+        "sample_size": 1800,
+        "total_eligible_user_count": 74200,
+        "sample_ratio": "0.020000",
+        "status": "active",
+    }
+    assert result.target_segments[0].data_evidence_json["source"] == "ai_suggested"
+    assert result.target_segments[0].profile_json["cluster_score"] == 0.99
+    assert vector_service.calls[0] == SegmentVectorBuildRequest(
+        project_id="hotel-client-a",
+        promotion_id=promotion.promotion_id,
+        analysis_id=f"analysis_{promotion.promotion_id}",
+        segment_id=ai_segment.segment_id,
+        candidate_user_ids=["user_101", "user_102"],
+    )
+
+
+def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    suggester = FakeSegmentSuggester([])
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=suggester,
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments) == [
+        "seg_family_trip",
+        "seg_mobile_user",
+        "seg_repeat_hotel_no_booking",
+        "seg_near_checkin",
+    ]
+    assert segment_definition_repository.saved_ai_suggested == []
+    assert suggester.calls == [promotion]
+
+
 def test_service_reflects_operator_instruction_in_content_brief() -> None:
     promotion = promotion_record(channel="onsite_banner")
-    service, _ = build_service(promotion=promotion, segments=default_segments())
+    service, _, _ = build_service(promotion=promotion, segments=default_segments())
 
     result = service.analyze(
         analysis_request(
@@ -352,7 +470,7 @@ def test_service_reflects_operator_instruction_in_content_brief() -> None:
 
 def test_service_marks_small_segments_as_low_priority() -> None:
     promotion = promotion_record(channel="email", min_sample_size=1000)
-    service, _ = build_service(
+    service, _, _ = build_service(
         promotion=promotion,
         segments=[
             segment_record("seg_mobile_user", sample_size=250),
@@ -371,7 +489,7 @@ def test_service_marks_small_segments_as_low_priority() -> None:
 
 
 def test_service_raises_when_promotion_is_missing() -> None:
-    service, _ = build_service(
+    service, _, _ = build_service(
         promotion=None,
         segments=default_segments(),
     )
@@ -382,7 +500,7 @@ def test_service_raises_when_promotion_is_missing() -> None:
 
 def test_service_raises_when_no_candidate_matches() -> None:
     promotion = promotion_record(channel="email")
-    service, _ = build_service(
+    service, _, _ = build_service(
         promotion=promotion,
         segments=[],
     )

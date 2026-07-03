@@ -12,6 +12,7 @@ from app.analysis.repositories import (
     PromotionAnalysisWrite,
     PromotionRepository,
     PromotionTargetSegmentWrite,
+    SegmentDefinitionRecord,
     SegmentDefinitionRepository,
     SegmentVectorRecord,
     SegmentVectorRepository,
@@ -179,6 +180,87 @@ def test_segment_definition_repository_filters_active_sources() -> None:
     assert "status = 'active'" in sql
     assert "source in (%s, %s)" in sql
     assert call.params == ("hotel-client-a", "custom_chatkit", "system_default")
+
+
+def test_segment_definition_repository_saves_ai_suggested_segments() -> None:
+    db = FakePostgresExecutor()
+    repo = SegmentDefinitionRepository(db)
+    segment = SegmentDefinitionRecord(
+        segment_id="seg_ai_cluster_promo_banner_001_1_abcdef1234",
+        project_id="hotel-client-a",
+        segment_name="AI suggested hotel audience 1",
+        source="ai_suggested",
+        query_preview_id=None,
+        natural_language_query="Users grouped by similar hotel behavior vectors.",
+        generated_sql=None,
+        rule_json={
+            "source": "user_vector_clustering",
+            "candidate_user_ids": ["user_001", "user_002"],
+        },
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_banner_001_1_abcdef1234",
+            "cluster_score": 0.98,
+        },
+        sample_size=2,
+        total_eligible_user_count=4,
+        sample_ratio=Decimal("0.500000"),
+        status="active",
+    )
+
+    repo.save_ai_suggested([segment])
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "execute"
+    assert "insert into segment_definitions" in sql
+    assert "on conflict (segment_id) do update" in sql
+    assert "where segment_definitions.source = 'ai_suggested'" in sql
+    assert call.params == (
+        "seg_ai_cluster_promo_banner_001_1_abcdef1234",
+        "hotel-client-a",
+        "AI suggested hotel audience 1",
+        "ai_suggested",
+        None,
+        "Users grouped by similar hotel behavior vectors.",
+        None,
+        {
+            "source": "user_vector_clustering",
+            "candidate_user_ids": ["user_001", "user_002"],
+        },
+        {
+            "primary_segment": "seg_ai_cluster_promo_banner_001_1_abcdef1234",
+            "cluster_score": 0.98,
+        },
+        2,
+        4,
+        Decimal("0.500000"),
+        "active",
+    )
+
+
+def test_segment_definition_repository_rejects_non_ai_suggested_save() -> None:
+    db = FakePostgresExecutor()
+    repo = SegmentDefinitionRepository(db)
+    segment = SegmentDefinitionRecord(
+        segment_id="seg_mobile_user",
+        project_id="hotel-client-a",
+        segment_name="Mobile users",
+        source="system_default",
+        query_preview_id=None,
+        natural_language_query=None,
+        generated_sql=None,
+        rule_json={},
+        profile_json={},
+        sample_size=100,
+        total_eligible_user_count=1000,
+        sample_ratio=Decimal("0.100000"),
+        status="active",
+    )
+
+    with pytest.raises(ValueError, match="ai_suggested"):
+        repo.save_ai_suggested([segment])
+
+    assert db.calls == []
 
 
 def test_promotion_analysis_repository_saves_analysis() -> None:
@@ -393,6 +475,47 @@ def test_user_behavior_vector_repository_skips_empty_user_ids() -> None:
 
     assert vectors == []
     assert client.calls == []
+
+
+def test_user_behavior_vector_repository_queries_recent_project_vectors() -> None:
+    vector_values = [0.1] * 64
+    client = FakeClickHouseClient(
+        rows=[
+            {
+                "project_id": "hotel-client-a",
+                "user_id": "user_001",
+                "vector_dim": 64,
+                "vector_values": vector_values,
+                "vector_version": "v1",
+                "source": "batch_profile",
+            }
+        ]
+    )
+    repo = UserBehaviorVectorRepository(client)
+
+    vectors = repo.list_recent(
+        project_id="hotel-client-a",
+        limit=50,
+        vector_version="v1",
+    )
+
+    assert len(vectors) == 1
+    assert vectors[0].user_id == "user_001"
+    assert vectors[0].vector_values == vector_values
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_behavior_vectors" in sql
+    assert "project_id = {project_id:string}" in sql
+    assert "vector_dim = {vector_dim:uint16}" in sql
+    assert "vector_version = {vector_version:string}" in sql
+    assert "order by updated_at desc, user_id asc" in sql
+    assert "limit {limit:uint32}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_dim": 64,
+        "vector_version": "v1",
+        "limit": 50,
+    }
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:

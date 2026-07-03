@@ -210,6 +210,61 @@ class SegmentDefinitionRepository:
         )
         return [SegmentDefinitionRecord(**row) for row in rows]
 
+    def save_ai_suggested(
+        self,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> None:
+        for segment in segments:
+            if segment.source != "ai_suggested":
+                raise ValueError("only ai_suggested segment definitions can be saved")
+            self._db.execute(
+                """
+                INSERT INTO segment_definitions (
+                    segment_id,
+                    project_id,
+                    segment_name,
+                    source,
+                    query_preview_id,
+                    natural_language_query,
+                    generated_sql,
+                    rule_json,
+                    profile_json,
+                    sample_size,
+                    total_eligible_user_count,
+                    sample_ratio,
+                    status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (segment_id) DO UPDATE SET
+                    segment_name = EXCLUDED.segment_name,
+                    natural_language_query = EXCLUDED.natural_language_query,
+                    generated_sql = EXCLUDED.generated_sql,
+                    rule_json = EXCLUDED.rule_json,
+                    profile_json = EXCLUDED.profile_json,
+                    sample_size = EXCLUDED.sample_size,
+                    total_eligible_user_count = EXCLUDED.total_eligible_user_count,
+                    sample_ratio = EXCLUDED.sample_ratio,
+                    status = EXCLUDED.status,
+                    updated_at = now()
+                WHERE segment_definitions.source = 'ai_suggested'
+                """,
+                (
+                    segment.segment_id,
+                    segment.project_id,
+                    segment.segment_name,
+                    segment.source,
+                    segment.query_preview_id,
+                    segment.natural_language_query,
+                    segment.generated_sql,
+                    segment.rule_json,
+                    segment.profile_json,
+                    segment.sample_size,
+                    segment.total_eligible_user_count,
+                    segment.sample_ratio,
+                    segment.status,
+                ),
+            )
+
 
 class PromotionAnalysisRepository:
     def __init__(self, db: PostgresExecutor) -> None:
@@ -403,6 +458,51 @@ class UserBehaviorVectorRepository:
                 "vector_dim": self.VECTOR_DIM,
                 "vector_version": vector_version,
                 "user_ids": list(user_ids),
+            },
+        )
+        return [
+            UserBehaviorVectorRecord(
+                project_id=_clickhouse_value(row, "project_id", 0),
+                user_id=_clickhouse_value(row, "user_id", 1),
+                vector_dim=_clickhouse_value(row, "vector_dim", 2),
+                vector_values=[
+                    float(value)
+                    for value in _clickhouse_value(row, "vector_values", 3)
+                ],
+                vector_version=_clickhouse_value(row, "vector_version", 4),
+                source=_clickhouse_value(row, "source", 5),
+            )
+            for row in _clickhouse_rows(result)
+        ]
+
+    def list_recent(
+        self,
+        *,
+        project_id: str,
+        limit: int = 200,
+        vector_version: str = "v1",
+    ) -> list[UserBehaviorVectorRecord]:
+        result = self._client.query(
+            """
+            SELECT
+                project_id,
+                user_id,
+                vector_dim,
+                vector_values,
+                vector_version,
+                source
+            FROM user_behavior_vectors
+            WHERE project_id = {project_id:String}
+              AND vector_dim = {vector_dim:UInt16}
+              AND vector_version = {vector_version:String}
+            ORDER BY updated_at DESC, user_id ASC
+            LIMIT {limit:UInt32}
+            """,
+            parameters={
+                "project_id": project_id,
+                "vector_dim": self.VECTOR_DIM,
+                "vector_version": vector_version,
+                "limit": limit,
             },
         )
         return [
