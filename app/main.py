@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from app.analysis.router import router as analysis_router
 from app.config import Settings, load_settings
 from app.dependencies import require_internal_key
+from app.generation.router import router as generation_router
 
 
 def create_app(*, settings: Settings | None = None) -> FastAPI:
@@ -46,6 +47,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         }
 
     app.include_router(analysis_router)
+    app.include_router(generation_router)
     return app
 
 
