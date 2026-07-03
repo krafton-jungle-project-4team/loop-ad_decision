@@ -115,6 +115,16 @@ class SegmentVectorRecord:
 
 
 @dataclass(frozen=True)
+class UserBehaviorVectorRecord:
+    project_id: str
+    user_id: str
+    vector_dim: int
+    vector_values: list[float]
+    vector_version: str
+    source: str
+
+
+@dataclass(frozen=True)
 class HotelMarketingProfileRecord:
     project_id: str
     profile_name: str
@@ -354,6 +364,61 @@ class SegmentVectorRepository:
             raise ValueError("segment vector_dim must be 64")
         if len(vector.vector_values) != self.VECTOR_DIM:
             raise ValueError("segment vector_values must contain 64 values")
+
+
+class UserBehaviorVectorRepository:
+    VECTOR_DIM = 64
+
+    def __init__(self, client: ClickHouseClient) -> None:
+        self._client = client
+
+    def list_by_user_ids(
+        self,
+        *,
+        project_id: str,
+        user_ids: Sequence[str],
+        vector_version: str = "v1",
+    ) -> list[UserBehaviorVectorRecord]:
+        if not user_ids:
+            return []
+
+        result = self._client.query(
+            """
+            SELECT
+                project_id,
+                user_id,
+                vector_dim,
+                vector_values,
+                vector_version,
+                source
+            FROM user_behavior_vectors
+            WHERE project_id = {project_id:String}
+              AND vector_dim = {vector_dim:UInt16}
+              AND vector_version = {vector_version:String}
+              AND user_id IN {user_ids:Array(String)}
+            ORDER BY user_id ASC
+            """,
+            parameters={
+                "project_id": project_id,
+                "vector_dim": self.VECTOR_DIM,
+                "vector_version": vector_version,
+                "user_ids": list(user_ids),
+            },
+        )
+        return [
+            UserBehaviorVectorRecord(
+                project_id=_clickhouse_value(row, "project_id", 0),
+                user_id=_clickhouse_value(row, "user_id", 1),
+                vector_dim=_clickhouse_value(row, "vector_dim", 2),
+                vector_values=[
+                    float(value)
+                    for value in _clickhouse_value(row, "vector_values", 3)
+                ],
+                vector_version=_clickhouse_value(row, "vector_version", 4),
+                source=_clickhouse_value(row, "source", 5),
+            )
+            for row in _clickhouse_rows(result)
+        ]
 
 
 class HotelProfileRepository:
