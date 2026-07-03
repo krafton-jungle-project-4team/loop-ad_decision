@@ -1,12 +1,12 @@
 import pytest
 from pydantic import ValidationError
 
-from app.dto.generation import (
+from app.generation.schemas import (
     ContentCandidateResponse,
     ContentChannel,
     GenerationRequest,
 )
-from app.repositories.content_candidates import ContentCandidateRecord
+from app.generation.repositories import ContentCandidateRecord
 
 
 def test_generation_request_accepts_valid_payload() -> None:
@@ -128,4 +128,3 @@ def test_content_candidate_record_rejects_missing_channel_fields() -> None:
             segment_id="seg_repeat_hotel_no_booking",
             channel=ContentChannel.SMS,
         )
-

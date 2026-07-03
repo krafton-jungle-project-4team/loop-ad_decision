@@ -1,5 +1,7 @@
-from app.repositories.content_candidates import CONTENT_CANDIDATE_COLUMNS
-from app.repositories.generation_runs import GENERATION_RUN_COLUMNS
+from app.generation.repositories import (
+    CONTENT_CANDIDATE_COLUMNS,
+    GENERATION_RUN_COLUMNS,
+)
 
 
 def test_generation_run_repository_columns_match_data_source_contract() -> None:

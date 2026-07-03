@@ -1,0 +1,2 @@
+"""Content generation API package."""
+

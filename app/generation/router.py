@@ -2,7 +2,7 @@ import re
 
 from fastapi import APIRouter, HTTPException, status
 
-from app.dto.generation import (
+from app.generation.schemas import (
     ContentCandidateResponse,
     ContentCandidateStatus,
     ContentChannel,
@@ -13,13 +13,13 @@ from app.dto.generation import (
 
 
 router = APIRouter(
-    prefix="/promotions/{promotion_id}",
+    prefix="/decision/v1/promotions",
     tags=["generation"],
 )
 
 
 @router.post(
-    "/generation",
+    "/{promotion_id}/generation",
     response_model=GenerationResponse,
     status_code=status.HTTP_200_OK,
 )
@@ -76,4 +76,3 @@ def _generation_id_from_promotion(promotion_id: str) -> str:
     promotion_slug = promotion_id.removeprefix("promo_")
     safe_slug = re.sub(r"[^a-zA-Z0-9_]+", "_", promotion_slug).strip("_")
     return f"generation_{safe_slug or 'content'}"
-
