@@ -60,7 +60,9 @@ class SegmentDefinitionRecord:
     natural_language_query: str | None
     generated_sql: str | None
     rule_json: Mapping[str, Any]
+    profile_json: Mapping[str, Any]
     sample_size: int
+    total_eligible_user_count: int
     sample_ratio: Decimal
     status: str
 
@@ -72,8 +74,11 @@ class PromotionAnalysisWrite:
     campaign_id: str
     promotion_id: str
     status: str
+    focus_segment_ids_json: Sequence[str] | None
+    operator_instruction: str | None
     input_snapshot_json: Mapping[str, Any]
     profile_summary_json: Mapping[str, Any]
+    output_json: Mapping[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -87,21 +92,25 @@ class PromotionTargetSegmentWrite:
     rule_json: Mapping[str, Any]
     profile_json: Mapping[str, Any]
     content_brief_json: Mapping[str, Any]
+    data_evidence_json: Mapping[str, Any]
     segment_vector_id: str | None
     estimated_size: int
     priority: str | None
+    status: str
 
 
 @dataclass(frozen=True)
 class SegmentVectorRecord:
     segment_vector_id: str
     project_id: str
-    promotion_id: str
+    promotion_id: str | None
     promotion_run_id: str | None
+    analysis_id: str | None
     segment_id: str
     vector_dim: int
     vector_values: list[float]
     vector_version: str
+    source: str
 
 
 @dataclass(frozen=True)
@@ -174,7 +183,9 @@ class SegmentDefinitionRepository:
                 natural_language_query,
                 generated_sql,
                 rule_json,
+                profile_json,
                 sample_size,
+                total_eligible_user_count,
                 sample_ratio,
                 status
             FROM segment_definitions
@@ -201,10 +212,13 @@ class PromotionAnalysisRepository:
                 campaign_id,
                 promotion_id,
                 status,
+                focus_segment_ids_json,
+                operator_instruction,
                 input_snapshot_json,
-                profile_summary_json
+                profile_summary_json,
+                output_json
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 analysis.analysis_id,
@@ -212,8 +226,11 @@ class PromotionAnalysisRepository:
                 analysis.campaign_id,
                 analysis.promotion_id,
                 analysis.status,
+                analysis.focus_segment_ids_json,
+                analysis.operator_instruction,
                 analysis.input_snapshot_json,
                 analysis.profile_summary_json,
+                analysis.output_json,
             ),
         )
 
@@ -234,11 +251,13 @@ class PromotionAnalysisRepository:
                     rule_json,
                     profile_json,
                     content_brief_json,
+                    data_evidence_json,
                     segment_vector_id,
                     estimated_size,
-                    priority
+                    priority,
+                    status
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     segment.analysis_id,
@@ -250,9 +269,11 @@ class PromotionAnalysisRepository:
                     segment.rule_json,
                     segment.profile_json,
                     segment.content_brief_json,
+                    segment.data_evidence_json,
                     segment.segment_vector_id,
                     segment.estimated_size,
                     segment.priority,
+                    segment.status,
                 ),
             )
 
@@ -277,10 +298,12 @@ class SegmentVectorRepository:
                 project_id,
                 promotion_id,
                 promotion_run_id,
+                analysis_id,
                 segment_id,
                 vector_dim,
                 vector_values,
-                vector_version
+                vector_version,
+                source
             FROM segment_vectors
             WHERE project_id = %s
               AND promotion_id = %s
@@ -301,22 +324,26 @@ class SegmentVectorRepository:
                 project_id,
                 promotion_id,
                 promotion_run_id,
+                analysis_id,
                 segment_id,
                 vector_dim,
                 vector_values,
-                vector_version
+                vector_version,
+                source
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 vector.segment_vector_id,
                 vector.project_id,
                 vector.promotion_id,
                 vector.promotion_run_id,
+                vector.analysis_id,
                 vector.segment_id,
                 vector.vector_dim,
                 vector.vector_values,
                 vector.vector_version,
+                vector.source,
             ),
         )
 

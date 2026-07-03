@@ -150,7 +150,9 @@ def test_segment_definition_repository_filters_active_sources() -> None:
                 "natural_language_query": "same hotel views without booking",
                 "generated_sql": "SELECT user_id FROM hotel_detail_events",
                 "rule_json": {"event_name": "hotel_detail_view"},
+                "profile_json": {"primary_segment": "seg_repeat_hotel_no_booking"},
                 "sample_size": 1342,
+                "total_eligible_user_count": 74200,
                 "sample_ratio": Decimal("0.018000"),
                 "status": "active",
             }
@@ -169,6 +171,8 @@ def test_segment_definition_repository_filters_active_sources() -> None:
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert "from segment_definitions" in sql
+    assert "profile_json" in sql
+    assert "total_eligible_user_count" in sql
     assert "status = 'active'" in sql
     assert "source in (%s, %s)" in sql
     assert call.params == ("hotel-client-a", "custom_chatkit", "system_default")
@@ -183,8 +187,11 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         status="completed",
+        focus_segment_ids_json=["seg_repeat_hotel_no_booking"],
+        operator_instruction="Focus on users with booking intent.",
         input_snapshot_json={"promotion": {"promotion_id": "promo_banner_001"}},
         profile_summary_json={"selected_segment_count": 1},
+        output_json={"target_segment_count": 1},
     )
 
     repo.save_analysis(analysis)
@@ -193,16 +200,22 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     sql = compact_sql(call.query)
     assert call.operation == "execute"
     assert "insert into promotion_analyses" in sql
+    assert "focus_segment_ids_json" in sql
+    assert "operator_instruction" in sql
     assert "input_snapshot_json" in sql
     assert "profile_summary_json" in sql
+    assert "output_json" in sql
     assert call.params == (
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "completed",
+        ["seg_repeat_hotel_no_booking"],
+        "Focus on users with booking intent.",
         {"promotion": {"promotion_id": "promo_banner_001"}},
         {"selected_segment_count": 1},
+        {"target_segment_count": 1},
     )
 
 
@@ -219,9 +232,11 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
         rule_json={"event_name": "hotel_detail_view"},
         profile_json={"hotel_cluster": "seoul_center"},
         content_brief_json={"keywords": ["free cancellation"]},
+        data_evidence_json={"event_count": 120},
         segment_vector_id="segvec_repeat_hotel_no_booking_v1",
         estimated_size=1342,
         priority="high",
+        status="planned",
     )
 
     repo.save_target_segments([segment])
@@ -231,7 +246,9 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
     assert call.operation == "execute"
     assert "insert into promotion_target_segments" in sql
     assert "content_brief_json" in sql
+    assert "data_evidence_json" in sql
     assert "segment_vector_id" in sql
+    assert "status" in sql
     assert call.params == (
         "analysis_banner_001",
         "hotel-client-a",
@@ -242,9 +259,11 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
         {"event_name": "hotel_detail_view"},
         {"hotel_cluster": "seoul_center"},
         {"keywords": ["free cancellation"]},
+        {"event_count": 120},
         "segvec_repeat_hotel_no_booking_v1",
         1342,
         "high",
+        "planned",
     )
 
 
@@ -256,10 +275,12 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
             "project_id": "hotel-client-a",
             "promotion_id": "promo_banner_001",
             "promotion_run_id": None,
+            "analysis_id": "analysis_banner_001",
             "segment_id": "seg_repeat_hotel_no_booking",
             "vector_dim": 64,
             "vector_values": vector_values,
             "vector_version": "v1",
+            "source": "decision_analysis",
         }
     )
     repo = SegmentVectorRepository(db)
@@ -285,10 +306,12 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "hotel-client-a",
         "promo_banner_001",
         None,
+        "analysis_banner_001",
         "seg_repeat_hotel_no_booking",
         64,
         vector_values,
         "v1",
+        "decision_analysis",
     )
 
 
@@ -300,10 +323,12 @@ def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
         project_id="hotel-client-a",
         promotion_id="promo_banner_001",
         promotion_run_id=None,
+        analysis_id="analysis_banner_001",
         segment_id="seg_bad",
         vector_dim=64,
         vector_values=[0.1] * 63,
         vector_version="v1",
+        source="decision_analysis",
     )
 
     with pytest.raises(ValueError, match="64 values"):
