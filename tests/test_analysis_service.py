@@ -183,14 +183,12 @@ def profile_record(
 def analysis_request(
     *,
     promotion_id: str,
-    focus_segment_ids: list[str] | None = None,
     operator_instruction: str | None = None,
 ) -> AnalysisRequest:
     return AnalysisRequest(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
-        focus_segment_ids=focus_segment_ids,
         operator_instruction=operator_instruction,
     )
 
@@ -300,27 +298,6 @@ def test_service_applies_sms_default_segment_order() -> None:
     ]
 
 
-def test_service_limits_analysis_to_focus_segment_ids() -> None:
-    promotion = promotion_record(channel="onsite_banner")
-    service, _ = build_service(promotion=promotion, segments=default_segments())
-
-    result = service.analyze(
-        analysis_request(
-            promotion_id=promotion.promotion_id,
-            focus_segment_ids=["seg_near_checkin", "seg_mobile_user"],
-        ),
-    )
-
-    assert segment_ids(result.target_segments) == [
-        "seg_near_checkin",
-        "seg_mobile_user",
-    ]
-    assert result.analysis.focus_segment_ids_json == [
-        "seg_near_checkin",
-        "seg_mobile_user",
-    ]
-
-
 def test_service_populates_segment_vector_ids_when_vector_service_is_configured() -> None:
     promotion = promotion_record(channel="onsite_banner")
     vector_service = FakeSegmentVectorService()
@@ -338,10 +315,7 @@ def test_service_populates_segment_vector_ids_when_vector_service_is_configured(
     )
 
     result = service.analyze(
-        analysis_request(
-            promotion_id=promotion.promotion_id,
-            focus_segment_ids=["seg_mobile_user"],
-        ),
+        analysis_request(promotion_id=promotion.promotion_id),
     )
 
     assert result.target_segments[0].segment_vector_id == "segvec_seg_mobile_user_v1"

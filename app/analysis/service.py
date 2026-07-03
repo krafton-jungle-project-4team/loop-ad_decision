@@ -284,13 +284,6 @@ class PromotionAnalysisService:
         request: AnalysisRequest,
         candidates: Mapping[str, SegmentCandidate],
     ) -> list[SegmentCandidate]:
-        if request.focus_segment_ids:
-            return [
-                candidates[segment_id]
-                for segment_id in request.focus_segment_ids
-                if segment_id in candidates
-            ]
-
         ordered_ids: list[str] = []
         for candidate in sorted(
             candidates.values(),
@@ -459,7 +452,7 @@ class PromotionAnalysisService:
             campaign_id=promotion.campaign_id,
             promotion_id=promotion.promotion_id,
             status=AnalysisStatus.COMPLETED.value,
-            focus_segment_ids_json=request.focus_segment_ids,
+            focus_segment_ids_json=None,
             operator_instruction=request.operator_instruction,
             input_snapshot_json={
                 "promotion": _promotion_snapshot(promotion),
@@ -467,7 +460,6 @@ class PromotionAnalysisService:
                     _segment_definition_snapshot(segment)
                     for segment in segment_definitions
                 ],
-                "focus_segment_ids": request.focus_segment_ids,
                 "operator_instruction": request.operator_instruction,
             },
             profile_summary_json={
