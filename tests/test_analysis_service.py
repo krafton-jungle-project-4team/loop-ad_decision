@@ -1,0 +1,354 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from decimal import Decimal
+from typing import Any, Mapping, Sequence
+
+import pytest
+
+from app.analysis.repositories import (
+    HotelMarketingProfileRecord,
+    PromotionAnalysisWrite,
+    PromotionRecord,
+    PromotionTargetSegmentWrite,
+    SegmentDefinitionRecord,
+)
+from app.analysis.schemas import AnalysisRequest
+from app.analysis.service import (
+    PromotionAnalysisService,
+    PromotionNotFoundError,
+    SegmentSelectionError,
+)
+
+
+@dataclass
+class SavedAnalysis:
+    analysis: PromotionAnalysisWrite | None = None
+    target_segments: list[PromotionTargetSegmentWrite] | None = None
+
+
+class FakePromotionRepository:
+    def __init__(self, promotion: PromotionRecord | None) -> None:
+        self.promotion = promotion
+        self.calls: list[Mapping[str, str]] = []
+
+    def get_for_analysis(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+    ) -> PromotionRecord | None:
+        self.calls.append(
+            {
+                "project_id": project_id,
+                "campaign_id": campaign_id,
+                "promotion_id": promotion_id,
+            }
+        )
+        return self.promotion
+
+
+class FakeSegmentDefinitionRepository:
+    def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
+        self.segments = segments
+        self.calls: list[Mapping[str, Any]] = []
+
+    def list_active(
+        self,
+        *,
+        project_id: str,
+        sources: Sequence[str] | None = None,
+    ) -> list[SegmentDefinitionRecord]:
+        self.calls.append({"project_id": project_id, "sources": sources})
+        return self.segments
+
+
+class FakeHotelProfileRepository:
+    def __init__(self, profiles: list[HotelMarketingProfileRecord]) -> None:
+        self.profiles = profiles
+        self.calls: list[Mapping[str, str]] = []
+
+    def list_marketing_profiles(
+        self,
+        *,
+        project_id: str,
+    ) -> list[HotelMarketingProfileRecord]:
+        self.calls.append({"project_id": project_id})
+        return self.profiles
+
+
+class FakePromotionAnalysisRepository:
+    def __init__(self) -> None:
+        self.saved = SavedAnalysis()
+
+    def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
+        self.saved.analysis = analysis
+
+    def save_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        self.saved.target_segments = list(target_segments)
+
+
+def promotion_record(
+    *,
+    channel: str = "onsite_banner",
+    goal_metric: str = "booking_conversion_rate",
+    min_sample_size: int = 1000,
+) -> PromotionRecord:
+    return PromotionRecord(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id=f"promo_{channel}_001",
+        channel=channel,
+        goal_metric=goal_metric,
+        goal_target_value=Decimal("0.030000"),
+        goal_basis="all_segments",
+        min_sample_size=min_sample_size,
+        landing_url="https://demo-stay.example.com/summer",
+        message_brief="Drive summer hotel booking.",
+    )
+
+
+def segment_record(
+    segment_id: str,
+    *,
+    source: str = "system_default",
+    sample_size: int = 2000,
+    sample_ratio: Decimal = Decimal("0.020000"),
+) -> SegmentDefinitionRecord:
+    return SegmentDefinitionRecord(
+        segment_id=segment_id,
+        project_id="hotel-client-a",
+        segment_name=segment_id.replace("_", " ").title(),
+        source=source,
+        query_preview_id=None,
+        natural_language_query=f"{segment_id} hotel audience",
+        generated_sql=None,
+        rule_json={"segment_id": segment_id},
+        profile_json={"primary_segment": segment_id},
+        sample_size=sample_size,
+        total_eligible_user_count=74200,
+        sample_ratio=sample_ratio,
+        status="active",
+    )
+
+
+def profile_record(
+    profile_name: str,
+    *,
+    event_count: int = 2000,
+) -> HotelMarketingProfileRecord:
+    return HotelMarketingProfileRecord(
+        project_id="hotel-client-a",
+        profile_name=profile_name,
+        profile_json={
+            "event_count": event_count,
+            "booking_count": 120,
+            "mobile_ratio": 0.65,
+            "package_ratio": 0.25,
+            "avg_stay_nights": 2.4,
+            "avg_days_until_checkin": 14.2,
+        },
+    )
+
+
+def analysis_request(
+    *,
+    promotion_id: str,
+    focus_segment_ids: list[str] | None = None,
+    operator_instruction: str | None = None,
+) -> AnalysisRequest:
+    return AnalysisRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id=promotion_id,
+        focus_segment_ids=focus_segment_ids,
+        operator_instruction=operator_instruction,
+    )
+
+
+def build_service(
+    *,
+    promotion: PromotionRecord | None,
+    segments: list[SegmentDefinitionRecord],
+    profiles: list[HotelMarketingProfileRecord] | None = None,
+) -> tuple[PromotionAnalysisService, FakePromotionAnalysisRepository]:
+    analysis_repository = FakePromotionAnalysisRepository()
+    service = PromotionAnalysisService(
+        promotion_repository=FakePromotionRepository(promotion),
+        segment_definition_repository=FakeSegmentDefinitionRepository(segments),
+        hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
+        promotion_analysis_repository=analysis_repository,
+    )
+    return service, analysis_repository
+
+
+def default_segments() -> list[SegmentDefinitionRecord]:
+    return [
+        segment_record("seg_mobile_user"),
+        segment_record("seg_family_trip"),
+        segment_record("seg_near_checkin"),
+        segment_record("seg_existing_all"),
+        segment_record("seg_repeat_hotel_no_booking"),
+        segment_record("seg_long_stay"),
+    ]
+
+
+def segment_ids(
+    target_segments: Sequence[PromotionTargetSegmentWrite],
+) -> list[str]:
+    return [segment.segment_id for segment in target_segments]
+
+
+def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
+    promotion = promotion_record(channel="email")
+    service, analysis_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        profiles=[profile_record("seg_mobile_user", event_count=5000)],
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert result.analysis.status == "completed"
+    assert segment_ids(result.target_segments) == [
+        "seg_mobile_user",
+        "seg_family_trip",
+        "seg_near_checkin",
+        "seg_existing_all",
+    ]
+    assert analysis_repository.saved.analysis == result.analysis
+    assert analysis_repository.saved.target_segments == result.target_segments
+    assert result.analysis.profile_summary_json["selected_segment_count"] == 4
+    assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+
+
+def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segments = [
+        segment_record(
+            "seg_repeat_hotel_no_booking",
+            source="custom_chatkit",
+            sample_size=1342,
+        ),
+        segment_record("seg_family_trip"),
+        segment_record("seg_mobile_user"),
+        segment_record("seg_near_checkin"),
+        segment_record("seg_existing_all"),
+    ]
+    service, _ = build_service(promotion=promotion, segments=segments)
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments) == [
+        "seg_repeat_hotel_no_booking",
+        "seg_family_trip",
+        "seg_mobile_user",
+        "seg_near_checkin",
+    ]
+    assert result.target_segments[0].priority == "high"
+    assert result.target_segments[0].status == "planned"
+
+
+def test_service_applies_sms_default_segment_order() -> None:
+    promotion = promotion_record(channel="sms")
+    service, _ = build_service(promotion=promotion, segments=default_segments())
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments) == [
+        "seg_near_checkin",
+        "seg_mobile_user",
+        "seg_family_trip",
+        "seg_existing_all",
+    ]
+
+
+def test_service_limits_analysis_to_focus_segment_ids() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    service, _ = build_service(promotion=promotion, segments=default_segments())
+
+    result = service.analyze(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_near_checkin", "seg_mobile_user"],
+        ),
+    )
+
+    assert segment_ids(result.target_segments) == [
+        "seg_near_checkin",
+        "seg_mobile_user",
+    ]
+    assert result.analysis.focus_segment_ids_json == [
+        "seg_near_checkin",
+        "seg_mobile_user",
+    ]
+
+
+def test_service_reflects_operator_instruction_in_content_brief() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    service, _ = build_service(promotion=promotion, segments=default_segments())
+
+    result = service.analyze(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            operator_instruction="Emphasize breakfast and same-day availability.",
+        ),
+    )
+
+    assert result.analysis.operator_instruction == (
+        "Emphasize breakfast and same-day availability."
+    )
+    assert result.target_segments[0].content_brief_json["operator_instruction"] == (
+        "Emphasize breakfast and same-day availability."
+    )
+
+
+def test_service_marks_small_segments_as_low_priority() -> None:
+    promotion = promotion_record(channel="email", min_sample_size=1000)
+    service, _ = build_service(
+        promotion=promotion,
+        segments=[
+            segment_record("seg_mobile_user", sample_size=250),
+            segment_record("seg_family_trip", sample_size=2000),
+            segment_record("seg_near_checkin", sample_size=2000),
+            segment_record("seg_existing_all", sample_size=2000),
+        ],
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert result.target_segments[0].segment_id == "seg_mobile_user"
+    assert result.target_segments[0].priority == "low"
+
+
+def test_service_raises_when_promotion_is_missing() -> None:
+    service, _ = build_service(
+        promotion=None,
+        segments=default_segments(),
+    )
+
+    with pytest.raises(PromotionNotFoundError):
+        service.analyze(analysis_request(promotion_id="promo_missing"))
+
+
+def test_service_raises_when_no_candidate_matches() -> None:
+    promotion = promotion_record(channel="email")
+    service, _ = build_service(
+        promotion=promotion,
+        segments=[],
+    )
+
+    with pytest.raises(SegmentSelectionError):
+        service.analyze(analysis_request(promotion_id=promotion.promotion_id))

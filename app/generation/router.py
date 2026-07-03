@@ -1,6 +1,9 @@
+from json import JSONDecodeError
 import re
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.encoders import jsonable_encoder
+from pydantic import ValidationError
 
 from app.generation.schemas import (
     ContentCandidateResponse,
@@ -23,17 +26,35 @@ router = APIRouter(
     response_model=GenerationResponse,
     status_code=status.HTTP_200_OK,
 )
-def create_generation(
+async def create_generation(
     promotion_id: str,
-    request: GenerationRequest,
+    request: Request,
 ) -> GenerationResponse:
-    if promotion_id != request.promotion_id:
+    generation_request = await _parse_generation_request(request)
+
+    if promotion_id != generation_request.promotion_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="promotion_id path parameter does not match request body",
         )
 
-    return _build_mock_generation_response(request)
+    return _build_mock_generation_response(generation_request)
+
+
+async def _parse_generation_request(request: Request) -> GenerationRequest:
+    try:
+        payload = await request.json()
+        return GenerationRequest.model_validate(payload)
+    except JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="request body must be valid JSON",
+        ) from exc
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=jsonable_encoder(exc.errors()),
+        ) from exc
 
 
 def _build_mock_generation_response(request: GenerationRequest) -> GenerationResponse:

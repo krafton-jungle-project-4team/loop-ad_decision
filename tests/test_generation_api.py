@@ -97,4 +97,3 @@ def assert_no_forbidden_public_keys(value) -> None:
     elif isinstance(value, list):
         for item in value:
             assert_no_forbidden_public_keys(item)
-

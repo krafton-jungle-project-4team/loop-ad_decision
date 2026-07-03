@@ -90,4 +90,3 @@ class GenerationResponse(BaseModel):
 def missing_channel_fields(channel: ContentChannel, values: dict[str, Any]) -> list[str]:
     required_fields = CHANNEL_REQUIRED_FIELDS[channel]
     return [field for field in required_fields if not values.get(field)]
-

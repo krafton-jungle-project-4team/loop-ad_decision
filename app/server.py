@@ -24,20 +24,33 @@ REQUIRED_ENV_VARS: tuple[str, ...] = (
 )
 
 
-def main() -> None:
-    load_dotenv()
+def validate_required_env_vars() -> None:
     missing_vars = [name for name in REQUIRED_ENV_VARS if not os.getenv(name)]
     if missing_vars:
         names = ", ".join(missing_vars)
         raise RuntimeError(f"Missing required environment variables: {names}")
 
+
+def get_port() -> int:
+    port = os.environ.get("PORT")
+    if port is None:
+        raise RuntimeError("PORT environment variable is required")
+
+    try:
+        return int(port)
+    except ValueError as exc:
+        raise RuntimeError("PORT environment variable must be an integer") from exc
+
+
+def main() -> None:
+    load_dotenv()
+    validate_required_env_vars()
     uvicorn.run(
         "app.main:app",
         host="0.0.0.0",
-        port=int(os.environ["PORT"]),
+        port=get_port(),
     )
 
 
 if __name__ == "__main__":
     main()
-
