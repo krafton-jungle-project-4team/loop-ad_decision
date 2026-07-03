@@ -5,6 +5,9 @@ from datetime import datetime
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
+from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
+
 
 class PostgresExecutor(Protocol):
     def fetchone(
@@ -27,6 +30,51 @@ class PostgresExecutor(Protocol):
         params: Sequence[Any] | Mapping[str, Any] = (),
     ) -> None:
         ...
+
+
+class PsycopgPostgresExecutor:
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def fetchone(
+        self,
+        query: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> Mapping[str, Any] | None:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, _adapt_params(params))
+            return cursor.fetchone()
+
+    def fetchall(
+        self,
+        query: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> list[Mapping[str, Any]]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, _adapt_params(params))
+            return list(cursor.fetchall())
+
+    def execute(
+        self,
+        query: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> None:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(query, _adapt_params(params))
+
+
+def _adapt_params(
+    params: Sequence[Any] | Mapping[str, Any],
+) -> Sequence[Any] | Mapping[str, Any]:
+    if isinstance(params, Mapping):
+        return {key: _adapt_param(value) for key, value in params.items()}
+    return tuple(_adapt_param(value) for value in params)
+
+
+def _adapt_param(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return Jsonb(value)
+    return value
 
 
 @dataclass(frozen=True)
