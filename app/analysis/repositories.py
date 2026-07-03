@@ -89,7 +89,7 @@ class PromotionTargetSegmentWrite:
     content_brief_json: Mapping[str, Any]
     segment_vector_id: str | None
     estimated_size: int
-    priority: int
+    priority: str | None
 
 
 @dataclass(frozen=True)
@@ -339,21 +339,36 @@ class HotelProfileRepository:
         result = self._client.query(
             """
             SELECT
-                project_id,
-                profile_name,
-                profile_json
+                primary_segment,
+                count() AS event_count,
+                countIf(is_booking = 1) AS booking_count,
+                avg(is_mobile) AS mobile_ratio,
+                avg(is_package) AS package_ratio,
+                avg(stay_nights) AS avg_stay_nights,
+                avg(days_until_checkin) AS avg_days_until_checkin
             FROM hotel_marketing_profiles
-            WHERE project_id = {project_id:String}
+            GROUP BY primary_segment
+            ORDER BY event_count DESC
             """,
-            parameters={"project_id": project_id},
         )
         return [
             HotelMarketingProfileRecord(
-                project_id=row[0],
-                profile_name=row[1],
-                profile_json=row[2],
+                project_id=project_id,
+                profile_name=_clickhouse_value(row, "primary_segment", 0),
+                profile_json={
+                    "event_count": _clickhouse_value(row, "event_count", 1),
+                    "booking_count": _clickhouse_value(row, "booking_count", 2),
+                    "mobile_ratio": _clickhouse_value(row, "mobile_ratio", 3),
+                    "package_ratio": _clickhouse_value(row, "package_ratio", 4),
+                    "avg_stay_nights": _clickhouse_value(row, "avg_stay_nights", 5),
+                    "avg_days_until_checkin": _clickhouse_value(
+                        row,
+                        "avg_days_until_checkin",
+                        6,
+                    ),
+                },
             )
-            for row in result.result_rows
+            for row in _clickhouse_rows(result)
         ]
 
     def summarize_expedia_hotel_events(
@@ -368,14 +383,28 @@ class HotelProfileRepository:
                 hotel_cluster,
                 count() AS event_count
             FROM expedia_hotel_events
-            WHERE project_id = {project_id:String}
             GROUP BY hotel_cluster
             ORDER BY event_count DESC
             LIMIT {limit:UInt32}
             """,
-            parameters={"project_id": project_id, "limit": limit},
+            parameters={"limit": limit},
         )
         return [
-            {"hotel_cluster": row[0], "event_count": row[1]}
-            for row in result.result_rows
+            {
+                "hotel_cluster": _clickhouse_value(row, "hotel_cluster", 0),
+                "event_count": _clickhouse_value(row, "event_count", 1),
+            }
+            for row in _clickhouse_rows(result)
         ]
+
+
+def _clickhouse_rows(result: Any) -> list[Any]:
+    if hasattr(result, "named_results"):
+        return list(result.named_results())
+    return list(result.result_rows)
+
+
+def _clickhouse_value(row: Any, key: str, index: int) -> Any:
+    if isinstance(row, Mapping):
+        return row[key]
+    return row[index]

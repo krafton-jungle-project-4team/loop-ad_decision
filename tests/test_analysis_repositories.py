@@ -61,12 +61,12 @@ class FakePostgresExecutor:
 
 
 class FakeClickHouseResult:
-    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+    def __init__(self, rows: list[Any]) -> None:
         self.result_rows = rows
 
 
 class FakeClickHouseClient:
-    def __init__(self, rows: list[tuple[Any, ...]]) -> None:
+    def __init__(self, rows: list[Any]) -> None:
         self.rows = rows
         self.calls: list[DbCall] = []
 
@@ -221,7 +221,7 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
         content_brief_json={"keywords": ["free cancellation"]},
         segment_vector_id="segvec_repeat_hotel_no_booking_v1",
         estimated_size=1342,
-        priority=1,
+        priority="high",
     )
 
     repo.save_target_segments([segment])
@@ -244,7 +244,7 @@ def test_promotion_analysis_repository_saves_target_segments() -> None:
         {"keywords": ["free cancellation"]},
         "segvec_repeat_hotel_no_booking_v1",
         1342,
-        1,
+        "high",
     )
 
 
@@ -315,27 +315,44 @@ def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:
     client = FakeClickHouseClient(
         rows=[
-            (
-                "hotel-client-a",
-                "family_trip",
-                {"keywords": ["family", "breakfast"]},
-            )
+            {
+                "primary_segment": "family_trip",
+                "event_count": 120,
+                "booking_count": 18,
+                "mobile_ratio": 0.65,
+                "package_ratio": 0.25,
+                "avg_stay_nights": 2.4,
+                "avg_days_until_checkin": 14.2,
+            }
         ]
     )
     repo = HotelProfileRepository(client)
 
     profiles = repo.list_marketing_profiles(project_id="hotel-client-a")
 
+    assert profiles[0].project_id == "hotel-client-a"
     assert profiles[0].profile_name == "family_trip"
+    assert profiles[0].profile_json == {
+        "event_count": 120,
+        "booking_count": 18,
+        "mobile_ratio": 0.65,
+        "package_ratio": 0.25,
+        "avg_stay_nights": 2.4,
+        "avg_days_until_checkin": 14.2,
+    }
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "from hotel_marketing_profiles" in sql
-    assert "project_id = {project_id:string}" in sql
-    assert call.params == {"project_id": "hotel-client-a"}
+    assert "primary_segment" in sql
+    assert "countif(is_booking = 1) as booking_count" in sql
+    assert "group by primary_segment" in sql
+    assert "order by event_count desc" in sql
+    assert "project_id" not in sql
+    assert call.params == {}
 
 
 def test_hotel_profile_repository_queries_expedia_event_profile() -> None:
-    client = FakeClickHouseClient(rows=[("seoul_center", 42)])
+    client = FakeClickHouseClient(rows=[{"hotel_cluster": "seoul_center", "event_count": 42}])
     repo = HotelProfileRepository(client)
 
     summary = repo.summarize_expedia_hotel_events(
@@ -349,4 +366,5 @@ def test_hotel_profile_repository_queries_expedia_event_profile() -> None:
     assert "from expedia_hotel_events" in sql
     assert "group by hotel_cluster" in sql
     assert "limit {limit:uint32}" in sql
-    assert call.params == {"project_id": "hotel-client-a", "limit": 5}
+    assert "project_id" not in sql
+    assert call.params == {"limit": 5}
