@@ -6,7 +6,17 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.analysis.repositories import (
+    PromotionAnalysisWrite,
+    PromotionTargetSegmentWrite,
+)
+from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus, Channel, GoalBasis, GoalMetric
+from app.analysis.service import (
+    PromotionAnalysisResult,
+    PromotionNotFoundError,
+    SegmentSelectionError,
+)
 from app.config import REQUIRED_ENV_NAMES, SettingsError, load_settings
 from app.main import create_app
 
@@ -24,8 +34,6 @@ def valid_env() -> dict[str, str]:
     )
     return values
 
-
-client = TestClient(create_app(settings=load_settings(valid_env())))
 
 FORBIDDEN_PUBLIC_TERMS = tuple(
     "".join(parts)
@@ -81,8 +89,15 @@ def enum_values(enum_type: type[Enum]) -> set[str]:
     return {member.value for member in enum_type}
 
 
+def make_client(service: object | None = None) -> TestClient:
+    app = create_app(settings=load_settings(valid_env()))
+    if service is not None:
+        app.dependency_overrides[get_analysis_service] = lambda: service
+    return TestClient(app)
+
+
 def test_health_returns_ok() -> None:
-    response = client.get("/health")
+    response = make_client().get("/health")
 
     assert response.status_code == 200
     assert response.json() == {
@@ -110,7 +125,8 @@ def test_server_port_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_analysis_returns_v1_6_contract_shape() -> None:
-    response = client.post(
+    service = FakeAnalysisService()
+    response = make_client(service).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(),
     )
@@ -139,10 +155,11 @@ def test_analysis_returns_v1_6_contract_shape() -> None:
             },
         }
     ]
+    assert service.calls[0].promotion_id == "promo_banner_001"
 
 
 def test_analysis_requires_mandatory_fields() -> None:
-    response = client.post(
+    response = make_client(FakeAnalysisService()).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json={"project_id": "hotel-client-a"},
     )
@@ -151,7 +168,7 @@ def test_analysis_requires_mandatory_fields() -> None:
 
 
 def test_analysis_rejects_focus_segment_ids() -> None:
-    response = client.post(
+    response = make_client(FakeAnalysisService()).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(focus_segment_ids=["seg_family_trip"]),
     )
@@ -160,7 +177,7 @@ def test_analysis_rejects_focus_segment_ids() -> None:
 
 
 def test_analysis_rejects_promotion_id_mismatch() -> None:
-    response = client.post(
+    response = make_client(FakeAnalysisService()).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(promotion_id="promo_email_001"),
     )
@@ -172,7 +189,7 @@ def test_analysis_rejects_promotion_id_mismatch() -> None:
 
 
 def test_analysis_response_does_not_expose_forbidden_terms() -> None:
-    response = client.post(
+    response = make_client(FakeAnalysisService()).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(),
     )
@@ -181,6 +198,21 @@ def test_analysis_response_does_not_expose_forbidden_terms() -> None:
     response_text = " ".join(collect_strings(response.json())).lower()
     for term in FORBIDDEN_PUBLIC_TERMS:
         assert term not in response_text
+
+
+def test_analysis_maps_service_errors() -> None:
+    cases = [
+        (PromotionNotFoundError("promotion not found"), 404),
+        (SegmentSelectionError("no active segment candidates matched analysis request"), 422),
+    ]
+
+    for exc, expected_status in cases:
+        response = make_client(FakeAnalysisService(exc=exc)).post(
+            "/decision/v1/promotions/promo_banner_001/analysis",
+            json=analysis_payload(),
+        )
+
+        assert response.status_code == expected_status
 
 
 def test_v1_6_enum_values() -> None:
@@ -197,3 +229,56 @@ def test_v1_6_enum_values() -> None:
         "completed",
         "failed",
     }
+
+
+class FakeAnalysisService:
+    def __init__(self, exc: Exception | None = None) -> None:
+        self.exc = exc
+        self.calls: list[Any] = []
+
+    def analyze(self, request: Any) -> PromotionAnalysisResult:
+        self.calls.append(request)
+        if self.exc is not None:
+            raise self.exc
+        return PromotionAnalysisResult(
+            analysis=PromotionAnalysisWrite(
+                analysis_id=f"analysis_{request.promotion_id}",
+                project_id=request.project_id,
+                campaign_id=request.campaign_id,
+                promotion_id=request.promotion_id,
+                status=AnalysisStatus.COMPLETED.value,
+                focus_segment_ids_json=None,
+                operator_instruction=request.operator_instruction,
+                input_snapshot_json={},
+                profile_summary_json={},
+                output_json={},
+            ),
+            target_segments=[
+                PromotionTargetSegmentWrite(
+                    analysis_id=f"analysis_{request.promotion_id}",
+                    project_id=request.project_id,
+                    campaign_id=request.campaign_id,
+                    promotion_id=request.promotion_id,
+                    segment_id="seg_repeat_hotel_no_booking",
+                    segment_name="Repeat hotel viewers without booking",
+                    rule_json={},
+                    profile_json={},
+                    content_brief_json={
+                        "message_direction": (
+                            "Emphasize free cancellation, same-day availability, "
+                            "and breakfast benefits."
+                        ),
+                        "keywords": [
+                            "free cancellation",
+                            "same-day availability",
+                            "breakfast included",
+                        ],
+                    },
+                    data_evidence_json={},
+                    segment_vector_id="segvec_repeat_hotel_no_booking_v1",
+                    estimated_size=1342,
+                    priority="high",
+                    status="planned",
+                )
+            ],
+        )
