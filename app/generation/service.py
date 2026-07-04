@@ -20,6 +20,10 @@ from app.generation.prompt_builder import (
     PromotionPromptInput,
     TargetSegmentPromptInput,
 )
+from app.generation.report_builder import (
+    GENERATION_REPORT_VERSION,
+    GenerationReportBuilder,
+)
 from app.generation.schemas import (
     ContentCandidateResponse,
     ContentCandidateStatus,
@@ -54,6 +58,7 @@ class GenerationService:
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
+        generation_report_builder: GenerationReportBuilder | None = None,
     ) -> None:
         self._generation_run_repository = generation_run_repository
         self._content_candidate_repository = content_candidate_repository
@@ -64,6 +69,9 @@ class GenerationService:
         self._content_generator = content_generator or DeterministicContentGenerator()
         self._content_generator_version = _content_generator_version(
             self._content_generator
+        )
+        self._generation_report_builder = (
+            generation_report_builder or GenerationReportBuilder()
         )
 
     def generate(self, request: GenerationRequest) -> GenerationResponse:
@@ -122,13 +130,14 @@ class GenerationService:
         status: GenerationStatus,
         error_code: str | None = None,
     ) -> GenerationRunRecord:
-        output_json: dict[str, Any] = {
-            "content_candidate_ids": [
-                candidate.content_id for candidate in content_candidates
+        output_json = self._generation_report_builder.build_run_output(
+            status=status,
+            target_segment_count=len(prompt_inputs),
+            content_candidate_metadata=[
+                candidate.metadata_json for candidate in content_candidates
             ],
-        }
-        if error_code:
-            output_json["error_code"] = error_code
+            error_code=error_code,
+        )
 
         generation_report_json: dict[str, Any] = {
             "status": status.value,
@@ -136,6 +145,7 @@ class GenerationService:
             "target_segment_count": len(prompt_inputs),
             "prompt_builder": PROMPT_BUILDER_VERSION,
             "content_generator": self._content_generator_version,
+            "report_builder": GENERATION_REPORT_VERSION,
         }
         if error_code:
             generation_report_json["error_code"] = error_code
@@ -207,7 +217,6 @@ class GenerationService:
         channel_slug = _channel_slug(channel)
         segment_slug = _segment_slug(prompt_input.target_segment)
         segment_id = prompt_input.target_segment.segment_id
-        segment_name = prompt_input.target_segment.segment_name
         content_id = f"content_{channel_slug}_{segment_slug}_{index:03d}"
         content_option_id = f"{channel_slug}_{segment_slug}_option_{index:03d}"
         generated_content = self._content_generator.generate(
@@ -216,6 +225,15 @@ class GenerationService:
             option_index=index,
         )
         content_values = generated_content.to_record_values(channel)
+        candidate_report = self._generation_report_builder.build_candidate_report(
+            prompt_input=prompt_input,
+            prompt_result=prompt_result,
+            content_id=content_id,
+            content_option_id=content_option_id,
+            content_generator_version=self._content_generator_version,
+            content_values=content_values,
+            status=ContentCandidateStatus.DRAFT.value,
+        )
 
         return ContentCandidateRecord(
             content_id=content_id,
@@ -236,20 +254,10 @@ class GenerationService:
             image_prompt=content_values["image_prompt"],
             landing_url=content_values["landing_url"],
             generation_prompt=prompt_result.generation_prompt,
-            reason_summary=prompt_result.reason_summary,
-            data_evidence_json=prompt_result.data_evidence_json,
-            message_strategy=prompt_result.message_strategy,
-            metadata_json={
-                **prompt_result.metadata_json,
-                "content_id": content_id,
-                "content_option_id": content_option_id,
-                "segment_id": segment_id,
-                "segment_name": segment_name,
-                "channel": channel.value,
-                "content_generator_version": self._content_generator_version,
-                **content_values,
-                "status": ContentCandidateStatus.DRAFT.value,
-            },
+            reason_summary=candidate_report.reason_summary,
+            data_evidence_json=candidate_report.data_evidence_json,
+            message_strategy=candidate_report.message_strategy,
+            metadata_json=candidate_report.metadata_json,
             status=ContentCandidateStatus.DRAFT.value,
         )
 
