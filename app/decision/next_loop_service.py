@@ -20,6 +20,8 @@ from app.decision.schemas import (
     RunCreateResponse,
 )
 
+COMPLETED_STATUS = "completed"
+
 
 class NextLoopNotFoundError(Exception):
     pass
@@ -43,6 +45,7 @@ class NextLoopAnalysisResult:
 class NextLoopGenerationResult:
     generation_id: str
     generated_segment_ids: Sequence[str]
+    status: str = COMPLETED_STATUS
 
 
 class NextLoopAnalysisGateway(Protocol):
@@ -53,6 +56,9 @@ class NextLoopAnalysisGateway(Protocol):
         campaign_id: str,
         promotion_id: str,
         focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
+        source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
     ) -> NextLoopAnalysisResult:
         ...
@@ -67,6 +73,8 @@ class NextLoopGenerationGateway(Protocol):
         promotion_id: str,
         analysis_id: str,
         focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
         ...
@@ -90,6 +98,9 @@ class UnavailableNextLoopAnalysisGateway:
         campaign_id: str,
         promotion_id: str,
         focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
+        source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
     ) -> NextLoopAnalysisResult:
         _ = (
@@ -97,6 +108,9 @@ class UnavailableNextLoopAnalysisGateway:
             campaign_id,
             promotion_id,
             focus_segment_ids,
+            loop_count,
+            source_promotion_run_id,
+            source_failed_ad_experiment_ids,
             operator_instruction,
         )
         raise NextLoopValidationError(
@@ -114,6 +128,8 @@ class UnavailableNextLoopGenerationGateway:
         promotion_id: str,
         analysis_id: str,
         focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
         _ = (
@@ -122,6 +138,8 @@ class UnavailableNextLoopGenerationGateway:
             promotion_id,
             analysis_id,
             focus_segment_ids,
+            loop_count,
+            source_promotion_run_id,
             operator_instruction,
         )
         raise NextLoopValidationError(
@@ -207,6 +225,9 @@ class NextLoopService:
             campaign_id=previous_run.campaign_id,
             promotion_id=previous_run.promotion_id,
             focus_segment_ids=failed_segment_ids,
+            loop_count=next_loop_count,
+            source_promotion_run_id=previous_run.promotion_run_id,
+            source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             operator_instruction=request.operator_instruction,
         )
         _validate_gateway_segments(
@@ -220,8 +241,11 @@ class NextLoopService:
             promotion_id=previous_run.promotion_id,
             analysis_id=analysis_result.analysis_id,
             focus_segment_ids=failed_segment_ids,
+            loop_count=next_loop_count,
+            source_promotion_run_id=previous_run.promotion_run_id,
             operator_instruction=request.operator_instruction,
         )
+        _validate_generation_completed(generation_result)
         _validate_gateway_segments(
             label="generation",
             expected_segment_ids=failed_segment_ids,
@@ -252,7 +276,6 @@ class NextLoopService:
             next_analysis_id=analysis_result.analysis_id,
             next_generation_id=generation_result.generation_id,
             next_ad_experiments=created_run.ad_experiments,
-            status="created",
         )
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:
@@ -271,7 +294,6 @@ def _no_op_response(run: PromotionRunRecord) -> NextLoopResponse:
         next_analysis_id=None,
         next_generation_id=None,
         next_ad_experiments=[],
-        status="no_op",
     )
 
 
@@ -360,4 +382,11 @@ def _validate_gateway_segments(
     if actual != expected:
         raise NextLoopValidationError(
             f"{label} result must contain only failed segment ids"
+        )
+
+
+def _validate_generation_completed(result: NextLoopGenerationResult) -> None:
+    if result.status != COMPLETED_STATUS:
+        raise NextLoopValidationError(
+            "next-loop generation result must be completed before run creation"
         )

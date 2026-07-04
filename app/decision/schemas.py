@@ -187,4 +187,3 @@ class NextLoopResponse(BaseModel):
     next_analysis_id: str | None = None
     next_generation_id: str | None = None
     next_ad_experiments: list[AdExperimentCreateResponse]
-    status: Literal["created", "no_op"]
