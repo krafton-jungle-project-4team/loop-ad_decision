@@ -8,7 +8,11 @@ from fastapi import FastAPI
 
 from app.analysis.router import router as analysis_router
 from app.config import Settings, load_settings
-from app.decision.router import promotion_run_router, router as decision_router
+from app.decision.router import (
+    ad_experiment_router,
+    promotion_run_router,
+    router as decision_router,
+)
 from app.dependencies import require_internal_key
 from app.generation.router import router as generation_router
 
@@ -51,6 +55,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     app.include_router(generation_router)
     app.include_router(decision_router)
     app.include_router(promotion_run_router)
+    app.include_router(ad_experiment_router)
     return app
 
 
