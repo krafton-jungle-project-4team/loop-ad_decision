@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Mapping, NamedTuple, Protocol, Sequence
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -252,6 +252,11 @@ class UserBehaviorVectorRecord:
     source: str
 
 
+class MetricCountRecord(NamedTuple):
+    numerator_count: int
+    denominator_count: int
+
+
 @dataclass(frozen=True)
 class UserSegmentAssignmentWrite:
     project_id: str
@@ -356,6 +361,9 @@ class PromotionRunWriter(Protocol):
 
 
 class AdExperimentWriter(Protocol):
+    def get_by_id(self, ad_experiment_id: str) -> AdExperimentRecord | None:
+        ...
+
     def insert_many(self, experiments: Sequence[AdExperimentWrite]) -> None:
         ...
 
@@ -417,6 +425,22 @@ class UserSegmentAssignmentWriter(Protocol):
         promotion_run_id: str,
         segment_ids: Sequence[str],
     ) -> dict[str, int]:
+        ...
+
+
+class PromotionEvaluationWriter(Protocol):
+    def insert(self, evaluation: PromotionEvaluationWrite) -> None:
+        ...
+
+
+class EvaluationMetricReader(Protocol):
+    def count_inflow_rate(self, experiment: AdExperimentRecord) -> MetricCountRecord:
+        ...
+
+    def count_booking_conversion_rate(
+        self,
+        experiment: AdExperimentRecord,
+    ) -> MetricCountRecord:
         ...
 
 
@@ -717,6 +741,36 @@ class PromotionRunRepository:
 class AdExperimentRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
+
+    def get_by_id(self, ad_experiment_id: str) -> AdExperimentRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                ad_experiment_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                promotion_run_id,
+                analysis_id,
+                generation_id,
+                segment_id,
+                segment_name,
+                content_id,
+                content_option_id,
+                channel,
+                loop_count,
+                status,
+                goal_metric,
+                goal_target_value,
+                goal_basis
+            FROM ad_experiments
+            WHERE ad_experiment_id = %s
+            """,
+            (ad_experiment_id,),
+        )
+        if row is None:
+            return None
+        return AdExperimentRecord(**row)
 
     def insert_many(self, experiments: Sequence[AdExperimentWrite]) -> None:
         for experiment in experiments:
@@ -1040,6 +1094,124 @@ class UserBehaviorVectorRepository:
         ]
 
 
+class PromotionEvaluationRepository:
+    def __init__(self, db: PostgresExecutor) -> None:
+        self._db = db
+
+    def insert(self, evaluation: PromotionEvaluationWrite) -> None:
+        self._db.execute(
+            """
+            INSERT INTO promotion_evaluations (
+                evaluation_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                promotion_run_id,
+                ad_experiment_id,
+                segment_id,
+                content_id,
+                content_option_id,
+                metric,
+                target_value,
+                actual_value,
+                numerator_count,
+                denominator_count,
+                sample_size,
+                basis,
+                status,
+                feedback,
+                next_loop_required,
+                result_json
+            )
+            VALUES (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            )
+            """,
+            (
+                evaluation.evaluation_id,
+                evaluation.project_id,
+                evaluation.campaign_id,
+                evaluation.promotion_id,
+                evaluation.promotion_run_id,
+                evaluation.ad_experiment_id,
+                evaluation.segment_id,
+                evaluation.content_id,
+                evaluation.content_option_id,
+                evaluation.metric,
+                evaluation.target_value,
+                evaluation.actual_value,
+                evaluation.numerator_count,
+                evaluation.denominator_count,
+                evaluation.sample_size,
+                evaluation.basis,
+                evaluation.status,
+                evaluation.feedback,
+                evaluation.next_loop_required,
+                evaluation.result_json,
+            ),
+        )
+
+
+class EvaluationMetricRepository:
+    def __init__(self, client: ClickHouseClient) -> None:
+        self._client = client
+
+    def count_inflow_rate(self, experiment: AdExperimentRecord) -> MetricCountRecord:
+        result = self._client.query(
+            """
+            SELECT
+                countDistinctIf(user_id, event_name = 'campaign_landing') AS numerator_count,
+                countDistinctIf(user_id, event_name = 'campaign_redirect_click') AS denominator_count
+            FROM promotion_touch_events
+            WHERE project_id = {project_id:String}
+              AND promotion_run_id = {promotion_run_id:String}
+              AND ad_experiment_id = {ad_experiment_id:String}
+              AND event_name IN ('campaign_redirect_click', 'campaign_landing')
+            """,
+            parameters={
+                "project_id": experiment.project_id,
+                "promotion_run_id": experiment.promotion_run_id,
+                "ad_experiment_id": experiment.ad_experiment_id,
+            },
+        )
+        return _metric_count_from_result(result)
+
+    def count_booking_conversion_rate(
+        self,
+        experiment: AdExperimentRecord,
+    ) -> MetricCountRecord:
+        result = self._client.query(
+            """
+            SELECT
+                (
+                    SELECT countDistinct(user_id)
+                    FROM booking_outcome_events
+                    WHERE project_id = {project_id:String}
+                      AND promotion_run_id IS NOT NULL
+                      AND ad_experiment_id IS NOT NULL
+                      AND promotion_run_id = {promotion_run_id:String}
+                      AND ad_experiment_id = {ad_experiment_id:String}
+                      AND event_name = 'booking_complete'
+                ) AS numerator_count,
+                (
+                    SELECT countDistinct(user_id)
+                    FROM promotion_touch_events
+                    WHERE project_id = {project_id:String}
+                      AND promotion_run_id = {promotion_run_id:String}
+                      AND ad_experiment_id = {ad_experiment_id:String}
+                      AND event_name = 'promotion_click'
+                ) AS denominator_count
+            """,
+            parameters={
+                "project_id": experiment.project_id,
+                "promotion_run_id": experiment.promotion_run_id,
+                "ad_experiment_id": experiment.ad_experiment_id,
+            },
+        )
+        return _metric_count_from_result(result)
+
+
 def _clickhouse_rows(result: Any) -> list[Any]:
     if hasattr(result, "named_results"):
         return list(result.named_results())
@@ -1050,3 +1222,14 @@ def _clickhouse_value(row: Any, key: str, index: int) -> Any:
     if isinstance(row, Mapping):
         return row[key]
     return row[index]
+
+
+def _metric_count_from_result(result: Any) -> MetricCountRecord:
+    rows = _clickhouse_rows(result)
+    if not rows:
+        return MetricCountRecord(numerator_count=0, denominator_count=0)
+    row = rows[0]
+    return MetricCountRecord(
+        numerator_count=int(_clickhouse_value(row, "numerator_count", 0)),
+        denominator_count=int(_clickhouse_value(row, "denominator_count", 1)),
+    )
