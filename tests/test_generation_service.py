@@ -79,18 +79,33 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "target_segment_ids": ["seg_repeat_hotel_no_booking"],
         "channel": "onsite_banner",
     }
-    assert generation_run.output_json == {
-        "content_candidate_ids": [
-            "content_banner_repeat_hotel_001",
-            "content_banner_repeat_hotel_002",
-        ],
+    assert generation_run.output_json is not None
+    assert generation_run.output_json["report_version"] == "dec-c4.v1"
+    assert generation_run.output_json["content_candidate_ids"] == [
+        "content_banner_repeat_hotel_001",
+        "content_banner_repeat_hotel_002",
+    ]
+    assert generation_run.output_json["generation_summary"] == {
+        "status": "completed",
+        "content_candidate_count": 2,
+        "target_segment_count": 1,
     }
+    assert generation_run.output_json["segment_summaries"][0][
+        "segment_id"
+    ] == "seg_repeat_hotel_no_booking"
+    assert generation_run.output_json["segment_summaries"][0][
+        "content_candidate_ids"
+    ] == [
+        "content_banner_repeat_hotel_001",
+        "content_banner_repeat_hotel_002",
+    ]
     assert generation_run.generation_report_json == {
         "status": "completed",
         "content_candidate_count": 2,
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v1",
         "content_generator": "dec-c3.deterministic.v1",
+        "report_builder": "dec-c4.v1",
     }
 
     assert len(content_candidate_repository.saved) == 2
@@ -112,11 +127,28 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
+    assert first_candidate.metadata_json["report_version"] == "dec-c4.v1"
     assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v1"
     assert (
         first_candidate.metadata_json["content_generator_version"]
         == "dec-c3.deterministic.v1"
     )
+    assert first_candidate.metadata_json["reason_summary"] == (
+        first_candidate.reason_summary
+    )
+    assert first_candidate.metadata_json["message_strategy"] == (
+        first_candidate.message_strategy
+    )
+    assert first_candidate.metadata_json["data_evidence"] == (
+        first_candidate.data_evidence_json
+    )
+    assert first_candidate.metadata_json["operator_instruction"] == (
+        "Make the banner direct and concise."
+    )
+    assert first_candidate.metadata_json["data_evidence"]["sample_size"] == 1342
+    assert first_candidate.metadata_json["data_evidence"]["sample_ratio"] == 0.018
+    assert first_candidate.metadata_json["source_query_preview_id"] is None
+    assert first_candidate.metadata_json["generated_sql_summary"] is None
 
 
 def test_generation_service_can_generate_response_without_repositories() -> None:
@@ -197,7 +229,15 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     generation_run = generation_run_repository.saved[0]
     assert generation_run.status == "failed"
     assert generation_run.output_json == {
+        "report_version": "dec-c4.v1",
         "content_candidate_ids": [],
+        "generation_summary": {
+            "status": "failed",
+            "content_candidate_count": 0,
+            "target_segment_count": 1,
+        },
+        "segment_summaries": [],
+        "content_report_summaries": [],
         "error_code": "content_generation_failed",
     }
     assert generation_run.generation_report_json == {
@@ -206,6 +246,7 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v1",
         "content_generator": "dec-c3.deterministic.v1",
+        "report_builder": "dec-c4.v1",
         "error_code": "content_generation_failed",
     }
     assert content_candidate_repository.saved == []
@@ -240,6 +281,53 @@ def test_generation_service_saves_channel_specific_fields() -> None:
     sms_candidate = sms_response.content_candidates[0]
     assert sms_candidate.message
     assert sms_candidate.landing_url
+
+
+def test_generation_service_saves_source_report_references() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                target_segment_input(
+                    generated_sql=(
+                        "SELECT user_id FROM hotel_detail_events "
+                        "WHERE repeat_view_count >= 2"
+                    ),
+                    query_preview_id="seg_query_preview_001",
+                )
+            ]
+        ),
+    )
+
+    service.generate(generation_request(content_option_count=1))
+
+    candidate = content_candidate_repository.saved[0]
+    metadata = candidate.metadata_json
+    assert metadata["source_segment_definition_id"] == "seg_repeat_hotel_001"
+    assert metadata["source_query_preview_id"] == "seg_query_preview_001"
+    assert metadata["generated_sql_summary"] == (
+        "SELECT user_id FROM hotel_detail_events WHERE repeat_view_count >= 2"
+    )
+    assert metadata["data_evidence"]["top_common_features"] == [
+        "same_hotel_repeat_view",
+        "near_checkin",
+    ]
+    assert metadata["data_evidence"]["booking_conversion_rate"] == 0.018
+    assert metadata["data_evidence"][
+        "comparison_group_conversion_rate"
+    ] == 0.034
+
+    output_json = generation_run_repository.saved[0].output_json
+    assert output_json is not None
+    assert output_json["content_report_summaries"][0][
+        "generated_sql_summary"
+    ] == metadata["generated_sql_summary"]
+    assert output_json["segment_summaries"][0]["operator_instruction"] == (
+        "Make the banner direct and concise."
+    )
 
 
 class StaticGenerationInputBuilder:
@@ -296,6 +384,8 @@ def target_segment_input(
     *,
     index: int = 1,
     content_slug: str = "repeat_hotel",
+    generated_sql: str | None = None,
+    query_preview_id: str | None = None,
 ) -> TargetSegmentPromptInput:
     return TargetSegmentPromptInput(
         analysis_id="analysis_banner_001",
@@ -306,13 +396,19 @@ def target_segment_input(
         content_brief_json={
             "message_direction": "Highlight refundable hotel stays.",
             "keywords": ["refundable stays", "hotel deals"],
+            "top_common_features": [
+                "same_hotel_repeat_view",
+                "near_checkin",
+            ],
+            "booking_conversion_rate": "0.018",
+            "comparison_group_conversion_rate": "0.034",
         },
         segment_vector_id=f"segvec_{content_slug}_{index:03d}",
         estimated_size=1000 + index,
         priority="high",
         natural_language_query="hotel visitors without booking",
-        generated_sql=None,
+        generated_sql=generated_sql,
         sample_ratio="0.018000",
         source="system_default",
-        query_preview_id=None,
+        query_preview_id=query_preview_id,
     )
