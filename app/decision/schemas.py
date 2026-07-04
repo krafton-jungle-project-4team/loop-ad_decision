@@ -142,3 +142,28 @@ class AdExperimentEvaluateResponse(BaseModel):
     status: PromotionEvaluationStatus
     next_loop_required: bool
     feedback: str | None = None
+
+
+class PromotionRunEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class PromotionRunAdExperimentResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    ad_experiment_id: str = Field(min_length=1)
+    segment_id: str = Field(min_length=1)
+    actual_value: Decimal
+    status: PromotionEvaluationStatus
+
+
+class PromotionRunEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    promotion_run_id: str = Field(min_length=1)
+    promotion_id: str = Field(min_length=1)
+    status: PromotionRunStatus
+    ad_experiment_results: list[PromotionRunAdExperimentResult]
+    next_loop_required: bool
+    failed_segment_ids: list[str]
+    failed_ad_experiment_ids: list[str]
