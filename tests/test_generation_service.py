@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import (
     GenerationPromptInput,
@@ -8,12 +10,15 @@ from app.generation.prompt_builder import (
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
+    PromotionPromptRecord,
+    PromotionTargetSegmentRecord,
 )
 from app.generation.schemas import (
     ContentChannel,
     GenerationRequest,
 )
 from app.generation.service import GenerationService
+from app.generation.service import NextLoopFocusGenerationRequest
 
 
 class FakeGenerationRunRepository:
@@ -34,6 +39,53 @@ class FakeContentCandidateRepository:
         return {"content_id": record.content_id}
 
 
+class FakePromotionRepository:
+    def __init__(self, promotion: PromotionPromptRecord | None = None) -> None:
+        self.promotion = promotion or promotion_prompt_record()
+
+    def get_for_generation(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+    ) -> PromotionPromptRecord | None:
+        if (
+            project_id,
+            campaign_id,
+            promotion_id,
+        ) != (
+            self.promotion.project_id,
+            self.promotion.campaign_id,
+            self.promotion.promotion_id,
+        ):
+            return None
+        return self.promotion
+
+
+class FakePromotionTargetSegmentRepository:
+    def __init__(self, segments: list[PromotionTargetSegmentRecord]) -> None:
+        self.segments = segments
+
+    def list_for_analysis(self, analysis_id: str) -> list[PromotionTargetSegmentRecord]:
+        return [
+            segment for segment in self.segments if segment.analysis_id == analysis_id
+        ]
+
+
+class FakeGenerationRunReader:
+    def __init__(self, *, content_option_count: int = 3) -> None:
+        self.content_option_count = content_option_count
+
+    def get_by_id(self, generation_id: str) -> dict[str, object] | None:
+        if generation_id != "generation_banner_001":
+            return None
+        return {
+            "generation_id": generation_id,
+            "content_option_count": self.content_option_count,
+        }
+
+
 def generation_request(
     *,
     content_option_count: int = 2,
@@ -46,6 +98,44 @@ def generation_request(
         analysis_id="analysis_banner_001",
         content_option_count=content_option_count,
         operator_instruction=operator_instruction,
+    )
+
+
+def promotion_prompt_record() -> PromotionPromptRecord:
+    return PromotionPromptRecord(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        channel="onsite_banner",
+        goal_metric="booking_conversion_rate",
+        goal_target_value=Decimal("0.030000"),
+        goal_basis="all_segments",
+        message_brief="Drive hotel booking conversion for summer stays.",
+        landing_url="https://demo-stay.example.com/summer",
+    )
+
+
+def target_segment_record(
+    segment_id: str,
+    *,
+    analysis_id: str = "analysis_banner_001_loop_2",
+) -> PromotionTargetSegmentRecord:
+    return PromotionTargetSegmentRecord(
+        analysis_id=analysis_id,
+        promotion_id="promo_banner_001",
+        segment_id=segment_id,
+        segment_name=segment_id.replace("_", " ").title(),
+        content_brief_json={
+            "message_direction": "Use a focused hotel booking message.",
+            "keywords": ["hotel booking", "breakfast"],
+        },
+        data_evidence_json={
+            "source": "system_default",
+            "sample_ratio": "0.020000",
+        },
+        segment_vector_id=f"segvec_{segment_id}_v1",
+        estimated_size=1200,
+        priority="high",
     )
 
 
@@ -212,6 +302,58 @@ def test_generation_service_creates_candidates_for_focus_segment_only() -> None:
         "content_banner_failed_focus_002",
         "content_banner_failed_focus_003",
     }
+
+
+def test_generation_service_generates_next_loop_focus_candidates_as_draft() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        promotion_repository=FakePromotionRepository(),
+        promotion_target_segment_repository=FakePromotionTargetSegmentRepository(
+            [
+                target_segment_record("seg_near_checkin"),
+                target_segment_record("seg_mobile_user"),
+            ]
+        ),
+        generation_run_reader=FakeGenerationRunReader(content_option_count=3),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+            operator_instruction="Stress breakfast.",
+        )
+    )
+
+    assert result.generation_id == "generation_banner_001_loop_2"
+    assert result.generated_segment_ids == ["seg_near_checkin"]
+    assert result.status == "completed"
+    assert len(generation_run_repository.saved) == 1
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.input_json["target_segment_ids"] == ["seg_near_checkin"]
+    assert generation_run.input_json["content_option_count"] == 3
+    assert generation_run.input_json["next_loop"] == {
+        "loop_count": 2,
+        "source_promotion_run_id": "prun_banner_001_loop_1",
+        "source_generation_id": "generation_banner_001",
+        "focus_segment_ids": ["seg_near_checkin"],
+    }
+    assert len(content_candidate_repository.saved) == 3
+    assert {
+        candidate.segment_id for candidate in content_candidate_repository.saved
+    } == {"seg_near_checkin"}
+    assert {
+        candidate.status for candidate in content_candidate_repository.saved
+    } == {"draft"}
 
 
 def test_generation_service_records_failed_run_when_generator_fails() -> None:

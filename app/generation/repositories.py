@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Protocol
 
 from psycopg.rows import dict_row
@@ -69,6 +70,107 @@ class CursorProtocol(Protocol):
 class ConnectionProtocol(Protocol):
     def cursor(self, *, row_factory: Any = None) -> Any:
         ...
+
+
+@dataclass(frozen=True)
+class PromotionPromptRecord:
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    channel: str
+    goal_metric: str
+    goal_target_value: Decimal
+    goal_basis: str
+    message_brief: str | None
+    landing_url: str | None
+
+
+@dataclass(frozen=True)
+class PromotionTargetSegmentRecord:
+    analysis_id: str
+    promotion_id: str
+    segment_id: str
+    segment_name: str
+    content_brief_json: dict[str, Any]
+    data_evidence_json: dict[str, Any]
+    segment_vector_id: str | None
+    estimated_size: int
+    priority: str | None
+
+
+class PromotionRepository:
+    SELECT_FOR_GENERATION_SQL = """
+        SELECT
+            project_id,
+            campaign_id,
+            promotion_id,
+            channel,
+            goal_metric,
+            goal_target_value,
+            goal_basis,
+            message_brief,
+            landing_url
+        FROM promotions
+        WHERE project_id = %(project_id)s
+          AND campaign_id = %(campaign_id)s
+          AND promotion_id = %(promotion_id)s
+    """
+
+    def __init__(self, connection: ConnectionProtocol):
+        self._connection = connection
+
+    def get_for_generation(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+    ) -> PromotionPromptRecord | None:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.SELECT_FOR_GENERATION_SQL,
+                {
+                    "project_id": project_id,
+                    "campaign_id": campaign_id,
+                    "promotion_id": promotion_id,
+                },
+            )
+            row = cursor.fetchone()
+
+        if row is None:
+            return None
+        return PromotionPromptRecord(**row)
+
+
+class PromotionTargetSegmentRepository:
+    SELECT_BY_ANALYSIS_SQL = """
+        SELECT
+            analysis_id,
+            promotion_id,
+            segment_id,
+            segment_name,
+            content_brief_json,
+            data_evidence_json,
+            segment_vector_id,
+            estimated_size,
+            priority
+        FROM promotion_target_segments
+        WHERE analysis_id = %(analysis_id)s
+        ORDER BY segment_id ASC
+    """
+
+    def __init__(self, connection: ConnectionProtocol):
+        self._connection = connection
+
+    def list_for_analysis(
+        self,
+        analysis_id: str,
+    ) -> list[PromotionTargetSegmentRecord]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(self.SELECT_BY_ANALYSIS_SQL, {"analysis_id": analysis_id})
+            rows = cursor.fetchall()
+
+        return [PromotionTargetSegmentRecord(**row) for row in rows]
 
 
 @dataclass(frozen=True)
