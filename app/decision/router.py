@@ -18,6 +18,9 @@ from app.decision.evaluation_service import (
     AdExperimentEvaluationNotFoundError,
     AdExperimentEvaluationService,
     AdExperimentEvaluationValidationError,
+    PromotionRunEvaluationNotFoundError,
+    PromotionRunEvaluationService,
+    PromotionRunEvaluationValidationError,
 )
 from app.decision.matcher import ExactCosineMatcher
 from app.decision.repositories import (
@@ -38,6 +41,8 @@ from app.decision.repositories import (
 from app.decision.schemas import (
     AdExperimentEvaluateRequest,
     AdExperimentEvaluateResponse,
+    PromotionRunEvaluateRequest,
+    PromotionRunEvaluateResponse,
     RunCreateRequest,
     RunCreateResponse,
     SegmentAssignmentBuildRequest,
@@ -155,6 +160,40 @@ def get_ad_experiment_evaluation_service(
         _close_clickhouse_client(clickhouse_client)
 
 
+def get_promotion_run_evaluation_service(
+    request: Request,
+) -> Iterator[PromotionRunEvaluationService]:
+    settings = get_settings(request)
+    connection = create_postgres_connection(settings)
+    clickhouse_client = create_clickhouse_client(settings)
+    executor = PsycopgPostgresExecutor(connection)
+    ad_experiment_repository = AdExperimentRepository(executor)
+    promotion_run_repository = PromotionRunRepository(executor)
+    promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+    try:
+        ad_experiment_evaluation_service = AdExperimentEvaluationService(
+            ad_experiment_repository=ad_experiment_repository,
+            promotion_run_repository=promotion_run_repository,
+            promotion_evaluation_repository=promotion_evaluation_repository,
+            evaluation_metric_repository=EvaluationMetricRepository(
+                clickhouse_client,
+            ),
+        )
+        yield PromotionRunEvaluationService(
+            promotion_run_repository=promotion_run_repository,
+            ad_experiment_repository=ad_experiment_repository,
+            promotion_evaluation_repository=promotion_evaluation_repository,
+            ad_experiment_evaluation_service=ad_experiment_evaluation_service,
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+        _close_clickhouse_client(clickhouse_client)
+
+
 @router.post(
     "/{promotion_id}/runs",
     response_model=RunCreateResponse,
@@ -219,6 +258,39 @@ async def build_segment_assignments(
             detail=str(exc),
         ) from exc
     except SegmentAssignmentValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+
+
+@promotion_run_router.post(
+    "/{promotion_run_id}/evaluate",
+    response_model=PromotionRunEvaluateResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def evaluate_promotion_run(
+    promotion_run_id: str,
+    request: Request,
+    promotion_run_evaluation_service: PromotionRunEvaluationService = Depends(
+        get_promotion_run_evaluation_service
+    ),
+) -> PromotionRunEvaluateResponse:
+    evaluate_request = await _parse_promotion_run_evaluate_request(request)
+    try:
+        return promotion_run_evaluation_service.evaluate(
+            promotion_run_id=promotion_run_id,
+            request=evaluate_request,
+        )
+    except PromotionRunEvaluationNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except (
+        PromotionRunEvaluationValidationError,
+        AdExperimentEvaluationValidationError,
+    ) as exc:
         raise HTTPException(
             status_code=422,
             detail=str(exc),
@@ -295,6 +367,24 @@ async def _parse_ad_experiment_evaluate_request(
     try:
         payload = await request.json()
         return AdExperimentEvaluateRequest.model_validate(payload)
+    except JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="request body must be valid JSON",
+        ) from exc
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=jsonable_encoder(exc.errors()),
+        ) from exc
+
+
+async def _parse_promotion_run_evaluate_request(
+    request: Request,
+) -> PromotionRunEvaluateRequest:
+    try:
+        payload = await request.json()
+        return PromotionRunEvaluateRequest.model_validate(payload)
     except JSONDecodeError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
