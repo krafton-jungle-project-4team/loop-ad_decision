@@ -252,6 +252,7 @@ class GenerationService:
             cta=content_values["cta"],
             message=content_values["message"],
             image_prompt=content_values["image_prompt"],
+            image_url=content_values["image_url"],
             landing_url=content_values["landing_url"],
             generation_prompt=prompt_result.generation_prompt,
             reason_summary=candidate_report.reason_summary,

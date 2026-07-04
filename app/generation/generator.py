@@ -19,6 +19,7 @@ class GeneratedContent:
     cta: str | None = None
     message: str | None = None
     image_prompt: str | None = None
+    image_url: str | None = None
     landing_url: str | None = None
 
     def to_record_values(self, channel: ContentChannel) -> dict[str, str | None]:
@@ -30,6 +31,7 @@ class GeneratedContent:
             "cta": self.cta,
             "message": self.message,
             "image_prompt": self.image_prompt,
+            "image_url": self.image_url,
             "landing_url": self.landing_url,
         }
         missing = missing_channel_fields(channel, values)

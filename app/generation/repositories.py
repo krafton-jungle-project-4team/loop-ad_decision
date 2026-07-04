@@ -42,6 +42,7 @@ CONTENT_CANDIDATE_COLUMNS: tuple[str, ...] = (
     "cta",
     "message",
     "image_prompt",
+    "image_url",
     "landing_url",
     "generation_prompt",
     "reason_summary",
@@ -202,6 +203,7 @@ class ContentCandidateRecord:
     cta: str | None = None
     message: str | None = None
     image_prompt: str | None = None
+    image_url: str | None = None
     landing_url: str | None = None
     generation_prompt: str | None = None
     reason_summary: str | None = None
@@ -239,6 +241,7 @@ class ContentCandidateRecord:
             "cta": self.cta,
             "message": self.message,
             "image_prompt": self.image_prompt,
+            "image_url": self.image_url,
             "landing_url": self.landing_url,
             "status": self.status,
         }
@@ -261,6 +264,7 @@ class ContentCandidateRecord:
             "cta": self.cta,
             "message": self.message,
             "image_prompt": self.image_prompt,
+            "image_url": self.image_url,
             "landing_url": self.landing_url,
             "generation_prompt": self.generation_prompt,
             "reason_summary": self.reason_summary,
@@ -290,6 +294,7 @@ class ContentCandidateRepository:
             cta,
             message,
             image_prompt,
+            image_url,
             landing_url,
             generation_prompt,
             reason_summary,
@@ -315,6 +320,7 @@ class ContentCandidateRepository:
             %(cta)s,
             %(message)s,
             %(image_prompt)s,
+            %(image_url)s,
             %(landing_url)s,
             %(generation_prompt)s,
             %(reason_summary)s,
@@ -340,6 +346,7 @@ class ContentCandidateRepository:
             cta,
             message,
             image_prompt,
+            image_url,
             landing_url,
             generation_prompt,
             reason_summary,
@@ -369,6 +376,7 @@ class ContentCandidateRepository:
             cta,
             message,
             image_prompt,
+            image_url,
             landing_url,
             generation_prompt,
             reason_summary,

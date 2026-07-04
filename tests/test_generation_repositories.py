@@ -82,6 +82,7 @@ def test_content_candidate_repository_columns_match_data_source_contract() -> No
         "cta",
         "message",
         "image_prompt",
+        "image_url",
         "landing_url",
         "generation_prompt",
         "reason_summary",
@@ -145,6 +146,7 @@ def test_content_candidate_repository_create_executes_insert() -> None:
             body="Compare refundable summer offers before rooms run out.",
             cta="View hotel deals",
             image_prompt="bright modern hotel room, summer travel banner",
+            image_url="https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_001.png",
             landing_url="https://demo-stay.example.com/summer",
             generation_prompt="Create an onsite banner.",
             data_evidence_json={"segment_id": "seg_repeat_hotel_no_booking"},
@@ -158,6 +160,9 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params is not None
     assert params["content_id"] == "content_banner_001"
     assert params["channel"] == "onsite_banner"
+    assert params["image_url"] == (
+        "https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_001.png"
+    )
     assert params["data_evidence_json"].obj == {
         "segment_id": "seg_repeat_hotel_no_booking"
     }
