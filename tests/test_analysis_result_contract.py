@@ -14,6 +14,7 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
+from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisRequest
 from app.analysis.service import PromotionAnalysisService
 from app.analysis.vector_service import (
@@ -150,8 +151,27 @@ def valid_env() -> dict[str, str]:
     return values
 
 
+def make_analysis_service() -> PromotionAnalysisService:
+    return PromotionAnalysisService(
+        promotion_repository=FakePromotionRepository(promotion_record()),
+        segment_definition_repository=FakeSegmentDefinitionRepository(
+            default_segments()
+        ),
+        hotel_profile_repository=FakeHotelProfileRepository(
+            [
+                profile_record("seg_repeat_hotel_no_booking", event_count=5000),
+                profile_record("seg_family_trip", event_count=3000),
+            ]
+        ),
+        promotion_analysis_repository=FakePromotionAnalysisRepository(),
+        segment_vector_service=FakeSegmentVectorService(),
+    )
+
+
 def make_client() -> TestClient:
-    return TestClient(create_app(settings=load_settings(valid_env())))
+    app = create_app(settings=load_settings(valid_env()))
+    app.dependency_overrides[get_analysis_service] = make_analysis_service
+    return TestClient(app)
 
 
 def analysis_payload(**overrides: Any) -> dict[str, Any]:
@@ -283,9 +303,41 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
         "status": "completed",
         "target_segments": [
             {
+                "segment_id": "seg_family_trip",
+                "segment_name": "Seg Family Trip",
+                "segment_vector_id": "segvec_seg_family_trip_v1",
+                "estimated_size": 2400,
+                "content_brief": {
+                    "message_direction": (
+                        "Highlight family rooms, breakfast, and flexible cancellation."
+                    ),
+                    "keywords": [
+                        "family room",
+                        "breakfast included",
+                        "flexible cancellation",
+                    ],
+                },
+            },
+            {
+                "segment_id": "seg_mobile_user",
+                "segment_name": "Seg Mobile User",
+                "segment_vector_id": "segvec_seg_mobile_user_v1",
+                "estimated_size": 2200,
+                "content_brief": {
+                    "message_direction": (
+                        "Reduce steps and emphasize mobile-friendly booking."
+                    ),
+                    "keywords": [
+                        "mobile booking",
+                        "quick checkout",
+                        "easy reservation",
+                    ],
+                },
+            },
+            {
                 "segment_id": "seg_repeat_hotel_no_booking",
-                "segment_name": "Repeat hotel viewers without booking",
-                "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
+                "segment_name": "Seg Repeat Hotel No Booking",
+                "segment_vector_id": "segvec_seg_repeat_hotel_no_booking_v1",
                 "estimated_size": 1342,
                 "content_brief": {
                     "message_direction": (
@@ -298,7 +350,23 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
                         "breakfast included",
                     ],
                 },
-            }
+            },
+            {
+                "segment_id": "seg_near_checkin",
+                "segment_name": "Seg Near Checkin",
+                "segment_vector_id": "segvec_seg_near_checkin_v1",
+                "estimated_size": 1800,
+                "content_brief": {
+                    "message_direction": (
+                        "Emphasize near check-in availability and low-friction booking."
+                    ),
+                    "keywords": [
+                        "near check-in",
+                        "same-day availability",
+                        "free cancellation",
+                    ],
+                },
+            },
         ],
     }
     assert_no_forbidden_public_terms(response.json())
