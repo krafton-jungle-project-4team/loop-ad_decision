@@ -1,6 +1,6 @@
 from enum import StrEnum
-from typing import Literal
-from typing import Any
+from decimal import Decimal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -118,3 +118,27 @@ class SegmentAssignmentBuildResponse(BaseModel):
     fallback_count: int = Field(ge=0)
     insufficient_segment_count: int = Field(ge=0)
     status: Literal["completed"] = "completed"
+
+
+class AdExperimentEvaluateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+
+class AdExperimentEvaluateResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    evaluation_id: str = Field(min_length=1)
+    ad_experiment_id: str = Field(min_length=1)
+    promotion_run_id: str = Field(min_length=1)
+    promotion_id: str = Field(min_length=1)
+    segment_id: str = Field(min_length=1)
+    metric: GoalMetric
+    target_value: Decimal
+    actual_value: Decimal
+    numerator_count: int = Field(ge=0)
+    denominator_count: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
+    basis: GoalBasis
+    status: PromotionEvaluationStatus
+    next_loop_required: bool
+    feedback: str | None = None
