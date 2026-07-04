@@ -9,8 +9,10 @@ from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
     ContentCandidateRepository,
+    EvaluationMetricRepository,
     GenerationRunRepository,
     PromotionAnalysisRepository,
+    PromotionEvaluationRepository,
     PromotionEvaluationWrite,
     PromotionRepository,
     PromotionRunRepository,
@@ -405,6 +407,48 @@ def test_ad_experiment_uniqueness_check_uses_run_and_segment() -> None:
     assert call.params == ("prun_banner_001_loop_1", "seg_family_trip")
 
 
+def test_ad_experiment_repository_get_by_id_reads_evaluation_context() -> None:
+    db = FakePostgresExecutor(
+        fetchone_result={
+            "ad_experiment_id": "adexp_family_trip_001",
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "promotion_run_id": "prun_banner_001_loop_1",
+            "analysis_id": "analysis_banner_001",
+            "generation_id": "generation_banner_001",
+            "segment_id": "seg_family_trip",
+            "segment_name": "Family hotel trip",
+            "content_id": "content_family_trip_001",
+            "content_option_id": "option_a",
+            "channel": Channel.ONSITE_BANNER.value,
+            "loop_count": 1,
+            "status": AdExperimentStatus.RUNNING.value,
+            "goal_metric": GoalMetric.BOOKING_CONVERSION_RATE.value,
+            "goal_target_value": Decimal("0.030000"),
+            "goal_basis": GoalBasis.ALL_SEGMENTS.value,
+        }
+    )
+    repo = AdExperimentRepository(db)
+
+    experiment = repo.get_by_id("adexp_family_trip_001")
+
+    assert experiment is not None
+    assert experiment.project_id == "hotel-client-a"
+    assert experiment.content_option_id == "option_a"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from ad_experiments" in sql
+    assert "where ad_experiment_id = %s" in sql
+    assert "project_id" in sql
+    assert "campaign_id" in sql
+    assert "promotion_id" in sql
+    assert "segment_id" in sql
+    assert "content_id" in sql
+    assert "content_option_id" in sql
+    assert call.params == ("adexp_family_trip_001",)
+
+
 def test_user_segment_assignment_write_carries_assignment_source() -> None:
     assigned_at = datetime(2026, 7, 3, tzinfo=UTC)
 
@@ -608,6 +652,100 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
     }
 
 
+def test_promotion_evaluation_repository_inserts_required_contract_columns() -> None:
+    db = FakePostgresExecutor()
+    repo = PromotionEvaluationRepository(db)
+
+    repo.insert(
+        PromotionEvaluationWrite(
+            evaluation_id="eval_adexp_family_trip_001",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            promotion_run_id="prun_banner_001_loop_1",
+            ad_experiment_id="adexp_family_trip_001",
+            segment_id="seg_family_trip",
+            content_id="content_family_trip_001",
+            content_option_id="option_a",
+            metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            target_value=Decimal("0.030000"),
+            actual_value=Decimal("0.025000"),
+            numerator_count=25,
+            denominator_count=1000,
+            sample_size=1000,
+            basis=GoalBasis.ALL_SEGMENTS.value,
+            status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            feedback=None,
+            next_loop_required=True,
+            result_json={"status_reason": "target_not_met"},
+        )
+    )
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "insert into promotion_evaluations" in sql
+    assert "project_id" in sql
+    assert "campaign_id" in sql
+    assert "promotion_id" in sql
+    assert "segment_id" in sql
+    assert "content_id" in sql
+    assert "content_option_id" in sql
+    assert "basis" in sql
+    assert "goal_near" not in sql
+    assert call.params[15] == GoalBasis.ALL_SEGMENTS.value
+    assert call.params[18] is True
+
+
+def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
+    client = FakeClickHouseClient(rows=[(4, 10)])
+    repo = EvaluationMetricRepository(client)
+
+    counts = repo.count_inflow_rate(
+        ad_experiment_record(goal_metric=GoalMetric.INFLOW_RATE.value)
+    )
+
+    assert counts.numerator_count == 4
+    assert counts.denominator_count == 10
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from promotion_touch_events" in sql
+    assert "campaign_landing" in sql
+    assert "campaign_redirect_click" in sql
+    assert "project_id = {project_id:string}" in sql
+    assert "promotion_run_id = {promotion_run_id:string}" in sql
+    assert "ad_experiment_id = {ad_experiment_id:string}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+    }
+
+
+def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_keys() -> None:
+    client = FakeClickHouseClient(rows=[(0, 10)])
+    repo = EvaluationMetricRepository(client)
+
+    counts = repo.count_booking_conversion_rate(
+        ad_experiment_record(goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value)
+    )
+
+    assert counts.numerator_count == 0
+    assert counts.denominator_count == 10
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from booking_outcome_events" in sql
+    assert "from promotion_touch_events" in sql
+    assert "booking_complete" in sql
+    assert "promotion_click" in sql
+    assert "promotion_run_id is not null" in sql
+    assert "ad_experiment_id is not null" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+    }
+
+
 def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
     statuses = {status.value for status in PromotionEvaluationStatus}
     evaluation = PromotionEvaluationWrite(
@@ -635,3 +773,32 @@ def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
 
     assert "goal_near" not in statuses
     assert evaluation.status == PromotionEvaluationStatus.GOAL_NOT_MET.value
+
+
+def ad_experiment_record(
+    *,
+    goal_metric: str = GoalMetric.BOOKING_CONVERSION_RATE.value,
+) -> Any:
+    return type(
+        "AdExperimentLike",
+        (),
+        {
+            "ad_experiment_id": "adexp_family_trip_001",
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "promotion_run_id": "prun_banner_001_loop_1",
+            "analysis_id": "analysis_banner_001",
+            "generation_id": "generation_banner_001",
+            "segment_id": "seg_family_trip",
+            "segment_name": "Family hotel trip",
+            "content_id": "content_family_trip_001",
+            "content_option_id": "option_a",
+            "channel": Channel.ONSITE_BANNER.value,
+            "loop_count": 1,
+            "status": AdExperimentStatus.RUNNING.value,
+            "goal_metric": goal_metric,
+            "goal_target_value": Decimal("0.030000"),
+            "goal_basis": GoalBasis.ALL_SEGMENTS.value,
+        },
+    )()
