@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
@@ -176,6 +177,25 @@ class PromotionAnalysisResult:
 
 
 @dataclass(frozen=True)
+class NextLoopFocusAnalysisRequest:
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    focus_segment_ids: Sequence[str]
+    loop_count: int
+    source_promotion_run_id: str
+    source_failed_ad_experiment_ids: Sequence[str]
+    operator_instruction: str | None = None
+
+
+@dataclass(frozen=True)
+class NextLoopAnalysisContext:
+    loop_count: int
+    source_promotion_run_id: str
+    source_failed_ad_experiment_ids: Sequence[str]
+
+
+@dataclass(frozen=True)
 class SegmentCandidate:
     definition: SegmentDefinitionRecord
     profile: HotelMarketingProfileRecord | None
@@ -218,6 +238,35 @@ class PromotionAnalysisService:
         self._max_default_target_segments = max_default_target_segments
 
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
+        return self._analyze(request=request, next_loop_context=None)
+
+    def analyze_focus(
+        self,
+        request: NextLoopFocusAnalysisRequest,
+    ) -> PromotionAnalysisResult:
+        return self._analyze(
+            request=AnalysisRequest(
+                project_id=request.project_id,
+                campaign_id=request.campaign_id,
+                promotion_id=request.promotion_id,
+                focus_segment_ids=list(request.focus_segment_ids),
+                operator_instruction=request.operator_instruction,
+            ),
+            next_loop_context=NextLoopAnalysisContext(
+                loop_count=request.loop_count,
+                source_promotion_run_id=request.source_promotion_run_id,
+                source_failed_ad_experiment_ids=list(
+                    request.source_failed_ad_experiment_ids
+                ),
+            ),
+        )
+
+    def _analyze(
+        self,
+        *,
+        request: AnalysisRequest,
+        next_loop_context: NextLoopAnalysisContext | None,
+    ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
         segment_definitions = self._segment_definition_repository.list_active(
             project_id=request.project_id,
@@ -243,11 +292,15 @@ class PromotionAnalysisService:
         if not selected_candidates:
             raise SegmentSelectionError("no active segment candidates matched analysis request")
 
-        analysis_id = f"analysis_{promotion.promotion_id}"
+        analysis_id = _analysis_id(
+            promotion_id=promotion.promotion_id,
+            next_loop_context=next_loop_context,
+        )
         analysis = self._build_analysis(
             analysis_id=analysis_id,
             promotion=promotion,
             request=request,
+            next_loop_context=next_loop_context,
             segment_definitions=segment_definitions,
             candidates=candidates,
             selected_segment_ids=[
@@ -318,6 +371,19 @@ class PromotionAnalysisService:
         request: AnalysisRequest,
         candidates: Mapping[str, SegmentCandidate],
     ) -> list[SegmentCandidate]:
+        focus_segment_ids = _focus_segment_ids(request.focus_segment_ids)
+        if focus_segment_ids is not None:
+            missing_segment_ids = [
+                segment_id
+                for segment_id in focus_segment_ids
+                if segment_id not in candidates
+            ]
+            if missing_segment_ids:
+                raise SegmentSelectionError(
+                    "focus_segment_ids must match active segment definitions"
+                )
+            return [candidates[segment_id] for segment_id in focus_segment_ids]
+
         ordered_ids: list[str] = []
         for candidate in sorted(
             candidates.values(),
@@ -488,34 +554,45 @@ class PromotionAnalysisService:
         analysis_id: str,
         promotion: PromotionRecord,
         request: AnalysisRequest,
+        next_loop_context: NextLoopAnalysisContext | None,
         segment_definitions: Sequence[SegmentDefinitionRecord],
         candidates: Mapping[str, SegmentCandidate],
         selected_segment_ids: Sequence[str],
     ) -> PromotionAnalysisWrite:
+        focus_segment_ids = _focus_segment_ids(request.focus_segment_ids)
+        input_snapshot_json: dict[str, Any] = {
+            "promotion": _promotion_snapshot(promotion),
+            "available_segment_definitions": [
+                _segment_definition_snapshot(segment)
+                for segment in segment_definitions
+            ],
+            "focus_segment_ids": focus_segment_ids,
+            "operator_instruction": request.operator_instruction,
+        }
+        if next_loop_context is not None:
+            input_snapshot_json["next_loop"] = {
+                "loop_count": next_loop_context.loop_count,
+                "source_promotion_run_id": next_loop_context.source_promotion_run_id,
+                "source_failed_ad_experiment_ids": list(
+                    next_loop_context.source_failed_ad_experiment_ids
+                ),
+            }
+
         return PromotionAnalysisWrite(
             analysis_id=analysis_id,
             project_id=promotion.project_id,
             campaign_id=promotion.campaign_id,
             promotion_id=promotion.promotion_id,
             status=AnalysisStatus.COMPLETED.value,
-            focus_segment_ids_json=None,
+            focus_segment_ids_json=focus_segment_ids,
             operator_instruction=request.operator_instruction,
-            input_snapshot_json={
-                "promotion": _promotion_snapshot(promotion),
-                "available_segment_definitions": [
-                    _segment_definition_snapshot(segment)
-                    for segment in segment_definitions
-                ],
-                "operator_instruction": request.operator_instruction,
-            },
+            input_snapshot_json=input_snapshot_json,
             profile_summary_json={
                 "total_eligible_users": _total_eligible_users(segment_definitions),
                 "candidate_segment_count": len(candidates),
                 "selected_segment_count": len(selected_segment_ids),
-                "reason": (
-                    "Selected hotel audience segments by channel, goal metric, "
-                    "and active segment definitions."
-                ),
+                "selection_mode": "focus" if focus_segment_ids else "default",
+                "reason": _analysis_reason(focus_segment_ids),
             },
             output_json={
                 "selected_segment_ids": list(selected_segment_ids),
@@ -582,6 +659,49 @@ def _merge_segment_definitions(
         if existing is None or existing.source == "ai_suggested":
             merged[segment.segment_id] = segment
     return list(merged.values())
+
+
+def _analysis_id(
+    *,
+    promotion_id: str,
+    next_loop_context: NextLoopAnalysisContext | None,
+) -> str:
+    if next_loop_context is None:
+        return f"analysis_{promotion_id}"
+    return (
+        f"analysis_{_slug_from_promotion_id(promotion_id)}"
+        f"_loop_{next_loop_context.loop_count}"
+    )
+
+
+def _slug_from_promotion_id(promotion_id: str) -> str:
+    slug = promotion_id.removeprefix("promo_")
+    slug = re.sub(r"[^a-zA-Z0-9_]+", "_", slug).strip("_")
+    return slug or "promotion"
+
+
+def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
+    if values is None:
+        return None
+    cleaned = [str(value).strip() for value in values]
+    if not cleaned:
+        raise SegmentSelectionError(
+            "focus_segment_ids must contain at least one segment when provided"
+        )
+    if any(not value for value in cleaned):
+        raise SegmentSelectionError("focus_segment_ids must not contain empty values")
+    if len(set(cleaned)) != len(cleaned):
+        raise SegmentSelectionError("focus_segment_ids must not contain duplicates")
+    return cleaned
+
+
+def _analysis_reason(focus_segment_ids: Sequence[str] | None) -> str:
+    if focus_segment_ids:
+        return "Selected next-loop focus_segment_ids for failed segment re-analysis."
+    return (
+        "Selected hotel audience segments by channel, goal metric, "
+        "and active segment definitions."
+    )
 
 
 def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:

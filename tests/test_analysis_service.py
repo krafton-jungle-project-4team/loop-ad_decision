@@ -205,11 +205,13 @@ def analysis_request(
     *,
     promotion_id: str,
     operator_instruction: str | None = None,
+    focus_segment_ids: list[str] | None = None,
 ) -> AnalysisRequest:
     return AnalysisRequest(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
+        focus_segment_ids=focus_segment_ids,
         operator_instruction=operator_instruction,
     )
 
@@ -323,6 +325,43 @@ def test_service_applies_sms_default_segment_order() -> None:
         "seg_mobile_user",
         "seg_family_trip",
         "seg_existing_all",
+    ]
+
+
+def test_service_analyzes_focus_segment_ids_only() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    vector_service = FakeSegmentVectorService()
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_vector_service=vector_service,
+    )
+
+    result = service.analyze(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_near_checkin"],
+            operator_instruction="Stress breakfast.",
+        ),
+    )
+
+    assert segment_ids(result.target_segments) == ["seg_near_checkin"]
+    saved_analysis = analysis_repository.saved.analysis
+    assert saved_analysis is not None
+    assert saved_analysis.focus_segment_ids_json == ["seg_near_checkin"]
+    assert saved_analysis.input_snapshot_json["focus_segment_ids"] == [
+        "seg_near_checkin"
+    ]
+    assert saved_analysis.operator_instruction == "Stress breakfast."
+    assert saved_analysis.profile_summary_json["selection_mode"] == "focus"
+    assert vector_service.calls == [
+        SegmentVectorBuildRequest(
+            project_id="hotel-client-a",
+            promotion_id=promotion.promotion_id,
+            analysis_id=f"analysis_{promotion.promotion_id}",
+            segment_id="seg_near_checkin",
+            candidate_user_ids=[],
+        )
     ]
 
 

@@ -372,13 +372,19 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
     assert_no_forbidden_public_terms(response.json())
 
 
-def test_analysis_api_rejects_focus_segment_ids_contract() -> None:
+def test_analysis_api_accepts_focus_segment_ids_contract() -> None:
     response = make_client().post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(focus_segment_ids=["seg_near_checkin"]),
     )
 
-    assert response.status_code == 422
+    assert response.status_code == 200
+    body = response.json()
+    assert body["analysis_id"] == "analysis_promo_banner_001"
+    assert [
+        target_segment["segment_id"]
+        for target_segment in body["target_segments"]
+    ] == ["seg_near_checkin"]
 
 
 def test_analysis_service_persists_dashboard_db_contract() -> None:
@@ -432,6 +438,7 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "total_eligible_users": 74200,
         "candidate_segment_count": 5,
         "selected_segment_count": 4,
+        "selection_mode": "default",
         "reason": (
             "Selected hotel audience segments by channel, goal metric, "
             "and active segment definitions."
@@ -441,8 +448,10 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
     assert set(saved_analysis.input_snapshot_json) == {
         "promotion",
         "available_segment_definitions",
+        "focus_segment_ids",
         "operator_instruction",
     }
+    assert saved_analysis.input_snapshot_json["focus_segment_ids"] is None
     assert saved_analysis.input_snapshot_json["promotion"] == {
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
