@@ -13,6 +13,7 @@ from app.decision.repositories import (
     GenerationRunRepository,
     PromotionAnalysisRepository,
     PromotionEvaluationRepository,
+    PromotionEvaluationRecord,
     PromotionEvaluationWrite,
     PromotionRepository,
     PromotionRunRepository,
@@ -328,6 +329,28 @@ def test_promotion_run_uniqueness_check_uses_promotion_id_and_loop_count() -> No
     assert "promotion_run_id" not in sql
     assert "segment_id" not in sql
     assert call.params == ("promo_banner_001", 1)
+
+
+def test_promotion_run_repository_updates_status() -> None:
+    db = FakePostgresExecutor()
+    repo = PromotionRunRepository(db)
+
+    repo.update_status(
+        promotion_run_id="prun_banner_001_loop_1",
+        status=PromotionRunStatus.PARTIAL_GOAL_MET.value,
+    )
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "execute"
+    assert "update promotion_runs" in sql
+    assert "set status = %s" in sql
+    assert "updated_at = now()" in sql
+    assert "where promotion_run_id = %s" in sql
+    assert call.params == (
+        PromotionRunStatus.PARTIAL_GOAL_MET.value,
+        "prun_banner_001_loop_1",
+    )
 
 
 def test_ad_experiment_repository_inserts_segment_content_and_goal_fields() -> None:
@@ -694,6 +717,73 @@ def test_promotion_evaluation_repository_inserts_required_contract_columns() -> 
     assert "goal_near" not in sql
     assert call.params[15] == GoalBasis.ALL_SEGMENTS.value
     assert call.params[18] is True
+
+
+def test_promotion_evaluation_repository_lists_latest_individual_evaluations() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "evaluation_id": "eval_adexp_family_trip_latest",
+                "project_id": "hotel-client-a",
+                "campaign_id": "camp_summer_2026",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": "prun_banner_001_loop_1",
+                "ad_experiment_id": "adexp_family_trip_001",
+                "segment_id": "seg_family_trip",
+                "content_id": "content_family_trip_001",
+                "content_option_id": "option_a",
+                "metric": GoalMetric.BOOKING_CONVERSION_RATE.value,
+                "target_value": Decimal("0.300000"),
+                "actual_value": Decimal("0.400000"),
+                "numerator_count": 4,
+                "denominator_count": 10,
+                "sample_size": 10,
+                "basis": GoalBasis.ALL_SEGMENTS.value,
+                "status": PromotionEvaluationStatus.GOAL_MET.value,
+                "feedback": None,
+                "next_loop_required": False,
+                "result_json": {"status_reason": "target_met"},
+            }
+        ]
+    )
+    repo = PromotionEvaluationRepository(db)
+
+    evaluations = repo.list_latest_by_run_ad_experiments(
+        "prun_banner_001_loop_1"
+    )
+
+    assert evaluations == [
+        PromotionEvaluationRecord(
+            evaluation_id="eval_adexp_family_trip_latest",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            promotion_run_id="prun_banner_001_loop_1",
+            ad_experiment_id="adexp_family_trip_001",
+            segment_id="seg_family_trip",
+            content_id="content_family_trip_001",
+            content_option_id="option_a",
+            metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            target_value=Decimal("0.300000"),
+            actual_value=Decimal("0.400000"),
+            numerator_count=4,
+            denominator_count=10,
+            sample_size=10,
+            basis=GoalBasis.ALL_SEGMENTS.value,
+            status=PromotionEvaluationStatus.GOAL_MET.value,
+            feedback=None,
+            next_loop_required=False,
+            result_json={"status_reason": "target_met"},
+        )
+    ]
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from promotion_evaluations" in sql
+    assert "where promotion_run_id = %s" in sql
+    assert "and ad_experiment_id is not null" in sql
+    assert "select distinct on (ad_experiment_id)" in sql
+    assert "order by ad_experiment_id asc, created_at desc, evaluation_id desc" in sql
+    assert call.params == ("prun_banner_001_loop_1",)
 
 
 def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:

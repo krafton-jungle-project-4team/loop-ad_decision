@@ -297,6 +297,30 @@ class PromotionEvaluationWrite:
     result_json: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class PromotionEvaluationRecord:
+    evaluation_id: str
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    promotion_run_id: str
+    ad_experiment_id: str | None
+    segment_id: str | None
+    content_id: str | None
+    content_option_id: str | None
+    metric: str
+    target_value: Decimal
+    actual_value: Decimal
+    numerator_count: int
+    denominator_count: int
+    sample_size: int
+    basis: str
+    status: str
+    feedback: str | None
+    next_loop_required: bool
+    result_json: Mapping[str, Any]
+
+
 class PromotionReader(Protocol):
     def get_by_id(self, promotion_id: str) -> PromotionRecord | None:
         ...
@@ -357,6 +381,9 @@ class PromotionRunWriter(Protocol):
         ...
 
     def exists_for_promotion_loop(self, *, promotion_id: str, loop_count: int) -> bool:
+        ...
+
+    def update_status(self, *, promotion_run_id: str, status: str) -> None:
         ...
 
 
@@ -430,6 +457,12 @@ class UserSegmentAssignmentWriter(Protocol):
 
 class PromotionEvaluationWriter(Protocol):
     def insert(self, evaluation: PromotionEvaluationWrite) -> None:
+        ...
+
+    def list_latest_by_run_ad_experiments(
+        self,
+        promotion_run_id: str,
+    ) -> list[PromotionEvaluationRecord]:
         ...
 
 
@@ -736,6 +769,17 @@ class PromotionRunRepository:
             (promotion_id, loop_count),
         )
         return row is not None
+
+    def update_status(self, *, promotion_run_id: str, status: str) -> None:
+        self._db.execute(
+            """
+            UPDATE promotion_runs
+            SET status = %s,
+                updated_at = now()
+            WHERE promotion_run_id = %s
+            """,
+            (status, promotion_run_id),
+        )
 
 
 class AdExperimentRepository:
@@ -1151,6 +1195,42 @@ class PromotionEvaluationRepository:
                 evaluation.result_json,
             ),
         )
+
+    def list_latest_by_run_ad_experiments(
+        self,
+        promotion_run_id: str,
+    ) -> list[PromotionEvaluationRecord]:
+        rows = self._db.fetchall(
+            """
+            SELECT DISTINCT ON (ad_experiment_id)
+                evaluation_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                promotion_run_id,
+                ad_experiment_id,
+                segment_id,
+                content_id,
+                content_option_id,
+                metric,
+                target_value,
+                actual_value,
+                numerator_count,
+                denominator_count,
+                sample_size,
+                basis,
+                status,
+                feedback,
+                next_loop_required,
+                result_json
+            FROM promotion_evaluations
+            WHERE promotion_run_id = %s
+              AND ad_experiment_id IS NOT NULL
+            ORDER BY ad_experiment_id ASC, created_at DESC, evaluation_id DESC
+            """,
+            (promotion_run_id,),
+        )
+        return [PromotionEvaluationRecord(**row) for row in rows]
 
 
 class EvaluationMetricRepository:
