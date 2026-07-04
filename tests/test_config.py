@@ -27,6 +27,14 @@ def test_load_settings_requires_all_contract_env_values() -> None:
         load_settings(env)
 
 
+def test_load_settings_requires_gemini_api_key() -> None:
+    env = valid_env()
+    env.pop("LOOPAD_GEMINI_API_KEY")
+
+    with pytest.raises(SettingsError, match="LOOPAD_GEMINI_API_KEY"):
+        load_settings(env)
+
+
 def test_load_settings_rejects_wrong_service_id() -> None:
     env = valid_env()
     env["LOOPAD_SERVICE_ID"] = "dashboard-api"
@@ -50,3 +58,4 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.port == 8080
     assert settings.aurora_port == 15432
     assert settings.openai_content_model == "gpt-test"
+    assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
