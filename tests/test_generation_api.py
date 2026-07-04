@@ -1,6 +1,7 @@
 from fastapi.testclient import TestClient
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.generation.generator import GeneratedContent
 from app.generation.router import get_generation_service
 from app.generation.schemas import (
     ContentCandidateResponse,
@@ -181,6 +182,52 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
     )
 
 
+def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+    built_settings = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    def fake_build_external_content_generator(settings):
+        built_settings.append(settings)
+        return FakeExternalContentGenerator()
+
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.build_external_content_generator",
+        fake_build_external_content_generator,
+    )
+    env = valid_env()
+    env["LOOPAD_ENV"] = "dev"
+    app = create_app(settings=load_settings(env))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content_candidates"][0]["image_url"] == (
+        "https://gen-ai.asset.dev.loop-ad.org/generated/content_banner_001.png"
+    )
+    assert len(connections) == 1
+    assert built_settings[0].env == "dev"
+
+
 def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
 
@@ -265,6 +312,23 @@ class FakeGenerationService:
                     status=ContentCandidateStatus.DRAFT,
                 )
             ],
+        )
+
+
+class FakeExternalContentGenerator:
+    version = "dec-c6.external-test.v1"
+
+    def generate(self, **_kwargs) -> GeneratedContent:
+        return GeneratedContent(
+            title="Hotel rooms ready this weekend",
+            body="Compare refundable hotel stays before rooms run out.",
+            cta="View hotel deals",
+            image_prompt="bright hotel suite banner",
+            image_url=(
+                "https://gen-ai.asset.dev.loop-ad.org/generated/"
+                "content_banner_001.png"
+            ),
+            landing_url="https://demo-stay.example.com/summer",
         )
 
 

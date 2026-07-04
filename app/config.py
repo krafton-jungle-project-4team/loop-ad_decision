@@ -36,7 +36,9 @@ class Settings:
     data_storage_bucket: str
     genai_assets_base_prefix: str
     openai_api_key: str
+    gemini_api_key: str
     openai_content_model: str | None = None
+    gemini_image_model: str | None = None
 
 
 REQUIRED_ENV_NAMES = (
@@ -56,6 +58,7 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
     "LOOPAD_OPENAI_API_KEY",
+    "LOOPAD_GEMINI_API_KEY",
 )
 
 
@@ -93,7 +96,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
+        gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
+        gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
     )
 
 
