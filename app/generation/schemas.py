@@ -63,6 +63,7 @@ class ContentCandidateResponse(BaseModel):
     cta: str | None = None
     message: str | None = None
     image_prompt: str | None = None
+    image_url: str | None = None
     landing_url: str | None = None
     status: ContentCandidateStatus = ContentCandidateStatus.DRAFT
 

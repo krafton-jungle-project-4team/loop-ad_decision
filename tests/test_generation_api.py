@@ -73,6 +73,7 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert first_candidate["body"]
     assert first_candidate["cta"]
     assert first_candidate["image_prompt"]
+    assert first_candidate["image_url"] is None
     assert first_candidate["landing_url"] == "https://demo-stay.example.com/summer"
 
 
@@ -259,6 +260,7 @@ class FakeGenerationService:
                     body="Compare refundable summer offers before rooms run out.",
                     cta="View hotel deals",
                     image_prompt="bright modern hotel room, summer travel banner",
+                    image_url=None,
                     landing_url="https://demo-stay.example.com/summer",
                     status=ContentCandidateStatus.DRAFT,
                 )

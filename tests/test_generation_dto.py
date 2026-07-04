@@ -79,6 +79,7 @@ def test_generation_request_rejects_extra_fields() -> None:
             "body": "Compare refundable summer offers before rooms run out.",
             "cta": "View hotel deals",
             "image_prompt": "bright modern hotel room, summer travel banner",
+            "image_url": "https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_repeat_hotel_001.png",
             "landing_url": "https://demo-stay.example.com/summer",
         },
     ],
@@ -87,6 +88,10 @@ def test_content_candidate_response_accepts_channel_required_fields(candidate) -
     dto = ContentCandidateResponse.model_validate(candidate)
 
     assert dto.status == "draft"
+    if dto.channel == ContentChannel.ONSITE_BANNER:
+        assert dto.image_url == (
+            "https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_repeat_hotel_001.png"
+        )
 
 
 def test_content_candidate_response_rejects_unknown_channel() -> None:

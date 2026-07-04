@@ -147,6 +147,8 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["data_evidence"]["sample_size"] == 1342
     assert first_candidate.metadata_json["data_evidence"]["sample_ratio"] == 0.018
+    assert first_candidate.image_url is None
+    assert first_candidate.metadata_json["image_url"] is None
     assert first_candidate.metadata_json["source_query_preview_id"] is None
     assert first_candidate.metadata_json["generated_sql_summary"] is None
 
