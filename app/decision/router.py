@@ -23,6 +23,14 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationValidationError,
 )
 from app.decision.matcher import ExactCosineMatcher
+from app.decision.next_loop_service import (
+    NextLoopConflictError,
+    NextLoopNotFoundError,
+    NextLoopService,
+    NextLoopValidationError,
+    UnavailableNextLoopAnalysisGateway,
+    UnavailableNextLoopGenerationGateway,
+)
 from app.decision.repositories import (
     AdExperimentRepository,
     ContentCandidateRepository,
@@ -41,6 +49,8 @@ from app.decision.repositories import (
 from app.decision.schemas import (
     AdExperimentEvaluateRequest,
     AdExperimentEvaluateResponse,
+    NextLoopRequest,
+    NextLoopResponse,
     PromotionRunEvaluateRequest,
     PromotionRunEvaluateResponse,
     RunCreateRequest,
@@ -194,6 +204,45 @@ def get_promotion_run_evaluation_service(
         _close_clickhouse_client(clickhouse_client)
 
 
+def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
+    settings = get_settings(request)
+    connection = create_postgres_connection(settings)
+    executor = PsycopgPostgresExecutor(connection)
+    promotion_repository = PromotionRepository(executor)
+    promotion_analysis_repository = PromotionAnalysisRepository(executor)
+    promotion_target_segment_repository = PromotionTargetSegmentRepository(executor)
+    generation_run_repository = GenerationRunRepository(executor)
+    content_candidate_repository = ContentCandidateRepository(executor)
+    promotion_run_repository = PromotionRunRepository(executor)
+    ad_experiment_repository = AdExperimentRepository(executor)
+    promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+    try:
+        promotion_run_service = PromotionRunService(
+            promotion_repository=promotion_repository,
+            promotion_analysis_repository=promotion_analysis_repository,
+            promotion_target_segment_repository=promotion_target_segment_repository,
+            generation_run_repository=generation_run_repository,
+            content_candidate_repository=content_candidate_repository,
+            promotion_run_repository=promotion_run_repository,
+            ad_experiment_repository=ad_experiment_repository,
+        )
+        yield NextLoopService(
+            promotion_repository=promotion_repository,
+            promotion_run_repository=promotion_run_repository,
+            ad_experiment_repository=ad_experiment_repository,
+            promotion_evaluation_repository=promotion_evaluation_repository,
+            promotion_run_creator=promotion_run_service,
+            analysis_gateway=UnavailableNextLoopAnalysisGateway(),
+            generation_gateway=UnavailableNextLoopGenerationGateway(),
+        )
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
 @router.post(
     "/{promotion_id}/runs",
     response_model=RunCreateResponse,
@@ -297,6 +346,56 @@ async def evaluate_promotion_run(
         ) from exc
 
 
+@promotion_run_router.post(
+    "/{promotion_run_id}/next-loop",
+    response_model=NextLoopResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def create_next_loop(
+    promotion_run_id: str,
+    request: Request,
+    next_loop_service: NextLoopService = Depends(get_next_loop_service),
+) -> NextLoopResponse:
+    next_loop_request = await _parse_next_loop_request(request)
+    try:
+        return next_loop_service.create_next_loop(
+            promotion_run_id=promotion_run_id,
+            request=next_loop_request,
+        )
+    except NextLoopNotFoundError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=str(exc),
+        ) from exc
+    except NextLoopValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except NextLoopConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except (RunValidationError, PromotionNotFoundError) as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=str(exc),
+        ) from exc
+    except RunConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except IntegrityError as exc:
+        if _is_unique_violation(exc):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="next promotion run or ad experiment already exists",
+            ) from exc
+        raise
+
+
 @ad_experiment_router.post(
     "/{ad_experiment_id}/evaluate",
     response_model=AdExperimentEvaluateResponse,
@@ -385,6 +484,22 @@ async def _parse_promotion_run_evaluate_request(
     try:
         payload = await request.json()
         return PromotionRunEvaluateRequest.model_validate(payload)
+    except JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="request body must be valid JSON",
+        ) from exc
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=jsonable_encoder(exc.errors()),
+        ) from exc
+
+
+async def _parse_next_loop_request(request: Request) -> NextLoopRequest:
+    try:
+        payload = await request.json()
+        return NextLoopRequest.model_validate(payload)
     except JSONDecodeError as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
