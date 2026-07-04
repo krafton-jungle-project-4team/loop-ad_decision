@@ -167,3 +167,24 @@ class PromotionRunEvaluateResponse(BaseModel):
     next_loop_required: bool
     failed_segment_ids: list[str]
     failed_ad_experiment_ids: list[str]
+
+
+class NextLoopRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    failed_segment_ids: list[str] = Field(default_factory=list)
+    failed_ad_experiment_ids: list[str] = Field(default_factory=list)
+    operator_instruction: str | None = None
+
+
+class NextLoopResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    previous_promotion_run_id: str = Field(min_length=1)
+    next_promotion_run_id: str | None = None
+    promotion_id: str = Field(min_length=1)
+    loop_count: int = Field(ge=1)
+    next_analysis_id: str | None = None
+    next_generation_id: str | None = None
+    next_ad_experiments: list[AdExperimentCreateResponse]
+    status: Literal["created", "no_op"]
