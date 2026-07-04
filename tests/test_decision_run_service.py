@@ -225,6 +225,53 @@ def test_run_service_creates_run_and_one_ad_experiment_per_target_segment() -> N
     ]
 
 
+def test_run_service_creates_next_loop_run_after_admin_approval() -> None:
+    analysis_id = "analysis_banner_001_loop_2"
+    generation_id = "generation_banner_001_loop_2"
+    service, repos = make_service(
+        analysis=analysis_record(analysis_id=analysis_id),
+        generation=generation_record(
+            generation_id=generation_id,
+            analysis_id=analysis_id,
+        ),
+        target_segments=[
+            target_segment_record(
+                analysis_id=analysis_id,
+                segment_id="seg_luxury",
+                segment_name="Luxury hotel users",
+            ),
+        ],
+        candidates=[
+            content_candidate_record(
+                analysis_id=analysis_id,
+                generation_id=generation_id,
+                segment_id="seg_luxury",
+                content_id="content_luxury_approved_001",
+                content_option_id="luxury_option_a",
+                status="approved",
+            ),
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id=analysis_id,
+            generation_id=generation_id,
+            loop_count=2,
+        ),
+    )
+
+    assert response.analysis_id == analysis_id
+    assert response.generation_id == generation_id
+    assert response.loop_count == 2
+    assert len(repos.runs.inserted) == 1
+    assert repos.runs.inserted[0].loop_count == 2
+    experiments = repos.ad_experiments.inserted_batches[0]
+    assert [experiment.segment_id for experiment in experiments] == ["seg_luxury"]
+    assert experiments[0].content_id == "content_luxury_approved_001"
+
+
 def test_bounded_decision_id_is_stable_and_under_contract_length() -> None:
     long_promotion_id = "promo_" + ("very_long_hotel_campaign_" * 10)
 
@@ -502,11 +549,12 @@ def generation_record(
 
 def target_segment_record(
     *,
+    analysis_id: str = "analysis_banner_001",
     segment_id: str = "seg_family_trip",
     segment_name: str = "Family hotel trip",
 ) -> PromotionTargetSegmentRecord:
     return PromotionTargetSegmentRecord(
-        analysis_id="analysis_banner_001",
+        analysis_id=analysis_id,
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
@@ -527,18 +575,21 @@ def content_candidate_record(
     *,
     content_id: str = "content_family_001",
     content_option_id: str = "family_option_a",
+    analysis_id: str = "analysis_banner_001",
+    generation_id: str = "generation_banner_001",
     segment_id: str = "seg_family_trip",
     project_id: str = "hotel-client-a",
+    status: str = "approved",
 ) -> ContentCandidateRecord:
     return ContentCandidateRecord(
         content_id=content_id,
         content_option_id=content_option_id,
-        generation_id="generation_banner_001",
-        analysis_id="analysis_banner_001",
+        generation_id=generation_id,
+        analysis_id=analysis_id,
         project_id=project_id,
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         segment_id=segment_id,
         channel=Channel.ONSITE_BANNER.value,
-        status="approved",
+        status=status,
     )
