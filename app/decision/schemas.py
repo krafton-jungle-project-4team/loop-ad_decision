@@ -114,8 +114,19 @@ class SegmentAssignmentBuildResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     promotion_run_id: str = Field(min_length=1)
+    matching_mode: Literal["pgvector_hnsw_rerank"] = "pgvector_hnsw_rerank"
+    vector_version: str = Field(min_length=1)
+    ann_candidate_limit: int = Field(ge=1)
+    ann_candidate_count: int = Field(ge=0)
+    exact_reranked_pair_count: int = Field(ge=0)
     assignment_count: int = Field(ge=0)
+    batch_has_fallback: bool
     fallback_count: int = Field(ge=0)
+    below_threshold_fallback_count: int = Field(ge=0)
+    no_candidate_fallback_count: int = Field(ge=0)
+    invalid_user_vector_fallback_count: int = Field(ge=0)
+    ann_underfilled_user_count: int = Field(ge=0)
+    skipped_existing_count: int = Field(ge=0)
     insufficient_segment_count: int = Field(ge=0)
     status: Literal["completed"] = "completed"
 

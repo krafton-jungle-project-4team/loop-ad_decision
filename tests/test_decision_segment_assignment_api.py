@@ -57,8 +57,19 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
     assert response.status_code == 200
     assert response.json() == {
         "promotion_run_id": "prun_banner_001_loop_1",
+        "matching_mode": "pgvector_hnsw_rerank",
+        "vector_version": "v1",
+        "ann_candidate_limit": 50,
+        "ann_candidate_count": 1,
+        "exact_reranked_pair_count": 1,
         "assignment_count": 1,
+        "batch_has_fallback": False,
         "fallback_count": 0,
+        "below_threshold_fallback_count": 0,
+        "no_candidate_fallback_count": 0,
+        "invalid_user_vector_fallback_count": 0,
+        "ann_underfilled_user_count": 0,
+        "skipped_existing_count": 0,
         "insufficient_segment_count": 0,
         "status": "completed",
     }
@@ -136,6 +147,10 @@ def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> N
     assert clickhouse_clients[0].close_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
+    assert any("set local hnsw.ef_search" in query for query in executed_sql)
+    assert any("set local hnsw.iterative_scan = strict_order" in query for query in executed_sql)
+    assert any("set local hnsw.max_scan_tuples" in query for query in executed_sql)
+    assert any("order by embedding <=>" in query for query in executed_sql)
     assert any("insert into user_segment_assignments" in query for query in executed_sql)
 
 
@@ -195,8 +210,19 @@ class FakeAssignmentService:
             raise self.exc
         return SegmentAssignmentBuildResponse(
             promotion_run_id=promotion_run_id,
+            matching_mode="pgvector_hnsw_rerank",
+            vector_version="v1",
+            ann_candidate_limit=50,
+            ann_candidate_count=1,
+            exact_reranked_pair_count=1,
             assignment_count=1,
+            batch_has_fallback=False,
             fallback_count=0,
+            below_threshold_fallback_count=0,
+            no_candidate_fallback_count=0,
+            invalid_user_vector_fallback_count=0,
+            ann_underfilled_user_count=0,
+            skipped_existing_count=0,
             insufficient_segment_count=0,
             status="completed",
         )
@@ -232,6 +258,22 @@ class RecordingCursor:
                 ad_experiment_row("seg_family_trip"),
                 ad_experiment_row("seg_existing_all"),
             ]
+        if "from segment_vectors" in sql and "order by embedding <=>" in sql:
+            return [
+                {
+                    "segment_vector_id": "segvec_family_v1",
+                    "project_id": "hotel-client-a",
+                    "promotion_id": "promo_banner_001",
+                    "promotion_run_id": None,
+                    "analysis_id": "analysis_banner_001",
+                    "segment_id": "seg_family_trip",
+                    "vector_dim": 64,
+                    "vector_values": [1.0] + [0.0] * 63,
+                    "vector_version": "v1",
+                    "source": "decision_analysis",
+                    "embedding": [1.0] + [0.0] * 63,
+                }
+            ]
         if "from segment_vectors" in sql:
             return [
                 {
@@ -245,8 +287,11 @@ class RecordingCursor:
                     "vector_values": [1.0] + [0.0] * 63,
                     "vector_version": "v1",
                     "source": "decision_analysis",
+                    "embedding": [1.0] + [0.0] * 63,
                 }
             ]
+        if "from user_segment_assignments" in sql and "select user_id" in sql:
+            return []
         if "from user_segment_assignments" in sql:
             return [
                 {

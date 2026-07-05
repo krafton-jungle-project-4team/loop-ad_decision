@@ -9,7 +9,12 @@ from app.decision.assignment_service import (
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
 )
-from app.decision.matcher import ExactCosineMatcher
+from app.decision.matcher import (
+    FALLBACK_REASON_BELOW_THRESHOLD,
+    FALLBACK_REASON_INVALID_USER_VECTOR,
+    FALLBACK_REASON_NO_CANDIDATE,
+    SegmentCandidateReranker,
+)
 from app.decision.repositories import (
     AdExperimentRecord,
     PromotionRunRecord,
@@ -36,7 +41,7 @@ def vector(index: int, value: float = 1.0) -> list[float]:
     return values
 
 
-def test_assignment_service_builds_exact_and_fallback_assignments() -> None:
+def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> None:
     service, repos = make_service(
         user_vectors=[
             user_vector_record("user_family", vector(0)),
@@ -51,7 +56,16 @@ def test_assignment_service_builds_exact_and_fallback_assignments() -> None:
     )
 
     assert response.assignment_count == 2
+    assert response.matching_mode == "pgvector_hnsw_rerank"
+    assert response.ann_candidate_limit == 50
+    assert response.ann_candidate_count == 2
+    assert response.exact_reranked_pair_count == 2
+    assert response.batch_has_fallback is True
     assert response.fallback_count == 1
+    assert response.below_threshold_fallback_count == 1
+    assert response.no_candidate_fallback_count == 0
+    assert response.invalid_user_vector_fallback_count == 0
+    assert response.ann_underfilled_user_count == 0
     assert response.insufficient_segment_count == 0
     assert [assignment.user_id for assignment in repos.assignments.inserted] == [
         "user_family",
@@ -64,6 +78,8 @@ def test_assignment_service_builds_exact_and_fallback_assignments() -> None:
     assert fallback.segment_id == "seg_existing_all"
     assert fallback.assignment_source == AssignmentSource.FALLBACK.value
     assert fallback.fallback is True
+    assert fallback.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
+    assert repos.segment_vectors.configure_ann_search_count == 1
 
 
 def test_assignment_service_requires_fallback_experiment_before_writes() -> None:
@@ -83,6 +99,79 @@ def test_assignment_service_requires_fallback_experiment_before_writes() -> None
         )
 
     assert repos.assignments.inserted == []
+
+
+def test_assignment_service_falls_back_for_no_ann_candidate() -> None:
+    service, repos = make_service(ann_candidates=[])
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+    )
+
+    assert response.fallback_count == 1
+    assert response.no_candidate_fallback_count == 1
+    assert response.ann_underfilled_user_count == 1
+    assert repos.assignments.inserted[0].fallback_reason == FALLBACK_REASON_NO_CANDIDATE
+
+
+def test_assignment_service_falls_back_for_invalid_user_vector() -> None:
+    service, repos = make_service(
+        user_vectors=[user_vector_record("user_bad", [0.0] * 64)]
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_bad"]),
+    )
+
+    assert response.fallback_count == 1
+    assert response.invalid_user_vector_fallback_count == 1
+    assert response.ann_candidate_count == 0
+    assert repos.segment_vectors.ann_calls == []
+    assert (
+        repos.assignments.inserted[0].fallback_reason
+        == FALLBACK_REASON_INVALID_USER_VECTOR
+    )
+
+
+def test_assignment_service_skips_existing_assignments() -> None:
+    service, repos = make_service(existing_user_ids={"user_family"})
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+    )
+
+    assert response.assignment_count == 0
+    assert response.skipped_existing_count == 1
+    assert repos.segment_vectors.ann_calls == []
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_counts_underfilled_only_against_corpus_size() -> None:
+    service, _repos = make_service(
+        experiments=[
+            ad_experiment_record(segment_id="seg_family_trip"),
+            ad_experiment_record(segment_id="seg_mobile_user"),
+            ad_experiment_record(segment_id="seg_existing_all"),
+        ],
+        segment_vectors=[
+            segment_vector_record("seg_family_trip", vector(0)),
+            segment_vector_record("seg_mobile_user", vector(1)),
+        ],
+        ann_candidates=[
+            segment_vector_record("seg_family_trip", vector(0)),
+        ],
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+    )
+
+    assert response.ann_candidate_count == 1
+    assert response.ann_underfilled_user_count == 1
 
 
 def test_assignment_service_rejects_missing_segment_vector_without_writes() -> None:
@@ -114,14 +203,14 @@ def test_assignment_service_rejects_duplicate_segment_vector_without_writes() ->
     assert repos.assignments.inserted == []
 
 
-def test_assignment_service_rejects_invalid_segment_vector_without_writes() -> None:
+def test_assignment_service_rejects_invalid_segment_embedding_without_writes() -> None:
     service, repos = make_service(
         segment_vectors=[
             segment_vector_record("seg_family_trip", [0.0] * 64),
         ],
     )
 
-    with pytest.raises(SegmentAssignmentValidationError, match="invalid segment vector"):
+    with pytest.raises(SegmentAssignmentValidationError, match="invalid segment embedding"):
         service.build_assignments(
             promotion_run_id="prun_banner_001_loop_1",
             request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
@@ -228,11 +317,25 @@ class FakePromotionTargetSegmentRepository:
 
 
 class FakeSegmentVectorRepository:
-    def __init__(self, vectors: list[SegmentVectorRecord]) -> None:
+    def __init__(
+        self,
+        vectors: list[SegmentVectorRecord],
+        ann_candidates: list[SegmentVectorRecord] | None,
+    ) -> None:
         self.vectors = vectors
+        self.ann_candidates = ann_candidates
+        self.configure_ann_search_count = 0
+        self.ann_calls: list[dict[str, object]] = []
 
     def list_for_run_segments(self, **_kwargs: object) -> list[SegmentVectorRecord]:
         return self.vectors
+
+    def configure_ann_search(self) -> None:
+        self.configure_ann_search_count += 1
+
+    def list_ann_candidates(self, **kwargs: object) -> list[SegmentVectorRecord]:
+        self.ann_calls.append(dict(kwargs))
+        return self.vectors if self.ann_candidates is None else self.ann_candidates
 
 
 class FakeUserBehaviorVectorRepository:
@@ -263,9 +366,18 @@ class FakeUserBehaviorVectorRepository:
 
 
 class FakeUserSegmentAssignmentRepository:
-    def __init__(self, counts: dict[str, int]) -> None:
+    def __init__(self, counts: dict[str, int], existing_user_ids: set[str]) -> None:
         self.counts = counts
+        self.existing_user_ids = existing_user_ids
         self.inserted: list[UserSegmentAssignmentWrite] = []
+
+    def list_existing_user_ids(
+        self,
+        *,
+        promotion_run_id: str,
+        user_ids: list[str],
+    ) -> set[str]:
+        return self.existing_user_ids.intersection(user_ids)
 
     def insert_many(self, assignments: list[UserSegmentAssignmentWrite]) -> int:
         self.inserted.extend(assignments)
@@ -290,15 +402,23 @@ class FakeRepositoryBundle:
         run: PromotionRunRecord | None,
         experiments: list[AdExperimentRecord],
         segment_vectors: list[SegmentVectorRecord],
+        ann_candidates: list[SegmentVectorRecord] | None,
         user_vectors: list[UserBehaviorVectorRecord],
         segment_counts: dict[str, int],
+        existing_user_ids: set[str],
     ) -> None:
         self.runs = FakePromotionRunRepository(run)
         self.ad_experiments = FakeAdExperimentRepository(experiments)
         self.target_segments = FakePromotionTargetSegmentRepository()
-        self.segment_vectors = FakeSegmentVectorRepository(segment_vectors)
+        self.segment_vectors = FakeSegmentVectorRepository(
+            segment_vectors,
+            ann_candidates,
+        )
         self.user_vectors = FakeUserBehaviorVectorRepository(user_vectors)
-        self.assignments = FakeUserSegmentAssignmentRepository(segment_counts)
+        self.assignments = FakeUserSegmentAssignmentRepository(
+            segment_counts,
+            existing_user_ids,
+        )
 
 
 def make_service(
@@ -306,8 +426,10 @@ def make_service(
     run: PromotionRunRecord | None | object = DEFAULT_RUN,
     experiments: list[AdExperimentRecord] | None = None,
     segment_vectors: list[SegmentVectorRecord] | None = None,
+    ann_candidates: list[SegmentVectorRecord] | None = None,
     user_vectors: list[UserBehaviorVectorRecord] | None = None,
     segment_counts: dict[str, int] | None = None,
+    existing_user_ids: set[str] | None = None,
 ) -> tuple[SegmentAssignmentService, FakeRepositoryBundle]:
     repos = FakeRepositoryBundle(
         run=promotion_run_record() if run is DEFAULT_RUN else run,
@@ -322,12 +444,14 @@ def make_service(
         else [
             segment_vector_record("seg_family_trip", vector(0)),
         ],
+        ann_candidates=ann_candidates,
         user_vectors=user_vectors
         if user_vectors is not None
         else [
             user_vector_record("user_family", vector(0)),
         ],
         segment_counts=segment_counts or {"seg_family_trip": 1},
+        existing_user_ids=existing_user_ids or set(),
     )
     service = SegmentAssignmentService(
         promotion_run_repository=repos.runs,
@@ -336,7 +460,7 @@ def make_service(
         segment_vector_repository=repos.segment_vectors,
         user_behavior_vector_repository=repos.user_vectors,
         user_segment_assignment_repository=repos.assignments,
-        matcher=ExactCosineMatcher(),
+        reranker=SegmentCandidateReranker(),
     )
     return service, repos
 
@@ -398,6 +522,7 @@ def segment_vector_record(
         vector_values=values,
         vector_version="v1",
         source="decision_analysis",
+        embedding=values,
     )
 
 

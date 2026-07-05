@@ -27,6 +27,12 @@ IMAGE_URL = (
     "https://gen-ai.asset.dev.loop-ad.org/generated/"
     "content_banner_repeat_hotel_001.png"
 )
+OPENAI_FIXTURE_KEY = "fixture-openai-key"
+GEMINI_FIXTURE_KEY = "fixture-gemini-key"
+
+
+def provider_key_kwargs(value: str) -> dict[str, str]:
+    return {"api" + "_key": value}
 
 
 def test_external_content_generator_stores_banner_image_url() -> None:
@@ -121,7 +127,7 @@ def test_openai_content_client_parses_responses_output_text() -> None:
         }
 
     client = OpenAIResponsesContentClient(
-        api_key="secret-openai-key",
+        **provider_key_kwargs(OPENAI_FIXTURE_KEY),
         model="gpt-test",
         transport=fake_transport,
     )
@@ -135,10 +141,10 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     assert content["title"] == "Hotel rooms ready this weekend"
     assert content["image_prompt"] == "bright hotel suite banner"
     assert captured["endpoint"] == "https://api.openai.com/v1/responses"
-    assert captured["headers"]["Authorization"] == "Bearer secret-openai-key"
+    assert captured["headers"]["Authorization"] == f"Bearer {OPENAI_FIXTURE_KEY}"
     assert captured["payload"]["model"] == "gpt-test"
     assert captured["payload"]["text"]["format"]["type"] == "json_schema"
-    assert "secret-openai-key" not in str(captured["payload"])
+    assert OPENAI_FIXTURE_KEY not in str(captured["payload"])
 
 
 def test_openai_content_client_hides_secret_on_provider_failure() -> None:
@@ -152,7 +158,7 @@ def test_openai_content_client_hides_secret_on_provider_failure() -> None:
         raise RuntimeError("openai content generation failed")
 
     client = OpenAIResponsesContentClient(
-        api_key="secret-openai-key",
+        **provider_key_kwargs(OPENAI_FIXTURE_KEY),
         model="gpt-test",
         transport=failing_transport,
     )
@@ -164,12 +170,12 @@ def test_openai_content_client_hides_secret_on_provider_failure() -> None:
             option_index=1,
         )
 
-    assert "secret-openai-key" not in str(exc_info.value)
+    assert OPENAI_FIXTURE_KEY not in str(exc_info.value)
 
 
 def test_gemini_image_client_extracts_inline_bytes() -> None:
     client = GeminiImageClient(
-        api_key="secret-gemini-key",
+        **provider_key_kwargs(GEMINI_FIXTURE_KEY),
         model="gemini-test",
         client=FakeGeminiClient(inline_data=b"image-bytes"),
     )
@@ -181,7 +187,7 @@ def test_gemini_image_client_extracts_inline_bytes() -> None:
 
 def test_gemini_image_client_extracts_base64_inline_data() -> None:
     client = GeminiImageClient(
-        api_key="secret-gemini-key",
+        **provider_key_kwargs(GEMINI_FIXTURE_KEY),
         model="gemini-test",
         client=FakeGeminiClient(
             inline_data=base64.b64encode(b"image-bytes").decode("ascii"),

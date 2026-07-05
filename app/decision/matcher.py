@@ -1,13 +1,22 @@
 from __future__ import annotations
 
+import json
 import math
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
-from typing import Protocol, Sequence
+from typing import Any, Sequence
 
 
 VECTOR_DIM = 64
 SIMILARITY_THRESHOLD = 0.65
 FALLBACK_SEGMENT_ID = "seg_existing_all"
+ANN_CANDIDATE_LIMIT = 50
+HNSW_EF_SEARCH = 100
+HNSW_MAX_SCAN_TUPLES = 20000
+
+FALLBACK_REASON_BELOW_THRESHOLD = "below_threshold"
+FALLBACK_REASON_NO_CANDIDATE = "no_candidate"
+FALLBACK_REASON_INVALID_USER_VECTOR = "invalid_user_vector"
 
 
 class SegmentMatchValidationError(Exception):
@@ -23,9 +32,10 @@ class UserVector:
 
 @dataclass(frozen=True)
 class SegmentVector:
+    segment_vector_id: str
     segment_id: str
     vector_dim: int
-    vector_values: Sequence[float]
+    embedding_values: Sequence[float]
 
 
 @dataclass(frozen=True)
@@ -33,31 +43,10 @@ class MatchResult:
     segment_id: str
     similarity_score: float | None
     fallback: bool
+    fallback_reason: str | None = None
 
 
-class SegmentMatcher(Protocol):
-    """Match eligible users to one segment.
-
-    Future ANN implementations should hide behind this interface.
-    Exact matching iterates users and scores all segments. ANN matching will
-    likely search by segment, so a user may appear in multiple top-N result
-    sets and must be deduplicated by best similarity before returning results.
-    Candidate A is ClickHouse HNSW, which needs schema/team agreement and is
-    currently a riskier beta dependency. Candidate B is in-memory faiss, which
-    avoids schema changes but makes index build, memory, and freshness app
-    responsibilities. Distance-to-similarity conversion and DB score clamping
-    stay common outside the matcher.
-    """
-
-    def match(
-        self,
-        eligible_users: Sequence[UserVector],
-        segment_vectors: Sequence[SegmentVector],
-    ) -> dict[str, MatchResult]:
-        ...
-
-
-class ExactCosineMatcher:
+class SegmentCandidateReranker:
     def __init__(
         self,
         *,
@@ -69,82 +58,75 @@ class ExactCosineMatcher:
         self._fallback_segment_id = fallback_segment_id
         self._vector_dim = vector_dim
 
-    def match(
+    def normalize_user_vector(self, user: UserVector) -> list[float] | None:
+        try:
+            return normalize_values(user.vector_values, user.vector_dim, self._vector_dim)
+        except ValueError:
+            return None
+
+    def rerank(
         self,
-        eligible_users: Sequence[UserVector],
-        segment_vectors: Sequence[SegmentVector],
-    ) -> dict[str, MatchResult]:
-        normalized_segments = [
-            (
-                segment.segment_id,
-                _normalize_segment_vector(segment, self._vector_dim),
-            )
-            for segment in sorted(segment_vectors, key=lambda item: item.segment_id)
-        ]
-        if not normalized_segments:
-            raise SegmentMatchValidationError(
-                "at least one non-fallback segment vector is required"
+        *,
+        normalized_user_vector: Sequence[float],
+        candidates: Sequence[SegmentVector],
+    ) -> MatchResult:
+        if not candidates:
+            return MatchResult(
+                segment_id=self._fallback_segment_id,
+                similarity_score=None,
+                fallback=True,
+                fallback_reason=FALLBACK_REASON_NO_CANDIDATE,
             )
 
-        results: dict[str, MatchResult] = {}
-        for user in eligible_users:
-            user_vector = _normalize_user_vector(user, self._vector_dim)
-            if user_vector is None:
-                results[user.user_id] = MatchResult(
-                    segment_id=self._fallback_segment_id,
-                    similarity_score=None,
-                    fallback=True,
-                )
-                continue
+        scored_candidates: list[tuple[float, str]] = []
+        for candidate in candidates:
+            segment_vector = _normalize_segment_vector(candidate, self._vector_dim)
+            scored_candidates.append(
+                (_dot(normalized_user_vector, segment_vector), candidate.segment_id)
+            )
 
-            best_segment_id: str | None = None
-            best_score: float | None = None
-            for segment_id, segment_vector in normalized_segments:
-                score = _dot(user_vector, segment_vector)
-                if best_score is None or score > best_score:
-                    best_segment_id = segment_id
-                    best_score = score
-
-            if best_segment_id is None or best_score is None:
-                results[user.user_id] = MatchResult(
-                    segment_id=self._fallback_segment_id,
-                    similarity_score=None,
-                    fallback=True,
-                )
-                continue
-
-            fallback = best_score < self._threshold
-            results[user.user_id] = MatchResult(
-                segment_id=self._fallback_segment_id if fallback else best_segment_id,
+        best_score, best_segment_id = sorted(
+            scored_candidates,
+            key=lambda item: (-item[0], item[1]),
+        )[0]
+        if best_score < self._threshold:
+            return MatchResult(
+                segment_id=self._fallback_segment_id,
                 similarity_score=best_score,
-                fallback=fallback,
+                fallback=True,
+                fallback_reason=FALLBACK_REASON_BELOW_THRESHOLD,
             )
-        return results
+        return MatchResult(
+            segment_id=best_segment_id,
+            similarity_score=best_score,
+            fallback=False,
+            fallback_reason=None,
+        )
 
 
-def _normalize_segment_vector(
-    segment: SegmentVector,
-    vector_dim: int,
-) -> list[float]:
+def invalid_user_vector_result() -> MatchResult:
+    return MatchResult(
+        segment_id=FALLBACK_SEGMENT_ID,
+        similarity_score=None,
+        fallback=True,
+        fallback_reason=FALLBACK_REASON_INVALID_USER_VECTOR,
+    )
+
+
+def parse_vector_values(value: Any) -> list[float]:
+    parsed = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(parsed, SequenceABC) or isinstance(parsed, (bytes, str)):
+        raise ValueError("vector_values must be an array")
     try:
-        return _normalize_values(segment.vector_values, segment.vector_dim, vector_dim)
-    except ValueError as exc:
-        raise SegmentMatchValidationError(
-            f"invalid segment vector: {segment.segment_id}"
-        ) from exc
+        return [float(item) for item in parsed]
+    except (TypeError, ValueError) as exc:
+        raise ValueError("vector_values must contain numbers") from exc
 
 
-def _normalize_user_vector(user: UserVector, vector_dim: int) -> list[float] | None:
-    try:
-        return _normalize_values(user.vector_values, user.vector_dim, vector_dim)
-    except ValueError:
-        return None
-
-
-def _normalize_values(
+def normalize_values(
     values: Sequence[float],
     declared_dim: int,
-    vector_dim: int,
+    vector_dim: int = VECTOR_DIM,
 ) -> list[float]:
     if declared_dim != vector_dim:
         raise ValueError("vector_dim must be 64")
@@ -159,6 +141,18 @@ def _normalize_values(
     if norm == 0:
         raise ValueError("vector must not be zero")
     return [value / norm for value in numeric_values]
+
+
+def _normalize_segment_vector(
+    segment: SegmentVector,
+    vector_dim: int,
+) -> list[float]:
+    try:
+        return normalize_values(segment.embedding_values, segment.vector_dim, vector_dim)
+    except ValueError as exc:
+        raise SegmentMatchValidationError(
+            f"invalid segment embedding: {segment.segment_id}"
+        ) from exc
 
 
 def _dot(left: Sequence[float], right: Sequence[float]) -> float:
