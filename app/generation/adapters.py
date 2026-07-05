@@ -30,7 +30,6 @@ TEXT_FIELD_NAMES = (
     "cta",
     "message",
     "image_prompt",
-    "landing_url",
 )
 
 
@@ -242,7 +241,7 @@ class ExternalContentGenerator:
         content = _generated_content_from_values(
             channel=channel,
             values=values,
-            fallback_landing_url=prompt_input.promotion.landing_url,
+            landing_url=prompt_input.promotion.landing_url,
         )
 
         if channel != ContentChannel.ONSITE_BANNER:
@@ -360,9 +359,10 @@ def _generated_content_from_values(
     *,
     channel: ContentChannel,
     values: Mapping[str, str | None],
-    fallback_landing_url: str | None,
+    landing_url: str | None,
 ) -> GeneratedContent:
-    landing_url = values.get("landing_url") or fallback_landing_url
+    if not landing_url:
+        raise ValueError("promotion.landing_url is required to generate content")
     content = GeneratedContent(
         subject=values.get("subject"),
         preheader=values.get("preheader"),
@@ -381,6 +381,7 @@ def _system_instruction(channel: ContentChannel) -> str:
     return (
         "You generate hotel booking advertisement content. "
         f"Return only the JSON fields for the {channel.value} channel contract. "
+        "Do not generate, infer, or override landing URLs. "
         "Do not include legacy naming, marketplace language, or unrelated commerce terms."
     )
 
@@ -395,7 +396,8 @@ def _user_instruction(
         [
             prompt_result.generation_prompt,
             f"Content option number: {option_index}",
-            f"Landing URL: {prompt_input.promotion.landing_url or ''}",
+            f"Fixed landing URL assigned by Loop-Ad: {prompt_input.promotion.landing_url or ''}",
+            "Do not return landing_url in the JSON response.",
             "Return concise hotel booking copy. Return JSON only.",
         ]
     )

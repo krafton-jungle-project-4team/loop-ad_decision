@@ -126,12 +126,12 @@ def test_generation_input_builder_rejects_mismatched_dependencies() -> None:
     (
         (
             ContentChannel.EMAIL,
-            ("subject", "preheader", "body", "cta", "landing_url"),
+            ("subject", "preheader", "body", "cta"),
         ),
-        (ContentChannel.SMS, ("message", "landing_url")),
+        (ContentChannel.SMS, ("message",)),
         (
             ContentChannel.ONSITE_BANNER,
-            ("title", "body", "cta", "image_prompt", "landing_url"),
+            ("title", "body", "cta", "image_prompt"),
         ),
     ),
 )
@@ -152,6 +152,16 @@ def test_prompt_builder_includes_channel_contract_and_operator_instruction(
 
     for required_term in required_terms:
         assert required_term in result.generation_prompt
+    required_fields_line = next(
+        line
+        for line in result.generation_prompt.splitlines()
+        if line.startswith("Required output fields:")
+    )
+    assert "landing_url" not in required_fields_line
+    assert "Fixed landing URL: https://demo-stay.example.com/summer" in (
+        result.generation_prompt
+    )
+    assert "Do not generate or override landing_url" in result.generation_prompt
     assert "Use a calm premium hotel tone." in result.generation_prompt
     assert "booking_conversion_rate" in result.generation_prompt
     assert "Repeat hotel viewers without booking" in result.generation_prompt

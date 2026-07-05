@@ -106,7 +106,7 @@ class PromptBuilder:
                 f"Target segment: {target_segment.segment_name} ({target_segment.segment_id})",
                 f"Estimated segment size: {target_segment.estimated_size}",
                 f"Goal: {promotion.goal_metric} {promotion.goal_basis} {promotion.goal_target_value}",
-                f"Landing URL: {promotion.landing_url or 'not provided'}",
+                f"Fixed landing URL: {promotion.landing_url or 'not provided'}",
                 f"Promotion brief: {promotion.message_brief or 'not provided'}",
                 f"Segment message direction: {_message_direction(target_segment)}",
                 f"Segment keywords: {', '.join(_keywords(target_segment)) or 'not provided'}",
@@ -121,6 +121,7 @@ class PromptBuilder:
                     prompt_input.request.operator_instruction,
                 ),
                 "Return only fields that belong to the requested channel contract.",
+                "Do not generate or override landing_url; Loop-Ad assigns the fixed landing URL.",
                 "Keep the content in the hotel booking domain.",
             ]
         )
@@ -171,10 +172,10 @@ def _validate_request_target_segment_match(
 
 def _channel_contract(channel: ContentChannel) -> tuple[str, ...]:
     if channel == ContentChannel.EMAIL:
-        return ("subject", "preheader", "body", "cta", "landing_url")
+        return ("subject", "preheader", "body", "cta")
     if channel == ContentChannel.SMS:
-        return ("message", "landing_url")
-    return ("title", "body", "cta", "image_prompt", "landing_url")
+        return ("message",)
+    return ("title", "body", "cta", "image_prompt")
 
 
 def _message_strategy(prompt_input: GenerationPromptInput) -> str:

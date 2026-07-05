@@ -27,6 +27,8 @@ IMAGE_URL = (
     "https://gen-ai.asset.dev.loop-ad.org/generated/"
     "content_banner_repeat_hotel_001.png"
 )
+PROMOTION_LANDING_URL = "https://demo-stay.example.com/summer"
+LLM_LANDING_URL = "https://yourhotelbookinglink.com/generated-by-model"
 OPENAI_FIXTURE_KEY = "fixture-openai-key"
 GEMINI_FIXTURE_KEY = "fixture-gemini-key"
 
@@ -45,7 +47,7 @@ def test_external_content_generator_stores_banner_image_url() -> None:
                 "body": "Compare refundable hotel stays before rooms run out.",
                 "cta": "View hotel deals",
                 "image_prompt": "bright hotel suite banner",
-                "landing_url": "https://demo-stay.example.com/summer",
+                "landing_url": LLM_LANDING_URL,
             }
         ),
         image_client=image_client,
@@ -60,6 +62,7 @@ def test_external_content_generator_stores_banner_image_url() -> None:
 
     assert content.title == "Hotel rooms ready this weekend"
     assert content.image_prompt == "bright hotel suite banner"
+    assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url == IMAGE_URL
     assert image_client.prompts == ["bright hotel suite banner"]
     assert asset_storage.saved == [
@@ -80,7 +83,6 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
                 "preheader": "Refundable hotels are available now.",
                 "body": "Compare summer stays before rooms run out.",
                 "cta": "View hotel deals",
-                "landing_url": "https://demo-stay.example.com/summer",
             }
         ),
         image_client=image_client,
@@ -94,9 +96,32 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
     )
 
     assert content.subject == "Rooms picked for your next stay"
+    assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url is None
     assert image_client.prompts == []
     assert asset_storage.saved == []
+
+
+def test_external_content_generator_requires_promotion_landing_url() -> None:
+    generator = ExternalContentGenerator(
+        content_client=FakeContentClient(
+            {
+                "subject": "Rooms picked for your next stay",
+                "preheader": "Refundable hotels are available now.",
+                "body": "Compare summer stays before rooms run out.",
+                "cta": "View hotel deals",
+            }
+        ),
+        image_client=FakeImageClient(),
+        asset_storage=FakeAssetStorage(),
+    )
+
+    with pytest.raises(ValueError, match="promotion.landing_url"):
+        generator.generate(
+            prompt_input=prompt_input(ContentChannel.EMAIL, landing_url=None),
+            prompt_result=prompt_result(),
+            option_index=1,
+        )
 
 
 def test_openai_content_client_parses_responses_output_text() -> None:
@@ -121,8 +146,7 @@ def test_openai_content_client_parses_responses_output_text() -> None:
                 '{"title":"Hotel rooms ready this weekend",'
                 '"body":"Compare refundable hotel stays.",'
                 '"cta":"View hotel deals",'
-                '"image_prompt":"bright hotel suite banner",'
-                '"landing_url":"https://demo-stay.example.com/summer"}'
+                '"image_prompt":"bright hotel suite banner"}'
             )
         }
 
@@ -144,6 +168,9 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     assert captured["headers"]["Authorization"] == f"Bearer {OPENAI_FIXTURE_KEY}"
     assert captured["payload"]["model"] == "gpt-test"
     assert captured["payload"]["text"]["format"]["type"] == "json_schema"
+    schema = captured["payload"]["text"]["format"]["schema"]
+    assert "landing_url" not in schema["properties"]
+    assert "landing_url" not in schema["required"]
     assert OPENAI_FIXTURE_KEY not in str(captured["payload"])
 
 
@@ -295,7 +322,11 @@ class FakeS3Client:
         self.put_objects.append(kwargs)
 
 
-def prompt_input(channel: ContentChannel) -> GenerationPromptInput:
+def prompt_input(
+    channel: ContentChannel,
+    *,
+    landing_url: str | None = PROMOTION_LANDING_URL,
+) -> GenerationPromptInput:
     return GenerationPromptInput(
         request=GenerationRequest(
             project_id="hotel-client-a",
@@ -314,7 +345,7 @@ def prompt_input(channel: ContentChannel) -> GenerationPromptInput:
             goal_target_value="0.030000",
             goal_basis="all_segments",
             message_brief="Drive hotel booking conversion for summer stays.",
-            landing_url="https://demo-stay.example.com/summer",
+            landing_url=landing_url,
         ),
         target_segment=TargetSegmentPromptInput(
             analysis_id="analysis_banner_001",

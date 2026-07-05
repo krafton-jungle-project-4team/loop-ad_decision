@@ -16,6 +16,8 @@ from app.generation.schemas import (
     GenerationRequest,
 )
 from app.generation.service import (
+    DEMO_DEFAULT_LANDING_URL,
+    DEMO_PROJECT_ID,
     GenerationInputUnavailable,
     GenerationService,
     NextLoopFocusGenerationRequest,
@@ -53,11 +55,12 @@ class FakeContentCandidateRepository:
 
 def generation_request(
     *,
+    project_id: str = "hotel-client-a",
     content_option_count: int = 2,
     operator_instruction: str | None = "Make the banner direct and concise.",
 ) -> GenerationRequest:
     return GenerationRequest(
-        project_id="hotel-client-a",
+        project_id=project_id,
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         analysis_id="analysis_banner_001",
@@ -134,9 +137,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.channel == ContentChannel.ONSITE_BANNER
     assert first_candidate.generation_prompt
     assert "Required output fields" in first_candidate.generation_prompt
-    assert "title, body, cta, image_prompt, landing_url" in (
-        first_candidate.generation_prompt
-    )
+    assert "title, body, cta, image_prompt" in first_candidate.generation_prompt
     assert first_candidate.reason_summary
     assert first_candidate.message_strategy
     assert first_candidate.data_evidence_json["segment_id"] == (
@@ -398,6 +399,55 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     assert "secret" not in str(generation_run.generation_report_json)
 
 
+def test_generation_service_uses_demo_default_landing_url_when_missing() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [target_segment_input()],
+            landing_url=None,
+        ),
+    )
+
+    response = service.generate(
+        generation_request(project_id=DEMO_PROJECT_ID, content_option_count=1)
+    )
+
+    assert response.status == "completed"
+    assert response.content_candidates[0].landing_url == DEMO_DEFAULT_LANDING_URL
+    candidate = content_candidate_repository.saved[0]
+    assert candidate.landing_url == DEMO_DEFAULT_LANDING_URL
+    assert f"Fixed landing URL: {DEMO_DEFAULT_LANDING_URL}" in (
+        candidate.generation_prompt
+    )
+
+
+def test_generation_service_fails_when_non_demo_landing_url_is_missing() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [target_segment_input()],
+            landing_url=None,
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=1))
+
+    assert response.status == "failed"
+    assert response.content_candidates == []
+    assert content_candidate_repository.saved == []
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.status == "failed"
+    assert generation_run.output_json is not None
+    assert (
+        generation_run.output_json["error_code"]
+        == "content_generation_validation_failed"
+    )
+
+
 def test_generation_service_saves_channel_specific_fields() -> None:
     email_service = GenerationService(
         generation_input_builder=StaticGenerationInputBuilder(
@@ -518,9 +568,11 @@ class StaticGenerationInputReader:
         target_segments: list[TargetSegmentPromptInput],
         *,
         channel: ContentChannel = ContentChannel.ONSITE_BANNER,
+        landing_url: str | None = "https://demo-stay.example.com/summer",
     ) -> None:
         self._target_segments = target_segments
         self._channel = channel
+        self._landing_url = landing_url
 
     def get_promotion_input(
         self,
@@ -535,7 +587,7 @@ class StaticGenerationInputReader:
             goal_target_value="0.030000",
             goal_basis="all_segments",
             message_brief="Drive hotel booking conversion for summer stays.",
-            landing_url="https://demo-stay.example.com/summer",
+            landing_url=self._landing_url,
         )
 
     def list_target_segment_inputs(

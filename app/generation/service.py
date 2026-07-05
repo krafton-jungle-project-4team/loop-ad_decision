@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence
 
 from app.generation.generator import (
@@ -69,6 +69,14 @@ class GenerationRequestHandler(Protocol):
 
 class GenerationInputUnavailable(RuntimeError):
     """Raised when confirmed generation input rows are not ready yet."""
+
+
+DEMO_PROJECT_ID = "demo_project"
+DEMO_DEFAULT_LANDING_URL = (
+    "https://demo-shoppingmall.dev.loop-ad.org/hotel/jeju-ocean-breeze-006"
+    "?destination=&checkIn=2026-08-01&checkOut=2026-08-03"
+    "&adults=1&children=0&rooms=1&deal=summer"
+)
 
 
 @dataclass(frozen=True)
@@ -395,6 +403,7 @@ class GenerationService:
         index: int,
         status: ContentCandidateStatus,
     ) -> ContentCandidateRecord:
+        prompt_input = _prompt_input_with_resolved_landing_url(prompt_input)
         prompt_result = self._prompt_builder.build(prompt_input)
         channel = prompt_input.promotion.channel
         channel_slug = _channel_slug(channel)
@@ -605,6 +614,23 @@ def _safe_generation_error_code(exc: Exception) -> str:
     if isinstance(exc, ValueError):
         return "content_generation_validation_failed"
     return "content_generation_failed"
+
+
+def _prompt_input_with_resolved_landing_url(
+    prompt_input: GenerationPromptInput,
+) -> GenerationPromptInput:
+    landing_url = prompt_input.promotion.landing_url
+    if landing_url:
+        return prompt_input
+    if prompt_input.promotion.project_id == DEMO_PROJECT_ID:
+        return replace(
+            prompt_input,
+            promotion=replace(
+                prompt_input.promotion,
+                landing_url=DEMO_DEFAULT_LANDING_URL,
+            ),
+        )
+    raise ValueError("promotion.landing_url is required to generate content")
 
 
 def _content_generator_version(content_generator: ContentGenerator) -> str:
