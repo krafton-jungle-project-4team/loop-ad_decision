@@ -356,6 +356,7 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
     assert "reason_json" in sql
     assert "metadata_json" in sql
     assert "status" in sql
+    assert sql.count("%s") == len(call.params)
     assert call.params == (
         "sugg_analysis_banner_001_seg_repeat",
         "analysis_banner_001",
