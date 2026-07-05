@@ -14,10 +14,34 @@ from app.analysis.repositories import (
 from app.analysis.vector_service import DEFAULT_VECTOR_VERSION, VECTOR_DIM
 
 
+DEFAULT_VECTOR_POOL_LIMIT = 1000
 DEFAULT_VECTOR_SAMPLE_LIMIT = 200
-DEFAULT_MAX_SUGGESTED_SEGMENTS = 2
+DEFAULT_MAX_SUGGESTED_SEGMENTS = 3
 DEFAULT_MIN_CLUSTER_SIZE = 2
 KMEANS_ITERATIONS = 8
+
+FEATURE_LABELS = {
+    0: "Hotel page viewers",
+    1: "Hotel search users",
+    2: "Hotel click users",
+    3: "Hotel detail viewers",
+    4: "Promotion impression users",
+    5: "Promotion click responders",
+    6: "Campaign redirect users",
+    7: "Campaign landing users",
+    8: "Booking starters",
+    9: "Booking converters",
+    10: "Booking cancellation risk users",
+    11: "Mixed event hotel users",
+    56: "Promotion-engaged hotel users",
+    57: "Experiment-exposed hotel users",
+    58: "Segment-tagged hotel users",
+    59: "Free cancellation seekers",
+    60: "Breakfast-included seekers",
+    61: "Higher-price hotel shoppers",
+    62: "Booking conversion ready users",
+    63: "Promotion click responsive users",
+}
 
 
 class UserBehaviorVectorSampler(Protocol):
@@ -25,7 +49,7 @@ class UserBehaviorVectorSampler(Protocol):
         self,
         *,
         project_id: str,
-        limit: int = DEFAULT_VECTOR_SAMPLE_LIMIT,
+        limit: int = DEFAULT_VECTOR_POOL_LIMIT,
         vector_version: str = DEFAULT_VECTOR_VERSION,
     ) -> list[UserBehaviorVectorRecord]:
         ...
@@ -50,26 +74,35 @@ class VectorClusterSegmentSuggester:
         self,
         *,
         user_behavior_vector_repository: UserBehaviorVectorSampler,
+        vector_pool_limit: int = DEFAULT_VECTOR_POOL_LIMIT,
         vector_sample_limit: int = DEFAULT_VECTOR_SAMPLE_LIMIT,
         max_suggested_segments: int = DEFAULT_MAX_SUGGESTED_SEGMENTS,
         min_cluster_size: int = DEFAULT_MIN_CLUSTER_SIZE,
         vector_version: str = DEFAULT_VECTOR_VERSION,
     ) -> None:
+        if vector_pool_limit <= 0:
+            raise ValueError("vector_pool_limit must be positive")
         if vector_sample_limit <= 0:
             raise ValueError("vector_sample_limit must be positive")
+        if vector_pool_limit < vector_sample_limit:
+            raise ValueError(
+                "vector_pool_limit must be greater than or equal to vector_sample_limit"
+            )
         if max_suggested_segments <= 0:
             raise ValueError("max_suggested_segments must be positive")
         if min_cluster_size <= 0:
             raise ValueError("min_cluster_size must be positive")
 
         self._user_behavior_vector_repository = user_behavior_vector_repository
+        self._vector_pool_limit = vector_pool_limit
         self._vector_sample_limit = vector_sample_limit
         self._max_suggested_segments = max_suggested_segments
         self._min_cluster_size = min_cluster_size
         self._vector_version = vector_version
 
     def suggest_segments(self, *, promotion: PromotionRecord) -> list[SegmentDefinitionRecord]:
-        user_vectors = self._load_user_vectors(promotion.project_id)
+        sample_seed = _promotion_sample_seed(promotion)
+        user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
             return []
 
@@ -88,6 +121,7 @@ class VectorClusterSegmentSuggester:
                 cluster=cluster,
                 rank=rank,
                 total_eligible_user_count=total_eligible_user_count,
+                sample_seed=sample_seed,
                 vector_version=self._vector_version,
             )
             for rank, cluster in enumerate(
@@ -103,18 +137,29 @@ class VectorClusterSegmentSuggester:
             if len(cluster.users) >= self._min_cluster_size
         ][: self._max_suggested_segments]
 
-    def _load_user_vectors(self, project_id: str) -> list[_UserVector]:
+    def _load_user_vectors(
+        self,
+        promotion: PromotionRecord,
+        sample_seed: str,
+    ) -> list[_UserVector]:
         records = self._user_behavior_vector_repository.list_recent(
-            project_id=project_id,
-            limit=self._vector_sample_limit,
+            project_id=promotion.project_id,
+            limit=self._vector_pool_limit,
             vector_version=self._vector_version,
         )
+        sampled_records = sorted(
+            records,
+            key=lambda record: (
+                _sample_sort_digest(sample_seed=sample_seed, user_id=record.user_id),
+                record.user_id,
+            ),
+        )[: self._vector_sample_limit]
         return [
             _UserVector(
                 user_id=record.user_id,
                 values=tuple(_l2_normalize(record.vector_values, record.vector_dim)),
             )
-            for record in sorted(records, key=lambda record: record.user_id)
+            for record in sampled_records
         ]
 
 
@@ -241,6 +286,7 @@ def _segment_definition_from_cluster(
     cluster: _Cluster,
     rank: int,
     total_eligible_user_count: int,
+    sample_seed: str,
     vector_version: str,
 ) -> SegmentDefinitionRecord:
     segment_id = _suggested_segment_id(
@@ -254,22 +300,30 @@ def _segment_definition_from_cluster(
         total_eligible_user_count=total_eligible_user_count,
     )
     candidate_user_ids = [user_vector.user_id for user_vector in cluster.users]
+    top_common_features = _top_feature_labels(cluster.centroid)
+    natural_language_query = (
+        "Users grouped by similar hotel behavior vectors for this promotion."
+    )
+    if top_common_features:
+        natural_language_query = (
+            f"{natural_language_query} Strongest signals: "
+            f"{', '.join(top_common_features)}."
+        )
     return SegmentDefinitionRecord(
         segment_id=segment_id,
         project_id=promotion.project_id,
         campaign_id=promotion.campaign_id,
         promotion_id=promotion.promotion_id,
-        segment_name=f"AI suggested hotel audience {rank + 1}",
+        segment_name=_segment_name_from_cluster(cluster=cluster, rank=rank),
         source="ai_suggested",
         query_preview_id=None,
-        natural_language_query=(
-            "Users grouped by similar hotel behavior vectors for this promotion."
-        ),
+        natural_language_query=natural_language_query,
         generated_sql=None,
         rule_json={
             "source": "user_vector_clustering",
             "vector_version": vector_version,
             "cluster_index": cluster.index,
+            "sample_seed": sample_seed,
             "candidate_user_ids": candidate_user_ids,
         },
         profile_json={
@@ -278,6 +332,7 @@ def _segment_definition_from_cluster(
             "vector_version": vector_version,
             "cluster_index": cluster.index,
             "cluster_score": round(cluster.score, 6),
+            "top_common_features": top_common_features,
             "promotion": {
                 "channel": promotion.channel,
                 "goal_metric": promotion.goal_metric,
@@ -298,6 +353,67 @@ def _sample_ratio(
     if total_eligible_user_count <= 0:
         return Decimal("0")
     return Decimal(sample_size / total_eligible_user_count).quantize(Decimal("0.000001"))
+
+
+def _promotion_sample_seed(promotion: PromotionRecord) -> str:
+    seed_input = ":".join(
+        [
+            promotion.project_id,
+            promotion.campaign_id,
+            promotion.promotion_id,
+            promotion.channel,
+            promotion.goal_metric,
+            promotion.message_brief or "",
+            promotion.landing_url or "",
+        ]
+    )
+    return hashlib.sha1(seed_input.encode("utf-8")).hexdigest()[:12]  # noqa: S324
+
+
+def _sample_sort_digest(*, sample_seed: str, user_id: str) -> str:
+    return hashlib.sha1(f"{sample_seed}:{user_id}".encode("utf-8")).hexdigest()  # noqa: S324
+
+
+def _segment_name_from_cluster(*, cluster: _Cluster, rank: int) -> str:
+    labels = _top_feature_labels(cluster.centroid, limit=2)
+    if not labels:
+        return f"Hotel behavior cluster {rank + 1}"
+    if len(labels) == 1:
+        return labels[0]
+    return f"{labels[0]} with {labels[1].lower()}"
+
+
+def _top_feature_labels(
+    centroid: Sequence[float],
+    *,
+    limit: int = 3,
+) -> list[str]:
+    labels: list[str] = []
+    for index, value in sorted(
+        enumerate(centroid),
+        key=lambda item: (-abs(float(item[1])), item[0]),
+    ):
+        if value == 0:
+            continue
+        label = _feature_label(index)
+        if label is None or label in labels:
+            continue
+        labels.append(label)
+        if len(labels) == limit:
+            break
+    return labels
+
+
+def _feature_label(index: int) -> str | None:
+    if index in FEATURE_LABELS:
+        return FEATURE_LABELS[index]
+    if 16 <= index <= 31:
+        return f"Hotel cluster bucket {index - 16} affinity users"
+    if 32 <= index <= 47:
+        return f"Hotel market bucket {index - 32} affinity users"
+    if 48 <= index <= 55:
+        return f"Hotel page path bucket {index - 48} users"
+    return None
 
 
 def _suggested_segment_id(
