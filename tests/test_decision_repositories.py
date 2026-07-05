@@ -499,6 +499,40 @@ def test_user_segment_assignment_write_carries_assignment_source() -> None:
     assert assignment.assigned_at == assigned_at
 
 
+def assignment_write(
+    user_id: str,
+    *,
+    segment_id: str = "seg_existing_all",
+    ad_experiment_id: str = "adexp_existing_all_001",
+    content_id: str = "content_existing_all_001",
+    content_option_id: str = "option_a",
+    similarity_score: Decimal | None = Decimal("0.410000"),
+    fallback: bool = True,
+    fallback_reason: str | None = "below_threshold",
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> UserSegmentAssignmentWrite:
+    return UserSegmentAssignmentWrite(
+        project_id="hotel-client-a",
+        promotion_run_id="prun_banner_001_loop_1",
+        user_id=user_id,
+        segment_id=segment_id,
+        ad_experiment_id=ad_experiment_id,
+        content_id=content_id,
+        content_option_id=content_option_id,
+        similarity_score=similarity_score,
+        fallback=fallback,
+        fallback_reason=fallback_reason,
+        assignment_source=(
+            AssignmentSource.FALLBACK.value
+            if fallback
+            else AssignmentSource.DECISION_BATCH.value
+        ),
+        assigned_at=assigned_at or datetime(2026, 7, 3, tzinfo=UTC),
+        expires_at=expires_at,
+    )
+
+
 def test_segment_vector_repository_filters_run_context_and_version() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[
@@ -747,17 +781,16 @@ def test_segment_vector_repository_rejects_unexpected_batch_query_user() -> None
         )
 
 
-def test_user_segment_assignment_repository_inserts_official_columns_only() -> None:
+def test_user_segment_assignment_repository_bulk_inserts_official_columns_only() -> None:
     assigned_at = datetime(2026, 7, 3, tzinfo=UTC)
-    db = FakePostgresExecutor(fetchone_result={"id": 1})
+    expires_at = datetime(2026, 8, 3, tzinfo=UTC)
+    db = FakePostgresExecutor(fetchall_result=[{"id": 1}, {"id": 2}])
     repo = UserSegmentAssignmentRepository(db)
 
     inserted_count = repo.insert_many(
         [
-            UserSegmentAssignmentWrite(
-                project_id="hotel-client-a",
-                promotion_run_id="prun_banner_001_loop_1",
-                user_id="user_001",
+            assignment_write(
+                "user_001",
                 segment_id="seg_existing_all",
                 ad_experiment_id="adexp_existing_all_001",
                 content_id="content_existing_all_001",
@@ -765,17 +798,32 @@ def test_user_segment_assignment_repository_inserts_official_columns_only() -> N
                 similarity_score=Decimal("0.410000"),
                 fallback=True,
                 fallback_reason="below_threshold",
-                assignment_source=AssignmentSource.FALLBACK.value,
                 assigned_at=assigned_at,
                 expires_at=None,
-            )
+            ),
+            assignment_write(
+                "user_002",
+                segment_id="seg_family_trip",
+                ad_experiment_id="adexp_family_trip_001",
+                content_id="content_family_trip_001",
+                content_option_id="option_b",
+                similarity_score=None,
+                fallback=False,
+                fallback_reason=None,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+            ),
         ]
     )
 
-    assert inserted_count == 1
+    assert inserted_count == 2
     call = db.calls[0]
+    assert call.operation == "fetchall"
     sql = compact_sql(call.query)
+    assert "with assignment_rows as" in sql
     assert "insert into user_segment_assignments" in sql
+    assert "from unnest(" in sql
+    assert "with ordinality" in sql
     assert "promotion_run_id" in sql
     assert "user_id" in sql
     assert "segment_id" in sql

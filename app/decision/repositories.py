@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import math
-from typing import Any, Mapping, NamedTuple, Protocol, Sequence
+from typing import Any, Mapping, NamedTuple, Protocol, Sequence, TypeVar
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -13,6 +13,9 @@ from app.decision.matcher import (
     HNSW_EF_SEARCH as DEFAULT_HNSW_EF_SEARCH,
     HNSW_MAX_SCAN_TUPLES as DEFAULT_HNSW_MAX_SCAN_TUPLES,
 )
+
+
+_T = TypeVar("_T")
 
 
 class PostgresExecutor(Protocol):
@@ -1191,6 +1194,8 @@ class SegmentVectorRepository:
 
 
 class UserSegmentAssignmentRepository:
+    INSERT_BATCH_SIZE = 1000
+
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
 
@@ -1216,9 +1221,56 @@ class UserSegmentAssignmentRepository:
 
     def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
         inserted_count = 0
-        for assignment in assignments:
-            row = self._db.fetchone(
+        for chunk in _chunks(assignments, self.INSERT_BATCH_SIZE):
+            rows = self._db.fetchall(
                 """
+                WITH assignment_rows AS (
+                    SELECT
+                        project_id,
+                        promotion_run_id,
+                        user_id,
+                        segment_id,
+                        ad_experiment_id,
+                        content_id,
+                        content_option_id,
+                        similarity_score,
+                        fallback_value,
+                        fallback_reason,
+                        assignment_source,
+                        assigned_at,
+                        expires_at,
+                        row_ordinal
+                    FROM unnest(
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::numeric[],
+                        %s::boolean[],
+                        %s::text[],
+                        %s::text[],
+                        %s::timestamptz[],
+                        %s::timestamptz[]
+                    ) WITH ORDINALITY AS assignment_input(
+                        project_id,
+                        promotion_run_id,
+                        user_id,
+                        segment_id,
+                        ad_experiment_id,
+                        content_id,
+                        content_option_id,
+                        similarity_score,
+                        fallback_value,
+                        fallback_reason,
+                        assignment_source,
+                        assigned_at,
+                        expires_at,
+                        row_ordinal
+                    )
+                )
                 INSERT INTO user_segment_assignments (
                     project_id,
                     promotion_run_id,
@@ -1234,28 +1286,42 @@ class UserSegmentAssignmentRepository:
                     assigned_at,
                     expires_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                SELECT
+                    project_id,
+                    promotion_run_id,
+                    user_id,
+                    segment_id,
+                    ad_experiment_id,
+                    content_id,
+                    content_option_id,
+                    similarity_score,
+                    fallback_value,
+                    fallback_reason,
+                    assignment_source,
+                    assigned_at,
+                    expires_at
+                FROM assignment_rows
+                ORDER BY row_ordinal ASC
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
                 RETURNING id
                 """,
                 (
-                    assignment.project_id,
-                    assignment.promotion_run_id,
-                    assignment.user_id,
-                    assignment.segment_id,
-                    assignment.ad_experiment_id,
-                    assignment.content_id,
-                    assignment.content_option_id,
-                    assignment.similarity_score,
-                    assignment.fallback,
-                    assignment.fallback_reason,
-                    assignment.assignment_source,
-                    assignment.assigned_at,
-                    assignment.expires_at,
+                    [assignment.project_id for assignment in chunk],
+                    [assignment.promotion_run_id for assignment in chunk],
+                    [assignment.user_id for assignment in chunk],
+                    [assignment.segment_id for assignment in chunk],
+                    [assignment.ad_experiment_id for assignment in chunk],
+                    [assignment.content_id for assignment in chunk],
+                    [assignment.content_option_id for assignment in chunk],
+                    [assignment.similarity_score for assignment in chunk],
+                    [assignment.fallback for assignment in chunk],
+                    [assignment.fallback_reason for assignment in chunk],
+                    [assignment.assignment_source for assignment in chunk],
+                    [assignment.assigned_at for assignment in chunk],
+                    [assignment.expires_at for assignment in chunk],
                 ),
             )
-            if row is not None:
-                inserted_count += 1
+            inserted_count += len(rows)
         return inserted_count
 
     def count_by_run_segments(
@@ -1561,3 +1627,7 @@ def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
     if not all(math.isfinite(value) for value in numeric_values):
         raise ValueError("vector literal values must be finite")
     return "[" + ",".join(str(value) for value in numeric_values) + "]"
+
+
+def _chunks(items: Sequence[_T], size: int) -> list[Sequence[_T]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]

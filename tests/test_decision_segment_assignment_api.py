@@ -247,12 +247,12 @@ class RecordingCursor:
         sql = compact_sql(self._last_query)
         if "from promotion_runs" in sql:
             return self._connection.run_row
-        if "insert into user_segment_assignments" in sql:
-            return {"id": 1}
         return None
 
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
+        if "insert into user_segment_assignments" in sql:
+            return [{"id": 1}]
         if "from ad_experiments" in sql:
             return [
                 ad_experiment_row("seg_family_trip"),
