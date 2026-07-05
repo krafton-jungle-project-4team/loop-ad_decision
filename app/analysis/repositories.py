@@ -416,7 +416,7 @@ class PromotionAnalysisRepository:
                     reason_json,
                     metadata_json
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     suggestion.suggestion_id,
