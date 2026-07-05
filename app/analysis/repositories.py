@@ -201,6 +201,16 @@ class HotelMarketingProfileRecord:
     profile_json: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class BookingTrainingRecord:
+    is_mobile: float
+    is_package: float
+    stay_nights: float
+    days_until_checkin: float
+    event_count: int
+    booking_count: int
+
+
 class PromotionRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
@@ -695,6 +705,103 @@ class HotelProfileRepository:
                         6,
                     ),
                 },
+            )
+            for row in _clickhouse_rows(result)
+        ]
+
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        if not user_ids:
+            return None
+
+        result = self._client.query(
+            """
+            SELECT
+                count() AS event_count,
+                countIf(is_booking = 1) AS booking_count,
+                avg(is_mobile) AS mobile_ratio,
+                avg(is_package) AS package_ratio,
+                avg(stay_nights) AS avg_stay_nights,
+                avg(days_until_checkin) AS avg_days_until_checkin
+            FROM hotel_marketing_profiles
+            WHERE user_id IN {user_ids:Array(String)}
+            """,
+            parameters={"user_ids": list(user_ids)},
+        )
+        rows = _clickhouse_rows(result)
+        if not rows:
+            return None
+
+        row = rows[0]
+        event_count = int(_clickhouse_value(row, "event_count", 0) or 0)
+        if event_count <= 0:
+            return None
+
+        return HotelMarketingProfileRecord(
+            project_id=project_id,
+            profile_name=profile_name,
+            profile_json={
+                "event_count": event_count,
+                "booking_count": _clickhouse_value(row, "booking_count", 1),
+                "mobile_ratio": _clickhouse_value(row, "mobile_ratio", 2),
+                "package_ratio": _clickhouse_value(row, "package_ratio", 3),
+                "avg_stay_nights": _clickhouse_value(row, "avg_stay_nights", 4),
+                "avg_days_until_checkin": _clickhouse_value(
+                    row,
+                    "avg_days_until_checkin",
+                    5,
+                ),
+            },
+        )
+
+    def list_booking_training_records(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[BookingTrainingRecord]:
+        result = self._client.query(
+            """
+            SELECT
+                is_mobile,
+                is_package,
+                if(
+                    isNull(srch_ci) OR isNull(srch_co),
+                    0,
+                    least(greatest(dateDiff('day', srch_ci, srch_co), 0), 14)
+                ) AS stay_nights,
+                if(
+                    isNull(srch_ci),
+                    30,
+                    least(greatest(dateDiff('day', toDate(date_time), srch_ci), 0), 60)
+                ) AS days_until_checkin,
+                count() AS event_count,
+                countIf(is_booking = 1) AS booking_count
+            FROM expedia_hotel_events
+            GROUP BY
+                is_mobile,
+                is_package,
+                stay_nights,
+                days_until_checkin
+            ORDER BY event_count DESC
+            LIMIT {limit:UInt32}
+            """,
+            parameters={"limit": limit},
+        )
+        return [
+            BookingTrainingRecord(
+                is_mobile=float(_clickhouse_value(row, "is_mobile", 0)),
+                is_package=float(_clickhouse_value(row, "is_package", 1)),
+                stay_nights=float(_clickhouse_value(row, "stay_nights", 2)),
+                days_until_checkin=float(
+                    _clickhouse_value(row, "days_until_checkin", 3),
+                ),
+                event_count=int(_clickhouse_value(row, "event_count", 4)),
+                booking_count=int(_clickhouse_value(row, "booking_count", 5)),
             )
             for row in _clickhouse_rows(result)
         ]

@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 import pytest
 
 from app.analysis.repositories import (
+    BookingTrainingRecord,
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
@@ -88,9 +89,19 @@ class FakeSegmentDefinitionRepository:
 
 
 class FakeHotelProfileRepository:
-    def __init__(self, profiles: list[HotelMarketingProfileRecord]) -> None:
+    def __init__(
+        self,
+        profiles: list[HotelMarketingProfileRecord],
+        *,
+        user_profile_summaries: Mapping[str, HotelMarketingProfileRecord] | None = None,
+        booking_training_records: list[BookingTrainingRecord] | None = None,
+    ) -> None:
         self.profiles = profiles
+        self.user_profile_summaries = user_profile_summaries or {}
+        self.booking_training_records = booking_training_records or []
         self.calls: list[Mapping[str, str]] = []
+        self.user_profile_calls: list[Mapping[str, Any]] = []
+        self.training_calls: list[Mapping[str, int]] = []
 
     def list_marketing_profiles(
         self,
@@ -99,6 +110,30 @@ class FakeHotelProfileRepository:
     ) -> list[HotelMarketingProfileRecord]:
         self.calls.append({"project_id": project_id})
         return self.profiles
+
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        self.user_profile_calls.append(
+            {
+                "project_id": project_id,
+                "profile_name": profile_name,
+                "user_ids": list(user_ids),
+            }
+        )
+        return self.user_profile_summaries.get(profile_name)
+
+    def list_booking_training_records(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[BookingTrainingRecord]:
+        self.training_calls.append({"limit": limit})
+        return self.booking_training_records
 
 
 class FakePromotionAnalysisRepository:
@@ -238,6 +273,8 @@ def build_service(
     promotion: PromotionRecord | None,
     segments: list[SegmentDefinitionRecord],
     profiles: list[HotelMarketingProfileRecord] | None = None,
+    user_profile_summaries: Mapping[str, HotelMarketingProfileRecord] | None = None,
+    booking_training_records: list[BookingTrainingRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
     segment_suggester: FakeSegmentSuggester | None = None,
 ) -> tuple[
@@ -250,7 +287,11 @@ def build_service(
     service = PromotionAnalysisService(
         promotion_repository=FakePromotionRepository(promotion),
         segment_definition_repository=segment_definition_repository,
-        hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
+        hotel_profile_repository=FakeHotelProfileRepository(
+            profiles or [],
+            user_profile_summaries=user_profile_summaries,
+            booking_training_records=booking_training_records,
+        ),
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service,
         segment_suggester=segment_suggester,
@@ -507,6 +548,123 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
     )
+
+
+def test_service_ranks_ai_clusters_by_booking_propensity_model() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    high_cluster_low_booking = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_1_highcluster",
+            source="ai_suggested",
+            sample_size=1800,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_low_001", "user_low_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_1_highcluster",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.99,
+        },
+    )
+    lower_cluster_high_booking = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_2_ml",
+            source="ai_suggested",
+            sample_size=1800,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_ml_001", "user_ml_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_2_ml",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.55,
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester(
+            [high_cluster_low_booking, lower_cluster_high_booking]
+        ),
+        booking_training_records=[
+            BookingTrainingRecord(
+                is_mobile=0,
+                is_package=0,
+                stay_nights=1,
+                days_until_checkin=50,
+                event_count=100,
+                booking_count=4,
+            ),
+            BookingTrainingRecord(
+                is_mobile=1,
+                is_package=1,
+                stay_nights=4,
+                days_until_checkin=3,
+                event_count=100,
+                booking_count=72,
+            ),
+        ],
+        user_profile_summaries={
+            high_cluster_low_booking.segment_id: HotelMarketingProfileRecord(
+                project_id="hotel-client-a",
+                profile_name=high_cluster_low_booking.segment_id,
+                profile_json={
+                    "event_count": 80,
+                    "booking_count": 2,
+                    "mobile_ratio": 0.0,
+                    "package_ratio": 0.0,
+                    "avg_stay_nights": 1.0,
+                    "avg_days_until_checkin": 50.0,
+                },
+            ),
+            lower_cluster_high_booking.segment_id: HotelMarketingProfileRecord(
+                project_id="hotel-client-a",
+                profile_name=lower_cluster_high_booking.segment_id,
+                profile_json={
+                    "event_count": 80,
+                    "booking_count": 50,
+                    "mobile_ratio": 1.0,
+                    "package_ratio": 1.0,
+                    "avg_stay_nights": 4.0,
+                    "avg_days_until_checkin": 3.0,
+                },
+            ),
+        },
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments)[:2] == [
+        lower_cluster_high_booking.segment_id,
+        high_cluster_low_booking.segment_id,
+    ]
+    first_score = result.segment_suggestions[0].score_json
+    second_score = result.segment_suggestions[1].score_json
+    assert first_score["cluster_score"] < second_score["cluster_score"]
+    assert first_score["booking_propensity_score"] > second_score[
+        "booking_propensity_score"
+    ]
+    assert first_score["booking_propensity_model"] == "booking_propensity_logistic_v1"
+    assert first_score["booking_propensity_training_sample_count"] == 2
+    assert result.segment_suggestions[0].reason_json["ml_model"] == (
+        "booking_propensity_logistic_v1"
+    )
+    assert result.segment_suggestions[0].reason_json["ml_features"] == {
+        "mobile_ratio": 1.0,
+        "package_ratio": 1.0,
+        "stay_nights_scaled": 0.285714,
+        "near_checkin_score": 0.95,
+    }
 
 
 def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -> None:
