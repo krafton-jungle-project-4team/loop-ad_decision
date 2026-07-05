@@ -15,6 +15,7 @@ from app.decision.router import (
 )
 from app.dependencies import require_internal_key
 from app.generation.router import router as generation_router
+from app.internal.router import router as internal_batch_router
 
 
 def create_app(*, settings: Settings | None = None) -> FastAPI:
@@ -56,6 +57,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     app.include_router(decision_router)
     app.include_router(promotion_run_router)
     app.include_router(ad_experiment_router)
+    app.include_router(internal_batch_router)
     return app
 
 

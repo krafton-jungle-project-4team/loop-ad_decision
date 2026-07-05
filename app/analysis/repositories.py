@@ -530,15 +530,16 @@ class UserBehaviorVectorRepository:
             SELECT
                 project_id,
                 user_id,
-                vector_dim,
-                vector_values,
+                argMax(vector_dim, updated_at) AS vector_dim,
+                argMax(vector_values, updated_at) AS vector_values,
                 vector_version,
-                source
+                argMax(source, updated_at) AS source
             FROM user_behavior_vectors
             WHERE project_id = {project_id:String}
               AND vector_dim = {vector_dim:UInt16}
               AND vector_version = {vector_version:String}
               AND user_id IN {user_ids:Array(String)}
+            GROUP BY project_id, user_id, vector_version
             ORDER BY user_id ASC
             """,
             parameters={
@@ -575,15 +576,17 @@ class UserBehaviorVectorRepository:
             SELECT
                 project_id,
                 user_id,
-                vector_dim,
-                vector_values,
+                argMax(vector_dim, updated_at) AS vector_dim,
+                argMax(vector_values, updated_at) AS vector_values,
                 vector_version,
-                source
+                argMax(source, updated_at) AS source,
+                max(updated_at) AS last_updated_at
             FROM user_behavior_vectors
             WHERE project_id = {project_id:String}
               AND vector_dim = {vector_dim:UInt16}
               AND vector_version = {vector_version:String}
-            ORDER BY updated_at DESC, user_id ASC
+            GROUP BY project_id, user_id, vector_version
+            ORDER BY last_updated_at DESC, user_id ASC
             LIMIT {limit:UInt32}
             """,
             parameters={
