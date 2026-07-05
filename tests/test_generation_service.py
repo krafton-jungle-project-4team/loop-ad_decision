@@ -1,3 +1,5 @@
+import pytest
+
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import (
     GenerationPromptInput,
@@ -13,7 +15,7 @@ from app.generation.schemas import (
     ContentChannel,
     GenerationRequest,
 )
-from app.generation.service import GenerationService
+from app.generation.service import GenerationInputUnavailable, GenerationService
 
 
 class FakeGenerationRunRepository:
@@ -163,6 +165,22 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     assert response.content_candidates[0].content_option_id == (
         "banner_repeat_hotel_option_001"
     )
+
+
+def test_generation_service_requires_confirmed_target_segments_from_reader() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader([]),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match="promotion_target_segments"):
+        service.generate(generation_request(content_option_count=1))
+
+    assert generation_run_repository.saved == []
+    assert content_candidate_repository.saved == []
 
 
 def test_generation_service_creates_candidates_for_each_segment_option() -> None:
@@ -368,6 +386,40 @@ class StaticGenerationInputBuilder:
             )
             for target_segment in self._target_segments
         ]
+
+
+class StaticGenerationInputReader:
+    def __init__(
+        self,
+        target_segments: list[TargetSegmentPromptInput],
+        *,
+        channel: ContentChannel = ContentChannel.ONSITE_BANNER,
+    ) -> None:
+        self._target_segments = target_segments
+        self._channel = channel
+
+    def get_promotion_input(
+        self,
+        request: GenerationRequest,
+    ) -> PromotionPromptInput:
+        return PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=self._channel,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel booking conversion for summer stays.",
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+    def list_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        del request
+        return list(self._target_segments)
 
 
 class FailingContentGenerator:

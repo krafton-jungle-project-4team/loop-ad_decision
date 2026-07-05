@@ -180,6 +180,48 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
         sum("INSERT INTO content_candidates" in query for query in executed_queries)
         == 2
     )
+    assert any("FROM promotion_target_segments" in query for query in executed_queries)
+    assert all("promotion_segment_suggestions" not in query for query in executed_queries)
+
+
+def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(target_segment_rows=[])
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 409
+    assert "promotion_target_segments" in response.json()["detail"]
+
+    connection = connections[0]
+    executed_queries = [query for query, _params in connection.executed]
+    assert any("FROM promotion_target_segments" in query for query in executed_queries)
+    assert all("INSERT INTO generation_runs" not in query for query in executed_queries)
+    assert all("promotion_segment_suggestions" not in query for query in executed_queries)
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
 
 
 def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) -> None:
@@ -335,6 +377,7 @@ class FakeExternalContentGenerator:
 class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
+        self._last_query = ""
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -343,12 +386,17 @@ class RecordingCursor:
         return None
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> None:
+        self._last_query = query
         self._connection.executed.append((query, params))
 
     def fetchone(self) -> dict[str, object] | None:
-        return self._connection.fetchone_result
+        if "FROM promotions" in self._last_query:
+            return self._connection.promotion_row
+        return self._connection.insert_fetchone_result
 
     def fetchall(self) -> list[dict[str, object]]:
+        if "FROM promotion_target_segments" in self._last_query:
+            return self._connection.target_segment_rows
         return []
 
 
@@ -357,11 +405,56 @@ class RecordingConnection:
         self,
         *,
         fetchone_result: dict[str, object] | None | object = DEFAULT_FETCHONE_RESULT,
+        target_segment_rows: list[dict[str, object]] | None = None,
     ) -> None:
-        self.fetchone_result = (
+        self.insert_fetchone_result = (
             {"ok": True}
             if fetchone_result is DEFAULT_FETCHONE_RESULT
             else fetchone_result
+        )
+        self.promotion_row = {
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "channel": "onsite_banner",
+            "goal_metric": "booking_conversion_rate",
+            "goal_target_value": "0.030000",
+            "goal_basis": "all_segments",
+            "message_brief": "Drive hotel booking conversion for summer stays.",
+            "landing_url": "https://demo-stay.example.com/summer",
+        }
+        self.target_segment_rows = (
+            target_segment_rows
+            if target_segment_rows is not None
+            else [
+                {
+                    "analysis_id": "analysis_banner_001",
+                    "promotion_id": "promo_banner_001",
+                    "segment_id": "seg_repeat_hotel_no_booking",
+                    "segment_name": "Repeat hotel viewers without booking",
+                    "content_brief_json": {
+                        "message_direction": (
+                            "Emphasize refundable rooms and clear booking steps."
+                        ),
+                        "keywords": ["refundable rooms", "hotel deals"],
+                    },
+                    "data_evidence_json": {
+                        "source": "ai_suggested",
+                        "sample_ratio": "0.018000",
+                    },
+                    "segment_vector_id": "segvec_repeat_hotel_v1",
+                    "estimated_size": 1342,
+                    "priority": "high",
+                    "segment_source": "ai_suggested",
+                    "query_preview_id": None,
+                    "natural_language_query": (
+                        "repeat hotel viewers who did not book"
+                    ),
+                    "generated_sql": None,
+                    "segment_sample_size": 1342,
+                    "segment_sample_ratio": "0.018000",
+                }
+            ]
         )
         self.executed: list[tuple[str, dict[str, object] | None]] = []
         self.row_factories: list[object] = []
