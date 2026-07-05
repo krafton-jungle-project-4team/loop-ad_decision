@@ -168,12 +168,14 @@ def test_analysis_requires_mandatory_fields() -> None:
 
 
 def test_analysis_rejects_focus_segment_ids() -> None:
-    response = make_client(FakeAnalysisService()).post(
+    service = FakeAnalysisService()
+    response = make_client(service).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
         json=analysis_payload(focus_segment_ids=["seg_family_trip"]),
     )
 
     assert response.status_code == 422
+    assert service.calls == []
 
 
 def test_analysis_rejects_promotion_id_mismatch() -> None:
@@ -240,6 +242,10 @@ class FakeAnalysisService:
         self.calls.append(request)
         if self.exc is not None:
             raise self.exc
+        focus_segment_ids = getattr(request, "focus_segment_ids", None)
+        segment_id = (
+            focus_segment_ids[0] if focus_segment_ids else "seg_repeat_hotel_no_booking"
+        )
         return PromotionAnalysisResult(
             analysis=PromotionAnalysisWrite(
                 analysis_id=f"analysis_{request.promotion_id}",
@@ -247,7 +253,7 @@ class FakeAnalysisService:
                 campaign_id=request.campaign_id,
                 promotion_id=request.promotion_id,
                 status=AnalysisStatus.COMPLETED.value,
-                focus_segment_ids_json=None,
+                focus_segment_ids_json=focus_segment_ids,
                 operator_instruction=request.operator_instruction,
                 input_snapshot_json={},
                 profile_summary_json={},
@@ -259,7 +265,7 @@ class FakeAnalysisService:
                     project_id=request.project_id,
                     campaign_id=request.campaign_id,
                     promotion_id=request.promotion_id,
-                    segment_id="seg_repeat_hotel_no_booking",
+                    segment_id=segment_id,
                     segment_name="Repeat hotel viewers without booking",
                     rule_json={},
                     profile_json={},

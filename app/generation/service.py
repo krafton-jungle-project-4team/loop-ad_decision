@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Any, Protocol, Sequence
 
 from app.generation.generator import (
@@ -65,6 +66,26 @@ class GenerationRequestHandler(Protocol):
 
 class GenerationInputUnavailable(RuntimeError):
     """Raised when confirmed generation input rows are not ready yet."""
+
+
+@dataclass(frozen=True)
+class NextLoopFocusGenerationRequest:
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    analysis_id: str
+    focus_segment_ids: Sequence[str]
+    loop_count: int
+    source_promotion_run_id: str
+    source_generation_id: str
+    operator_instruction: str | None = None
+
+
+@dataclass(frozen=True)
+class NextLoopFocusGenerationResult:
+    generation_id: str
+    generated_segment_ids: list[str]
+    status: GenerationStatus
 
 
 class GenerationService:
@@ -140,6 +161,74 @@ class GenerationService:
             ],
         )
 
+    def generate_focus(
+        self,
+        request: NextLoopFocusGenerationRequest,
+    ) -> NextLoopFocusGenerationResult:
+        generation_request = GenerationRequest(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            analysis_id=request.analysis_id,
+            content_option_count=1,
+            operator_instruction=request.operator_instruction,
+        )
+        generation_id = _generation_id_from_promotion(
+            request.promotion_id,
+            loop_count=request.loop_count,
+        )
+        prompt_inputs = self._build_focus_prompt_inputs(
+            request=generation_request,
+            focus_segment_ids=request.focus_segment_ids,
+        )
+        try:
+            content_candidates = self._build_content_candidate_records(
+                request=generation_request,
+                generation_id=generation_id,
+                prompt_inputs=prompt_inputs,
+                # v1.7 section 6.8 does not specify a separate approval gate for
+                # next-loop regenerated content. Temporarily approve the
+                # single internal focus candidate so /next-loop can create
+                # the next run; this may change if the team chooses draft +
+                # explicit approval for next-loop content.
+                candidate_status=ContentCandidateStatus.APPROVED,
+            )
+        except Exception as exc:
+            generation_run = self._build_generation_run_record(
+                request=generation_request,
+                generation_id=generation_id,
+                prompt_inputs=prompt_inputs,
+                content_candidates=[],
+                status=GenerationStatus.FAILED,
+                error_code=_safe_generation_error_code(exc),
+                source_context=_next_loop_source_context(request),
+            )
+            self._save_generation_run(generation_run)
+            return NextLoopFocusGenerationResult(
+                generation_id=generation_id,
+                generated_segment_ids=[],
+                status=GenerationStatus.FAILED,
+            )
+
+        generation_run = self._build_generation_run_record(
+            request=generation_request,
+            generation_id=generation_id,
+            prompt_inputs=prompt_inputs,
+            content_candidates=content_candidates,
+            status=GenerationStatus.COMPLETED,
+            source_context=_next_loop_source_context(request),
+        )
+        self._save_generation_run(generation_run)
+        self._save_content_candidates(content_candidates)
+
+        return NextLoopFocusGenerationResult(
+            generation_id=generation_id,
+            generated_segment_ids=[
+                prompt_input.target_segment.segment_id for prompt_input in prompt_inputs
+            ],
+            status=GenerationStatus.COMPLETED,
+        )
+
     def _build_generation_run_record(
         self,
         *,
@@ -149,6 +238,7 @@ class GenerationService:
         content_candidates: Sequence[ContentCandidateRecord],
         status: GenerationStatus,
         error_code: str | None = None,
+        source_context: dict[str, Any] | None = None,
     ) -> GenerationRunRecord:
         output_json = self._generation_report_builder.build_run_output(
             status=status,
@@ -170,6 +260,24 @@ class GenerationService:
         if error_code:
             generation_report_json["error_code"] = error_code
 
+        input_json: dict[str, Any] = {
+            "project_id": request.project_id,
+            "campaign_id": request.campaign_id,
+            "promotion_id": request.promotion_id,
+            "analysis_id": request.analysis_id,
+            "content_option_count": request.content_option_count,
+            "operator_instruction": request.operator_instruction,
+            "target_segment_ids": [
+                prompt_input.target_segment.segment_id
+                for prompt_input in prompt_inputs
+            ],
+            "channel": prompt_inputs[0].promotion.channel.value
+            if prompt_inputs
+            else None,
+        }
+        if source_context is not None:
+            input_json["next_loop"] = source_context
+
         return GenerationRunRecord(
             generation_id=generation_id,
             analysis_id=request.analysis_id,
@@ -178,21 +286,7 @@ class GenerationService:
             promotion_id=request.promotion_id,
             content_option_count=request.content_option_count,
             operator_instruction=request.operator_instruction,
-            input_json={
-                "project_id": request.project_id,
-                "campaign_id": request.campaign_id,
-                "promotion_id": request.promotion_id,
-                "analysis_id": request.analysis_id,
-                "content_option_count": request.content_option_count,
-                "operator_instruction": request.operator_instruction,
-                "target_segment_ids": [
-                    prompt_input.target_segment.segment_id
-                    for prompt_input in prompt_inputs
-                ],
-                "channel": prompt_inputs[0].promotion.channel.value
-                if prompt_inputs
-                else None,
-            },
+            input_json=input_json,
             output_json=output_json,
             generation_report_json=generation_report_json,
             status=status.value,
@@ -229,18 +323,62 @@ class GenerationService:
             target_segments=[_fixture_target_segment_prompt_input(request)],
         )
 
+    def _build_focus_prompt_inputs(
+        self,
+        *,
+        request: GenerationRequest,
+        focus_segment_ids: Sequence[str],
+    ) -> list[GenerationPromptInput]:
+        if self._generation_input_reader is None:
+            raise ValueError("generation input reader is required for focus generation")
+
+        promotion = self._generation_input_reader.get_promotion_input(request)
+        if promotion is None:
+            raise ValueError("promotion input was not found for focus generation")
+
+        target_segments = self._generation_input_reader.list_target_segment_inputs(
+            request
+        )
+        if not target_segments:
+            raise ValueError(
+                "confirmed promotion_target_segments are required for focus generation"
+            )
+        focus_ids = _focus_segment_ids(focus_segment_ids)
+        target_segments_by_id = {
+            target_segment.segment_id: target_segment
+            for target_segment in target_segments
+        }
+        missing_segment_ids = [
+            segment_id
+            for segment_id in focus_ids
+            if segment_id not in target_segments_by_id
+        ]
+        if missing_segment_ids:
+            raise ValueError("focus_segment_ids must match promotion_target_segments")
+
+        return self._generation_input_builder.build(
+            request=request,
+            promotion=promotion,
+            target_segments=[
+                target_segments_by_id[segment_id]
+                for segment_id in focus_ids
+            ],
+        )
+
     def _build_content_candidate_records(
         self,
         *,
         request: GenerationRequest,
         generation_id: str,
         prompt_inputs: Sequence[GenerationPromptInput],
+        candidate_status: ContentCandidateStatus = ContentCandidateStatus.DRAFT,
     ) -> list[ContentCandidateRecord]:
         return [
             self._build_content_candidate_record(
                 generation_id=generation_id,
                 prompt_input=prompt_input,
                 index=index,
+                status=candidate_status,
             )
             for prompt_input in prompt_inputs
             for index in range(1, request.content_option_count + 1)
@@ -252,6 +390,7 @@ class GenerationService:
         generation_id: str,
         prompt_input: GenerationPromptInput,
         index: int,
+        status: ContentCandidateStatus,
     ) -> ContentCandidateRecord:
         prompt_result = self._prompt_builder.build(prompt_input)
         channel = prompt_input.promotion.channel
@@ -273,7 +412,7 @@ class GenerationService:
             content_option_id=content_option_id,
             content_generator_version=self._content_generator_version,
             content_values=content_values,
-            status=ContentCandidateStatus.DRAFT.value,
+            status=status.value,
         )
 
         return ContentCandidateRecord(
@@ -300,7 +439,7 @@ class GenerationService:
             data_evidence_json=candidate_report.data_evidence_json,
             message_strategy=candidate_report.message_strategy,
             metadata_json=candidate_report.metadata_json,
-            status=ContentCandidateStatus.DRAFT.value,
+            status=status.value,
         )
 
     def _save_generation_run(self, generation_run: GenerationRunRecord) -> None:
@@ -318,10 +457,38 @@ class GenerationService:
             self._content_candidate_repository.create(content_candidate)
 
 
-def _generation_id_from_promotion(promotion_id: str) -> str:
+def _generation_id_from_promotion(
+    promotion_id: str,
+    *,
+    loop_count: int | None = None,
+) -> str:
     promotion_slug = promotion_id.removeprefix("promo_")
     safe_slug = re.sub(r"[^a-zA-Z0-9_]+", "_", promotion_slug).strip("_")
+    if loop_count is not None:
+        return f"generation_{safe_slug or 'content'}_loop_{loop_count}"
     return f"generation_{safe_slug or 'content'}"
+
+
+def _focus_segment_ids(values: Sequence[str]) -> list[str]:
+    cleaned = [str(value).strip() for value in values]
+    if not cleaned:
+        raise ValueError("focus_segment_ids must contain at least one segment")
+    if any(not value for value in cleaned):
+        raise ValueError("focus_segment_ids must not contain empty values")
+    if len(set(cleaned)) != len(cleaned):
+        raise ValueError("focus_segment_ids must not contain duplicates")
+    return cleaned
+
+
+def _next_loop_source_context(
+    request: NextLoopFocusGenerationRequest,
+) -> dict[str, Any]:
+    return {
+        "loop_count": request.loop_count,
+        "source_promotion_run_id": request.source_promotion_run_id,
+        "source_generation_id": request.source_generation_id,
+        "focus_segment_ids": list(request.focus_segment_ids),
+    }
 
 
 def _fixture_promotion_prompt_input(

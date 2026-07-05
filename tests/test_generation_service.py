@@ -15,7 +15,11 @@ from app.generation.schemas import (
     ContentChannel,
     GenerationRequest,
 )
-from app.generation.service import GenerationInputUnavailable, GenerationService
+from app.generation.service import (
+    GenerationInputUnavailable,
+    GenerationService,
+    NextLoopFocusGenerationRequest,
+)
 
 
 class FakeGenerationRunRepository:
@@ -232,6 +236,64 @@ def test_generation_service_creates_candidates_for_focus_segment_only() -> None:
     }
 
 
+def test_generation_service_generates_next_loop_focus_candidate_as_approved() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                ),
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_mobile_user",
+                    content_slug="mobile_user",
+                ),
+            ]
+        ),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+            operator_instruction="Stress breakfast.",
+        )
+    )
+
+    assert result.generation_id == "generation_banner_001_loop_2"
+    assert result.generated_segment_ids == ["seg_near_checkin"]
+    assert result.status == "completed"
+    assert len(generation_run_repository.saved) == 1
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.input_json["target_segment_ids"] == ["seg_near_checkin"]
+    assert generation_run.input_json["content_option_count"] == 1
+    assert generation_run.input_json["next_loop"] == {
+        "loop_count": 2,
+        "source_promotion_run_id": "prun_banner_001_loop_1",
+        "source_generation_id": "generation_banner_001",
+        "focus_segment_ids": ["seg_near_checkin"],
+    }
+    assert len(content_candidate_repository.saved) == 1
+    assert {
+        candidate.segment_id for candidate in content_candidate_repository.saved
+    } == {"seg_near_checkin"}
+    assert {
+        candidate.status for candidate in content_candidate_repository.saved
+    } == {"approved"}
+
+
 def test_generation_service_records_failed_run_when_generator_fails() -> None:
     generation_run_repository = FakeGenerationRunRepository()
     content_candidate_repository = FakeContentCandidateRepository()
@@ -437,14 +499,16 @@ class FailingContentGenerator:
 def target_segment_input(
     *,
     index: int = 1,
+    analysis_id: str = "analysis_banner_001",
+    segment_id: str | None = None,
     content_slug: str = "repeat_hotel",
     generated_sql: str | None = None,
     query_preview_id: str | None = None,
 ) -> TargetSegmentPromptInput:
     return TargetSegmentPromptInput(
-        analysis_id="analysis_banner_001",
+        analysis_id=analysis_id,
         promotion_id="promo_banner_001",
-        segment_id=f"seg_{content_slug}_{index:03d}",
+        segment_id=segment_id or f"seg_{content_slug}_{index:03d}",
         segment_name=f"Hotel audience segment {index}",
         content_slug=content_slug,
         content_brief_json={

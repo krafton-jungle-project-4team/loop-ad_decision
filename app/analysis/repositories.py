@@ -424,6 +424,49 @@ class PromotionAnalysisRepository:
                 ),
             )
 
+    def save_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        for segment in target_segments:
+            self._db.execute(
+                """
+                INSERT INTO promotion_target_segments (
+                    analysis_id,
+                    project_id,
+                    campaign_id,
+                    promotion_id,
+                    segment_id,
+                    segment_name,
+                    rule_json,
+                    profile_json,
+                    content_brief_json,
+                    data_evidence_json,
+                    segment_vector_id,
+                    estimated_size,
+                    priority,
+                    status
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    segment.analysis_id,
+                    segment.project_id,
+                    segment.campaign_id,
+                    segment.promotion_id,
+                    segment.segment_id,
+                    segment.segment_name,
+                    segment.rule_json,
+                    segment.profile_json,
+                    segment.content_brief_json,
+                    segment.data_evidence_json,
+                    segment.segment_vector_id,
+                    segment.estimated_size,
+                    segment.priority,
+                    segment.status,
+                ),
+            )
+
 
 class SegmentVectorRepository:
     VECTOR_DIM = 64

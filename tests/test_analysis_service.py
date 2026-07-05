@@ -16,6 +16,7 @@ from app.analysis.repositories import (
 )
 from app.analysis.schemas import AnalysisRequest
 from app.analysis.service import (
+    NextLoopFocusAnalysisRequest,
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
@@ -29,6 +30,7 @@ from app.analysis.vector_service import (
 @dataclass
 class SavedAnalysis:
     analysis: PromotionAnalysisWrite | None = None
+    target_segments: list[PromotionTargetSegmentWrite] | None = None
     segment_suggestions: list[PromotionSegmentSuggestionWrite] | None = None
 
 
@@ -107,6 +109,13 @@ class FakePromotionAnalysisRepository:
     def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
         self.saved.analysis = analysis
         self.events.append("analysis")
+
+    def save_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        self.saved.target_segments = list(target_segments)
+        self.events.append("target_segments")
 
     def save_segment_suggestions(
         self,
@@ -342,6 +351,54 @@ def test_service_applies_sms_default_segment_order() -> None:
         "seg_mobile_user",
         "seg_family_trip",
         "seg_existing_all",
+    ]
+
+
+def test_service_analyzes_focus_segment_ids_only() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    vector_service = FakeSegmentVectorService()
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_vector_service=vector_service,
+    )
+
+    result = service.analyze_focus(
+        NextLoopFocusAnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_failed_ad_experiment_ids=["adexp_near_checkin_001"],
+            operator_instruction="Stress breakfast.",
+        ),
+    )
+
+    assert segment_ids(result.target_segments) == ["seg_near_checkin"]
+    assert analysis_repository.saved.target_segments == result.target_segments
+    assert analysis_repository.events == [
+        "analysis",
+        "target_segments",
+        "segment_suggestions",
+    ]
+    saved_analysis = analysis_repository.saved.analysis
+    assert saved_analysis is not None
+    assert saved_analysis.focus_segment_ids_json == ["seg_near_checkin"]
+    assert saved_analysis.input_snapshot_json["focus_segment_ids"] == [
+        "seg_near_checkin"
+    ]
+    assert saved_analysis.operator_instruction == "Stress breakfast."
+    assert saved_analysis.profile_summary_json["selection_mode"] == "focus"
+    assert vector_service.calls == [
+        SegmentVectorBuildRequest(
+                project_id="hotel-client-a",
+                promotion_id=promotion.promotion_id,
+                analysis_id=result.analysis.analysis_id,
+                segment_id="seg_near_checkin",
+                candidate_user_ids=[],
+            )
     ]
 
 

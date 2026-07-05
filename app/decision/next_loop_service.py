@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
+from app.analysis.service import (
+    NextLoopFocusAnalysisRequest,
+    PromotionAnalysisService,
+    PromotionNotFoundError as AnalysisPromotionNotFoundError,
+    SegmentSelectionError,
+)
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
@@ -18,6 +24,15 @@ from app.decision.schemas import (
     PromotionEvaluationStatus,
     RunCreateRequest,
     RunCreateResponse,
+)
+from app.decision.service import (
+    PromotionNotFoundError as RunPromotionNotFoundError,
+    RunConflictError,
+    RunValidationError,
+)
+from app.generation.service import (
+    GenerationService,
+    NextLoopFocusGenerationRequest,
 )
 
 COMPLETED_STATUS = "completed"
@@ -75,6 +90,7 @@ class NextLoopGenerationGateway(Protocol):
         focus_segment_ids: Sequence[str],
         loop_count: int,
         source_promotion_run_id: str,
+        source_generation_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
         ...
@@ -130,6 +146,7 @@ class UnavailableNextLoopGenerationGateway:
         focus_segment_ids: Sequence[str],
         loop_count: int,
         source_promotion_run_id: str,
+        source_generation_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
         _ = (
@@ -140,11 +157,93 @@ class UnavailableNextLoopGenerationGateway:
             focus_segment_ids,
             loop_count,
             source_promotion_run_id,
+            source_generation_id,
             operator_instruction,
         )
         raise NextLoopValidationError(
             "next-loop generation integration is not configured; Owner 3 "
             "promotion_target_segments based generation is required"
+        )
+
+
+class ServiceNextLoopAnalysisGateway:
+    def __init__(self, analysis_service: PromotionAnalysisService) -> None:
+        self._analysis_service = analysis_service
+
+    def start_analysis(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
+        source_failed_ad_experiment_ids: Sequence[str],
+        operator_instruction: str | None,
+    ) -> NextLoopAnalysisResult:
+        try:
+            result = self._analysis_service.analyze_focus(
+                NextLoopFocusAnalysisRequest(
+                    project_id=project_id,
+                    campaign_id=campaign_id,
+                    promotion_id=promotion_id,
+                    focus_segment_ids=focus_segment_ids,
+                    loop_count=loop_count,
+                    source_promotion_run_id=source_promotion_run_id,
+                    source_failed_ad_experiment_ids=source_failed_ad_experiment_ids,
+                    operator_instruction=operator_instruction,
+                )
+            )
+        except (AnalysisPromotionNotFoundError, SegmentSelectionError) as exc:
+            raise NextLoopValidationError(str(exc)) from exc
+
+        return NextLoopAnalysisResult(
+            analysis_id=result.analysis.analysis_id,
+            target_segment_ids=[
+                target_segment.segment_id for target_segment in result.target_segments
+            ],
+        )
+
+
+class ServiceNextLoopGenerationGateway:
+    def __init__(self, generation_service: GenerationService) -> None:
+        self._generation_service = generation_service
+
+    def start_generation(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        focus_segment_ids: Sequence[str],
+        loop_count: int,
+        source_promotion_run_id: str,
+        source_generation_id: str,
+        operator_instruction: str | None,
+    ) -> NextLoopGenerationResult:
+        try:
+            result = self._generation_service.generate_focus(
+                NextLoopFocusGenerationRequest(
+                    project_id=project_id,
+                    campaign_id=campaign_id,
+                    promotion_id=promotion_id,
+                    analysis_id=analysis_id,
+                    focus_segment_ids=focus_segment_ids,
+                    loop_count=loop_count,
+                    source_promotion_run_id=source_promotion_run_id,
+                    source_generation_id=source_generation_id,
+                    operator_instruction=operator_instruction,
+                )
+            )
+        except ValueError as exc:
+            raise NextLoopValidationError(str(exc)) from exc
+
+        return NextLoopGenerationResult(
+            generation_id=result.generation_id,
+            generated_segment_ids=result.generated_segment_ids,
+            status=result.status.value,
         )
 
 
@@ -156,17 +255,17 @@ class NextLoopService:
         promotion_run_repository: PromotionRunWriter,
         ad_experiment_repository: AdExperimentWriter,
         promotion_evaluation_repository: PromotionEvaluationWriter,
-        promotion_run_creator: PromotionRunCreator,
         analysis_gateway: NextLoopAnalysisGateway,
         generation_gateway: NextLoopGenerationGateway,
+        run_creator: PromotionRunCreator,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
         self._promotion_evaluation_repository = promotion_evaluation_repository
-        self._promotion_run_creator = promotion_run_creator
         self._analysis_gateway = analysis_gateway
         self._generation_gateway = generation_gateway
+        self._run_creator = run_creator
 
     def create_next_loop(
         self,
@@ -243,6 +342,7 @@ class NextLoopService:
             focus_segment_ids=failed_segment_ids,
             loop_count=next_loop_count,
             source_promotion_run_id=previous_run.promotion_run_id,
+            source_generation_id=previous_run.generation_id,
             operator_instruction=request.operator_instruction,
         )
         _validate_generation_completed(generation_result)
@@ -252,30 +352,36 @@ class NextLoopService:
             actual_segment_ids=generation_result.generated_segment_ids,
         )
 
-        created_run = self._promotion_run_creator.create_run(
-            promotion_id=previous_run.promotion_id,
-            request=RunCreateRequest(
-                analysis_id=analysis_result.analysis_id,
-                generation_id=generation_result.generation_id,
-                loop_count=next_loop_count,
-            ),
-        )
+        try:
+            run_result = self._run_creator.create_run(
+                promotion_id=previous_run.promotion_id,
+                request=RunCreateRequest(
+                    analysis_id=analysis_result.analysis_id,
+                    generation_id=generation_result.generation_id,
+                    loop_count=next_loop_count,
+                ),
+            )
+        except (RunPromotionNotFoundError, RunValidationError) as exc:
+            raise NextLoopValidationError(str(exc)) from exc
+        except RunConflictError as exc:
+            raise NextLoopConflictError(str(exc)) from exc
+
         _validate_gateway_segments(
             label="created ad_experiments",
             expected_segment_ids=failed_segment_ids,
             actual_segment_ids=[
-                experiment.segment_id for experiment in created_run.ad_experiments
+                experiment.segment_id for experiment in run_result.ad_experiments
             ],
         )
 
         return NextLoopResponse(
             previous_promotion_run_id=previous_run.promotion_run_id,
-            next_promotion_run_id=created_run.promotion_run_id,
-            promotion_id=previous_run.promotion_id,
-            loop_count=created_run.loop_count,
-            next_analysis_id=analysis_result.analysis_id,
-            next_generation_id=generation_result.generation_id,
-            next_ad_experiments=created_run.ad_experiments,
+            next_promotion_run_id=run_result.promotion_run_id,
+            promotion_id=run_result.promotion_id,
+            loop_count=run_result.loop_count,
+            next_analysis_id=run_result.analysis_id,
+            next_generation_id=run_result.generation_id,
+            next_ad_experiments=run_result.ad_experiments,
         )
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:

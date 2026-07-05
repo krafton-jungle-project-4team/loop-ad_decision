@@ -48,6 +48,7 @@ FORBIDDEN_PUBLIC_TERMS = tuple(
 @dataclass
 class SavedAnalysis:
     analysis: PromotionAnalysisWrite | None = None
+    target_segments: list[PromotionTargetSegmentWrite] | None = None
     segment_suggestions: list[PromotionSegmentSuggestionWrite] | None = None
 
 
@@ -115,6 +116,13 @@ class FakePromotionAnalysisRepository:
     def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
         self.saved.analysis = analysis
         self.events.append("analysis")
+
+    def save_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentWrite],
+    ) -> None:
+        self.saved.target_segments = list(target_segments)
+        self.events.append("target_segments")
 
     def save_segment_suggestions(
         self,
@@ -438,6 +446,7 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "total_eligible_users": 74200,
         "candidate_segment_count": 5,
         "selected_segment_count": 4,
+        "selection_mode": "default",
         "reason": (
             "Selected hotel audience segments by channel, goal metric, "
             "and active segment definitions."
@@ -447,8 +456,10 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
     assert set(saved_analysis.input_snapshot_json) == {
         "promotion",
         "available_segment_definitions",
+        "focus_segment_ids",
         "operator_instruction",
     }
+    assert saved_analysis.input_snapshot_json["focus_segment_ids"] is None
     assert saved_analysis.input_snapshot_json["promotion"] == {
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",

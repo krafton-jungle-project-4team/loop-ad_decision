@@ -8,6 +8,18 @@ from fastapi.encoders import jsonable_encoder
 from psycopg import IntegrityError, errors
 from pydantic import ValidationError
 
+from app.analysis.repositories import (
+    HotelProfileRepository as AnalysisHotelProfileRepository,
+    PromotionAnalysisRepository as AnalysisPromotionAnalysisRepository,
+    PromotionRepository as AnalysisPromotionRepository,
+    PsycopgPostgresExecutor as AnalysisPostgresExecutor,
+    SegmentDefinitionRepository as AnalysisSegmentDefinitionRepository,
+    SegmentVectorRepository as AnalysisSegmentVectorRepository,
+    UserBehaviorVectorRepository as AnalysisUserBehaviorVectorRepository,
+)
+from app.analysis.segment_suggester import VectorClusterSegmentSuggester
+from app.analysis.service import PromotionAnalysisService
+from app.analysis.vector_service import SegmentVectorService
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.decision.assignment_service import (
     SegmentAssignmentRunNotFoundError,
@@ -28,8 +40,8 @@ from app.decision.next_loop_service import (
     NextLoopNotFoundError,
     NextLoopService,
     NextLoopValidationError,
-    UnavailableNextLoopAnalysisGateway,
-    UnavailableNextLoopGenerationGateway,
+    ServiceNextLoopAnalysisGateway,
+    ServiceNextLoopGenerationGateway,
 )
 from app.decision.repositories import (
     AdExperimentRepository,
@@ -65,12 +77,25 @@ from app.decision.service import (
     RunValidationError,
 )
 from app.dependencies import get_settings
+from app.generation.adapters import build_external_content_generator
+from app.generation.repositories import (
+    ContentCandidateRepository as GenerationContentCandidateRepository,
+    GenerationInputRepository,
+    GenerationRunRepository as GenerationGenerationRunRepository,
+)
+from app.generation.service import GenerationService
 
 
 UNIQUE_CONSTRAINTS = {
+    "promotion_analyses_pkey",
+    "generation_runs_pkey",
+    "content_candidates_pkey",
+    "uq_content_candidates_one_approved_per_segment",
     "uq_promotion_runs_loop",
     "uq_ad_experiments_segment_per_run",
 }
+
+APPROVED_CONTENT_UNIQUE_CONSTRAINT = "uq_content_candidates_one_approved_per_segment"
 
 
 router = APIRouter(
@@ -207,22 +232,58 @@ def get_promotion_run_evaluation_service(
 def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
+    clickhouse_client = None
     executor = PsycopgPostgresExecutor(connection)
     promotion_repository = PromotionRepository(executor)
-    promotion_analysis_repository = PromotionAnalysisRepository(executor)
-    promotion_target_segment_repository = PromotionTargetSegmentRepository(executor)
-    generation_run_repository = GenerationRunRepository(executor)
-    content_candidate_repository = ContentCandidateRepository(executor)
     promotion_run_repository = PromotionRunRepository(executor)
     ad_experiment_repository = AdExperimentRepository(executor)
     promotion_evaluation_repository = PromotionEvaluationRepository(executor)
     try:
-        promotion_run_service = PromotionRunService(
-            promotion_repository=promotion_repository,
-            promotion_analysis_repository=promotion_analysis_repository,
-            promotion_target_segment_repository=promotion_target_segment_repository,
+        clickhouse_client = create_clickhouse_client(settings)
+        analysis_executor = AnalysisPostgresExecutor(connection)
+        analysis_user_behavior_vector_repository = AnalysisUserBehaviorVectorRepository(
+            clickhouse_client
+        )
+        analysis_segment_vector_repository = AnalysisSegmentVectorRepository(
+            analysis_executor
+        )
+        analysis_service = PromotionAnalysisService(
+            promotion_repository=AnalysisPromotionRepository(analysis_executor),
+            segment_definition_repository=AnalysisSegmentDefinitionRepository(
+                analysis_executor,
+            ),
+            hotel_profile_repository=AnalysisHotelProfileRepository(clickhouse_client),
+            promotion_analysis_repository=AnalysisPromotionAnalysisRepository(
+                analysis_executor,
+            ),
+            segment_vector_service=SegmentVectorService(
+                segment_vector_repository=analysis_segment_vector_repository,
+                user_behavior_vector_repository=analysis_user_behavior_vector_repository,
+            ),
+            segment_suggester=VectorClusterSegmentSuggester(
+                user_behavior_vector_repository=analysis_user_behavior_vector_repository,
+            ),
+        )
+        content_generator = None
+        if settings.env != "test":
+            content_generator = build_external_content_generator(settings)
+        generation_run_repository = GenerationGenerationRunRepository(connection)
+        generation_service = GenerationService(
             generation_run_repository=generation_run_repository,
-            content_candidate_repository=content_candidate_repository,
+            content_candidate_repository=GenerationContentCandidateRepository(
+                connection
+            ),
+            generation_input_reader=GenerationInputRepository(connection),
+            content_generator=content_generator,
+        )
+        run_creator = PromotionRunService(
+            promotion_repository=promotion_repository,
+            promotion_analysis_repository=PromotionAnalysisRepository(executor),
+            promotion_target_segment_repository=PromotionTargetSegmentRepository(
+                executor,
+            ),
+            generation_run_repository=GenerationRunRepository(executor),
+            content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
         )
@@ -231,9 +292,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
-            promotion_run_creator=promotion_run_service,
-            analysis_gateway=UnavailableNextLoopAnalysisGateway(),
-            generation_gateway=UnavailableNextLoopGenerationGateway(),
+            analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
+            generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
+            run_creator=run_creator,
         )
         connection.commit()
     except Exception:
@@ -241,6 +302,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
         raise
     finally:
         connection.close()
+        _close_clickhouse_client(clickhouse_client)
 
 
 @router.post(
@@ -391,7 +453,7 @@ async def create_next_loop(
         if _is_unique_violation(exc):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="next promotion run or ad experiment already exists",
+                detail=_next_loop_unique_violation_detail(exc),
             ) from exc
         raise
 
@@ -515,8 +577,18 @@ async def _parse_next_loop_request(request: Request) -> NextLoopRequest:
 def _is_unique_violation(exc: IntegrityError) -> bool:
     if isinstance(exc, errors.UniqueViolation):
         return True
-    constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    constraint_name = _unique_violation_constraint_name(exc)
     return constraint_name in UNIQUE_CONSTRAINTS
+
+
+def _unique_violation_constraint_name(exc: IntegrityError) -> str | None:
+    return getattr(getattr(exc, "diag", None), "constraint_name", None)
+
+
+def _next_loop_unique_violation_detail(exc: IntegrityError) -> str:
+    if _unique_violation_constraint_name(exc) == APPROVED_CONTENT_UNIQUE_CONSTRAINT:
+        return "approved content already exists for segment"
+    return "next-loop output already exists"
 
 
 def _close_clickhouse_client(client: object) -> None:

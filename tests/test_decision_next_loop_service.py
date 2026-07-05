@@ -31,7 +31,7 @@ from app.decision.schemas import (
 )
 
 
-def test_next_loop_creates_next_run_for_goal_not_met_segments_only() -> None:
+def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() -> None:
     repos = FakeNextLoopRepos()
     service = make_service(repos)
 
@@ -65,6 +65,9 @@ def test_next_loop_creates_next_run_for_goal_not_met_segments_only() -> None:
             "Emphasize breakfast benefits.",
         )
     ]
+    assert repos.run_creator.calls == [
+        ("promo_banner_001", "analysis_next_001", "generation_next_001", 2)
+    ]
     assert repos.generation_gateway.calls == [
         (
             "hotel-client-a",
@@ -74,17 +77,8 @@ def test_next_loop_creates_next_run_for_goal_not_met_segments_only() -> None:
             ("seg_luxury",),
             2,
             "prun_banner_001_loop_1",
+            "generation_banner_001",
             "Emphasize breakfast benefits.",
-        )
-    ]
-    assert repos.run_creator.calls == [
-        (
-            "promo_banner_001",
-            RunCreateRequest(
-                analysis_id="analysis_next_001",
-                generation_id="generation_next_001",
-                loop_count=2,
-            ),
         )
     ]
 
@@ -103,7 +97,6 @@ def test_next_loop_noops_when_failed_ids_are_empty() -> None:
     assert response.next_ad_experiments == []
     assert repos.analysis_gateway.calls == []
     assert repos.generation_gateway.calls == []
-    assert repos.run_creator.calls == []
 
 
 @pytest.mark.parametrize(
@@ -135,7 +128,6 @@ def test_next_loop_allows_only_goal_not_met_evaluations(status: str) -> None:
             ),
         )
 
-    assert repos.run_creator.calls == []
 
 
 def test_next_loop_rejects_failed_ids_outside_previous_run() -> None:
@@ -151,7 +143,6 @@ def test_next_loop_rejects_failed_ids_outside_previous_run() -> None:
             ),
         )
 
-    assert repos.run_creator.calls == []
 
 
 def test_next_loop_rejects_failed_segment_experiment_mismatch() -> None:
@@ -215,7 +206,6 @@ def test_next_loop_rejects_gateway_segments_outside_failed_set() -> None:
         )
 
     assert repos.generation_gateway.calls == []
-    assert repos.run_creator.calls == []
 
 
 def test_next_loop_rejects_generation_segments_outside_failed_set() -> None:
@@ -235,7 +225,6 @@ def test_next_loop_rejects_generation_segments_outside_failed_set() -> None:
             ),
         )
 
-    assert repos.run_creator.calls == []
 
 
 def test_next_loop_rejects_generation_that_is_not_completed() -> None:
@@ -253,16 +242,14 @@ def test_next_loop_rejects_generation_that_is_not_completed() -> None:
             ),
         )
 
-    assert repos.run_creator.calls == []
 
-
-def test_next_loop_rejects_created_run_segments_outside_failed_set() -> None:
+def test_next_loop_rejects_created_ad_experiments_outside_failed_set() -> None:
     repos = FakeNextLoopRepos(
-        run_creator=FakeRunCreator(created_segment_ids=["seg_luxury", "seg_spa"])
+        run_creator=FakeRunCreator(created_segment_ids=["seg_spa"]),
     )
     service = make_service(repos)
 
-    with pytest.raises(NextLoopValidationError, match="created ad_experiments"):
+    with pytest.raises(NextLoopValidationError, match="created ad_experiments result"):
         service.create_next_loop(
             promotion_run_id="prun_banner_001_loop_1",
             request=NextLoopRequest(
@@ -272,7 +259,8 @@ def test_next_loop_rejects_created_run_segments_outside_failed_set() -> None:
         )
 
 
-def test_next_loop_creates_next_run_for_multiple_failed_segments() -> None:
+
+def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> None:
     repos = FakeNextLoopRepos(
         experiments=default_experiments(),
         evaluations=[
@@ -312,10 +300,9 @@ def test_next_loop_creates_next_run_for_multiple_failed_segments() -> None:
 
     assert "status" not in response.model_dump()
     assert response.next_promotion_run_id == "prun_banner_001_loop_2"
-    assert [experiment.segment_id for experiment in response.next_ad_experiments] == [
-        "seg_family_trip",
-        "seg_luxury",
-    ]
+    assert {
+        experiment.segment_id for experiment in response.next_ad_experiments
+    } == {"seg_family_trip", "seg_luxury"}
     assert response.next_analysis_id == "analysis_next_001"
     assert response.next_generation_id == "generation_next_001"
     assert response.loop_count == 2
@@ -338,9 +325,9 @@ def make_service(repos: "FakeNextLoopRepos") -> NextLoopService:
         promotion_run_repository=repos.runs,
         ad_experiment_repository=repos.experiments,
         promotion_evaluation_repository=repos.evaluations,
-        promotion_run_creator=repos.run_creator,
         analysis_gateway=repos.analysis_gateway,
         generation_gateway=repos.generation_gateway,
+        run_creator=repos.run_creator,
     )
 
 
@@ -510,7 +497,9 @@ class FakeGenerationGateway:
     ) -> None:
         self.generated_segment_ids = generated_segment_ids or ["seg_luxury"]
         self.status = status
-        self.calls: list[tuple[str, str, str, str, tuple[str, ...], int, str, str | None]] = []
+        self.calls: list[
+            tuple[str, str, str, str, tuple[str, ...], int, str, str, str | None]
+        ] = []
 
     def start_generation(
         self,
@@ -522,6 +511,7 @@ class FakeGenerationGateway:
         focus_segment_ids: Sequence[str],
         loop_count: int,
         source_promotion_run_id: str,
+        source_generation_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
         self.calls.append(
@@ -533,6 +523,7 @@ class FakeGenerationGateway:
                 tuple(focus_segment_ids),
                 loop_count,
                 source_promotion_run_id,
+                source_generation_id,
                 operator_instruction,
             )
         )
@@ -546,7 +537,7 @@ class FakeGenerationGateway:
 class FakeRunCreator:
     def __init__(self, created_segment_ids: list[str] | None = None) -> None:
         self.created_segment_ids = created_segment_ids or ["seg_luxury"]
-        self.calls: list[tuple[str, RunCreateRequest]] = []
+        self.calls: list[tuple[str, str | None, str | None, int]] = []
 
     def create_run(
         self,
@@ -554,14 +545,21 @@ class FakeRunCreator:
         promotion_id: str,
         request: RunCreateRequest,
     ) -> RunCreateResponse:
-        self.calls.append((promotion_id, request))
+        self.calls.append(
+            (
+                promotion_id,
+                request.analysis_id,
+                request.generation_id,
+                request.loop_count,
+            )
+        )
         return RunCreateResponse(
-            promotion_run_id="prun_banner_001_loop_2",
+            promotion_run_id=f"prun_banner_001_loop_{request.loop_count}",
             project_id="hotel-client-a",
             campaign_id="camp_summer_2026",
             promotion_id=promotion_id,
-            analysis_id=str(request.analysis_id),
-            generation_id=str(request.generation_id),
+            analysis_id=request.analysis_id or "analysis_next_001",
+            generation_id=request.generation_id or "generation_next_001",
             loop_count=request.loop_count,
             status=PromotionRunStatus.PLANNED,
             goal_snapshot_json={
@@ -572,11 +570,11 @@ class FakeRunCreator:
             },
             ad_experiments=[
                 AdExperimentCreateResponse(
-                    ad_experiment_id=f"adexp_{segment_id}_002",
+                    ad_experiment_id=f"adexp_{segment_id}_loop_{request.loop_count}",
                     segment_id=segment_id,
-                    segment_name=f"Next {segment_id}",
-                    content_id=f"content_{segment_id}_002",
-                    content_option_id=f"option_{segment_id}_002",
+                    segment_name=f"Segment {segment_id}",
+                    content_id=f"content_{segment_id}_next",
+                    content_option_id=f"option_{segment_id}_next",
                     channel=Channel.ONSITE_BANNER,
                     loop_count=request.loop_count,
                     status=AdExperimentStatus.PLANNED,
