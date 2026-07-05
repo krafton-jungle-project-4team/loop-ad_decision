@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 
 from app.decision.matcher import (
     ANN_CANDIDATE_LIMIT,
+    ANN_QUERY_USER_BATCH_SIZE,
     FALLBACK_REASON_BELOW_THRESHOLD,
     FALLBACK_REASON_INVALID_USER_VECTOR,
     FALLBACK_REASON_NO_CANDIDATE,
@@ -157,7 +158,7 @@ class SegmentAssignmentService:
                 users=users_to_match,
                 segment_vectors=segment_vectors,
             )
-        except SegmentMatchValidationError as exc:
+        except (SegmentMatchValidationError, ValueError) as exc:
             raise SegmentAssignmentValidationError(str(exc)) from exc
 
         fallback_needed = any(
@@ -240,35 +241,47 @@ class SegmentAssignmentService:
         exact_reranked_pair_count = 0
         ann_underfilled_user_count = 0
 
-        self._segment_vector_repository.configure_ann_search()
-        for user in users:
+        normalized_users: list[tuple[str, list[float]]] = []
+        for user in _deduplicate_users_by_id(users):
             normalized_user_vector = self._reranker.normalize_user_vector(user)
             if normalized_user_vector is None:
                 matches[user.user_id] = invalid_user_vector_result()
                 continue
+            normalized_users.append((user.user_id, normalized_user_vector))
 
-            candidate_records = self._segment_vector_repository.list_ann_candidates(
-                project_id=project_id,
-                promotion_id=promotion_id,
-                analysis_id=analysis_id,
-                segment_vector_ids=segment_vector_ids,
-                vector_version=vector_version,
-                query_vector=normalized_user_vector,
-                limit=ANN_CANDIDATE_LIMIT,
-            )
-            candidate_count = len(candidate_records)
-            ann_candidate_count += candidate_count
-            exact_reranked_pair_count += candidate_count
-            if candidate_count < expected_candidate_count:
-                ann_underfilled_user_count += 1
+        if normalized_users:
+            self._segment_vector_repository.configure_ann_search()
 
-            matches[user.user_id] = self._reranker.rerank(
-                normalized_user_vector=normalized_user_vector,
-                candidates=[
-                    _segment_vector_from_record(record, require_embedding=True)
-                    for record in candidate_records
-                ],
+        for user_chunk in _chunks(normalized_users, ANN_QUERY_USER_BATCH_SIZE):
+            user_ids = [user_id for user_id, _vector in user_chunk]
+            query_vectors = [vector for _user_id, vector in user_chunk]
+            candidates_by_user = (
+                self._segment_vector_repository.list_ann_candidates_for_users(
+                    project_id=project_id,
+                    promotion_id=promotion_id,
+                    analysis_id=analysis_id,
+                    segment_vector_ids=segment_vector_ids,
+                    vector_version=vector_version,
+                    user_ids=user_ids,
+                    query_vectors=query_vectors,
+                    limit=ANN_CANDIDATE_LIMIT,
+                )
             )
+            for user_id, normalized_user_vector in user_chunk:
+                candidate_records = candidates_by_user.get(user_id, [])
+                candidate_count = len(candidate_records)
+                ann_candidate_count += candidate_count
+                exact_reranked_pair_count += candidate_count
+                if candidate_count < expected_candidate_count:
+                    ann_underfilled_user_count += 1
+
+                matches[user_id] = self._reranker.rerank(
+                    normalized_user_vector=normalized_user_vector,
+                    candidates=[
+                        _segment_vector_from_record(record, require_embedding=True)
+                        for record in candidate_records
+                    ],
+                )
 
         return _BuildMatchResult(
             matches=matches,
@@ -383,6 +396,24 @@ def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _Experiment
         else:
             non_fallback.append(experiment)
     return _ExperimentSet(non_fallback=non_fallback, fallback=fallback)
+
+
+def _deduplicate_users_by_id(users: Sequence[UserVector]) -> list[UserVector]:
+    seen_user_ids: set[str] = set()
+    deduplicated: list[UserVector] = []
+    for user in users:
+        if user.user_id in seen_user_ids:
+            continue
+        seen_user_ids.add(user.user_id)
+        deduplicated.append(user)
+    return deduplicated
+
+
+def _chunks(
+    items: Sequence[tuple[str, list[float]]],
+    size: int,
+) -> list[Sequence[tuple[str, list[float]]]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]
 
 
 def _build_assignment_writes(

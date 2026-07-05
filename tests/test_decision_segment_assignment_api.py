@@ -261,6 +261,8 @@ class RecordingCursor:
         if "from segment_vectors" in sql and "order by embedding <=>" in sql:
             return [
                 {
+                    "query_user_id": "user_001",
+                    "query_ordinal": 1,
                     "segment_vector_id": "segvec_family_v1",
                     "project_id": "hotel-client-a",
                     "promotion_id": "promo_banner_001",
