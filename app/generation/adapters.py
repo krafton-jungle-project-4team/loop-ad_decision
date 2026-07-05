@@ -18,7 +18,7 @@ from app.generation.schemas import ContentChannel
 
 EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v1"
 DEFAULT_OPENAI_CONTENT_MODEL = "gpt-4o-mini"
-DEFAULT_GEMINI_IMAGE_MODEL = "gemini-2.5-flash-image-preview"
+DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
