@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
+import pytest
+
 from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
@@ -609,6 +611,140 @@ def test_segment_vector_repository_reads_ann_candidates_by_frozen_ids() -> None:
         "[" + ",".join(["1.0", *["0.0"] * 63]) + "]",
         50,
     )
+
+
+def test_segment_vector_repository_reads_batch_ann_candidates_by_users() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "query_user_id": "user_family",
+                "query_ordinal": 1,
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    candidates_by_user = repo.list_ann_candidates_for_users(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_vector_ids=["segvec_family_v1"],
+        vector_version="v1",
+        user_ids=["user_family", "user_no_candidate"],
+        query_vectors=[
+            [1.0] + [0.0] * 63,
+            [0.0, 1.0, *([0.0] * 62)],
+        ],
+        limit=50,
+    )
+
+    assert set(candidates_by_user) == {"user_family", "user_no_candidate"}
+    assert candidates_by_user["user_family"][0].segment_vector_id == "segvec_family_v1"
+    assert not hasattr(candidates_by_user["user_family"][0], "query_user_id")
+    assert candidates_by_user["user_no_candidate"] == []
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "with query_users as" in sql
+    assert "with ordinality" in sql
+    assert "cross join lateral" in sql
+    assert "select *" not in sql
+    assert "embedding <=> q.query_vector::vector" in sql
+    assert "order by q.query_ordinal asc, sv.segment_id asc" in sql
+    assert call.params == (
+        ["user_family", "user_no_candidate"],
+        [
+            "[" + ",".join(["1.0", *["0.0"] * 63]) + "]",
+            "[" + ",".join(["0.0", "1.0", *["0.0"] * 62]) + "]",
+        ],
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        ["segvec_family_v1"],
+        "v1",
+        64,
+        50,
+    )
+
+
+def test_segment_vector_repository_rejects_mismatched_batch_inputs() -> None:
+    repo = SegmentVectorRepository(FakePostgresExecutor())
+
+    with pytest.raises(ValueError, match="same length"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family"],
+            query_vectors=[],
+            limit=50,
+        )
+
+
+def test_segment_vector_repository_rejects_duplicate_batch_user_ids() -> None:
+    repo = SegmentVectorRepository(FakePostgresExecutor())
+
+    with pytest.raises(ValueError, match="duplicates"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family", "user_family"],
+            query_vectors=[
+                [1.0] + [0.0] * 63,
+                [1.0] + [0.0] * 63,
+            ],
+            limit=50,
+        )
+
+
+def test_segment_vector_repository_rejects_unexpected_batch_query_user() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "query_user_id": "user_unrequested",
+                "query_ordinal": 1,
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    with pytest.raises(ValueError, match="unexpected query_user_id"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family"],
+            query_vectors=[[1.0] + [0.0] * 63],
+            limit=50,
+        )
 
 
 def test_user_segment_assignment_repository_inserts_official_columns_only() -> None:

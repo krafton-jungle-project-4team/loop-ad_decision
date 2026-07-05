@@ -445,6 +445,20 @@ class SegmentVectorReader(Protocol):
     ) -> list[SegmentVectorRecord]:
         ...
 
+    def list_ann_candidates_for_users(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        user_ids: Sequence[str],
+        query_vectors: Sequence[Sequence[float]],
+        limit: int,
+    ) -> dict[str, list[SegmentVectorRecord]]:
+        ...
+
 
 class UserBehaviorVectorReader(Protocol):
     def list_by_user_ids(
@@ -1066,6 +1080,114 @@ class SegmentVectorRepository:
             ),
         )
         return [SegmentVectorRecord(**row) for row in rows]
+
+    def list_ann_candidates_for_users(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        user_ids: Sequence[str],
+        query_vectors: Sequence[Sequence[float]],
+        limit: int,
+    ) -> dict[str, list[SegmentVectorRecord]]:
+        if len(user_ids) != len(query_vectors):
+            raise ValueError("user_ids and query_vectors must have the same length")
+        if len(set(user_ids)) != len(user_ids):
+            raise ValueError("user_ids must not contain duplicates")
+
+        candidates_by_user = {user_id: [] for user_id in user_ids}
+        if not user_ids or not segment_vector_ids:
+            return candidates_by_user
+
+        query_vector_literals = [
+            _vector_literal(query_vector, self.VECTOR_DIM)
+            for query_vector in query_vectors
+        ]
+        rows = self._db.fetchall(
+            """
+            WITH query_users AS (
+                SELECT
+                    user_id,
+                    query_vector,
+                    query_ordinal
+                FROM unnest(%s::text[], %s::text[]) WITH ORDINALITY
+                    AS q(user_id, query_vector, query_ordinal)
+            )
+            SELECT
+                q.user_id AS query_user_id,
+                q.query_ordinal AS query_ordinal,
+                sv.segment_vector_id,
+                sv.project_id,
+                sv.promotion_id,
+                sv.promotion_run_id,
+                sv.analysis_id,
+                sv.segment_id,
+                sv.vector_dim,
+                sv.vector_values,
+                sv.vector_version,
+                sv.source,
+                sv.embedding::text AS embedding
+            FROM query_users q
+            CROSS JOIN LATERAL (
+                SELECT
+                    segment_vector_id,
+                    project_id,
+                    promotion_id,
+                    promotion_run_id,
+                    analysis_id,
+                    segment_id,
+                    vector_dim,
+                    vector_values,
+                    vector_version,
+                    source,
+                    embedding
+                FROM segment_vectors
+                WHERE project_id = %s
+                  AND promotion_id = %s
+                  AND analysis_id = %s
+                  AND segment_vector_id = ANY(%s)
+                  AND vector_version = %s
+                  AND vector_dim = %s
+                ORDER BY embedding <=> q.query_vector::vector, segment_id ASC
+                LIMIT %s
+            ) sv
+            ORDER BY q.query_ordinal ASC, sv.segment_id ASC
+            """,
+            (
+                list(user_ids),
+                query_vector_literals,
+                project_id,
+                promotion_id,
+                analysis_id,
+                list(segment_vector_ids),
+                vector_version,
+                self.VECTOR_DIM,
+                limit,
+            ),
+        )
+        for row in rows:
+            query_user_id = str(row["query_user_id"])
+            if query_user_id not in candidates_by_user:
+                raise ValueError("unexpected query_user_id returned by ANN query")
+            candidates_by_user[query_user_id].append(
+                SegmentVectorRecord(
+                    segment_vector_id=row["segment_vector_id"],
+                    project_id=row["project_id"],
+                    promotion_id=row["promotion_id"],
+                    promotion_run_id=row["promotion_run_id"],
+                    analysis_id=row["analysis_id"],
+                    segment_id=row["segment_id"],
+                    vector_dim=row["vector_dim"],
+                    vector_values=row["vector_values"],
+                    vector_version=row["vector_version"],
+                    source=row["source"],
+                    embedding=row["embedding"],
+                )
+            )
+        return candidates_by_user
 
 
 class UserSegmentAssignmentRepository:
