@@ -39,6 +39,9 @@ class GenerationRunWriter(Protocol):
     def create(self, record: GenerationRunRecord) -> dict[str, Any]:
         ...
 
+    def list_ids_by_promotion(self, promotion_id: str) -> list[str]:
+        ...
+
 
 class ContentCandidateWriter(Protocol):
     def create(self, record: ContentCandidateRecord) -> dict[str, Any]:
@@ -116,7 +119,7 @@ class GenerationService:
         )
 
     def generate(self, request: GenerationRequest) -> GenerationResponse:
-        generation_id = _generation_id_from_promotion(request.promotion_id)
+        generation_id = self._next_generation_id(request.promotion_id)
         prompt_inputs = self._build_prompt_inputs(request)
         try:
             content_candidates = self._build_content_candidate_records(
@@ -396,9 +399,16 @@ class GenerationService:
         channel = prompt_input.promotion.channel
         channel_slug = _channel_slug(channel)
         segment_slug = _segment_slug(prompt_input.target_segment)
+        generation_slug = _general_generation_attempt_slug(
+            generation_id=generation_id,
+            promotion_id=prompt_input.request.promotion_id,
+        )
+        content_slug = (
+            f"{segment_slug}_{generation_slug}" if generation_slug else segment_slug
+        )
         segment_id = prompt_input.target_segment.segment_id
-        content_id = f"content_{channel_slug}_{segment_slug}_{index:03d}"
-        content_option_id = f"{channel_slug}_{segment_slug}_option_{index:03d}"
+        content_id = f"content_{channel_slug}_{content_slug}_{index:03d}"
+        content_option_id = f"{channel_slug}_{content_slug}_option_{index:03d}"
         generated_content = self._content_generator.generate(
             prompt_input=prompt_input,
             prompt_result=prompt_result,
@@ -456,17 +466,57 @@ class GenerationService:
         for content_candidate in content_candidates:
             self._content_candidate_repository.create(content_candidate)
 
+    def _next_generation_id(self, promotion_id: str) -> str:
+        base_generation_id = _generation_id_from_promotion(promotion_id)
+        if self._generation_run_repository is None:
+            return base_generation_id
+
+        existing_generation_ids = set(
+            self._generation_run_repository.list_ids_by_promotion(promotion_id)
+        )
+        if base_generation_id not in existing_generation_ids:
+            return base_generation_id
+
+        run_number = 2
+        while True:
+            candidate_generation_id = _generation_id_from_promotion(
+                promotion_id,
+                generation_run_number=run_number,
+            )
+            if candidate_generation_id not in existing_generation_ids:
+                return candidate_generation_id
+            run_number += 1
+
 
 def _generation_id_from_promotion(
     promotion_id: str,
     *,
     loop_count: int | None = None,
+    generation_run_number: int | None = None,
 ) -> str:
     promotion_slug = promotion_id.removeprefix("promo_")
     safe_slug = re.sub(r"[^a-zA-Z0-9_]+", "_", promotion_slug).strip("_")
     if loop_count is not None:
         return f"generation_{safe_slug or 'content'}_loop_{loop_count}"
-    return f"generation_{safe_slug or 'content'}"
+    generation_id = f"generation_{safe_slug or 'content'}"
+    if generation_run_number is not None and generation_run_number > 1:
+        return f"{generation_id}_run_{generation_run_number}"
+    return generation_id
+
+
+def _general_generation_attempt_slug(
+    *,
+    generation_id: str,
+    promotion_id: str,
+) -> str | None:
+    base_generation_id = _generation_id_from_promotion(promotion_id)
+    prefix = f"{base_generation_id}_"
+    if not generation_id.startswith(prefix):
+        return None
+    attempt_slug = generation_id.removeprefix(prefix)
+    if re.fullmatch(r"run_[2-9][0-9]*", attempt_slug):
+        return attempt_slug
+    return None
 
 
 def _focus_segment_ids(values: Sequence[str]) -> list[str]:

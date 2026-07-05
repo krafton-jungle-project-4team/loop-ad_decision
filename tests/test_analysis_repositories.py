@@ -356,6 +356,7 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
     assert "reason_json" in sql
     assert "metadata_json" in sql
     assert "status" in sql
+    assert sql.count("%s") == len(call.params)
     assert call.params == (
         "sugg_analysis_banner_001_seg_repeat",
         "analysis_banner_001",
@@ -500,6 +501,7 @@ def test_user_behavior_vector_repository_queries_candidate_user_vectors() -> Non
     assert vectors[0].vector_values == vector_values
     call = client.calls[0]
     sql = compact_sql(call.query)
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "from user_behavior_vectors" in sql
     assert "project_id = {project_id:string}" in sql
     assert "vector_dim = {vector_dim:uint16}" in sql
@@ -555,6 +557,7 @@ def test_user_behavior_vector_repository_queries_recent_project_vectors() -> Non
     assert vectors[0].vector_values == vector_values
     call = client.calls[0]
     sql = compact_sql(call.query)
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "from user_behavior_vectors" in sql
     assert "project_id = {project_id:string}" in sql
     assert "vector_dim = {vector_dim:uint16}" in sql

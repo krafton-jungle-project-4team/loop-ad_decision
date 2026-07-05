@@ -128,6 +128,24 @@ def test_generation_run_repository_create_executes_insert() -> None:
     assert params["generation_report_json"].obj == {"content_candidate_count": 2}
 
 
+def test_generation_run_repository_lists_ids_by_promotion() -> None:
+    cursor = FakeCursor(
+        fetchall_result=[
+            {"generation_id": "generation_banner_001"},
+            {"generation_id": "generation_banner_001_run_2"},
+        ]
+    )
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result = repository.list_ids_by_promotion("promo_banner_001")
+
+    assert result == ["generation_banner_001", "generation_banner_001_run_2"]
+    query, params = cursor.executed[0]
+    assert "FROM generation_runs" in query
+    assert "promotion_id = %(promotion_id)s" in query
+    assert params == {"promotion_id": "promo_banner_001"}
+
+
 def test_content_candidate_repository_create_executes_insert() -> None:
     cursor = FakeCursor(fetchone_result={"content_id": "content_banner_001"})
     repository = ContentCandidateRepository(FakeConnection(cursor))
