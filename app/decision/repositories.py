@@ -962,11 +962,14 @@ class SegmentVectorRepository:
         self._db = db
 
     def configure_ann_search(self) -> None:
-        self._db.execute("SET LOCAL hnsw.ef_search = %s", (self.HNSW_EF_SEARCH,))
-        self._db.execute("SET LOCAL hnsw.iterative_scan = strict_order")
         self._db.execute(
-            "SET LOCAL hnsw.max_scan_tuples = %s",
-            (self.HNSW_MAX_SCAN_TUPLES,),
+            "SELECT set_config('hnsw.ef_search', %s, true)",
+            (str(self.HNSW_EF_SEARCH),),
+        )
+        self._db.execute("SELECT set_config('hnsw.iterative_scan', 'strict_order', true)")
+        self._db.execute(
+            "SELECT set_config('hnsw.max_scan_tuples', %s, true)",
+            (str(self.HNSW_MAX_SCAN_TUPLES),),
         )
 
     def list_for_run_segments(

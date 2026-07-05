@@ -147,9 +147,9 @@ def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> N
     assert clickhouse_clients[0].close_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
-    assert any("set local hnsw.ef_search" in query for query in executed_sql)
-    assert any("set local hnsw.iterative_scan = strict_order" in query for query in executed_sql)
-    assert any("set local hnsw.max_scan_tuples" in query for query in executed_sql)
+    assert any("set_config('hnsw.ef_search'" in query for query in executed_sql)
+    assert any("set_config('hnsw.iterative_scan'" in query for query in executed_sql)
+    assert any("set_config('hnsw.max_scan_tuples'" in query for query in executed_sql)
     assert any("order by embedding <=>" in query for query in executed_sql)
     assert any("insert into user_segment_assignments" in query for query in executed_sql)
 

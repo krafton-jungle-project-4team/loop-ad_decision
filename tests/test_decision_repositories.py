@@ -554,12 +554,12 @@ def test_segment_vector_repository_configures_hnsw_search_params() -> None:
 
     executed = [compact_sql(call.query) for call in db.calls]
     assert executed == [
-        "set local hnsw.ef_search = %s",
-        "set local hnsw.iterative_scan = strict_order",
-        "set local hnsw.max_scan_tuples = %s",
+        "select set_config('hnsw.ef_search', %s, true)",
+        "select set_config('hnsw.iterative_scan', 'strict_order', true)",
+        "select set_config('hnsw.max_scan_tuples', %s, true)",
     ]
-    assert db.calls[0].params == (100,)
-    assert db.calls[2].params == (20000,)
+    assert db.calls[0].params == ("100",)
+    assert db.calls[2].params == ("20000",)
 
 
 def test_segment_vector_repository_reads_ann_candidates_by_frozen_ids() -> None:
