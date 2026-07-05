@@ -7,6 +7,10 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
+from app.analysis.repositories import PromotionAnalysisWrite, PromotionTargetSegmentWrite
+from app.analysis.router import get_analysis_service
+from app.analysis.schemas import AnalysisStatus
+from app.analysis.service import PromotionAnalysisResult
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.generation.router import get_generation_service
 from app.generation.service import GenerationService
@@ -74,6 +78,7 @@ def valid_env() -> dict[str, str]:
 
 def make_client() -> TestClient:
     app = create_app(settings=load_settings(valid_env()))
+    app.dependency_overrides[get_analysis_service] = lambda: FakeAnalysisService()
     app.dependency_overrides[get_generation_service] = lambda: GenerationService()
     return TestClient(app)
 
@@ -135,6 +140,51 @@ def test_readme_documents_decision_boundary_and_dashboard_serving_path() -> None
     assert "does not provide active_ad_serving_assignments" in readme
     assert "B6 next-loop" in readme
     assert "follow-up integration PR" in readme
+
+
+class FakeAnalysisService:
+    def analyze(self, request: Any) -> PromotionAnalysisResult:
+        return PromotionAnalysisResult(
+            analysis=PromotionAnalysisWrite(
+                analysis_id=f"analysis_{request.promotion_id}",
+                project_id=request.project_id,
+                campaign_id=request.campaign_id,
+                promotion_id=request.promotion_id,
+                status=AnalysisStatus.COMPLETED.value,
+                focus_segment_ids_json=None,
+                operator_instruction=request.operator_instruction,
+                input_snapshot_json={},
+                profile_summary_json={},
+                output_json={},
+            ),
+            target_segments=[
+                PromotionTargetSegmentWrite(
+                    analysis_id=f"analysis_{request.promotion_id}",
+                    project_id=request.project_id,
+                    campaign_id=request.campaign_id,
+                    promotion_id=request.promotion_id,
+                    segment_id="seg_repeat_hotel_no_booking",
+                    segment_name="Repeat hotel viewers without booking",
+                    rule_json={},
+                    profile_json={},
+                    content_brief_json={
+                        "message_direction": (
+                            "Emphasize hotel booking availability and breakfast benefits."
+                        ),
+                        "keywords": [
+                            "hotel booking",
+                            "same-day availability",
+                            "breakfast included",
+                        ],
+                    },
+                    data_evidence_json={},
+                    segment_vector_id="segvec_repeat_hotel_no_booking_v1",
+                    estimated_size=1342,
+                    priority="high",
+                    status="planned",
+                )
+            ],
+        )
 
 
 def public_payload_text(client: TestClient) -> str:
