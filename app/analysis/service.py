@@ -5,7 +5,13 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
+from app.analysis.booking_model import (
+    BookingPropensityModel,
+    BookingPropensityPrediction,
+    train_booking_propensity_model,
+)
 from app.analysis.repositories import (
+    BookingTrainingRecord,
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
@@ -144,6 +150,22 @@ class HotelProfileReader(Protocol):
     ) -> list[HotelMarketingProfileRecord]:
         ...
 
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        ...
+
+    def list_booking_training_records(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[BookingTrainingRecord]:
+        ...
+
 
 class PromotionAnalysisWriter(Protocol):
     def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
@@ -241,11 +263,21 @@ class PromotionAnalysisService:
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
-        candidates = self._build_candidates(segment_definitions, hotel_profiles)
+        candidates = self._build_candidates(
+            project_id=request.project_id,
+            segment_definitions=segment_definitions,
+            hotel_profiles=hotel_profiles,
+        )
+        booking_model = self._train_booking_model()
+        booking_predictions = _predict_booking_propensity(
+            model=booking_model,
+            candidates=candidates,
+        )
         selected_candidates = self._select_candidates(
             promotion=promotion,
             request=request,
             candidates=candidates,
+            booking_predictions=booking_predictions,
         )
         if not selected_candidates:
             raise SegmentSelectionError("no active segment candidates matched analysis request")
@@ -284,6 +316,10 @@ class PromotionAnalysisService:
                 promotion=promotion,
                 target_segment=target_segment,
                 candidate=selected_candidates[rank],
+                booking_prediction=booking_predictions.get(
+                    selected_candidates[rank].segment_id,
+                ),
+                booking_model=booking_model,
                 rank=rank,
             )
             for rank, target_segment in enumerate(target_segments)
@@ -294,6 +330,10 @@ class PromotionAnalysisService:
             target_segments=target_segments,
             segment_suggestions=segment_suggestions,
         )
+
+    def _train_booking_model(self) -> BookingPropensityModel | None:
+        training_records = self._hotel_profile_repository.list_booking_training_records()
+        return train_booking_propensity_model(training_records)
 
     def _suggest_segment_definitions(
         self,
@@ -317,17 +357,40 @@ class PromotionAnalysisService:
 
     def _build_candidates(
         self,
+        *,
+        project_id: str,
         segment_definitions: Sequence[SegmentDefinitionRecord],
         hotel_profiles: Sequence[HotelMarketingProfileRecord],
     ) -> dict[str, SegmentCandidate]:
         profiles_by_segment = {profile.profile_name: profile for profile in hotel_profiles}
-        return {
-            segment.segment_id: SegmentCandidate(
+        candidates: dict[str, SegmentCandidate] = {}
+        for segment in segment_definitions:
+            profile = profiles_by_segment.get(segment.segment_id)
+            if profile is None and segment.source == "ai_suggested":
+                profile = self._summarize_ai_segment_profile(
+                    project_id=project_id,
+                    segment=segment,
+                )
+            candidates[segment.segment_id] = SegmentCandidate(
                 definition=segment,
-                profile=profiles_by_segment.get(segment.segment_id),
+                profile=profile,
             )
-            for segment in segment_definitions
-        }
+        return candidates
+
+    def _summarize_ai_segment_profile(
+        self,
+        *,
+        project_id: str,
+        segment: SegmentDefinitionRecord,
+    ) -> HotelMarketingProfileRecord | None:
+        candidate_user_ids = _candidate_user_ids(segment.rule_json)
+        if not candidate_user_ids:
+            return None
+        return self._hotel_profile_repository.summarize_user_ids(
+            project_id=project_id,
+            profile_name=segment.segment_id,
+            user_ids=candidate_user_ids,
+        )
 
     def _select_candidates(
         self,
@@ -335,6 +398,7 @@ class PromotionAnalysisService:
         promotion: PromotionRecord,
         request: AnalysisRequest,
         candidates: Mapping[str, SegmentCandidate],
+        booking_predictions: Mapping[str, BookingPropensityPrediction],
     ) -> list[SegmentCandidate]:
         ordered_ids: list[str] = []
         for candidate in sorted(
@@ -348,10 +412,9 @@ class PromotionAnalysisService:
             candidate.segment_id
             for candidate in sorted(
                 candidates.values(),
-                key=lambda candidate: (
-                    -_ai_segment_score(candidate.definition),
-                    -candidate.estimated_size,
-                    candidate.segment_id,
+                key=lambda candidate: _ai_candidate_sort_key(
+                    candidate,
+                    booking_predictions,
                 ),
             )
             if candidate.definition.source == "ai_suggested"
@@ -458,6 +521,8 @@ class PromotionAnalysisService:
         promotion: PromotionRecord,
         target_segment: PromotionTargetSegmentWrite,
         candidate: SegmentCandidate,
+        booking_prediction: BookingPropensityPrediction | None,
+        booking_model: BookingPropensityModel | None,
         rank: int,
     ) -> PromotionSegmentSuggestionWrite:
         segment = candidate.definition
@@ -479,12 +544,33 @@ class PromotionAnalysisService:
                 "estimated_size": target_segment.estimated_size,
                 "priority": target_segment.priority,
                 "cluster_score": _ai_segment_score(segment),
+                "booking_propensity_score": (
+                    booking_prediction.probability if booking_prediction else None
+                ),
+                "booking_propensity_model": (
+                    booking_prediction.model_version
+                    if booking_prediction
+                    else "unavailable"
+                ),
+                "booking_propensity_training_sample_count": (
+                    booking_prediction.training_sample_count
+                    if booking_prediction
+                    else 0
+                ),
             },
             reason_json={
                 "channel": promotion.channel,
                 "goal_metric": promotion.goal_metric,
                 "segment_source": segment.source,
                 "has_hotel_profile": candidate.profile is not None,
+                "ml_model": (
+                    booking_model.model_version if booking_model else "unavailable"
+                ),
+                "ml_features": (
+                    dict(booking_prediction.feature_values)
+                    if booking_prediction
+                    else {}
+                ),
             },
             metadata_json={
                 "segment_name": target_segment.segment_name,
@@ -604,6 +690,34 @@ class PromotionAnalysisService:
             )
         )
         return result.segment_vector_id
+
+
+def _predict_booking_propensity(
+    *,
+    model: BookingPropensityModel | None,
+    candidates: Mapping[str, SegmentCandidate],
+) -> dict[str, BookingPropensityPrediction]:
+    if model is None:
+        return {}
+    return {
+        candidate.segment_id: prediction
+        for candidate in candidates.values()
+        if (prediction := model.predict_profile(candidate.profile)) is not None
+    }
+
+
+def _ai_candidate_sort_key(
+    candidate: SegmentCandidate,
+    booking_predictions: Mapping[str, BookingPropensityPrediction],
+) -> tuple[float, float, int, str]:
+    prediction = booking_predictions.get(candidate.segment_id)
+    propensity_score = prediction.probability if prediction is not None else -1.0
+    return (
+        -propensity_score,
+        -_ai_segment_score(candidate.definition),
+        -candidate.estimated_size,
+        candidate.segment_id,
+    )
 
 
 def _promotion_snapshot(promotion: PromotionRecord) -> dict[str, Any]:
