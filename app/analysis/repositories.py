@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import math
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg.rows import dict_row
@@ -180,6 +181,7 @@ class SegmentVectorRecord:
     vector_values: list[float]
     vector_version: str
     source: str
+    embedding: str | None = None
 
 
 @dataclass(frozen=True)
@@ -448,7 +450,8 @@ class SegmentVectorRepository:
                 vector_dim,
                 vector_values,
                 vector_version,
-                source
+                source,
+                embedding::text AS embedding
             FROM segment_vectors
             WHERE project_id = %s
               AND promotion_id = %s
@@ -473,10 +476,11 @@ class SegmentVectorRepository:
                 segment_id,
                 vector_dim,
                 vector_values,
+                embedding,
                 vector_version,
                 source
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::vector, %s, %s)
             """,
             (
                 vector.segment_vector_id,
@@ -487,6 +491,7 @@ class SegmentVectorRepository:
                 vector.segment_id,
                 vector.vector_dim,
                 vector.vector_values,
+                _vector_literal(vector.vector_values, self.VECTOR_DIM),
                 vector.vector_version,
                 vector.source,
             ),
@@ -497,6 +502,11 @@ class SegmentVectorRepository:
             raise ValueError("segment vector_dim must be 64")
         if len(vector.vector_values) != self.VECTOR_DIM:
             raise ValueError("segment vector_values must contain 64 values")
+        numeric_values = [float(value) for value in vector.vector_values]
+        if not all(math.isfinite(value) for value in numeric_values):
+            raise ValueError("segment vector_values must be finite")
+        if math.sqrt(sum(value * value for value in numeric_values)) == 0:
+            raise ValueError("segment vector_values must not be a zero vector")
 
 
 class UserBehaviorVectorRepository:
@@ -680,3 +690,12 @@ def _clickhouse_value(row: Any, key: str, index: int) -> Any:
     if isinstance(row, Mapping):
         return row[key]
     return row[index]
+
+
+def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
+    if len(values) != vector_dim:
+        raise ValueError("vector literal must contain 64 values")
+    numeric_values = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("vector literal values must be finite")
+    return "[" + ",".join(str(value) for value in numeric_values) + "]"

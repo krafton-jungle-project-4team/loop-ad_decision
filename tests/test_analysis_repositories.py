@@ -389,6 +389,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
             "vector_values": vector_values,
             "vector_version": "v1",
             "source": "decision_analysis",
+            "embedding": vector_values,
         }
     )
     repo = SegmentVectorRepository(db)
@@ -403,12 +404,14 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
 
     select_call, insert_call = db.calls
     assert "from segment_vectors" in compact_sql(select_call.query)
+    assert "embedding::text as embedding" in compact_sql(select_call.query)
     assert select_call.params == (
         "hotel-client-a",
         "promo_banner_001",
         "seg_repeat_hotel_no_booking",
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
+    assert "embedding" in compact_sql(insert_call.query)
     assert insert_call.params == (
         "segvec_repeat_hotel_no_booking_v1",
         "hotel-client-a",
@@ -418,6 +421,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "seg_repeat_hotel_no_booking",
         64,
         vector_values,
+        "[" + ",".join(str(value) for value in vector_values) + "]",
         "v1",
         "decision_analysis",
     )
@@ -440,6 +444,28 @@ def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
     )
 
     with pytest.raises(ValueError, match="64 values"):
+        repo.save(vector)
+
+    assert db.calls == []
+
+
+def test_segment_vector_repository_rejects_zero_vectors() -> None:
+    db = FakePostgresExecutor()
+    repo = SegmentVectorRepository(db)
+    vector = SegmentVectorRecord(
+        segment_vector_id="segvec_zero",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_zero",
+        vector_dim=64,
+        vector_values=[0.0] * 64,
+        vector_version="v1",
+        source="decision_analysis",
+    )
+
+    with pytest.raises(ValueError, match="zero vector"):
         repo.save(vector)
 
     assert db.calls == []
