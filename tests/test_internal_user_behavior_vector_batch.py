@@ -80,7 +80,6 @@ def test_internal_user_behavior_vector_batch_requires_internal_key() -> None:
         json={
             "project_id": "demo_project",
             "vector_version": "v1",
-            "source": "expedia_hotel_events",
             "window_days": 90,
         },
     )
@@ -88,7 +87,7 @@ def test_internal_user_behavior_vector_batch_requires_internal_key() -> None:
     assert response.status_code == 401
 
 
-def test_internal_user_behavior_vector_batch_rejects_invalid_source() -> None:
+def test_internal_user_behavior_vector_batch_rejects_source_override() -> None:
     env = valid_env()
     client = TestClient(create_app(settings=load_settings(env)))
 
@@ -98,7 +97,7 @@ def test_internal_user_behavior_vector_batch_rejects_invalid_source() -> None:
         json={
             "project_id": "demo_project",
             "vector_version": "v1",
-            "source": "raw_events",
+            "source": "expedia_hotel_events",
             "window_days": 90,
         },
     )
@@ -127,7 +126,6 @@ def test_internal_user_behavior_vector_batch_wires_clickhouse_and_closes(
         json={
             "project_id": "demo_project",
             "vector_version": "v1",
-            "source": "expedia_hotel_events",
             "window_days": 90,
         },
     )
@@ -136,15 +134,17 @@ def test_internal_user_behavior_vector_batch_wires_clickhouse_and_closes(
     payload = response.json()
     assert payload["project_id"] == "demo_project"
     assert payload["vector_version"] == "v1"
-    assert payload["source"] == "expedia_hotel_events"
+    assert payload["source"] == "raw_events"
     assert payload["vector_dim"] == 64
     assert payload["processed_user_count"] == 12
     assert payload["status"] == "completed"
     assert fake_client.close_count == 1
     assert [call.operation for call in fake_client.calls] == ["query", "command"]
+    assert "from raw_events" in compact_sql(fake_client.calls[0].query)
+    assert "from raw_events" in compact_sql(fake_client.calls[1].query)
 
 
-def test_user_behavior_vector_build_repository_counts_and_inserts_expedia_vectors() -> None:
+def test_user_behavior_vector_build_repository_counts_and_inserts_raw_event_vectors() -> None:
     fake_client = FakeClickHouseClient(processed_user_count=2)
     repository = UserBehaviorVectorBuildRepository(fake_client)
     service = UserBehaviorVectorBatchService(
@@ -156,36 +156,40 @@ def test_user_behavior_vector_build_repository_counts_and_inserts_expedia_vector
         UserBehaviorVectorBuildRequest(
             project_id="demo_project",
             vector_version="v1",
-            source="expedia_hotel_events",
             window_days=30,
         ),
     )
 
+    assert result.source == "raw_events"
     assert result.processed_user_count == 2
     assert result.vector_dim == 64
     count_call, insert_call = fake_client.calls
     count_sql = compact_sql(count_call.query)
     insert_sql = compact_sql(insert_call.query)
     assert count_call.operation == "query"
-    assert "from expedia_hotel_events" in count_sql
-    assert "countdistinct(tostring(user_id))" in count_sql
+    assert "from raw_events" in count_sql
+    assert "project_id = {project_id:string}" in count_sql
+    assert "validation_status = 'valid'" in count_sql
+    assert "countdistinct(user_id)" in count_sql
     assert count_call.parameters == {
+        "project_id": "demo_project",
         "window_start": "2026-06-05 12:00:00",
         "window_end": "2026-07-05 12:00:00",
     }
     assert insert_call.operation == "command"
     assert "insert into user_behavior_vectors" in insert_sql
-    assert "from expedia_hotel_events" in insert_sql
-    assert "arraymap" in insert_sql
+    assert "from raw_events" in insert_sql
+    assert "jsonextractstring(properties_json, 'hotel_cluster')" in insert_sql
+    assert "jsonextractstring(properties_json, 'hotel_market')" in insert_sql
+    assert "jsonextractstring(properties_json, 'page_path')" in insert_sql
+    assert "event_name = 'booking_complete'" in insert_sql
+    assert "event_name = 'promotion_click'" in insert_sql
     assert "touint16({vector_dim:uint16})" in insert_sql
-    assert "modulo(touint32(hotel_cluster), 32)" in insert_sql
-    assert "modulo(touint32(srch_destination_id), 16)" in insert_sql
-    assert "modulo(touint32(channel), 10)" in insert_sql
     assert insert_call.parameters == {
         "project_id": "demo_project",
         "vector_dim": 64,
         "vector_version": "v1",
-        "source": "expedia_hotel_events",
+        "source": "raw_events",
         "window_start": "2026-06-05 12:00:00",
         "window_end": "2026-07-05 12:00:00",
     }
@@ -203,7 +207,6 @@ def test_user_behavior_vector_batch_skips_insert_when_no_source_users() -> None:
         UserBehaviorVectorBuildRequest(
             project_id="demo_project",
             vector_version="v1",
-            source="expedia_hotel_events",
             window_days=30,
         ),
     )

@@ -38,12 +38,10 @@ jobs:
           payload="$(jq -n \
             --arg project_id "$PROJECT_ID" \
             --arg vector_version "$VECTOR_VERSION" \
-            --arg source "expedia_hotel_events" \
             --argjson window_days "$WINDOW_DAYS" \
             '{
               project_id: $project_id,
               vector_version: $vector_version,
-              source: $source,
               window_days: $window_days
             }')"
           curl --fail-with-body --show-error --silent --max-time 900 \
