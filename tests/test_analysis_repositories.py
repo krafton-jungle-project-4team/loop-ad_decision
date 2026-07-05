@@ -580,6 +580,46 @@ def test_hotel_profile_repository_queries_marketing_profiles() -> None:
     assert call.params == {}
 
 
+def test_hotel_profile_repository_summarizes_candidate_users() -> None:
+    client = FakeClickHouseClient(
+        rows=[
+            {
+                "event_count": 80,
+                "booking_count": 20,
+                "mobile_ratio": 0.9,
+                "package_ratio": 0.35,
+                "avg_stay_nights": 3.4,
+                "avg_days_until_checkin": 4.5,
+            }
+        ]
+    )
+    repo = HotelProfileRepository(client)
+
+    profile = repo.summarize_user_ids(
+        project_id="hotel-client-a",
+        profile_name="seg_ai_cluster_promo_001_1",
+        user_ids=["user_001", "user_002"],
+    )
+
+    assert profile is not None
+    assert profile.project_id == "hotel-client-a"
+    assert profile.profile_name == "seg_ai_cluster_promo_001_1"
+    assert profile.profile_json == {
+        "event_count": 80,
+        "booking_count": 20,
+        "mobile_ratio": 0.9,
+        "package_ratio": 0.35,
+        "avg_stay_nights": 3.4,
+        "avg_days_until_checkin": 4.5,
+    }
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from hotel_marketing_profiles" in sql
+    assert "where user_id in {user_ids:array(string)}" in sql
+    assert "project_id" not in sql
+    assert call.params == {"user_ids": ["user_001", "user_002"]}
+
+
 def test_hotel_profile_repository_queries_expedia_event_profile() -> None:
     client = FakeClickHouseClient(rows=[{"hotel_cluster": "seoul_center", "event_count": 42}])
     repo = HotelProfileRepository(client)

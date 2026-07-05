@@ -106,6 +106,19 @@ class FakeHotelProfileRepository:
     ) -> list[HotelMarketingProfileRecord]:
         return [profile for profile in self.profiles if profile.project_id == project_id]
 
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        del user_ids
+        for profile in self.profiles:
+            if profile.project_id == project_id and profile.profile_name == profile_name:
+                return profile
+        return None
+
 
 class FakePromotionAnalysisRepository:
     def __init__(self) -> None:

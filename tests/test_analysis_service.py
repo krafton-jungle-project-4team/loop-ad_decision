@@ -86,9 +86,15 @@ class FakeSegmentDefinitionRepository:
 
 
 class FakeHotelProfileRepository:
-    def __init__(self, profiles: list[HotelMarketingProfileRecord]) -> None:
+    def __init__(
+        self,
+        profiles: list[HotelMarketingProfileRecord],
+        user_profile_summaries: Mapping[str, HotelMarketingProfileRecord] | None = None,
+    ) -> None:
         self.profiles = profiles
+        self.user_profile_summaries = user_profile_summaries or {}
         self.calls: list[Mapping[str, str]] = []
+        self.user_profile_calls: list[Mapping[str, Any]] = []
 
     def list_marketing_profiles(
         self,
@@ -97,6 +103,22 @@ class FakeHotelProfileRepository:
     ) -> list[HotelMarketingProfileRecord]:
         self.calls.append({"project_id": project_id})
         return self.profiles
+
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        self.user_profile_calls.append(
+            {
+                "project_id": project_id,
+                "profile_name": profile_name,
+                "user_ids": list(user_ids),
+            }
+        )
+        return self.user_profile_summaries.get(profile_name)
 
 
 class FakePromotionAnalysisRepository:
@@ -229,6 +251,7 @@ def build_service(
     promotion: PromotionRecord | None,
     segments: list[SegmentDefinitionRecord],
     profiles: list[HotelMarketingProfileRecord] | None = None,
+    user_profile_summaries: Mapping[str, HotelMarketingProfileRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
     segment_suggester: FakeSegmentSuggester | None = None,
 ) -> tuple[
@@ -241,7 +264,10 @@ def build_service(
     service = PromotionAnalysisService(
         promotion_repository=FakePromotionRepository(promotion),
         segment_definition_repository=segment_definition_repository,
-        hotel_profile_repository=FakeHotelProfileRepository(profiles or []),
+        hotel_profile_repository=FakeHotelProfileRepository(
+            profiles or [],
+            user_profile_summaries=user_profile_summaries,
+        ),
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service,
         segment_suggester=segment_suggester,
@@ -450,6 +476,96 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
     )
+
+
+def test_service_ranks_ai_clusters_by_promotion_fit_score() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    high_cluster_low_fit = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_1_highcluster",
+            source="ai_suggested",
+            sample_size=1800,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_low_001", "user_low_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_1_highcluster",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.99,
+        },
+    )
+    lower_cluster_high_fit = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_2_fit",
+            source="ai_suggested",
+            sample_size=1800,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_fit_001", "user_fit_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_2_fit",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.62,
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester(
+            [high_cluster_low_fit, lower_cluster_high_fit]
+        ),
+        user_profile_summaries={
+            high_cluster_low_fit.segment_id: HotelMarketingProfileRecord(
+                project_id="hotel-client-a",
+                profile_name=high_cluster_low_fit.segment_id,
+                profile_json={
+                    "event_count": 100,
+                    "booking_count": 1,
+                    "mobile_ratio": 0.2,
+                    "package_ratio": 0.05,
+                    "avg_stay_nights": 1.2,
+                    "avg_days_until_checkin": 30.0,
+                },
+            ),
+            lower_cluster_high_fit.segment_id: HotelMarketingProfileRecord(
+                project_id="hotel-client-a",
+                profile_name=lower_cluster_high_fit.segment_id,
+                profile_json={
+                    "event_count": 100,
+                    "booking_count": 24,
+                    "mobile_ratio": 0.92,
+                    "package_ratio": 0.4,
+                    "avg_stay_nights": 3.0,
+                    "avg_days_until_checkin": 4.0,
+                },
+            ),
+        },
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments)[:2] == [
+        lower_cluster_high_fit.segment_id,
+        high_cluster_low_fit.segment_id,
+    ]
+    first_score = result.segment_suggestions[0].score_json
+    second_score = result.segment_suggestions[1].score_json
+    assert first_score["cluster_score"] < second_score["cluster_score"]
+    assert first_score["promotion_fit_score"] > second_score["promotion_fit_score"]
+    assert first_score["goal_alignment_score"] > second_score["goal_alignment_score"]
+    assert "goal_booking_conversion_rate_aligned" in result.segment_suggestions[
+        0
+    ].reason_json["fit_rationale"]
 
 
 def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -> None:
