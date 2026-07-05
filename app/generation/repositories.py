@@ -175,6 +175,13 @@ class GenerationRunRepository:
         WHERE generation_id = %(generation_id)s
     """
 
+    LIST_IDS_BY_PROMOTION_SQL = """
+        SELECT generation_id
+        FROM generation_runs
+        WHERE promotion_id = %(promotion_id)s
+        ORDER BY created_at ASC, generation_id ASC
+    """
+
     def __init__(self, connection: ConnectionProtocol):
         self._connection = connection
 
@@ -191,6 +198,15 @@ class GenerationRunRepository:
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(self.SELECT_BY_ID_SQL, {"generation_id": generation_id})
             return cursor.fetchone()
+
+    def list_ids_by_promotion(self, promotion_id: str) -> list[str]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.LIST_IDS_BY_PROMOTION_SQL,
+                {"promotion_id": promotion_id},
+            )
+            rows = cursor.fetchall()
+        return [str(row["generation_id"]) for row in rows]
 
 
 class GenerationInputRepository:
