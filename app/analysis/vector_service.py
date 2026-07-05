@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import hashlib
 import math
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
 from typing import Protocol, Sequence
 
@@ -75,7 +77,7 @@ class SegmentVectorService:
             segment_id=request.segment_id,
         )
         if existing is not None:
-            _validate_vector(existing.vector_values, existing.vector_dim)
+            _validate_existing_segment_vector(existing)
             return SegmentVectorBuildResult(
                 segment_id=existing.segment_id,
                 segment_vector_id=existing.segment_vector_id,
@@ -153,10 +155,55 @@ def _validate_vector(vector_values: Sequence[float], vector_dim: int) -> None:
 
 def _l2_normalize(vector_values: Sequence[float]) -> list[float]:
     _validate_vector(vector_values, len(vector_values))
-    norm = math.sqrt(sum(float(value) * float(value) for value in vector_values))
+    numeric_values = [float(value) for value in vector_values]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("segment vector_values must be finite")
+    norm = math.sqrt(sum(value * value for value in numeric_values))
     if norm == 0:
         raise ValueError("segment vector must not be a zero vector")
-    return [float(value) / norm for value in vector_values]
+    return [value / norm for value in numeric_values]
+
+
+def _validate_existing_segment_vector(vector: SegmentVectorRecord) -> None:
+    _validate_reusable_vector_values(
+        vector.vector_values,
+        vector.vector_dim,
+        field_name="segment vector_values",
+    )
+    if vector.embedding is None:
+        raise ValueError("segment embedding is required")
+    _validate_reusable_vector_values(
+        _parse_vector_values(vector.embedding, field_name="segment embedding"),
+        vector.vector_dim,
+        field_name="segment embedding",
+    )
+
+
+def _validate_reusable_vector_values(
+    vector_values: Sequence[float],
+    vector_dim: int,
+    *,
+    field_name: str,
+) -> None:
+    if vector_dim != VECTOR_DIM:
+        raise ValueError(f"{field_name} vector_dim must be 64")
+    if len(vector_values) != VECTOR_DIM:
+        raise ValueError(f"{field_name} must contain 64 values")
+    numeric_values = [float(value) for value in vector_values]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError(f"{field_name} must be finite")
+    if math.sqrt(sum(value * value for value in numeric_values)) == 0:
+        raise ValueError(f"{field_name} must not be a zero vector")
+
+
+def _parse_vector_values(value: object, *, field_name: str) -> list[float]:
+    parsed = json.loads(value) if isinstance(value, str) else value
+    if not isinstance(parsed, SequenceABC) or isinstance(parsed, (bytes, str)):
+        raise ValueError(f"{field_name} must be an array")
+    try:
+        return [float(item) for item in parsed]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must contain numbers") from exc
 
 
 def _fixture_vector(segment_id: str) -> list[float]:

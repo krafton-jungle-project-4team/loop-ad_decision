@@ -518,6 +518,7 @@ class SegmentVectorRepository:
 
     def save(self, vector: SegmentVectorRecord) -> None:
         self._validate_vector(vector)
+        normalized_values = _normalize_vector(vector.vector_values, self.VECTOR_DIM)
         self._db.execute(
             """
             INSERT INTO segment_vectors (
@@ -543,8 +544,8 @@ class SegmentVectorRepository:
                 vector.analysis_id,
                 vector.segment_id,
                 vector.vector_dim,
-                vector.vector_values,
-                _vector_literal(vector.vector_values, self.VECTOR_DIM),
+                normalized_values,
+                _vector_literal(normalized_values, self.VECTOR_DIM),
                 vector.vector_version,
                 vector.source,
             ),
@@ -852,3 +853,15 @@ def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
     if not all(math.isfinite(value) for value in numeric_values):
         raise ValueError("vector literal values must be finite")
     return "[" + ",".join(str(value) for value in numeric_values) + "]"
+
+
+def _normalize_vector(values: Sequence[float], vector_dim: int) -> list[float]:
+    if len(values) != vector_dim:
+        raise ValueError("vector literal must contain 64 values")
+    numeric_values = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("vector literal values must be finite")
+    norm = math.sqrt(sum(value * value for value in numeric_values))
+    if norm == 0:
+        raise ValueError("segment vector_values must not be a zero vector")
+    return [value / norm for value in numeric_values]

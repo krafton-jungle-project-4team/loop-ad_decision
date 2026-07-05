@@ -170,9 +170,10 @@ def test_segment_vector_service_reuses_existing_vector() -> None:
         analysis_id="analysis_banner_001",
         segment_id="seg_repeat_hotel_no_booking",
         vector_dim=64,
-        vector_values=[1.0, *([0.0] * 63)],
+        vector_values=[2.0, *([0.0] * 63)],
         vector_version="v1",
         source="decision_analysis",
+        embedding=[2.0, *([0.0] * 63)],
     )
     store = FakeSegmentVectorRepository(existing=existing)
     reader = FakeUserBehaviorVectorRepository([vector_record()])
@@ -185,7 +186,88 @@ def test_segment_vector_service_reuses_existing_vector() -> None:
 
     assert result.segment_vector_id == "segvec_existing_v1"
     assert result.vector_values == existing.vector_values
+    assert vector_norm(result.vector_values) == pytest.approx(2.0)
     assert reader.calls == []
+    assert store.saved == []
+
+
+def test_segment_vector_service_rejects_existing_vector_without_embedding() -> None:
+    existing = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="v1",
+        source="decision_analysis",
+    )
+    store = FakeSegmentVectorRepository(existing=existing)
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+    )
+
+    with pytest.raises(ValueError, match="embedding is required"):
+        service.prepare_segment_vector(build_request())
+
+    assert store.saved == []
+
+
+def test_segment_vector_service_rejects_invalid_existing_vector_values() -> None:
+    existing = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[0.0] * 64,
+        vector_version="v1",
+        source="decision_analysis",
+        embedding=[1.0, *([0.0] * 63)],
+    )
+    store = FakeSegmentVectorRepository(existing=existing)
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="segment vector_values must not be a zero vector",
+    ):
+        service.prepare_segment_vector(build_request())
+
+    assert store.saved == []
+
+
+def test_segment_vector_service_rejects_invalid_existing_embedding() -> None:
+    existing = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="v1",
+        source="decision_analysis",
+        embedding=[0.0] * 64,
+    )
+    store = FakeSegmentVectorRepository(existing=existing)
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+    )
+
+    with pytest.raises(ValueError, match="segment embedding must not be a zero vector"):
+        service.prepare_segment_vector(build_request())
+
     assert store.saved == []
 
 

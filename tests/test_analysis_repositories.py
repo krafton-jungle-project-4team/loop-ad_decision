@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from decimal import Decimal
+import math
 from typing import Any, Mapping, Sequence
 
 import pytest
@@ -377,6 +378,7 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
 
 def test_segment_vector_repository_get_and_save_vector() -> None:
     vector_values = [0.1] * 64
+    normalized_values = [1 / math.sqrt(64)] * 64
     db = FakePostgresExecutor(
         fetchone_result={
             "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
@@ -400,6 +402,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         segment_id="seg_repeat_hotel_no_booking",
     )
     assert loaded is not None
+    original_values = list(loaded.vector_values)
     repo.save(loaded)
 
     select_call, insert_call = db.calls
@@ -420,11 +423,37 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "analysis_banner_001",
         "seg_repeat_hotel_no_booking",
         64,
-        vector_values,
-        "[" + ",".join(str(value) for value in vector_values) + "]",
+        normalized_values,
+        "[" + ",".join(str(value) for value in normalized_values) + "]",
         "v1",
         "decision_analysis",
     )
+    assert loaded.vector_values == original_values
+
+
+def test_segment_vector_repository_normalizes_without_mutating_input() -> None:
+    vector_values = [2.0, *([0.0] * 63)]
+    vector = SegmentVectorRecord(
+        segment_vector_id="segvec_raw",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_raw",
+        vector_dim=64,
+        vector_values=vector_values,
+        vector_version="v1",
+        source="decision_analysis",
+    )
+    db = FakePostgresExecutor()
+    repo = SegmentVectorRepository(db)
+
+    repo.save(vector)
+
+    assert vector.vector_values == [2.0, *([0.0] * 63)]
+    insert_call = db.calls[0]
+    assert insert_call.params[7] == [1.0, *([0.0] * 63)]
+    assert insert_call.params[8] == "[" + ",".join(["1.0", *["0.0"] * 63]) + "]"
 
 
 def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
