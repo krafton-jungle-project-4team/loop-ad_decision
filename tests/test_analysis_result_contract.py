@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from enum import Enum
@@ -331,8 +332,13 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
     )
 
     assert response.status_code == 200
-    assert response.json() == {
-        "analysis_id": "analysis_promo_banner_001",
+    body = response.json()
+    assert re.fullmatch(
+        r"analysis_promo_banner_001_run_[0-9a-f]{8}",
+        body["analysis_id"],
+    )
+    assert body == {
+        "analysis_id": body["analysis_id"],
         "promotion_id": "promo_banner_001",
         "status": "completed",
         "target_segments": [
@@ -500,9 +506,13 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
             "available_segment_definitions"
         ]
     )
+    assert re.fullmatch(
+        r"analysis_promo_banner_001_run_[0-9a-f]{8}",
+        saved_analysis.analysis_id,
+    )
 
     for rank, segment in enumerate(saved_segments):
-        assert segment.analysis_id == "analysis_promo_banner_001"
+        assert segment.analysis_id == saved_analysis.analysis_id
         assert segment.project_id == "hotel-client-a"
         assert segment.campaign_id == "camp_summer_2026"
         assert segment.promotion_id == "promo_banner_001"
@@ -522,7 +532,7 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         assert segment.profile_json["primary_segment"] == segment.segment_id
 
     for rank, suggestion in enumerate(saved_suggestions):
-        assert suggestion.analysis_id == "analysis_promo_banner_001"
+        assert suggestion.analysis_id == saved_analysis.analysis_id
         assert suggestion.project_id == "hotel-client-a"
         assert suggestion.campaign_id == "camp_summer_2026"
         assert suggestion.promotion_id == "promo_banner_001"

@@ -31,18 +31,22 @@ class FakeUserBehaviorVectorRepository:
         return self.vectors
 
 
-def promotion_record() -> PromotionRecord:
+def promotion_record(
+    *,
+    promotion_id: str = "promo_banner_001",
+    message_brief: str = "Drive hotel booking conversion for summer stays.",
+) -> PromotionRecord:
     return PromotionRecord(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
-        promotion_id="promo_banner_001",
+        promotion_id=promotion_id,
         channel="onsite_banner",
         goal_metric="booking_conversion_rate",
         goal_target_value=Decimal("0.030000"),
         goal_basis="all_segments",
         min_sample_size=2,
         landing_url="https://demo-stay.example.com/hotel-detail",
-        message_brief="Drive hotel booking conversion for summer stays.",
+        message_brief=message_brief,
     )
 
 
@@ -79,6 +83,7 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
     )
     suggester = VectorClusterSegmentSuggester(
         user_behavior_vector_repository=reader,
+        vector_pool_limit=20,
         vector_sample_limit=20,
         max_suggested_segments=2,
         min_cluster_size=2,
@@ -105,6 +110,10 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
         Decimal("0.500000"),
         Decimal("0.500000"),
     ]
+    assert all(
+        not segment.segment_name.startswith("AI suggested hotel audience")
+        for segment in segments
+    )
     assert {
         tuple(segment.rule_json["candidate_user_ids"])
         for segment in segments
@@ -118,6 +127,67 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
         for segment in segments
     )
     assert all("cluster_score" in segment.profile_json for segment in segments)
+    assert all("top_common_features" in segment.profile_json for segment in segments)
+
+
+def test_vector_cluster_suggester_uses_promotion_seed_for_sampling() -> None:
+    reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector(f"user_{index:03}", vector_values(index % 4))
+            for index in range(8)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=reader,
+        vector_pool_limit=8,
+        vector_sample_limit=4,
+        max_suggested_segments=1,
+        min_cluster_size=1,
+    )
+
+    first_segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            promotion_id="promo_family_trip",
+            message_brief="Promote family hotel stays.",
+        )
+    )
+    second_segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            promotion_id="promo_last_minute",
+            message_brief="Promote last minute hotel deals.",
+        )
+    )
+
+    assert first_segments[0].rule_json["sample_seed"] != second_segments[0].rule_json[
+        "sample_seed"
+    ]
+    assert set(first_segments[0].rule_json["candidate_user_ids"]) != set(
+        second_segments[0].rule_json["candidate_user_ids"]
+    )
+
+
+def test_vector_cluster_suggester_names_segments_from_dominant_features() -> None:
+    reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("booking_user_001", vector_values(8)),
+            user_vector("booking_user_002", vector_values(8)),
+            user_vector("promo_user_001", vector_values(5)),
+            user_vector("promo_user_002", vector_values(5)),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=reader,
+        vector_pool_limit=4,
+        vector_sample_limit=4,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(promotion=promotion_record())
+    segment_names = {segment.segment_name for segment in segments}
+
+    assert "Booking starters" in segment_names
+    assert "Promotion click responders" in segment_names
 
 
 def test_vector_cluster_suggester_returns_empty_when_vectors_are_insufficient() -> None:
