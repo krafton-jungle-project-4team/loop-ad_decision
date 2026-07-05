@@ -11,7 +11,7 @@ from app.analysis.repositories import (
     PromotionAnalysisRepository,
     PromotionAnalysisWrite,
     PromotionRepository,
-    PromotionTargetSegmentWrite,
+    PromotionSegmentSuggestionWrite,
     SegmentDefinitionRecord,
     SegmentDefinitionRepository,
     SegmentVectorRecord,
@@ -148,6 +148,8 @@ def test_segment_definition_repository_filters_active_sources() -> None:
             {
                 "segment_id": "seg_repeat_hotel_no_booking",
                 "project_id": "hotel-client-a",
+                "campaign_id": "camp_summer_2026",
+                "promotion_id": "promo_banner_001",
                 "segment_name": "Repeat hotel viewers without booking",
                 "source": "custom_chatkit",
                 "query_preview_id": "seg_query_preview_001",
@@ -166,6 +168,8 @@ def test_segment_definition_repository_filters_active_sources() -> None:
 
     segments = repo.list_active(
         project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
         sources=("custom_chatkit", "system_default"),
     )
 
@@ -175,11 +179,21 @@ def test_segment_definition_repository_filters_active_sources() -> None:
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert "from segment_definitions" in sql
+    assert "campaign_id" in sql
+    assert "promotion_id" in sql
     assert "profile_json" in sql
     assert "total_eligible_user_count" in sql
     assert "status = 'active'" in sql
+    assert "(campaign_id is null or campaign_id = %s)" in sql
+    assert "(promotion_id is null or promotion_id = %s)" in sql
     assert "source in (%s, %s)" in sql
-    assert call.params == ("hotel-client-a", "custom_chatkit", "system_default")
+    assert call.params == (
+        "hotel-client-a",
+        "camp_summer_2026",
+        "promo_banner_001",
+        "custom_chatkit",
+        "system_default",
+    )
 
 
 def test_segment_definition_repository_saves_ai_suggested_segments() -> None:
@@ -188,6 +202,8 @@ def test_segment_definition_repository_saves_ai_suggested_segments() -> None:
     segment = SegmentDefinitionRecord(
         segment_id="seg_ai_cluster_promo_banner_001_1_abcdef1234",
         project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
         segment_name="AI suggested hotel audience 1",
         source="ai_suggested",
         query_preview_id=None,
@@ -218,6 +234,8 @@ def test_segment_definition_repository_saves_ai_suggested_segments() -> None:
     assert call.params == (
         "seg_ai_cluster_promo_banner_001_1_abcdef1234",
         "hotel-client-a",
+        "camp_summer_2026",
+        "promo_banner_001",
         "AI suggested hotel audience 1",
         "ai_suggested",
         None,
@@ -304,51 +322,56 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     )
 
 
-def test_promotion_analysis_repository_saves_target_segments() -> None:
+def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
     db = FakePostgresExecutor()
     repo = PromotionAnalysisRepository(db)
-    segment = PromotionTargetSegmentWrite(
+    suggestion = PromotionSegmentSuggestionWrite(
+        suggestion_id="sugg_analysis_banner_001_seg_repeat",
         analysis_id="analysis_banner_001",
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         segment_id="seg_repeat_hotel_no_booking",
-        segment_name="Repeat hotel viewers without booking",
-        rule_json={"event_name": "hotel_detail_view"},
-        profile_json={"hotel_cluster": "seoul_center"},
-        content_brief_json={"keywords": ["free cancellation"]},
-        data_evidence_json={"event_count": 120},
-        segment_vector_id="segvec_repeat_hotel_no_booking_v1",
-        estimated_size=1342,
-        priority="high",
-        status="planned",
+        suggested_rank=1,
+        suggestion_source="ai_ranked_existing",
+        status="suggested",
+        score_json={"rank": 1, "estimated_size": 1342, "priority": "high"},
+        reason_json={"channel": "onsite_banner", "goal_metric": "booking_conversion_rate"},
+        metadata_json={
+            "segment_name": "Repeat hotel viewers without booking",
+            "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
+        },
     )
 
-    repo.save_target_segments([segment])
+    repo.save_segment_suggestions([suggestion])
 
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert call.operation == "execute"
-    assert "insert into promotion_target_segments" in sql
-    assert "content_brief_json" in sql
-    assert "data_evidence_json" in sql
-    assert "segment_vector_id" in sql
+    assert "insert into promotion_segment_suggestions" in sql
+    assert "suggestion_id" in sql
+    assert "suggested_rank" in sql
+    assert "suggestion_source" in sql
+    assert "score_json" in sql
+    assert "reason_json" in sql
+    assert "metadata_json" in sql
     assert "status" in sql
     assert call.params == (
+        "sugg_analysis_banner_001_seg_repeat",
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "seg_repeat_hotel_no_booking",
-        "Repeat hotel viewers without booking",
-        {"event_name": "hotel_detail_view"},
-        {"hotel_cluster": "seoul_center"},
-        {"keywords": ["free cancellation"]},
-        {"event_count": 120},
-        "segvec_repeat_hotel_no_booking_v1",
-        1342,
-        "high",
-        "planned",
+        1,
+        "ai_ranked_existing",
+        "suggested",
+        {"rank": 1, "estimated_size": 1342, "priority": "high"},
+        {"channel": "onsite_banner", "goal_metric": "booking_conversion_rate"},
+        {
+            "segment_name": "Repeat hotel viewers without booking",
+            "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
+        },
     )
 
 
@@ -366,6 +389,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
             "vector_values": vector_values,
             "vector_version": "v1",
             "source": "decision_analysis",
+            "embedding": vector_values,
         }
     )
     repo = SegmentVectorRepository(db)
@@ -380,12 +404,14 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
 
     select_call, insert_call = db.calls
     assert "from segment_vectors" in compact_sql(select_call.query)
+    assert "embedding::text as embedding" in compact_sql(select_call.query)
     assert select_call.params == (
         "hotel-client-a",
         "promo_banner_001",
         "seg_repeat_hotel_no_booking",
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
+    assert "embedding" in compact_sql(insert_call.query)
     assert insert_call.params == (
         "segvec_repeat_hotel_no_booking_v1",
         "hotel-client-a",
@@ -395,6 +421,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "seg_repeat_hotel_no_booking",
         64,
         vector_values,
+        "[" + ",".join(str(value) for value in vector_values) + "]",
         "v1",
         "decision_analysis",
     )
@@ -417,6 +444,28 @@ def test_segment_vector_repository_rejects_non_64_dimensional_vectors() -> None:
     )
 
     with pytest.raises(ValueError, match="64 values"):
+        repo.save(vector)
+
+    assert db.calls == []
+
+
+def test_segment_vector_repository_rejects_zero_vectors() -> None:
+    db = FakePostgresExecutor()
+    repo = SegmentVectorRepository(db)
+    vector = SegmentVectorRecord(
+        segment_vector_id="segvec_zero",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_zero",
+        vector_dim=64,
+        vector_values=[0.0] * 64,
+        vector_version="v1",
+        source="decision_analysis",
+    )
+
+    with pytest.raises(ValueError, match="zero vector"):
         repo.save(vector)
 
     assert db.calls == []

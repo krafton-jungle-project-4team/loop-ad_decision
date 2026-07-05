@@ -1,12 +1,20 @@
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from decimal import Decimal
 from typing import Any, Protocol
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-from app.generation.schemas import ContentChannel, missing_channel_fields
+from app.generation.prompt_builder import (
+    PromotionPromptInput,
+    TargetSegmentPromptInput,
+)
+from app.generation.schemas import (
+    ContentChannel,
+    GenerationRequest,
+    missing_channel_fields,
+)
 
 
 GENERATION_RUN_COLUMNS: tuple[str, ...] = (
@@ -70,107 +78,6 @@ class CursorProtocol(Protocol):
 class ConnectionProtocol(Protocol):
     def cursor(self, *, row_factory: Any = None) -> Any:
         ...
-
-
-@dataclass(frozen=True)
-class PromotionPromptRecord:
-    project_id: str
-    campaign_id: str
-    promotion_id: str
-    channel: str
-    goal_metric: str
-    goal_target_value: Decimal
-    goal_basis: str
-    message_brief: str | None
-    landing_url: str | None
-
-
-@dataclass(frozen=True)
-class PromotionTargetSegmentRecord:
-    analysis_id: str
-    promotion_id: str
-    segment_id: str
-    segment_name: str
-    content_brief_json: dict[str, Any]
-    data_evidence_json: dict[str, Any]
-    segment_vector_id: str | None
-    estimated_size: int
-    priority: str | None
-
-
-class PromotionRepository:
-    SELECT_FOR_GENERATION_SQL = """
-        SELECT
-            project_id,
-            campaign_id,
-            promotion_id,
-            channel,
-            goal_metric,
-            goal_target_value,
-            goal_basis,
-            message_brief,
-            landing_url
-        FROM promotions
-        WHERE project_id = %(project_id)s
-          AND campaign_id = %(campaign_id)s
-          AND promotion_id = %(promotion_id)s
-    """
-
-    def __init__(self, connection: ConnectionProtocol):
-        self._connection = connection
-
-    def get_for_generation(
-        self,
-        *,
-        project_id: str,
-        campaign_id: str,
-        promotion_id: str,
-    ) -> PromotionPromptRecord | None:
-        with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                self.SELECT_FOR_GENERATION_SQL,
-                {
-                    "project_id": project_id,
-                    "campaign_id": campaign_id,
-                    "promotion_id": promotion_id,
-                },
-            )
-            row = cursor.fetchone()
-
-        if row is None:
-            return None
-        return PromotionPromptRecord(**row)
-
-
-class PromotionTargetSegmentRepository:
-    SELECT_BY_ANALYSIS_SQL = """
-        SELECT
-            analysis_id,
-            promotion_id,
-            segment_id,
-            segment_name,
-            content_brief_json,
-            data_evidence_json,
-            segment_vector_id,
-            estimated_size,
-            priority
-        FROM promotion_target_segments
-        WHERE analysis_id = %(analysis_id)s
-        ORDER BY segment_id ASC
-    """
-
-    def __init__(self, connection: ConnectionProtocol):
-        self._connection = connection
-
-    def list_for_analysis(
-        self,
-        analysis_id: str,
-    ) -> list[PromotionTargetSegmentRecord]:
-        with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(self.SELECT_BY_ANALYSIS_SQL, {"analysis_id": analysis_id})
-            rows = cursor.fetchall()
-
-        return [PromotionTargetSegmentRecord(**row) for row in rows]
 
 
 @dataclass(frozen=True)
@@ -284,6 +191,111 @@ class GenerationRunRepository:
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(self.SELECT_BY_ID_SQL, {"generation_id": generation_id})
             return cursor.fetchone()
+
+
+class GenerationInputRepository:
+    SELECT_PROMOTION_SQL = """
+        SELECT
+            project_id,
+            campaign_id,
+            promotion_id,
+            channel,
+            goal_metric,
+            goal_target_value,
+            goal_basis,
+            message_brief,
+            landing_url
+        FROM promotions
+        WHERE project_id = %(project_id)s
+          AND campaign_id = %(campaign_id)s
+          AND promotion_id = %(promotion_id)s
+    """
+
+    SELECT_TARGET_SEGMENTS_SQL = """
+        SELECT
+            pts.analysis_id,
+            pts.promotion_id,
+            pts.segment_id,
+            pts.segment_name,
+            pts.content_brief_json,
+            pts.data_evidence_json,
+            pts.segment_vector_id,
+            pts.estimated_size,
+            pts.priority,
+            sd.source AS segment_source,
+            sd.query_preview_id,
+            sd.natural_language_query,
+            sd.generated_sql,
+            sd.sample_size AS segment_sample_size,
+            sd.sample_ratio AS segment_sample_ratio
+        FROM promotion_target_segments pts
+        LEFT JOIN segment_definitions sd
+          ON sd.project_id = pts.project_id
+         AND sd.segment_id = pts.segment_id
+        WHERE pts.project_id = %(project_id)s
+          AND pts.campaign_id = %(campaign_id)s
+          AND pts.promotion_id = %(promotion_id)s
+          AND pts.analysis_id = %(analysis_id)s
+        ORDER BY
+            CASE pts.priority
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+                ELSE 4
+            END,
+            pts.segment_id
+    """
+
+    def __init__(self, connection: ConnectionProtocol):
+        self._connection = connection
+
+    def get_promotion_input(
+        self,
+        request: GenerationRequest,
+    ) -> PromotionPromptInput | None:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.SELECT_PROMOTION_SQL,
+                {
+                    "project_id": request.project_id,
+                    "campaign_id": request.campaign_id,
+                    "promotion_id": request.promotion_id,
+                },
+            )
+            row = cursor.fetchone()
+
+        if row is None:
+            return None
+
+        return PromotionPromptInput(
+            project_id=str(row["project_id"]),
+            campaign_id=str(row["campaign_id"]),
+            promotion_id=str(row["promotion_id"]),
+            channel=ContentChannel(str(row["channel"])),
+            goal_metric=str(row["goal_metric"]),
+            goal_target_value=str(row["goal_target_value"]),
+            goal_basis=str(row["goal_basis"]),
+            message_brief=_optional_text(row.get("message_brief")),
+            landing_url=_optional_text(row.get("landing_url")),
+        )
+
+    def list_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.SELECT_TARGET_SEGMENTS_SQL,
+                {
+                    "project_id": request.project_id,
+                    "campaign_id": request.campaign_id,
+                    "promotion_id": request.promotion_id,
+                    "analysis_id": request.analysis_id,
+                },
+            )
+            rows = cursor.fetchall()
+
+        return [_target_segment_prompt_input(row) for row in rows]
 
 
 @dataclass(frozen=True)
@@ -512,3 +524,67 @@ class ContentCandidateRepository:
                 {"generation_id": generation_id},
             )
             return cursor.fetchall()
+
+
+def _target_segment_prompt_input(
+    row: Mapping[str, Any],
+) -> TargetSegmentPromptInput:
+    return TargetSegmentPromptInput(
+        analysis_id=str(row["analysis_id"]),
+        promotion_id=str(row["promotion_id"]),
+        segment_id=str(row["segment_id"]),
+        segment_name=str(row.get("segment_name") or row["segment_id"]),
+        content_brief_json=_content_brief_json(row),
+        segment_vector_id=_optional_text(row.get("segment_vector_id")),
+        estimated_size=_positive_int(
+            row.get("estimated_size"),
+            fallback=_positive_int(row.get("segment_sample_size")),
+        ),
+        priority=_optional_text(row.get("priority")),
+        natural_language_query=_optional_text(row.get("natural_language_query")),
+        generated_sql=_optional_text(row.get("generated_sql")),
+        sample_ratio=(
+            _optional_text(row.get("segment_sample_ratio"))
+            or _optional_text(
+                _json_object(row.get("data_evidence_json")).get("sample_ratio")
+            )
+        ),
+        source=_optional_text(row.get("segment_source"))
+        or _optional_text(_json_object(row.get("data_evidence_json")).get("source")),
+        query_preview_id=_optional_text(row.get("query_preview_id")),
+    )
+
+
+def _content_brief_json(row: Mapping[str, Any]) -> dict[str, Any]:
+    content_brief = _json_object(row.get("content_brief_json"))
+    data_evidence = _json_object(row.get("data_evidence_json"))
+    for key in (
+        "booking_conversion_rate",
+        "comparison_group_conversion_rate",
+        "top_common_features",
+        "keywords",
+    ):
+        if key not in content_brief and key in data_evidence:
+            content_brief[key] = data_evidence[key]
+    return content_brief
+
+
+def _json_object(value: object) -> dict[str, Any]:
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def _optional_text(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _positive_int(value: object, *, fallback: int = 0) -> int:
+    try:
+        number = int(str(value))
+    except (TypeError, ValueError):
+        return max(fallback, 0)
+    return max(number, 0)

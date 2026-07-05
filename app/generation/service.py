@@ -12,8 +12,6 @@ from app.generation.generator import (
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
-    PromotionPromptRecord,
-    PromotionTargetSegmentRecord,
 )
 from app.generation.prompt_builder import (
     GenerationInputBuilder,
@@ -47,33 +45,27 @@ class ContentCandidateWriter(Protocol):
         ...
 
 
-class PromotionPromptReader(Protocol):
-    def get_for_generation(
+class GenerationInputReader(Protocol):
+    def get_promotion_input(
         self,
-        *,
-        project_id: str,
-        campaign_id: str,
-        promotion_id: str,
-    ) -> PromotionPromptRecord | None:
+        request: GenerationRequest,
+    ) -> PromotionPromptInput | None:
         ...
 
-
-class PromotionTargetSegmentReader(Protocol):
-    def list_for_analysis(
+    def list_target_segment_inputs(
         self,
-        analysis_id: str,
-    ) -> list[PromotionTargetSegmentRecord]:
-        ...
-
-
-class GenerationRunReader(Protocol):
-    def get_by_id(self, generation_id: str) -> dict[str, Any] | None:
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
         ...
 
 
 class GenerationRequestHandler(Protocol):
     def generate(self, request: GenerationRequest) -> GenerationResponse:
         ...
+
+
+class GenerationInputUnavailable(RuntimeError):
+    """Raised when confirmed generation input rows are not ready yet."""
 
 
 @dataclass(frozen=True)
@@ -102,9 +94,7 @@ class GenerationService:
         *,
         generation_run_repository: GenerationRunWriter | None = None,
         content_candidate_repository: ContentCandidateWriter | None = None,
-        promotion_repository: PromotionPromptReader | None = None,
-        promotion_target_segment_repository: PromotionTargetSegmentReader | None = None,
-        generation_run_reader: GenerationRunReader | None = None,
+        generation_input_reader: GenerationInputReader | None = None,
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
@@ -112,9 +102,7 @@ class GenerationService:
     ) -> None:
         self._generation_run_repository = generation_run_repository
         self._content_candidate_repository = content_candidate_repository
-        self._promotion_repository = promotion_repository
-        self._promotion_target_segment_repository = promotion_target_segment_repository
-        self._generation_run_reader = generation_run_reader
+        self._generation_input_reader = generation_input_reader
         self._generation_input_builder = (
             generation_input_builder or GenerationInputBuilder()
         )
@@ -308,6 +296,27 @@ class GenerationService:
         self,
         request: GenerationRequest,
     ) -> list[GenerationPromptInput]:
+        if self._generation_input_reader is not None:
+            promotion = self._generation_input_reader.get_promotion_input(request)
+            if promotion is None:
+                raise GenerationInputUnavailable(
+                    "promotion input was not found for generation"
+                )
+
+            target_segments = (
+                self._generation_input_reader.list_target_segment_inputs(request)
+            )
+            if not target_segments:
+                raise GenerationInputUnavailable(
+                    "confirmed promotion_target_segments are required for generation"
+                )
+
+            return self._generation_input_builder.build(
+                request=request,
+                promotion=promotion,
+                target_segments=target_segments,
+            )
+
         return self._generation_input_builder.build(
             request=request,
             promotion=_fixture_promotion_prompt_input(request),
@@ -320,29 +329,24 @@ class GenerationService:
         request: GenerationRequest,
         focus_segment_ids: Sequence[str],
     ) -> list[GenerationPromptInput]:
-        if self._promotion_repository is None:
-            raise ValueError("promotion repository is required for focus generation")
-        if self._promotion_target_segment_repository is None:
-            raise ValueError(
-                "promotion target segment repository is required for focus generation"
-            )
+        if self._generation_input_reader is None:
+            raise ValueError("generation input reader is required for focus generation")
 
-        promotion = self._promotion_repository.get_for_generation(
-            project_id=request.project_id,
-            campaign_id=request.campaign_id,
-            promotion_id=request.promotion_id,
-        )
+        promotion = self._generation_input_reader.get_promotion_input(request)
         if promotion is None:
-            raise ValueError("promotion not found for focus generation")
+            raise ValueError("promotion input was not found for focus generation")
 
-        target_segments = self._promotion_target_segment_repository.list_for_analysis(
-            request.analysis_id
+        target_segments = self._generation_input_reader.list_target_segment_inputs(
+            request
         )
+        if not target_segments:
+            raise ValueError(
+                "confirmed promotion_target_segments are required for focus generation"
+            )
         focus_ids = _focus_segment_ids(focus_segment_ids)
         target_segments_by_id = {
             target_segment.segment_id: target_segment
             for target_segment in target_segments
-            if target_segment.promotion_id == request.promotion_id
         }
         missing_segment_ids = [
             segment_id
@@ -354,29 +358,12 @@ class GenerationService:
 
         return self._generation_input_builder.build(
             request=request,
-            promotion=_promotion_prompt_input_from_record(promotion),
+            promotion=promotion,
             target_segments=[
-                _target_segment_prompt_input_from_record(
-                    target_segments_by_id[segment_id]
-                )
+                target_segments_by_id[segment_id]
                 for segment_id in focus_ids
             ],
         )
-
-    def _source_content_option_count(self, source_generation_id: str) -> int:
-        if self._generation_run_reader is None:
-            raise ValueError("generation run reader is required for focus generation")
-        generation_run = self._generation_run_reader.get_by_id(source_generation_id)
-        if generation_run is None:
-            raise ValueError("source generation run not found for focus generation")
-        raw_count = generation_run.get("content_option_count")
-        try:
-            count = int(raw_count)
-        except (TypeError, ValueError) as exc:
-            raise ValueError("source generation content_option_count is invalid") from exc
-        if count < 1:
-            raise ValueError("source generation content_option_count is invalid")
-        return count
 
     def _build_content_candidate_records(
         self,
@@ -491,43 +478,6 @@ def _focus_segment_ids(values: Sequence[str]) -> list[str]:
     if len(set(cleaned)) != len(cleaned):
         raise ValueError("focus_segment_ids must not contain duplicates")
     return cleaned
-
-
-def _promotion_prompt_input_from_record(
-    promotion: PromotionPromptRecord,
-) -> PromotionPromptInput:
-    return PromotionPromptInput(
-        project_id=promotion.project_id,
-        campaign_id=promotion.campaign_id,
-        promotion_id=promotion.promotion_id,
-        channel=ContentChannel(promotion.channel),
-        goal_metric=promotion.goal_metric,
-        goal_target_value=str(promotion.goal_target_value),
-        goal_basis=promotion.goal_basis,
-        message_brief=promotion.message_brief,
-        landing_url=promotion.landing_url,
-    )
-
-
-def _target_segment_prompt_input_from_record(
-    target_segment: PromotionTargetSegmentRecord,
-) -> TargetSegmentPromptInput:
-    return TargetSegmentPromptInput(
-        analysis_id=target_segment.analysis_id,
-        promotion_id=target_segment.promotion_id,
-        segment_id=target_segment.segment_id,
-        segment_name=target_segment.segment_name,
-        content_brief_json=target_segment.content_brief_json,
-        segment_vector_id=target_segment.segment_vector_id,
-        estimated_size=target_segment.estimated_size,
-        priority=target_segment.priority,
-        sample_ratio=str(target_segment.data_evidence_json.get("sample_ratio"))
-        if target_segment.data_evidence_json.get("sample_ratio") is not None
-        else None,
-        source=str(target_segment.data_evidence_json.get("source"))
-        if target_segment.data_evidence_json.get("source") is not None
-        else None,
-    )
 
 
 def _next_loop_source_context(

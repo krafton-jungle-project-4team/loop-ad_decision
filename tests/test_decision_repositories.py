@@ -485,12 +485,14 @@ def test_user_segment_assignment_write_carries_assignment_source() -> None:
         content_option_id="option_a",
         similarity_score=Decimal("0.410000"),
         fallback=True,
+        fallback_reason="below_threshold",
         assignment_source=AssignmentSource.FALLBACK.value,
         assigned_at=assigned_at,
         expires_at=None,
     )
 
     assert assignment.fallback is True
+    assert assignment.fallback_reason == "below_threshold"
     assert assignment.assignment_source == AssignmentSource.FALLBACK.value
     assert assignment.assigned_at == assigned_at
 
@@ -509,6 +511,7 @@ def test_segment_vector_repository_filters_run_context_and_version() -> None:
                 "vector_values": [1.0] + [0.0] * 63,
                 "vector_version": "v1",
                 "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
             }
         ]
     )
@@ -526,6 +529,7 @@ def test_segment_vector_repository_filters_run_context_and_version() -> None:
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert "from segment_vectors" in sql
+    assert "embedding::text as embedding" in sql
     assert "project_id = %s" in sql
     assert "promotion_id = %s" in sql
     assert "analysis_id = %s" in sql
@@ -539,6 +543,71 @@ def test_segment_vector_repository_filters_run_context_and_version() -> None:
         ["seg_family_trip"],
         "v1",
         64,
+    )
+
+
+def test_segment_vector_repository_configures_hnsw_search_params() -> None:
+    db = FakePostgresExecutor()
+    repo = SegmentVectorRepository(db)
+
+    repo.configure_ann_search()
+
+    executed = [compact_sql(call.query) for call in db.calls]
+    assert executed == [
+        "set local hnsw.ef_search = %s",
+        "set local hnsw.iterative_scan = strict_order",
+        "set local hnsw.max_scan_tuples = %s",
+    ]
+    assert db.calls[0].params == (100,)
+    assert db.calls[2].params == (20000,)
+
+
+def test_segment_vector_repository_reads_ann_candidates_by_frozen_ids() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    candidates = repo.list_ann_candidates(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_vector_ids=["segvec_family_v1"],
+        vector_version="v1",
+        query_vector=[1.0] + [0.0] * 63,
+        limit=50,
+    )
+
+    assert candidates[0].segment_vector_id == "segvec_family_v1"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from segment_vectors" in sql
+    assert "segment_vector_id = any(%s)" in sql
+    assert "embedding <=> %s::vector" in sql
+    assert "limit %s" in sql
+    assert call.params == (
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        ["segvec_family_v1"],
+        "v1",
+        64,
+        "[" + ",".join(["1.0", *["0.0"] * 63]) + "]",
+        50,
     )
 
 
@@ -559,6 +628,7 @@ def test_user_segment_assignment_repository_inserts_official_columns_only() -> N
                 content_option_id="option_a",
                 similarity_score=Decimal("0.410000"),
                 fallback=True,
+                fallback_reason="below_threshold",
                 assignment_source=AssignmentSource.FALLBACK.value,
                 assigned_at=assigned_at,
                 expires_at=None,
@@ -578,10 +648,37 @@ def test_user_segment_assignment_repository_inserts_official_columns_only() -> N
     assert "content_option_id" in sql
     assert "similarity_score" in sql
     assert "fallback" in sql
+    assert "fallback_reason" in sql
     assert "assignment_source" in sql
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
     assert "returning id" in sql
+
+
+def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {"user_id": "user_001"},
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    existing = repo.list_existing_user_ids(
+        promotion_run_id="prun_banner_001_loop_1",
+        user_ids=["user_001", "user_002"],
+    )
+
+    assert existing == {"user_001"}
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_segment_assignments" in sql
+    assert "select user_id" in sql
+    assert "promotion_run_id = %s" in sql
+    assert "user_id = any(%s)" in sql
+    assert call.params == (
+        "prun_banner_001_loop_1",
+        ["user_001", "user_002"],
+    )
 
 
 def test_user_segment_assignment_repository_counts_final_assignments() -> None:

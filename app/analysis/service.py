@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+import hashlib
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -9,6 +10,7 @@ from app.analysis.repositories import (
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
+    PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
@@ -122,6 +124,8 @@ class SegmentDefinitionReader(Protocol):
         self,
         *,
         project_id: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
         sources: Sequence[str] | None = None,
     ) -> list[SegmentDefinitionRecord]:
         ...
@@ -152,6 +156,12 @@ class PromotionAnalysisWriter(Protocol):
     ) -> None:
         ...
 
+    def save_segment_suggestions(
+        self,
+        suggestions: Sequence[PromotionSegmentSuggestionWrite],
+    ) -> None:
+        ...
+
 
 class SegmentVectorPreparer(Protocol):
     def prepare_segment_vector(
@@ -174,6 +184,7 @@ class SegmentDefinitionSuggester(Protocol):
 class PromotionAnalysisResult:
     analysis: PromotionAnalysisWrite
     target_segments: list[PromotionTargetSegmentWrite]
+    segment_suggestions: list[PromotionSegmentSuggestionWrite] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -275,6 +286,8 @@ class PromotionAnalysisService:
         promotion = self._get_promotion(request)
         segment_definitions = self._segment_definition_repository.list_active(
             project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
         )
         suggested_segment_definitions = self._suggest_segment_definitions(promotion)
         if suggested_segment_definitions:
@@ -330,10 +343,23 @@ class PromotionAnalysisService:
             )
             for rank, candidate in enumerate(selected_candidates)
         ]
-        self._promotion_analysis_repository.save_target_segments(target_segments)
+        segment_suggestions = [
+            self._build_segment_suggestion(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                target_segment=target_segment,
+                candidate=selected_candidates[rank],
+                rank=rank,
+            )
+            for rank, target_segment in enumerate(target_segments)
+        ]
+        if next_loop_context is not None:
+            self._promotion_analysis_repository.save_target_segments(target_segments)
+        self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
         return PromotionAnalysisResult(
             analysis=analysis,
             target_segments=target_segments,
+            segment_suggestions=segment_suggestions,
         )
 
     def _suggest_segment_definitions(
@@ -505,6 +531,49 @@ class PromotionAnalysisService:
             status="planned",
         )
 
+    def _build_segment_suggestion(
+        self,
+        *,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        target_segment: PromotionTargetSegmentWrite,
+        candidate: SegmentCandidate,
+        rank: int,
+    ) -> PromotionSegmentSuggestionWrite:
+        segment = candidate.definition
+        return PromotionSegmentSuggestionWrite(
+            suggestion_id=_suggestion_id(
+                analysis_id=analysis_id,
+                segment_id=segment.segment_id,
+            ),
+            analysis_id=analysis_id,
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_id=segment.segment_id,
+            suggested_rank=rank + 1,
+            suggestion_source=_suggestion_source(segment),
+            status="suggested",
+            score_json={
+                "rank": rank + 1,
+                "estimated_size": target_segment.estimated_size,
+                "priority": target_segment.priority,
+                "cluster_score": _ai_segment_score(segment),
+            },
+            reason_json={
+                "channel": promotion.channel,
+                "goal_metric": promotion.goal_metric,
+                "segment_source": segment.source,
+                "has_hotel_profile": candidate.profile is not None,
+            },
+            metadata_json={
+                "segment_name": target_segment.segment_name,
+                "segment_vector_id": target_segment.segment_vector_id,
+                "content_brief": target_segment.content_brief_json,
+                "data_evidence": target_segment.data_evidence_json,
+            },
+        )
+
     def _build_content_brief_json(
         self,
         *,
@@ -647,6 +716,8 @@ def _promotion_snapshot(promotion: PromotionRecord) -> dict[str, Any]:
 def _segment_definition_snapshot(segment: SegmentDefinitionRecord) -> dict[str, Any]:
     return {
         "segment_id": segment.segment_id,
+        "campaign_id": segment.campaign_id,
+        "promotion_id": segment.promotion_id,
         "segment_name": segment.segment_name,
         "source": segment.source,
         "sample_size": segment.sample_size,
@@ -717,6 +788,19 @@ def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:
         return float(raw_score)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _suggestion_source(segment: SegmentDefinitionRecord) -> str:
+    if segment.source == "ai_suggested":
+        return "ai_generated"
+    return "ai_ranked_existing"
+
+
+def _suggestion_id(*, analysis_id: str, segment_id: str) -> str:
+    digest = hashlib.sha1(  # noqa: S324 - stable non-security identifier.
+        f"{analysis_id}:{segment_id}".encode("utf-8"),
+    ).hexdigest()[:24]
+    return f"sugg_{digest}"
 
 
 def _total_eligible_users(

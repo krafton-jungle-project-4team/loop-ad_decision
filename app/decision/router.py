@@ -34,7 +34,7 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
 )
-from app.decision.matcher import ExactCosineMatcher
+from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
     NextLoopConflictError,
     NextLoopNotFoundError,
@@ -80,9 +80,8 @@ from app.dependencies import get_settings
 from app.generation.adapters import build_external_content_generator
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
+    GenerationInputRepository,
     GenerationRunRepository as GenerationGenerationRunRepository,
-    PromotionRepository as GenerationPromotionRepository,
-    PromotionTargetSegmentRepository as GenerationPromotionTargetSegmentRepository,
 )
 from app.generation.service import GenerationService
 
@@ -160,7 +159,7 @@ def get_segment_assignment_service(
             user_segment_assignment_repository=UserSegmentAssignmentRepository(
                 executor,
             ),
-            matcher=ExactCosineMatcher(),
+            reranker=SegmentCandidateReranker(),
         )
         connection.commit()
     except Exception:
@@ -274,11 +273,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             content_candidate_repository=GenerationContentCandidateRepository(
                 connection
             ),
-            promotion_repository=GenerationPromotionRepository(connection),
-            promotion_target_segment_repository=GenerationPromotionTargetSegmentRepository(
-                connection
-            ),
-            generation_run_reader=generation_run_repository,
+            generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
         )
         run_creator = PromotionRunService(

@@ -11,6 +11,7 @@ from app.analysis.repositories import (
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
+    PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
@@ -48,6 +49,7 @@ FORBIDDEN_PUBLIC_TERMS = tuple(
 class SavedAnalysis:
     analysis: PromotionAnalysisWrite | None = None
     target_segments: list[PromotionTargetSegmentWrite] | None = None
+    segment_suggestions: list[PromotionSegmentSuggestionWrite] | None = None
 
 
 class FakePromotionRepository:
@@ -82,8 +84,11 @@ class FakeSegmentDefinitionRepository:
         self,
         *,
         project_id: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
         sources: Sequence[str] | None = None,
     ) -> list[SegmentDefinitionRecord]:
+        del campaign_id, promotion_id
         return [
             segment
             for segment in self.segments
@@ -118,6 +123,13 @@ class FakePromotionAnalysisRepository:
     ) -> None:
         self.saved.target_segments = list(target_segments)
         self.events.append("target_segments")
+
+    def save_segment_suggestions(
+        self,
+        suggestions: Sequence[PromotionSegmentSuggestionWrite],
+    ) -> None:
+        self.saved.segment_suggestions = list(suggestions)
+        self.events.append("segment_suggestions")
 
 
 class FakeSegmentVectorService:
@@ -409,12 +421,12 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
     )
 
     saved_analysis = analysis_repository.saved.analysis
-    saved_segments = analysis_repository.saved.target_segments
+    saved_suggestions = analysis_repository.saved.segment_suggestions
     assert saved_analysis is not None
-    assert saved_segments is not None
-    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert saved_suggestions is not None
+    assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert saved_analysis == result.analysis
-    assert saved_segments == result.target_segments
+    assert saved_suggestions == result.segment_suggestions
 
     expected_segment_ids = [
         "seg_family_trip",
@@ -422,8 +434,10 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "seg_repeat_hotel_no_booking",
         "seg_near_checkin",
     ]
+    saved_segments = result.target_segments
+    assert [segment.segment_id for segment in saved_suggestions] == expected_segment_ids
     assert [segment.segment_id for segment in saved_segments] == expected_segment_ids
-    assert len(saved_segments) == saved_analysis.output_json["target_segment_count"]
+    assert len(saved_suggestions) == saved_analysis.output_json["target_segment_count"]
     assert saved_analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
         "target_segment_count": 4,
@@ -484,6 +498,20 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         assert "sample_ratio" in segment.data_evidence_json
         assert "total_eligible_user_count" in segment.data_evidence_json
         assert segment.profile_json["primary_segment"] == segment.segment_id
+
+    for rank, suggestion in enumerate(saved_suggestions):
+        assert suggestion.analysis_id == "analysis_promo_banner_001"
+        assert suggestion.project_id == "hotel-client-a"
+        assert suggestion.campaign_id == "camp_summer_2026"
+        assert suggestion.promotion_id == "promo_banner_001"
+        assert suggestion.segment_id == expected_segment_ids[rank]
+        assert suggestion.suggested_rank == rank + 1
+        assert suggestion.suggestion_source == "ai_ranked_existing"
+        assert suggestion.status == "suggested"
+        assert suggestion.metadata_json["segment_name"] == saved_segments[rank].segment_name
+        assert suggestion.metadata_json["segment_vector_id"] == (
+            f"segvec_{suggestion.segment_id}_v1"
+        )
 
     family_segment = saved_segments[0]
     repeat_hotel_segment = saved_segments[2]

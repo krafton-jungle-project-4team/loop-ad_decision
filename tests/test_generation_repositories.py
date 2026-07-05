@@ -3,10 +3,11 @@ from app.generation.repositories import (
     GENERATION_RUN_COLUMNS,
     ContentCandidateRecord,
     ContentCandidateRepository,
+    GenerationInputRepository,
     GenerationRunRecord,
     GenerationRunRepository,
 )
-from app.generation.schemas import ContentChannel
+from app.generation.schemas import ContentChannel, GenerationRequest
 
 
 class FakeCursor:
@@ -180,3 +181,101 @@ def test_content_candidate_repository_lists_by_generation() -> None:
     query, params = cursor.executed[0]
     assert "FROM content_candidates" in query
     assert params == {"generation_id": "generation_banner_001"}
+
+
+def test_generation_input_repository_reads_confirmed_target_segments() -> None:
+    cursor = FakeCursor(
+        fetchone_result={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "channel": "onsite_banner",
+            "goal_metric": "booking_conversion_rate",
+            "goal_target_value": "0.030000",
+            "goal_basis": "all_segments",
+            "message_brief": "Drive hotel booking conversion.",
+            "landing_url": "https://demo-stay.example.com/summer",
+        },
+        fetchall_result=[
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_ai_repeat_hotel",
+                "segment_name": "AI suggested repeat hotel viewers",
+                "content_brief_json": {
+                    "message_direction": "Highlight refundable hotel stays.",
+                    "keywords": ["refundable stays", "hotel deals"],
+                },
+                "data_evidence_json": {
+                    "source": "ai_suggested",
+                    "booking_conversion_rate": "0.018",
+                    "top_common_features": ["same_hotel_repeat_view"],
+                    "sample_ratio": "0.018000",
+                },
+                "segment_vector_id": "segvec_ai_repeat_hotel_v1",
+                "estimated_size": 1342,
+                "priority": "high",
+                "segment_source": "ai_suggested",
+                "query_preview_id": "seg_query_preview_001",
+                "natural_language_query": "repeat hotel viewers without booking",
+                "generated_sql": "SELECT user_id FROM hotel_detail_events",
+                "segment_sample_size": 1342,
+                "segment_sample_ratio": "0.018000",
+            },
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_manual_family_trip",
+                "segment_name": "Manual family trip segment",
+                "content_brief_json": {
+                    "message_direction": "Promote family-friendly rooms.",
+                    "keywords": ["family rooms"],
+                },
+                "data_evidence_json": {"source": "manual_rule"},
+                "segment_vector_id": "segvec_manual_family_trip_v1",
+                "estimated_size": 820,
+                "priority": "medium",
+                "segment_source": "manual_rule",
+                "query_preview_id": None,
+                "natural_language_query": "family hotel trip planners",
+                "generated_sql": None,
+                "segment_sample_size": 820,
+                "segment_sample_ratio": "0.011000",
+            },
+        ],
+    )
+    repository = GenerationInputRepository(FakeConnection(cursor))
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        content_option_count=2,
+        operator_instruction=None,
+    )
+
+    promotion = repository.get_promotion_input(request)
+    target_segments = repository.list_target_segment_inputs(request)
+
+    assert promotion is not None
+    assert promotion.channel == ContentChannel.ONSITE_BANNER
+    assert promotion.landing_url == "https://demo-stay.example.com/summer"
+    assert [segment.segment_id for segment in target_segments] == [
+        "seg_ai_repeat_hotel",
+        "seg_manual_family_trip",
+    ]
+    assert target_segments[0].source == "ai_suggested"
+    assert target_segments[1].source == "manual_rule"
+    assert target_segments[0].content_brief_json["booking_conversion_rate"] == "0.018"
+    assert target_segments[0].natural_language_query == (
+        "repeat hotel viewers without booking"
+    )
+    assert target_segments[0].generated_sql == (
+        "SELECT user_id FROM hotel_detail_events"
+    )
+    assert target_segments[0].query_preview_id == "seg_query_preview_001"
+
+    executed_sql = "\n".join(query for query, _params in cursor.executed)
+    assert "FROM promotion_target_segments" in executed_sql
+    assert "LEFT JOIN segment_definitions" in executed_sql
+    assert "promotion_segment_suggestions" not in executed_sql

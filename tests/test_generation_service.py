@@ -1,4 +1,4 @@
-from decimal import Decimal
+import pytest
 
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import (
@@ -10,15 +10,16 @@ from app.generation.prompt_builder import (
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
-    PromotionPromptRecord,
-    PromotionTargetSegmentRecord,
 )
 from app.generation.schemas import (
     ContentChannel,
     GenerationRequest,
 )
-from app.generation.service import GenerationService
-from app.generation.service import NextLoopFocusGenerationRequest
+from app.generation.service import (
+    GenerationInputUnavailable,
+    GenerationService,
+    NextLoopFocusGenerationRequest,
+)
 
 
 class FakeGenerationRunRepository:
@@ -39,53 +40,6 @@ class FakeContentCandidateRepository:
         return {"content_id": record.content_id}
 
 
-class FakePromotionRepository:
-    def __init__(self, promotion: PromotionPromptRecord | None = None) -> None:
-        self.promotion = promotion or promotion_prompt_record()
-
-    def get_for_generation(
-        self,
-        *,
-        project_id: str,
-        campaign_id: str,
-        promotion_id: str,
-    ) -> PromotionPromptRecord | None:
-        if (
-            project_id,
-            campaign_id,
-            promotion_id,
-        ) != (
-            self.promotion.project_id,
-            self.promotion.campaign_id,
-            self.promotion.promotion_id,
-        ):
-            return None
-        return self.promotion
-
-
-class FakePromotionTargetSegmentRepository:
-    def __init__(self, segments: list[PromotionTargetSegmentRecord]) -> None:
-        self.segments = segments
-
-    def list_for_analysis(self, analysis_id: str) -> list[PromotionTargetSegmentRecord]:
-        return [
-            segment for segment in self.segments if segment.analysis_id == analysis_id
-        ]
-
-
-class FakeGenerationRunReader:
-    def __init__(self, *, content_option_count: int = 3) -> None:
-        self.content_option_count = content_option_count
-
-    def get_by_id(self, generation_id: str) -> dict[str, object] | None:
-        if generation_id != "generation_banner_001":
-            return None
-        return {
-            "generation_id": generation_id,
-            "content_option_count": self.content_option_count,
-        }
-
-
 def generation_request(
     *,
     content_option_count: int = 2,
@@ -98,44 +52,6 @@ def generation_request(
         analysis_id="analysis_banner_001",
         content_option_count=content_option_count,
         operator_instruction=operator_instruction,
-    )
-
-
-def promotion_prompt_record() -> PromotionPromptRecord:
-    return PromotionPromptRecord(
-        project_id="hotel-client-a",
-        campaign_id="camp_summer_2026",
-        promotion_id="promo_banner_001",
-        channel="onsite_banner",
-        goal_metric="booking_conversion_rate",
-        goal_target_value=Decimal("0.030000"),
-        goal_basis="all_segments",
-        message_brief="Drive hotel booking conversion for summer stays.",
-        landing_url="https://demo-stay.example.com/summer",
-    )
-
-
-def target_segment_record(
-    segment_id: str,
-    *,
-    analysis_id: str = "analysis_banner_001_loop_2",
-) -> PromotionTargetSegmentRecord:
-    return PromotionTargetSegmentRecord(
-        analysis_id=analysis_id,
-        promotion_id="promo_banner_001",
-        segment_id=segment_id,
-        segment_name=segment_id.replace("_", " ").title(),
-        content_brief_json={
-            "message_direction": "Use a focused hotel booking message.",
-            "keywords": ["hotel booking", "breakfast"],
-        },
-        data_evidence_json={
-            "source": "system_default",
-            "sample_ratio": "0.020000",
-        },
-        segment_vector_id=f"segvec_{segment_id}_v1",
-        estimated_size=1200,
-        priority="high",
     )
 
 
@@ -255,6 +171,22 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     )
 
 
+def test_generation_service_requires_confirmed_target_segments_from_reader() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader([]),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match="promotion_target_segments"):
+        service.generate(generation_request(content_option_count=1))
+
+    assert generation_run_repository.saved == []
+    assert content_candidate_repository.saved == []
+
+
 def test_generation_service_creates_candidates_for_each_segment_option() -> None:
     content_candidate_repository = FakeContentCandidateRepository()
     service = GenerationService(
@@ -310,14 +242,20 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
     service = GenerationService(
         generation_run_repository=generation_run_repository,
         content_candidate_repository=content_candidate_repository,
-        promotion_repository=FakePromotionRepository(),
-        promotion_target_segment_repository=FakePromotionTargetSegmentRepository(
+        generation_input_reader=StaticGenerationInputReader(
             [
-                target_segment_record("seg_near_checkin"),
-                target_segment_record("seg_mobile_user"),
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                ),
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_mobile_user",
+                    content_slug="mobile_user",
+                ),
             ]
         ),
-        generation_run_reader=FakeGenerationRunReader(content_option_count=3),
     )
 
     result = service.generate_focus(
@@ -512,6 +450,40 @@ class StaticGenerationInputBuilder:
         ]
 
 
+class StaticGenerationInputReader:
+    def __init__(
+        self,
+        target_segments: list[TargetSegmentPromptInput],
+        *,
+        channel: ContentChannel = ContentChannel.ONSITE_BANNER,
+    ) -> None:
+        self._target_segments = target_segments
+        self._channel = channel
+
+    def get_promotion_input(
+        self,
+        request: GenerationRequest,
+    ) -> PromotionPromptInput:
+        return PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=self._channel,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel booking conversion for summer stays.",
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+    def list_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        del request
+        return list(self._target_segments)
+
+
 class FailingContentGenerator:
     def generate(
         self,
@@ -527,14 +499,16 @@ class FailingContentGenerator:
 def target_segment_input(
     *,
     index: int = 1,
+    analysis_id: str = "analysis_banner_001",
+    segment_id: str | None = None,
     content_slug: str = "repeat_hotel",
     generated_sql: str | None = None,
     query_preview_id: str | None = None,
 ) -> TargetSegmentPromptInput:
     return TargetSegmentPromptInput(
-        analysis_id="analysis_banner_001",
+        analysis_id=analysis_id,
         promotion_id="promo_banner_001",
-        segment_id=f"seg_{content_slug}_{index:03d}",
+        segment_id=segment_id or f"seg_{content_slug}_{index:03d}",
         segment_name=f"Hotel audience segment {index}",
         content_slug=content_slug,
         content_brief_json={
