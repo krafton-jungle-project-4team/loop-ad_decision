@@ -182,9 +182,7 @@ class GenerationService:
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
             analysis_id=request.analysis_id,
-            content_option_count=self._source_content_option_count(
-                request.source_generation_id
-            ),
+            content_option_count=1,
             operator_instruction=request.operator_instruction,
         )
         generation_id = _generation_id_from_promotion(
@@ -200,6 +198,12 @@ class GenerationService:
                 request=generation_request,
                 generation_id=generation_id,
                 prompt_inputs=prompt_inputs,
+                # v1.7 section 6.8 does not specify a separate approval gate for
+                # next-loop regenerated content. Temporarily approve the
+                # single internal focus candidate so /next-loop can create
+                # the next run; this may change if the team chooses draft +
+                # explicit approval for next-loop content.
+                candidate_status=ContentCandidateStatus.APPROVED,
             )
         except Exception as exc:
             generation_run = self._build_generation_run_record(
@@ -380,12 +384,14 @@ class GenerationService:
         request: GenerationRequest,
         generation_id: str,
         prompt_inputs: Sequence[GenerationPromptInput],
+        candidate_status: ContentCandidateStatus = ContentCandidateStatus.DRAFT,
     ) -> list[ContentCandidateRecord]:
         return [
             self._build_content_candidate_record(
                 generation_id=generation_id,
                 prompt_input=prompt_input,
                 index=index,
+                status=candidate_status,
             )
             for prompt_input in prompt_inputs
             for index in range(1, request.content_option_count + 1)
@@ -397,6 +403,7 @@ class GenerationService:
         generation_id: str,
         prompt_input: GenerationPromptInput,
         index: int,
+        status: ContentCandidateStatus,
     ) -> ContentCandidateRecord:
         prompt_result = self._prompt_builder.build(prompt_input)
         channel = prompt_input.promotion.channel
@@ -418,7 +425,7 @@ class GenerationService:
             content_option_id=content_option_id,
             content_generator_version=self._content_generator_version,
             content_values=content_values,
-            status=ContentCandidateStatus.DRAFT.value,
+            status=status.value,
         )
 
         return ContentCandidateRecord(
@@ -445,7 +452,7 @@ class GenerationService:
             data_evidence_json=candidate_report.data_evidence_json,
             message_strategy=candidate_report.message_strategy,
             metadata_json=candidate_report.metadata_json,
-            status=ContentCandidateStatus.DRAFT.value,
+            status=status.value,
         )
 
     def _save_generation_run(self, generation_run: GenerationRunRecord) -> None:

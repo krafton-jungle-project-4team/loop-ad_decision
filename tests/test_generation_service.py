@@ -304,7 +304,7 @@ def test_generation_service_creates_candidates_for_focus_segment_only() -> None:
     }
 
 
-def test_generation_service_generates_next_loop_focus_candidates_as_draft() -> None:
+def test_generation_service_generates_next_loop_focus_candidate_as_approved() -> None:
     generation_run_repository = FakeGenerationRunRepository()
     content_candidate_repository = FakeContentCandidateRepository()
     service = GenerationService(
@@ -340,20 +340,20 @@ def test_generation_service_generates_next_loop_focus_candidates_as_draft() -> N
     assert len(generation_run_repository.saved) == 1
     generation_run = generation_run_repository.saved[0]
     assert generation_run.input_json["target_segment_ids"] == ["seg_near_checkin"]
-    assert generation_run.input_json["content_option_count"] == 3
+    assert generation_run.input_json["content_option_count"] == 1
     assert generation_run.input_json["next_loop"] == {
         "loop_count": 2,
         "source_promotion_run_id": "prun_banner_001_loop_1",
         "source_generation_id": "generation_banner_001",
         "focus_segment_ids": ["seg_near_checkin"],
     }
-    assert len(content_candidate_repository.saved) == 3
+    assert len(content_candidate_repository.saved) == 1
     assert {
         candidate.segment_id for candidate in content_candidate_repository.saved
     } == {"seg_near_checkin"}
     assert {
         candidate.status for candidate in content_candidate_repository.saved
-    } == {"draft"}
+    } == {"approved"}
 
 
 def test_generation_service_records_failed_run_when_generator_fails() -> None:
