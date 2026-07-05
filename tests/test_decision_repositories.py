@@ -50,9 +50,11 @@ class FakePostgresExecutor:
         *,
         fetchone_result: Mapping[str, Any] | None = None,
         fetchall_result: list[Mapping[str, Any]] | None = None,
+        fetchall_results: list[list[Mapping[str, Any]]] | None = None,
     ) -> None:
         self.fetchone_result = fetchone_result
         self.fetchall_result = fetchall_result or []
+        self.fetchall_results = list(fetchall_results or [])
         self.calls: list[DbCall] = []
 
     def fetchone(
@@ -69,6 +71,8 @@ class FakePostgresExecutor:
         params: Sequence[Any] | Mapping[str, Any] = (),
     ) -> list[Mapping[str, Any]]:
         self.calls.append(DbCall("fetchall", query, params))
+        if self.fetchall_results:
+            return self.fetchall_results.pop(0)
         return self.fetchall_result
 
     def execute(
@@ -837,6 +841,66 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
     assert "returning id" in sql
+    assert "%s::text[]" in sql
+    assert "%s::numeric[]" in sql
+    assert "%s::boolean[]" in sql
+    assert "%s::timestamptz[]" in sql
+    assert call.params == (
+        ["hotel-client-a", "hotel-client-a"],
+        ["prun_banner_001_loop_1", "prun_banner_001_loop_1"],
+        ["user_001", "user_002"],
+        ["seg_existing_all", "seg_family_trip"],
+        ["adexp_existing_all_001", "adexp_family_trip_001"],
+        ["content_existing_all_001", "content_family_trip_001"],
+        ["option_a", "option_b"],
+        [Decimal("0.410000"), None],
+        [True, False],
+        ["below_threshold", None],
+        [AssignmentSource.FALLBACK.value, AssignmentSource.DECISION_BATCH.value],
+        [assigned_at, assigned_at],
+        [None, expires_at],
+    )
+
+
+def test_user_segment_assignment_repository_skips_empty_bulk_insert() -> None:
+    db = FakePostgresExecutor()
+    repo = UserSegmentAssignmentRepository(db)
+
+    assert repo.insert_many([]) == 0
+    assert db.calls == []
+
+
+def test_user_segment_assignment_repository_splits_bulk_insert_chunks() -> None:
+    db = FakePostgresExecutor(
+        fetchall_results=[
+            [{"id": index} for index in range(1000)],
+            [{"id": 1001}],
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    inserted_count = repo.insert_many(
+        [assignment_write(f"user_{index:04d}") for index in range(1001)]
+    )
+
+    assert inserted_count == 1001
+    assert len(db.calls) == 2
+    assert len(db.calls[0].params[0]) == 1000
+    assert len(db.calls[1].params[0]) == 1
+
+
+def test_user_segment_assignment_repository_counts_returned_bulk_rows() -> None:
+    db = FakePostgresExecutor(fetchall_result=[{"id": 1}])
+    repo = UserSegmentAssignmentRepository(db)
+
+    inserted_count = repo.insert_many(
+        [
+            assignment_write("user_001"),
+            assignment_write("user_002"),
+        ]
+    )
+
+    assert inserted_count == 1
 
 
 def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
