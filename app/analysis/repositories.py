@@ -116,6 +116,8 @@ class SegmentDefinitionRecord:
     total_eligible_user_count: int
     sample_ratio: Decimal
     status: str
+    campaign_id: str | None = None
+    promotion_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +150,22 @@ class PromotionTargetSegmentWrite:
     estimated_size: int
     priority: str | None
     status: str
+
+
+@dataclass(frozen=True)
+class PromotionSegmentSuggestionWrite:
+    suggestion_id: str
+    analysis_id: str
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    segment_id: str
+    suggested_rank: int
+    suggestion_source: str
+    status: str
+    score_json: Mapping[str, Any]
+    reason_json: Mapping[str, Any]
+    metadata_json: Mapping[str, Any]
 
 
 @dataclass(frozen=True)
@@ -225,9 +243,11 @@ class SegmentDefinitionRepository:
         self,
         *,
         project_id: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
         sources: Sequence[str] | None = None,
     ) -> list[SegmentDefinitionRecord]:
-        params: list[Any] = [project_id]
+        params: list[Any] = [project_id, campaign_id, promotion_id]
         source_filter = ""
         if sources:
             placeholders = ", ".join(["%s"] * len(sources))
@@ -239,6 +259,8 @@ class SegmentDefinitionRepository:
             SELECT
                 segment_id,
                 project_id,
+                campaign_id,
+                promotion_id,
                 segment_name,
                 source,
                 query_preview_id,
@@ -253,6 +275,8 @@ class SegmentDefinitionRepository:
             FROM segment_definitions
             WHERE project_id = %s
               AND status = 'active'
+              AND (campaign_id IS NULL OR campaign_id = %s)
+              AND (promotion_id IS NULL OR promotion_id = %s)
               {source_filter}
             ORDER BY sample_size DESC, segment_id ASC
             """,
@@ -267,11 +291,15 @@ class SegmentDefinitionRepository:
         for segment in segments:
             if segment.source != "ai_suggested":
                 raise ValueError("only ai_suggested segment definitions can be saved")
+            if segment.campaign_id is None or segment.promotion_id is None:
+                raise ValueError("ai_suggested segment definitions must be promotion scoped")
             self._db.execute(
                 """
                 INSERT INTO segment_definitions (
                     segment_id,
                     project_id,
+                    campaign_id,
+                    promotion_id,
                     segment_name,
                     source,
                     query_preview_id,
@@ -284,8 +312,10 @@ class SegmentDefinitionRepository:
                     sample_ratio,
                     status
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (segment_id) DO UPDATE SET
+                    campaign_id = EXCLUDED.campaign_id,
+                    promotion_id = EXCLUDED.promotion_id,
                     segment_name = EXCLUDED.segment_name,
                     natural_language_query = EXCLUDED.natural_language_query,
                     generated_sql = EXCLUDED.generated_sql,
@@ -301,6 +331,8 @@ class SegmentDefinitionRepository:
                 (
                     segment.segment_id,
                     segment.project_id,
+                    segment.campaign_id,
+                    segment.promotion_id,
                     segment.segment_name,
                     segment.source,
                     segment.query_preview_id,
@@ -351,46 +383,42 @@ class PromotionAnalysisRepository:
             ),
         )
 
-    def save_target_segments(
+    def save_segment_suggestions(
         self,
-        target_segments: Sequence[PromotionTargetSegmentWrite],
+        suggestions: Sequence[PromotionSegmentSuggestionWrite],
     ) -> None:
-        for segment in target_segments:
+        for suggestion in suggestions:
             self._db.execute(
                 """
-                INSERT INTO promotion_target_segments (
+                INSERT INTO promotion_segment_suggestions (
+                    suggestion_id,
                     analysis_id,
                     project_id,
                     campaign_id,
                     promotion_id,
                     segment_id,
-                    segment_name,
-                    rule_json,
-                    profile_json,
-                    content_brief_json,
-                    data_evidence_json,
-                    segment_vector_id,
-                    estimated_size,
-                    priority,
-                    status
+                    suggested_rank,
+                    suggestion_source,
+                    status,
+                    score_json,
+                    reason_json,
+                    metadata_json
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    segment.analysis_id,
-                    segment.project_id,
-                    segment.campaign_id,
-                    segment.promotion_id,
-                    segment.segment_id,
-                    segment.segment_name,
-                    segment.rule_json,
-                    segment.profile_json,
-                    segment.content_brief_json,
-                    segment.data_evidence_json,
-                    segment.segment_vector_id,
-                    segment.estimated_size,
-                    segment.priority,
-                    segment.status,
+                    suggestion.suggestion_id,
+                    suggestion.analysis_id,
+                    suggestion.project_id,
+                    suggestion.campaign_id,
+                    suggestion.promotion_id,
+                    suggestion.segment_id,
+                    suggestion.suggested_rank,
+                    suggestion.suggestion_source,
+                    suggestion.status,
+                    suggestion.score_json,
+                    suggestion.reason_json,
+                    suggestion.metadata_json,
                 ),
             )
 

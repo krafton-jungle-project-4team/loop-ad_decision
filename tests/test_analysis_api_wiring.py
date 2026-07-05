@@ -89,7 +89,12 @@ def test_analysis_api_wires_real_service_and_commits(monkeypatch) -> None:
     assert any("from segment_definitions" in query for query in executed_sql)
     assert any("insert into promotion_analyses" in query for query in executed_sql)
     assert any("insert into segment_vectors" in query for query in executed_sql)
-    assert any("insert into promotion_target_segments" in query for query in executed_sql)
+    assert any(
+        "insert into promotion_segment_suggestions" in query for query in executed_sql
+    )
+    assert not any(
+        "insert into promotion_target_segments" in query for query in executed_sql
+    )
     assert any(
         "from user_behavior_vectors" in compact_sql(query)
         for query, _parameters in clickhouse_clients[0].queries
@@ -239,6 +244,8 @@ def segment_definition_row(segment_id: str, sample_size: int) -> dict[str, objec
     return {
         "segment_id": segment_id,
         "project_id": "hotel-client-a",
+        "campaign_id": None,
+        "promotion_id": None,
         "segment_name": segment_id.replace("_", " ").title(),
         "source": "system_default",
         "query_preview_id": None,

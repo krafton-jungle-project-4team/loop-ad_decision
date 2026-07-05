@@ -10,6 +10,7 @@ from app.analysis.repositories import (
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
+    PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
@@ -28,7 +29,7 @@ from app.analysis.vector_service import (
 @dataclass
 class SavedAnalysis:
     analysis: PromotionAnalysisWrite | None = None
-    target_segments: list[PromotionTargetSegmentWrite] | None = None
+    segment_suggestions: list[PromotionSegmentSuggestionWrite] | None = None
 
 
 class FakePromotionRepository:
@@ -63,9 +64,18 @@ class FakeSegmentDefinitionRepository:
         self,
         *,
         project_id: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
         sources: Sequence[str] | None = None,
     ) -> list[SegmentDefinitionRecord]:
-        self.calls.append({"project_id": project_id, "sources": sources})
+        self.calls.append(
+            {
+                "project_id": project_id,
+                "campaign_id": campaign_id,
+                "promotion_id": promotion_id,
+                "sources": sources,
+            }
+        )
         return self.segments
 
     def save_ai_suggested(
@@ -98,12 +108,12 @@ class FakePromotionAnalysisRepository:
         self.saved.analysis = analysis
         self.events.append("analysis")
 
-    def save_target_segments(
+    def save_segment_suggestions(
         self,
-        target_segments: Sequence[PromotionTargetSegmentWrite],
+        suggestions: Sequence[PromotionSegmentSuggestionWrite],
     ) -> None:
-        self.saved.target_segments = list(target_segments)
-        self.events.append("target_segments")
+        self.saved.segment_suggestions = list(suggestions)
+        self.events.append("segment_suggestions")
 
 
 class FakeSegmentVectorService:
@@ -256,7 +266,13 @@ def segment_ids(
     return [segment.segment_id for segment in target_segments]
 
 
-def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
+def suggestion_segment_ids(
+    suggestions: Sequence[PromotionSegmentSuggestionWrite],
+) -> list[str]:
+    return [suggestion.segment_id for suggestion in suggestions]
+
+
+def test_service_analyzes_email_promotion_and_persists_four_suggestions() -> None:
     promotion = promotion_record(channel="email")
     service, analysis_repository, _ = build_service(
         promotion=promotion,
@@ -276,7 +292,10 @@ def test_service_analyzes_email_promotion_and_persists_four_segments() -> None:
         "seg_existing_all",
     ]
     assert analysis_repository.saved.analysis == result.analysis
-    assert analysis_repository.saved.target_segments == result.target_segments
+    assert analysis_repository.saved.segment_suggestions == result.segment_suggestions
+    assert suggestion_segment_ids(result.segment_suggestions) == segment_ids(
+        result.target_segments
+    )
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
     assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
 
@@ -347,7 +366,7 @@ def test_service_populates_segment_vector_ids_when_vector_service_is_configured(
     )
 
     assert result.target_segments[0].segment_vector_id == "segvec_seg_mobile_user_v1"
-    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert vector_service.calls == [
         SegmentVectorBuildRequest(
             project_id="hotel-client-a",
@@ -372,6 +391,8 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     )
     ai_segment = replace(
         ai_segment,
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
         profile_json={
             "primary_segment": ai_segment.segment_id,
             "source": "user_vector_clustering",
@@ -400,7 +421,7 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     assert segment_ids(result.target_segments) == expected_segment_ids
     assert segment_definition_repository.saved_ai_suggested == [ai_segment]
     assert suggester.calls == [promotion]
-    assert analysis_repository.events == ["analysis", "target_segments"]
+    assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert result.analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
         "target_segment_count": 4,
@@ -408,6 +429,8 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     assert result.analysis.profile_summary_json["candidate_segment_count"] == 7
     assert result.analysis.input_snapshot_json["available_segment_definitions"][6] == {
         "segment_id": ai_segment.segment_id,
+        "campaign_id": promotion.campaign_id,
+        "promotion_id": promotion.promotion_id,
         "segment_name": ai_segment.segment_name,
         "source": "ai_suggested",
         "sample_size": 1800,
@@ -417,6 +440,9 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     }
     assert result.target_segments[0].data_evidence_json["source"] == "ai_suggested"
     assert result.target_segments[0].profile_json["cluster_score"] == 0.99
+    assert result.segment_suggestions[0].suggestion_source == "ai_generated"
+    assert result.segment_suggestions[0].status == "suggested"
+    assert result.segment_suggestions[0].suggested_rank == 1
     assert vector_service.calls[0] == SegmentVectorBuildRequest(
         project_id="hotel-client-a",
         promotion_id=promotion.promotion_id,
