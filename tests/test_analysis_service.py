@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
@@ -335,6 +336,10 @@ def test_service_analyzes_email_promotion_and_persists_four_suggestions() -> Non
     )
 
     assert result.analysis.status == "completed"
+    assert re.fullmatch(
+        rf"analysis_{promotion.promotion_id}_run_[0-9a-f]{{8}}",
+        result.analysis.analysis_id,
+    )
     assert segment_ids(result.target_segments) == [
         "seg_mobile_user",
         "seg_family_trip",
@@ -348,6 +353,33 @@ def test_service_analyzes_email_promotion_and_persists_four_suggestions() -> Non
     )
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
     assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+
+
+def test_service_creates_new_analysis_id_for_repeated_ai_recommendations() -> None:
+    promotion = promotion_record(channel="email")
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+    )
+
+    first = service.analyze(analysis_request(promotion_id=promotion.promotion_id))
+    second = service.analyze(analysis_request(promotion_id=promotion.promotion_id))
+
+    assert first.analysis.analysis_id != second.analysis.analysis_id
+    assert re.fullmatch(
+        rf"analysis_{promotion.promotion_id}_run_[0-9a-f]{{8}}",
+        first.analysis.analysis_id,
+    )
+    assert re.fullmatch(
+        rf"analysis_{promotion.promotion_id}_run_[0-9a-f]{{8}}",
+        second.analysis.analysis_id,
+    )
+    assert {
+        suggestion.analysis_id for suggestion in first.segment_suggestions
+    } == {first.analysis.analysis_id}
+    assert {
+        suggestion.analysis_id for suggestion in second.segment_suggestions
+    } == {second.analysis.analysis_id}
 
 
 def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
@@ -469,7 +501,7 @@ def test_service_populates_segment_vector_ids_when_vector_service_is_configured(
         SegmentVectorBuildRequest(
             project_id="hotel-client-a",
             promotion_id=promotion.promotion_id,
-            analysis_id=f"analysis_{promotion.promotion_id}",
+            analysis_id=result.analysis.analysis_id,
             segment_id="seg_mobile_user",
             candidate_user_ids=["user_001", "user_002"],
         )
@@ -544,7 +576,7 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     assert vector_service.calls[0] == SegmentVectorBuildRequest(
         project_id="hotel-client-a",
         promotion_id=promotion.promotion_id,
-        analysis_id=f"analysis_{promotion.promotion_id}",
+        analysis_id=result.analysis.analysis_id,
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
     )

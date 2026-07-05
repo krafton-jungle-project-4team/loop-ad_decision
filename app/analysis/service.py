@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import re
 import hashlib
+import re
+import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
@@ -859,7 +860,7 @@ def _analysis_id(
     next_loop_context: NextLoopAnalysisContext | None,
 ) -> str:
     if next_loop_context is None:
-        return f"analysis_{promotion_id}"
+        return f"analysis_{promotion_id}_run_{uuid.uuid4().hex[:8]}"
     return (
         f"analysis_{_slug_from_promotion_id(promotion_id)}"
         f"_loop_{next_loop_context.loop_count}"

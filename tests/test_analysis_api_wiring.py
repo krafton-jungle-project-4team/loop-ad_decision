@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any
 
@@ -67,7 +68,10 @@ def test_analysis_api_wires_real_service_and_commits(monkeypatch) -> None:
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["analysis_id"] == "analysis_promo_banner_001"
+    assert re.fullmatch(
+        r"analysis_promo_banner_001_run_[0-9a-f]{8}",
+        payload["analysis_id"],
+    )
     assert payload["promotion_id"] == "promo_banner_001"
     assert payload["status"] == "completed"
     assert [segment["segment_id"] for segment in payload["target_segments"]] == [
