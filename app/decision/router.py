@@ -91,9 +91,12 @@ UNIQUE_CONSTRAINTS = {
     "promotion_analyses_pkey",
     "generation_runs_pkey",
     "content_candidates_pkey",
+    "uq_content_candidates_one_approved_per_segment",
     "uq_promotion_runs_loop",
     "uq_ad_experiments_segment_per_run",
 }
+
+APPROVED_CONTENT_UNIQUE_CONSTRAINT = "uq_content_candidates_one_approved_per_segment"
 
 
 router = APIRouter(
@@ -455,7 +458,7 @@ async def create_next_loop(
         if _is_unique_violation(exc):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="next-loop output already exists",
+                detail=_next_loop_unique_violation_detail(exc),
             ) from exc
         raise
 
@@ -579,8 +582,18 @@ async def _parse_next_loop_request(request: Request) -> NextLoopRequest:
 def _is_unique_violation(exc: IntegrityError) -> bool:
     if isinstance(exc, errors.UniqueViolation):
         return True
-    constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    constraint_name = _unique_violation_constraint_name(exc)
     return constraint_name in UNIQUE_CONSTRAINTS
+
+
+def _unique_violation_constraint_name(exc: IntegrityError) -> str | None:
+    return getattr(getattr(exc, "diag", None), "constraint_name", None)
+
+
+def _next_loop_unique_violation_detail(exc: IntegrityError) -> str:
+    if _unique_violation_constraint_name(exc) == APPROVED_CONTENT_UNIQUE_CONSTRAINT:
+        return "approved content already exists for segment"
+    return "next-loop output already exists"
 
 
 def _close_clickhouse_client(client: object) -> None:

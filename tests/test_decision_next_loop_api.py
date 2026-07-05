@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from psycopg import errors
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.decision.next_loop_service import (
@@ -25,6 +26,21 @@ from app.main import create_app
 
 
 DEFAULT_ROW = object()
+
+
+class _FakeDiag:
+    def __init__(self, constraint_name: str) -> None:
+        self.constraint_name = constraint_name
+
+
+class UniqueViolationWithConstraint(errors.UniqueViolation):
+    def __init__(self, message: str, constraint_name: str) -> None:
+        super().__init__(message)
+        self._constraint_name = constraint_name
+
+    @property
+    def diag(self) -> _FakeDiag:
+        return _FakeDiag(self._constraint_name)
 
 
 def valid_env() -> dict[str, str]:
@@ -260,6 +276,140 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     assert content_insert_params["status"] == "approved"
 
 
+def test_next_loop_api_maps_approved_content_unique_violation_to_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(
+            raise_unique_on_content_candidate_insert=True,
+        )
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "next-loop output already exists"
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into generation_runs" in query for query in executed_sql)
+    assert any("insert into content_candidates" in query for query in executed_sql)
+    assert not any("insert into promotion_runs" in query for query in executed_sql)
+
+
+def test_next_loop_api_maps_approved_content_constraint_to_specific_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(
+            raise_unique_on_content_candidate_insert=True,
+            content_candidate_unique_constraint_name=(
+                "uq_content_candidates_one_approved_per_segment"
+            ),
+        )
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "approved content already exists for segment"
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+
+
+def test_next_loop_api_rolls_back_approved_content_when_run_creation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(
+            raise_unique_on_promotion_run_insert=True,
+        )
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "next-loop output already exists"
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into content_candidates" in query for query in executed_sql)
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert not any("insert into ad_experiments" in query for query in executed_sql)
+    assert connection.committed_inserts == []
+    assert connection.pending_inserts == []
+    assert connection.rolled_back_inserts == [
+        "generation_runs",
+        "content_candidates",
+    ]
+
+
 class FakeNextLoopService:
     def __init__(self, exc: Exception | None = None) -> None:
         self.exc = exc
@@ -312,6 +462,25 @@ class RecordingCursor:
         self._last_query = query
         self._last_params = params
         self._connection.executed.append((query, params))
+        sql = compact_sql(query)
+        if (
+            self._connection.raise_unique_on_content_candidate_insert
+            and "insert into content_candidates" in sql
+        ):
+            if self._connection.content_candidate_unique_constraint_name is not None:
+                raise UniqueViolationWithConstraint(
+                    "duplicate approved content candidate",
+                    self._connection.content_candidate_unique_constraint_name,
+                )
+            raise errors.UniqueViolation("duplicate approved content candidate")
+        if (
+            self._connection.raise_unique_on_promotion_run_insert
+            and "insert into promotion_runs" in sql
+        ):
+            raise errors.UniqueViolation("duplicate promotion run")
+        table_name = _inserted_table_name(sql)
+        if table_name is not None:
+            self._connection.pending_inserts.append(table_name)
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
@@ -355,6 +524,9 @@ class RecordingConnection:
         self,
         *,
         promotion_run_row: dict[str, object] | None | object = DEFAULT_ROW,
+        raise_unique_on_content_candidate_insert: bool = False,
+        content_candidate_unique_constraint_name: str | None = None,
+        raise_unique_on_promotion_run_insert: bool = False,
     ) -> None:
         self.promotion_run_row = (
             default_promotion_run_row()
@@ -362,9 +534,19 @@ class RecordingConnection:
             else promotion_run_row
         )
         self.executed: list[tuple[str, Any]] = []
+        self.raise_unique_on_content_candidate_insert = (
+            raise_unique_on_content_candidate_insert
+        )
+        self.content_candidate_unique_constraint_name = (
+            content_candidate_unique_constraint_name
+        )
+        self.raise_unique_on_promotion_run_insert = raise_unique_on_promotion_run_insert
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
+        self.pending_inserts: list[str] = []
+        self.committed_inserts: list[str] = []
+        self.rolled_back_inserts: list[str] = []
 
     def cursor(self, row_factory: Any = None) -> RecordingCursor:
         _ = row_factory
@@ -372,12 +554,28 @@ class RecordingConnection:
 
     def commit(self) -> None:
         self.commit_count += 1
+        self.committed_inserts.extend(self.pending_inserts)
+        self.pending_inserts.clear()
 
     def rollback(self) -> None:
         self.rollback_count += 1
+        self.rolled_back_inserts.extend(self.pending_inserts)
+        self.pending_inserts.clear()
 
     def close(self) -> None:
         self.close_count += 1
+
+
+def _inserted_table_name(sql: str) -> str | None:
+    for table_name in (
+        "generation_runs",
+        "content_candidates",
+        "promotion_runs",
+        "ad_experiments",
+    ):
+        if f"insert into {table_name}" in sql:
+            return table_name
+    return None
 
 
 def default_promotion_run_row() -> dict[str, object]:
