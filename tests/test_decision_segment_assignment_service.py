@@ -84,6 +84,21 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     assert len(repos.segment_vectors.ann_calls) == 1
 
 
+def test_assignment_service_passes_normalized_query_vectors_to_batch_ann() -> None:
+    service, repos = make_service(
+        user_vectors=[user_vector_record("user_family", vector(0, value=2.0))],
+    )
+
+    service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+    )
+
+    assert repos.segment_vectors.ann_calls[0]["query_vectors"] == [
+        [1.0, *([0.0] * 63)]
+    ]
+
+
 def test_assignment_service_requires_fallback_experiment_before_writes() -> None:
     service, repos = make_service(
         experiments=[

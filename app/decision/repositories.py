@@ -12,6 +12,7 @@ from psycopg.types.json import Jsonb
 from app.decision.matcher import (
     HNSW_EF_SEARCH as DEFAULT_HNSW_EF_SEARCH,
     HNSW_MAX_SCAN_TUPLES as DEFAULT_HNSW_MAX_SCAN_TUPLES,
+    normalize_values,
 )
 
 
@@ -1046,7 +1047,7 @@ class SegmentVectorRepository:
         if not segment_vector_ids:
             return []
 
-        vector_literal = _vector_literal(query_vector, self.VECTOR_DIM)
+        vector_literal = _canonical_vector_literal(query_vector, self.VECTOR_DIM)
         rows = self._db.fetchall(
             """
             SELECT
@@ -1106,7 +1107,7 @@ class SegmentVectorRepository:
             return candidates_by_user
 
         query_vector_literals = [
-            _vector_literal(query_vector, self.VECTOR_DIM)
+            _canonical_vector_literal(query_vector, self.VECTOR_DIM)
             for query_vector in query_vectors
         ]
         rows = self._db.fetchall(
@@ -1627,6 +1628,11 @@ def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
     if not all(math.isfinite(value) for value in numeric_values):
         raise ValueError("vector literal values must be finite")
     return "[" + ",".join(str(value) for value in numeric_values) + "]"
+
+
+def _canonical_vector_literal(values: Sequence[float], vector_dim: int) -> str:
+    normalized_values = normalize_values(values, vector_dim, vector_dim)
+    return _vector_literal(normalized_values, vector_dim)
 
 
 def _chunks(items: Sequence[_T], size: int) -> list[Sequence[_T]]:

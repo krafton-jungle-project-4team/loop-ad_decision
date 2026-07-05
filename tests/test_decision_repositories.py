@@ -628,7 +628,7 @@ def test_segment_vector_repository_reads_ann_candidates_by_frozen_ids() -> None:
         analysis_id="analysis_banner_001",
         segment_vector_ids=["segvec_family_v1"],
         vector_version="v1",
-        query_vector=[1.0] + [0.0] * 63,
+        query_vector=[2.0] + [0.0] * 63,
         limit=50,
     )
 
@@ -681,7 +681,7 @@ def test_segment_vector_repository_reads_batch_ann_candidates_by_users() -> None
         vector_version="v1",
         user_ids=["user_family", "user_no_candidate"],
         query_vectors=[
-            [1.0] + [0.0] * 63,
+            [2.0] + [0.0] * 63,
             [0.0, 1.0, *([0.0] * 62)],
         ],
         limit=50,
