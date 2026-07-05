@@ -3,10 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import math
 from typing import Any, Mapping, NamedTuple, Protocol, Sequence
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from app.decision.matcher import (
+    HNSW_EF_SEARCH as DEFAULT_HNSW_EF_SEARCH,
+    HNSW_MAX_SCAN_TUPLES as DEFAULT_HNSW_MAX_SCAN_TUPLES,
+)
 
 
 class PostgresExecutor(Protocol):
@@ -240,6 +246,7 @@ class SegmentVectorRecord:
     vector_values: Any
     vector_version: str
     source: str
+    embedding: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -268,6 +275,7 @@ class UserSegmentAssignmentWrite:
     content_option_id: str
     similarity_score: Decimal | None
     fallback: bool
+    fallback_reason: str | None
     assignment_source: str
     assigned_at: datetime
     expires_at: datetime | None
@@ -421,6 +429,22 @@ class SegmentVectorReader(Protocol):
     ) -> list[SegmentVectorRecord]:
         ...
 
+    def configure_ann_search(self) -> None:
+        ...
+
+    def list_ann_candidates(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        query_vector: Sequence[float],
+        limit: int,
+    ) -> list[SegmentVectorRecord]:
+        ...
+
 
 class UserBehaviorVectorReader(Protocol):
     def list_by_user_ids(
@@ -443,6 +467,14 @@ class UserBehaviorVectorReader(Protocol):
 
 
 class UserSegmentAssignmentWriter(Protocol):
+    def list_existing_user_ids(
+        self,
+        *,
+        promotion_run_id: str,
+        user_ids: Sequence[str],
+    ) -> set[str]:
+        ...
+
     def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
         ...
 
@@ -923,9 +955,19 @@ class AdExperimentRepository:
 
 class SegmentVectorRepository:
     VECTOR_DIM = 64
+    HNSW_EF_SEARCH = DEFAULT_HNSW_EF_SEARCH
+    HNSW_MAX_SCAN_TUPLES = DEFAULT_HNSW_MAX_SCAN_TUPLES
 
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
+
+    def configure_ann_search(self) -> None:
+        self._db.execute("SET LOCAL hnsw.ef_search = %s", (self.HNSW_EF_SEARCH,))
+        self._db.execute("SET LOCAL hnsw.iterative_scan = strict_order")
+        self._db.execute(
+            "SET LOCAL hnsw.max_scan_tuples = %s",
+            (self.HNSW_MAX_SCAN_TUPLES,),
+        )
 
     def list_for_run_segments(
         self,
@@ -951,7 +993,8 @@ class SegmentVectorRepository:
                 vector_dim,
                 vector_values,
                 vector_version,
-                source
+                source,
+                embedding::text AS embedding
             FROM segment_vectors
             WHERE project_id = %s
               AND promotion_id = %s
@@ -972,10 +1015,82 @@ class SegmentVectorRepository:
         )
         return [SegmentVectorRecord(**row) for row in rows]
 
+    def list_ann_candidates(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        query_vector: Sequence[float],
+        limit: int,
+    ) -> list[SegmentVectorRecord]:
+        if not segment_vector_ids:
+            return []
+
+        vector_literal = _vector_literal(query_vector, self.VECTOR_DIM)
+        rows = self._db.fetchall(
+            """
+            SELECT
+                segment_vector_id,
+                project_id,
+                promotion_id,
+                promotion_run_id,
+                analysis_id,
+                segment_id,
+                vector_dim,
+                vector_values,
+                vector_version,
+                source,
+                embedding::text AS embedding
+            FROM segment_vectors
+            WHERE project_id = %s
+              AND promotion_id = %s
+              AND analysis_id = %s
+              AND segment_vector_id = ANY(%s)
+              AND vector_version = %s
+              AND vector_dim = %s
+            ORDER BY embedding <=> %s::vector, segment_id ASC
+            LIMIT %s
+            """,
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                list(segment_vector_ids),
+                vector_version,
+                self.VECTOR_DIM,
+                vector_literal,
+                limit,
+            ),
+        )
+        return [SegmentVectorRecord(**row) for row in rows]
+
 
 class UserSegmentAssignmentRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
+
+    def list_existing_user_ids(
+        self,
+        *,
+        promotion_run_id: str,
+        user_ids: Sequence[str],
+    ) -> set[str]:
+        if not user_ids:
+            return set()
+
+        rows = self._db.fetchall(
+            """
+            SELECT user_id
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+              AND user_id = ANY(%s)
+            """,
+            (promotion_run_id, list(user_ids)),
+        )
+        return {str(row["user_id"]) for row in rows}
 
     def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
         inserted_count = 0
@@ -992,11 +1107,12 @@ class UserSegmentAssignmentRepository:
                     content_option_id,
                     similarity_score,
                     fallback,
+                    fallback_reason,
                     assignment_source,
                     assigned_at,
                     expires_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
                 RETURNING id
                 """,
@@ -1010,6 +1126,7 @@ class UserSegmentAssignmentRepository:
                     assignment.content_option_id,
                     assignment.similarity_score,
                     assignment.fallback,
+                    assignment.fallback_reason,
                     assignment.assignment_source,
                     assignment.assigned_at,
                     assignment.expires_at,
@@ -1313,3 +1430,12 @@ def _metric_count_from_result(result: Any) -> MetricCountRecord:
         numerator_count=int(_clickhouse_value(row, "numerator_count", 0)),
         denominator_count=int(_clickhouse_value(row, "denominator_count", 1)),
     )
+
+
+def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
+    if len(values) != vector_dim:
+        raise ValueError("vector literal must contain 64 values")
+    numeric_values = [float(value) for value in values]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("vector literal values must be finite")
+    return "[" + ",".join(str(value) for value in numeric_values) + "]"

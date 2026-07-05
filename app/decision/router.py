@@ -22,7 +22,7 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
 )
-from app.decision.matcher import ExactCosineMatcher
+from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
     NextLoopConflictError,
     NextLoopNotFoundError,
@@ -134,7 +134,7 @@ def get_segment_assignment_service(
             user_segment_assignment_repository=UserSegmentAssignmentRepository(
                 executor,
             ),
-            matcher=ExactCosineMatcher(),
+            reranker=SegmentCandidateReranker(),
         )
         connection.commit()
     except Exception:
