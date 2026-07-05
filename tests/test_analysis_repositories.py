@@ -505,6 +505,8 @@ def test_user_behavior_vector_repository_queries_candidate_user_vectors() -> Non
     assert "vector_dim = {vector_dim:uint16}" in sql
     assert "vector_version = {vector_version:string}" in sql
     assert "user_id in {user_ids:array(string)}" in sql
+    assert "argmax(vector_values, updated_at) as vector_values" in sql
+    assert "group by project_id, user_id, vector_version" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_dim": 64,
@@ -557,7 +559,9 @@ def test_user_behavior_vector_repository_queries_recent_project_vectors() -> Non
     assert "project_id = {project_id:string}" in sql
     assert "vector_dim = {vector_dim:uint16}" in sql
     assert "vector_version = {vector_version:string}" in sql
-    assert "order by updated_at desc, user_id asc" in sql
+    assert "argmax(vector_values, updated_at) as vector_values" in sql
+    assert "group by project_id, user_id, vector_version" in sql
+    assert "order by last_updated_at desc, user_id asc" in sql
     assert "limit {limit:uint32}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
