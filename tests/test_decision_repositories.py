@@ -737,6 +737,7 @@ def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> N
     sql = compact_sql(call.query)
     assert "argmax(vector_values, updated_at)" in sql
     assert "argmax(vector_dim, updated_at)" in sql
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "from user_behavior_vectors" in sql
     assert "group by project_id, user_id, vector_version" in sql
     assert "user_id in {user_ids:array(string)}" in sql
@@ -762,6 +763,7 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "argmax(vector_values, updated_at)" in sql
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "limit {limit:uint32}" in sql
     assert "user_id in" not in sql
     assert call.params == {

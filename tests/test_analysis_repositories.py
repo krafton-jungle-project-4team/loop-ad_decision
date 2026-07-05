@@ -500,6 +500,7 @@ def test_user_behavior_vector_repository_queries_candidate_user_vectors() -> Non
     assert vectors[0].vector_values == vector_values
     call = client.calls[0]
     sql = compact_sql(call.query)
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "from user_behavior_vectors" in sql
     assert "project_id = {project_id:string}" in sql
     assert "vector_dim = {vector_dim:uint16}" in sql
@@ -555,6 +556,7 @@ def test_user_behavior_vector_repository_queries_recent_project_vectors() -> Non
     assert vectors[0].vector_values == vector_values
     call = client.calls[0]
     sql = compact_sql(call.query)
+    assert "from ( select project_id, user_id, vector_dim" in sql
     assert "from user_behavior_vectors" in sql
     assert "project_id = {project_id:string}" in sql
     assert "vector_dim = {vector_dim:uint16}" in sql
