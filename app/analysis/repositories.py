@@ -643,6 +643,56 @@ class HotelProfileRepository:
             for row in _clickhouse_rows(result)
         ]
 
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        if not user_ids:
+            return None
+
+        result = self._client.query(
+            """
+            SELECT
+                count() AS event_count,
+                countIf(is_booking = 1) AS booking_count,
+                avg(is_mobile) AS mobile_ratio,
+                avg(is_package) AS package_ratio,
+                avg(stay_nights) AS avg_stay_nights,
+                avg(days_until_checkin) AS avg_days_until_checkin
+            FROM hotel_marketing_profiles
+            WHERE user_id IN {user_ids:Array(String)}
+            """,
+            parameters={"user_ids": list(user_ids)},
+        )
+        rows = _clickhouse_rows(result)
+        if not rows:
+            return None
+
+        row = rows[0]
+        event_count = int(_clickhouse_value(row, "event_count", 0) or 0)
+        if event_count <= 0:
+            return None
+
+        return HotelMarketingProfileRecord(
+            project_id=project_id,
+            profile_name=profile_name,
+            profile_json={
+                "event_count": event_count,
+                "booking_count": _clickhouse_value(row, "booking_count", 1),
+                "mobile_ratio": _clickhouse_value(row, "mobile_ratio", 2),
+                "package_ratio": _clickhouse_value(row, "package_ratio", 3),
+                "avg_stay_nights": _clickhouse_value(row, "avg_stay_nights", 4),
+                "avg_days_until_checkin": _clickhouse_value(
+                    row,
+                    "avg_days_until_checkin",
+                    5,
+                ),
+            },
+        )
+
     def summarize_expedia_hotel_events(
         self,
         *,

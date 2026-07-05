@@ -106,6 +106,69 @@ RELATED_TERMS_BY_GOAL = {
     ),
 }
 
+CHANNEL_AFFINITY_BY_SEGMENT = {
+    Channel.EMAIL.value: {
+        "seg_mobile_user": 1.0,
+        "seg_family_trip": 0.9,
+        "seg_near_checkin": 0.65,
+        "seg_existing_all": 0.6,
+        "seg_package_trip": 0.82,
+        "seg_long_stay": 0.78,
+        "seg_repeat_hotel_no_booking": 0.68,
+    },
+    Channel.ONSITE_BANNER.value: {
+        "seg_family_trip": 1.0,
+        "seg_mobile_user": 0.9,
+        "seg_repeat_hotel_no_booking": 0.72,
+        "seg_near_checkin": 0.65,
+        "seg_package_trip": 0.7,
+        "seg_long_stay": 0.62,
+        "seg_existing_all": 0.55,
+    },
+    Channel.SMS.value: {
+        "seg_near_checkin": 1.0,
+        "seg_mobile_user": 0.9,
+        "seg_family_trip": 0.8,
+        "seg_existing_all": 0.58,
+        "seg_repeat_hotel_no_booking": 0.76,
+        "seg_package_trip": 0.58,
+        "seg_long_stay": 0.45,
+    },
+}
+
+GOAL_AFFINITY_BY_SEGMENT = {
+    GoalMetric.INFLOW_RATE.value: {
+        "seg_mobile_user": 0.86,
+        "seg_existing_all": 0.78,
+        "seg_family_trip": 0.68,
+        "seg_near_checkin": 0.64,
+        "seg_repeat_hotel_no_booking": 0.6,
+    },
+    GoalMetric.BOOKING_CONVERSION_RATE.value: {
+        "seg_repeat_hotel_no_booking": 0.95,
+        "seg_near_checkin": 0.9,
+        "seg_package_trip": 0.82,
+        "seg_family_trip": 0.75,
+        "seg_mobile_user": 0.65,
+        "seg_existing_all": 0.48,
+    },
+    GoalMetric.FUNNEL_STEP_RATE.value: {
+        "seg_near_checkin": 0.88,
+        "seg_repeat_hotel_no_booking": 0.82,
+        "seg_mobile_user": 0.76,
+        "seg_family_trip": 0.72,
+        "seg_existing_all": 0.55,
+    },
+}
+
+FIT_SCORE_WEIGHTS = {
+    "cluster_quality": 0.10,
+    "sample_reliability": 0.20,
+    "goal_alignment": 0.25,
+    "channel_affinity": 0.35,
+    "hotel_profile": 0.10,
+}
+
 
 class PromotionReader(Protocol):
     def get_for_analysis(
@@ -142,6 +205,15 @@ class HotelProfileReader(Protocol):
         *,
         project_id: str,
     ) -> list[HotelMarketingProfileRecord]:
+        ...
+
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
         ...
 
 
@@ -194,6 +266,17 @@ class SegmentCandidate:
         return self.definition.sample_size
 
 
+@dataclass(frozen=True)
+class SegmentFitScore:
+    promotion_fit_score: float
+    cluster_quality_score: float
+    sample_reliability_score: float
+    goal_alignment_score: float
+    channel_affinity_score: float
+    hotel_profile_score: float
+    rationale: tuple[str, ...]
+
+
 class PromotionNotFoundError(Exception):
     pass
 
@@ -241,11 +324,20 @@ class PromotionAnalysisService:
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
-        candidates = self._build_candidates(segment_definitions, hotel_profiles)
+        candidates = self._build_candidates(
+            project_id=request.project_id,
+            segment_definitions=segment_definitions,
+            hotel_profiles=hotel_profiles,
+        )
+        fit_scores = _score_candidates(
+            promotion=promotion,
+            candidates=candidates,
+        )
         selected_candidates = self._select_candidates(
             promotion=promotion,
             request=request,
             candidates=candidates,
+            fit_scores=fit_scores,
         )
         if not selected_candidates:
             raise SegmentSelectionError("no active segment candidates matched analysis request")
@@ -284,6 +376,7 @@ class PromotionAnalysisService:
                 promotion=promotion,
                 target_segment=target_segment,
                 candidate=selected_candidates[rank],
+                fit_score=fit_scores[selected_candidates[rank].segment_id],
                 rank=rank,
             )
             for rank, target_segment in enumerate(target_segments)
@@ -317,17 +410,40 @@ class PromotionAnalysisService:
 
     def _build_candidates(
         self,
+        *,
+        project_id: str,
         segment_definitions: Sequence[SegmentDefinitionRecord],
         hotel_profiles: Sequence[HotelMarketingProfileRecord],
     ) -> dict[str, SegmentCandidate]:
         profiles_by_segment = {profile.profile_name: profile for profile in hotel_profiles}
-        return {
-            segment.segment_id: SegmentCandidate(
+        candidates: dict[str, SegmentCandidate] = {}
+        for segment in segment_definitions:
+            profile = profiles_by_segment.get(segment.segment_id)
+            if profile is None and segment.source == "ai_suggested":
+                profile = self._summarize_ai_segment_profile(
+                    project_id=project_id,
+                    segment=segment,
+                )
+            candidates[segment.segment_id] = SegmentCandidate(
                 definition=segment,
-                profile=profiles_by_segment.get(segment.segment_id),
+                profile=profile,
             )
-            for segment in segment_definitions
-        }
+        return candidates
+
+    def _summarize_ai_segment_profile(
+        self,
+        *,
+        project_id: str,
+        segment: SegmentDefinitionRecord,
+    ) -> HotelMarketingProfileRecord | None:
+        candidate_user_ids = _candidate_user_ids(segment.rule_json)
+        if not candidate_user_ids:
+            return None
+        return self._hotel_profile_repository.summarize_user_ids(
+            project_id=project_id,
+            profile_name=segment.segment_id,
+            user_ids=candidate_user_ids,
+        )
 
     def _select_candidates(
         self,
@@ -335,11 +451,12 @@ class PromotionAnalysisService:
         promotion: PromotionRecord,
         request: AnalysisRequest,
         candidates: Mapping[str, SegmentCandidate],
+        fit_scores: Mapping[str, SegmentFitScore],
     ) -> list[SegmentCandidate]:
         ordered_ids: list[str] = []
         for candidate in sorted(
             candidates.values(),
-            key=lambda candidate: (-candidate.estimated_size, candidate.segment_id),
+            key=lambda candidate: _fit_sort_key(candidate, fit_scores),
         ):
             if self._is_related_custom_segment(candidate.definition, promotion):
                 ordered_ids.append(candidate.segment_id)
@@ -348,11 +465,7 @@ class PromotionAnalysisService:
             candidate.segment_id
             for candidate in sorted(
                 candidates.values(),
-                key=lambda candidate: (
-                    -_ai_segment_score(candidate.definition),
-                    -candidate.estimated_size,
-                    candidate.segment_id,
-                ),
+                key=lambda candidate: _fit_sort_key(candidate, fit_scores),
             )
             if candidate.definition.source == "ai_suggested"
         )
@@ -371,7 +484,7 @@ class PromotionAnalysisService:
             candidate.segment_id
             for candidate in sorted(
                 candidates.values(),
-                key=lambda candidate: (-candidate.estimated_size, candidate.segment_id),
+                key=lambda candidate: _fit_sort_key(candidate, fit_scores),
             )
             if candidate.definition.source in {"system_default", "ai_suggested"}
         )
@@ -458,6 +571,7 @@ class PromotionAnalysisService:
         promotion: PromotionRecord,
         target_segment: PromotionTargetSegmentWrite,
         candidate: SegmentCandidate,
+        fit_score: SegmentFitScore,
         rank: int,
     ) -> PromotionSegmentSuggestionWrite:
         segment = candidate.definition
@@ -478,13 +592,21 @@ class PromotionAnalysisService:
                 "rank": rank + 1,
                 "estimated_size": target_segment.estimated_size,
                 "priority": target_segment.priority,
+                "promotion_fit_score": fit_score.promotion_fit_score,
                 "cluster_score": _ai_segment_score(segment),
+                "cluster_quality_score": fit_score.cluster_quality_score,
+                "sample_reliability_score": fit_score.sample_reliability_score,
+                "goal_alignment_score": fit_score.goal_alignment_score,
+                "channel_affinity_score": fit_score.channel_affinity_score,
+                "hotel_profile_score": fit_score.hotel_profile_score,
             },
             reason_json={
                 "channel": promotion.channel,
                 "goal_metric": promotion.goal_metric,
                 "segment_source": segment.source,
                 "has_hotel_profile": candidate.profile is not None,
+                "fit_model": "rule_based_v1",
+                "fit_rationale": list(fit_score.rationale),
             },
             metadata_json={
                 "segment_name": target_segment.segment_name,
@@ -604,6 +726,280 @@ class PromotionAnalysisService:
             )
         )
         return result.segment_vector_id
+
+
+def _score_candidates(
+    *,
+    promotion: PromotionRecord,
+    candidates: Mapping[str, SegmentCandidate],
+) -> dict[str, SegmentFitScore]:
+    max_profile_event_count = max(
+        (
+            int(candidate.profile.profile_json.get("event_count", 0))
+            for candidate in candidates.values()
+            if candidate.profile is not None
+        ),
+        default=0,
+    )
+    return {
+        candidate.segment_id: _score_candidate(
+            promotion=promotion,
+            candidate=candidate,
+            max_profile_event_count=max_profile_event_count,
+        )
+        for candidate in candidates.values()
+    }
+
+
+def _score_candidate(
+    *,
+    promotion: PromotionRecord,
+    candidate: SegmentCandidate,
+    max_profile_event_count: int,
+) -> SegmentFitScore:
+    cluster_quality_score = _clamp01(_ai_segment_score(candidate.definition))
+    sample_reliability_score = _sample_reliability_score(
+        sample_size=candidate.estimated_size,
+        min_sample_size=promotion.min_sample_size,
+    )
+    goal_alignment_score = _goal_alignment_score(
+        promotion=promotion,
+        candidate=candidate,
+    )
+    channel_affinity_score = _channel_affinity_score(
+        promotion=promotion,
+        candidate=candidate,
+    )
+    hotel_profile_score = _hotel_profile_score(
+        profile=candidate.profile,
+        max_profile_event_count=max_profile_event_count,
+    )
+    promotion_fit_score = round(
+        cluster_quality_score * FIT_SCORE_WEIGHTS["cluster_quality"]
+        + sample_reliability_score * FIT_SCORE_WEIGHTS["sample_reliability"]
+        + goal_alignment_score * FIT_SCORE_WEIGHTS["goal_alignment"]
+        + channel_affinity_score * FIT_SCORE_WEIGHTS["channel_affinity"]
+        + hotel_profile_score * FIT_SCORE_WEIGHTS["hotel_profile"],
+        6,
+    )
+    return SegmentFitScore(
+        promotion_fit_score=promotion_fit_score,
+        cluster_quality_score=round(cluster_quality_score, 6),
+        sample_reliability_score=round(sample_reliability_score, 6),
+        goal_alignment_score=round(goal_alignment_score, 6),
+        channel_affinity_score=round(channel_affinity_score, 6),
+        hotel_profile_score=round(hotel_profile_score, 6),
+        rationale=_fit_rationale(
+            promotion=promotion,
+            has_profile=candidate.profile is not None,
+            cluster_quality_score=cluster_quality_score,
+            sample_reliability_score=sample_reliability_score,
+            goal_alignment_score=goal_alignment_score,
+            channel_affinity_score=channel_affinity_score,
+            hotel_profile_score=hotel_profile_score,
+        ),
+    )
+
+
+def _fit_sort_key(
+    candidate: SegmentCandidate,
+    fit_scores: Mapping[str, SegmentFitScore],
+) -> tuple[float, int, str]:
+    fit_score = fit_scores[candidate.segment_id]
+    return (
+        -fit_score.promotion_fit_score,
+        -candidate.estimated_size,
+        candidate.segment_id,
+    )
+
+
+def _sample_reliability_score(
+    *,
+    sample_size: int,
+    min_sample_size: int,
+) -> float:
+    if min_sample_size <= 0:
+        return 1.0
+    return _clamp01(sample_size / min_sample_size)
+
+
+def _goal_alignment_score(
+    *,
+    promotion: PromotionRecord,
+    candidate: SegmentCandidate,
+) -> float:
+    segment = candidate.definition
+    segment_score = GOAL_AFFINITY_BY_SEGMENT.get(promotion.goal_metric, {}).get(
+        segment.segment_id,
+        0.0,
+    )
+    profile_score = _goal_profile_score(
+        goal_metric=promotion.goal_metric,
+        profile=candidate.profile,
+    )
+    text_score = _term_match_score(
+        _candidate_searchable_text(segment),
+        RELATED_TERMS_BY_GOAL.get(promotion.goal_metric, ()),
+    )
+    return _clamp01(max(segment_score, profile_score, text_score))
+
+
+def _goal_profile_score(
+    *,
+    goal_metric: str,
+    profile: HotelMarketingProfileRecord | None,
+) -> float:
+    if profile is None:
+        return 0.0
+    profile_json = profile.profile_json
+    event_count = _float_value(profile_json.get("event_count"))
+    booking_count = _float_value(profile_json.get("booking_count"))
+    booking_rate = booking_count / event_count if event_count > 0 else 0.0
+    mobile_ratio = _float_value(profile_json.get("mobile_ratio"))
+    package_ratio = _float_value(profile_json.get("package_ratio"))
+    avg_days_until_checkin = _float_value(
+        profile_json.get("avg_days_until_checkin"),
+        default=999.0,
+    )
+
+    if goal_metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
+        return _clamp01(booking_rate / 0.08)
+    if goal_metric == GoalMetric.INFLOW_RATE.value:
+        return _clamp01((mobile_ratio * 0.7) + (package_ratio * 0.3))
+    if goal_metric == GoalMetric.FUNNEL_STEP_RATE.value:
+        near_checkin_score = 1.0 if 0 <= avg_days_until_checkin <= 7 else 0.4
+        return _clamp01((mobile_ratio * 0.4) + (near_checkin_score * 0.6))
+    return 0.0
+
+
+def _channel_affinity_score(
+    *,
+    promotion: PromotionRecord,
+    candidate: SegmentCandidate,
+) -> float:
+    segment = candidate.definition
+    segment_score = CHANNEL_AFFINITY_BY_SEGMENT.get(promotion.channel, {}).get(
+        segment.segment_id,
+        0.0,
+    )
+    profile_score = _channel_profile_score(
+        channel=promotion.channel,
+        profile=candidate.profile,
+    )
+    channel_terms = (promotion.channel.replace("_", " "), promotion.channel)
+    text_score = _term_match_score(_candidate_searchable_text(segment), channel_terms)
+    return _clamp01(max(segment_score, profile_score, text_score))
+
+
+def _channel_profile_score(
+    *,
+    channel: str,
+    profile: HotelMarketingProfileRecord | None,
+) -> float:
+    if profile is None:
+        return 0.0
+    profile_json = profile.profile_json
+    mobile_ratio = _float_value(profile_json.get("mobile_ratio"))
+    package_ratio = _float_value(profile_json.get("package_ratio"))
+    avg_stay_nights = _float_value(profile_json.get("avg_stay_nights"))
+    avg_days_until_checkin = _float_value(
+        profile_json.get("avg_days_until_checkin"),
+        default=999.0,
+    )
+
+    if channel == Channel.SMS.value:
+        near_checkin_score = 1.0 if 0 <= avg_days_until_checkin <= 7 else 0.3
+        return _clamp01((mobile_ratio * 0.7) + (near_checkin_score * 0.3))
+    if channel == Channel.EMAIL.value:
+        long_stay_score = 1.0 if avg_stay_nights >= 3 else 0.5
+        return _clamp01((package_ratio * 0.5) + (long_stay_score * 0.5))
+    if channel == Channel.ONSITE_BANNER.value:
+        return _clamp01((mobile_ratio * 0.5) + (package_ratio * 0.2) + 0.3)
+    return 0.0
+
+
+def _hotel_profile_score(
+    *,
+    profile: HotelMarketingProfileRecord | None,
+    max_profile_event_count: int,
+) -> float:
+    if profile is None:
+        return 0.0
+    profile_json = profile.profile_json
+    event_count = _float_value(profile_json.get("event_count"))
+    event_score = (
+        _clamp01(event_count / max_profile_event_count)
+        if max_profile_event_count > 0
+        else 0.0
+    )
+    metric_keys = (
+        "booking_count",
+        "mobile_ratio",
+        "package_ratio",
+        "avg_stay_nights",
+        "avg_days_until_checkin",
+    )
+    completeness_score = sum(
+        1 for key in metric_keys if profile_json.get(key) is not None
+    ) / len(metric_keys)
+    return _clamp01((event_score * 0.7) + (completeness_score * 0.3))
+
+
+def _fit_rationale(
+    *,
+    promotion: PromotionRecord,
+    has_profile: bool,
+    cluster_quality_score: float,
+    sample_reliability_score: float,
+    goal_alignment_score: float,
+    channel_affinity_score: float,
+    hotel_profile_score: float,
+) -> tuple[str, ...]:
+    rationale: list[str] = []
+    if cluster_quality_score >= 0.7:
+        rationale.append("cluster_quality_high")
+    if sample_reliability_score >= 1.0:
+        rationale.append("sample_size_meets_minimum")
+    elif sample_reliability_score < 0.5:
+        rationale.append("sample_size_below_minimum")
+    if goal_alignment_score >= 0.65:
+        rationale.append(f"goal_{promotion.goal_metric}_aligned")
+    if channel_affinity_score >= 0.65:
+        rationale.append(f"channel_{promotion.channel}_aligned")
+    if has_profile and hotel_profile_score > 0:
+        rationale.append("hotel_profile_used")
+    return tuple(rationale)
+
+
+def _candidate_searchable_text(segment: SegmentDefinitionRecord) -> str:
+    return " ".join(
+        [
+            segment.segment_id,
+            segment.segment_name,
+            segment.natural_language_query or "",
+            segment.generated_sql or "",
+            str(segment.rule_json),
+            str(segment.profile_json),
+        ]
+    ).lower()
+
+
+def _term_match_score(text: str, terms: Sequence[str]) -> float:
+    if not terms:
+        return 0.0
+    matched_count = sum(1 for term in terms if term and term.lower() in text)
+    return _clamp01(matched_count / min(len(terms), 3))
+
+
+def _float_value(value: Any, *, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _clamp01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
 
 
 def _promotion_snapshot(promotion: PromotionRecord) -> dict[str, Any]:
