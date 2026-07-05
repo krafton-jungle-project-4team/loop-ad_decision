@@ -44,9 +44,27 @@ class ContentCandidateWriter(Protocol):
         ...
 
 
+class GenerationInputReader(Protocol):
+    def get_promotion_input(
+        self,
+        request: GenerationRequest,
+    ) -> PromotionPromptInput | None:
+        ...
+
+    def list_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        ...
+
+
 class GenerationRequestHandler(Protocol):
     def generate(self, request: GenerationRequest) -> GenerationResponse:
         ...
+
+
+class GenerationInputUnavailable(RuntimeError):
+    """Raised when confirmed generation input rows are not ready yet."""
 
 
 class GenerationService:
@@ -55,6 +73,7 @@ class GenerationService:
         *,
         generation_run_repository: GenerationRunWriter | None = None,
         content_candidate_repository: ContentCandidateWriter | None = None,
+        generation_input_reader: GenerationInputReader | None = None,
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
@@ -62,6 +81,7 @@ class GenerationService:
     ) -> None:
         self._generation_run_repository = generation_run_repository
         self._content_candidate_repository = content_candidate_repository
+        self._generation_input_reader = generation_input_reader
         self._generation_input_builder = (
             generation_input_builder or GenerationInputBuilder()
         )
@@ -182,6 +202,27 @@ class GenerationService:
         self,
         request: GenerationRequest,
     ) -> list[GenerationPromptInput]:
+        if self._generation_input_reader is not None:
+            promotion = self._generation_input_reader.get_promotion_input(request)
+            if promotion is None:
+                raise GenerationInputUnavailable(
+                    "promotion input was not found for generation"
+                )
+
+            target_segments = (
+                self._generation_input_reader.list_target_segment_inputs(request)
+            )
+            if not target_segments:
+                raise GenerationInputUnavailable(
+                    "confirmed promotion_target_segments are required for generation"
+                )
+
+            return self._generation_input_builder.build(
+                request=request,
+                promotion=promotion,
+                target_segments=target_segments,
+            )
+
         return self._generation_input_builder.build(
             request=request,
             promotion=_fixture_promotion_prompt_input(request),

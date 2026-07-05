@@ -10,13 +10,18 @@ from app.dependencies import get_settings
 from app.generation.adapters import build_external_content_generator
 from app.generation.repositories import (
     ContentCandidateRepository,
+    GenerationInputRepository,
     GenerationRunRepository,
 )
 from app.generation.schemas import (
     GenerationRequest,
     GenerationResponse,
 )
-from app.generation.service import GenerationRequestHandler, GenerationService
+from app.generation.service import (
+    GenerationInputUnavailable,
+    GenerationRequestHandler,
+    GenerationService,
+)
 
 
 router = APIRouter(
@@ -35,6 +40,7 @@ def get_generation_service(request: Request) -> Iterator[GenerationRequestHandle
         yield GenerationService(
             generation_run_repository=GenerationRunRepository(connection),
             content_candidate_repository=ContentCandidateRepository(connection),
+            generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
         )
         connection.commit()
@@ -63,7 +69,13 @@ async def create_generation(
             detail="promotion_id path parameter does not match request body",
         )
 
-    return generation_service.generate(generation_request)
+    try:
+        return generation_service.generate(generation_request)
+    except GenerationInputUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
 
 
 async def _parse_generation_request(request: Request) -> GenerationRequest:
