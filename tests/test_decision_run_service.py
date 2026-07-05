@@ -15,6 +15,7 @@ from app.decision.repositories import (
     PromotionRunWrite,
     PromotionTargetSegmentRecord,
 )
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.schemas import (
     AdExperimentStatus,
     Channel,
@@ -165,7 +166,7 @@ def test_run_service_rejects_content_candidate_context_mismatch() -> None:
     assert repos.ad_experiments.inserted_batches == []
 
 
-def test_run_service_creates_run_and_one_ad_experiment_per_target_segment() -> None:
+def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
     target_segments = [
         target_segment_record(
             segment_id="seg_family_trip",
@@ -210,6 +211,7 @@ def test_run_service_creates_run_and_one_ad_experiment_per_target_segment() -> N
     assert [experiment.segment_id for experiment in experiments] == [
         "seg_family_trip",
         "seg_mobile_user",
+        FALLBACK_SEGMENT_ID,
     ]
     assert all(experiment.loop_count == run.loop_count for experiment in experiments)
     assert all(
@@ -218,11 +220,50 @@ def test_run_service_creates_run_and_one_ad_experiment_per_target_segment() -> N
     )
     assert experiments[0].content_id == "content_family_001"
     assert experiments[1].content_option_id == "mobile_option_a"
+    assert experiments[2].content_id == "content_family_001"
+    assert experiments[2].content_option_id == "family_option_a"
     assert response.promotion_run_id == run.promotion_run_id
     assert [item.segment_id for item in response.ad_experiments] == [
         "seg_family_trip",
         "seg_mobile_user",
+        FALLBACK_SEGMENT_ID,
     ]
+
+
+def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
+    service, repos = make_service(
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_family_trip",
+                segment_name="Family hotel trip",
+            ),
+        ],
+        candidates=[
+            content_candidate_record(
+                segment_id="seg_family_trip",
+                content_id="content_family_001",
+                content_option_id="family_option_a",
+            ),
+            content_candidate_record(
+                segment_id=FALLBACK_SEGMENT_ID,
+                content_id="content_existing_all_001",
+                content_option_id="existing_all_option_a",
+            ),
+        ],
+    )
+
+    service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    experiments = repos.ad_experiments.inserted_batches[0]
+    assert [experiment.segment_id for experiment in experiments] == [
+        "seg_family_trip",
+        FALLBACK_SEGMENT_ID,
+    ]
+    assert experiments[1].content_id == "content_existing_all_001"
+    assert experiments[1].content_option_id == "existing_all_option_a"
 
 
 def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> None:
@@ -268,8 +309,12 @@ def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> No
     assert len(repos.runs.inserted) == 1
     assert repos.runs.inserted[0].loop_count == 2
     experiments = repos.ad_experiments.inserted_batches[0]
-    assert [experiment.segment_id for experiment in experiments] == ["seg_luxury"]
+    assert [experiment.segment_id for experiment in experiments] == [
+        "seg_luxury",
+        FALLBACK_SEGMENT_ID,
+    ]
     assert experiments[0].content_id == "content_luxury_approved_001"
+    assert experiments[1].content_id == "content_luxury_approved_001"
 
 
 def test_bounded_decision_id_is_stable_and_under_contract_length() -> None:

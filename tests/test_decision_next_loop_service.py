@@ -13,6 +13,7 @@ from app.decision.next_loop_service import (
     NextLoopService,
     NextLoopValidationError,
 )
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import (
     AdExperimentRecord,
     PromotionEvaluationRecord,
@@ -80,6 +81,28 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
             "generation_banner_001",
             "Emphasize breakfast benefits.",
         )
+    ]
+
+
+def test_next_loop_allows_created_fallback_ad_experiment() -> None:
+    repos = FakeNextLoopRepos(
+        run_creator=FakeRunCreator(
+            created_segment_ids=["seg_luxury", FALLBACK_SEGMENT_ID],
+        )
+    )
+    service = make_service(repos)
+
+    response = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=NextLoopRequest(
+            failed_segment_ids=["seg_luxury"],
+            failed_ad_experiment_ids=["adexp_luxury_001"],
+        ),
+    )
+
+    assert [experiment.segment_id for experiment in response.next_ad_experiments] == [
+        "seg_luxury",
+        FALLBACK_SEGMENT_ID,
     ]
 
 

@@ -254,7 +254,7 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     assert body["next_generation_id"] == "generation_banner_001_loop_2"
     assert [
         experiment["segment_id"] for experiment in body["next_ad_experiments"]
-    ] == ["seg_luxury"]
+    ] == ["seg_luxury", "seg_existing_all"]
     assert "status" not in body
     connection = connections[0]
     assert connection.commit_count == 1

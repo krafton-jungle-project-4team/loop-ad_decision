@@ -22,6 +22,7 @@ from app.decision.repositories import (
     PromotionTargetSegmentReader,
     PromotionTargetSegmentRecord,
 )
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.schemas import (
     AdExperimentCreateResponse,
     AdExperimentStatus,
@@ -32,6 +33,7 @@ from app.decision.schemas import (
 
 
 COMPLETED_STATUS = "completed"
+FALLBACK_SEGMENT_NAME = "Existing users fallback"
 MAX_CONTRACT_ID_LENGTH = 100
 
 
@@ -121,6 +123,7 @@ class PromotionRunService:
             promotion_run_id=promotion_run_id,
             target_segments=target_segments,
             selected_content=selected_content,
+            content_by_segment=content_by_segment,
             loop_count=request.loop_count,
         )
 
@@ -295,25 +298,46 @@ class PromotionRunService:
                     f"content candidate: {segment.segment_id}"
                 )
             candidate = candidates[0]
-            _validate_project_campaign_promotion(
-                label="content candidate",
-                project_id=candidate.project_id,
-                campaign_id=candidate.campaign_id,
-                promotion_id=candidate.promotion_id,
+            _validate_content_candidate(
+                candidate=candidate,
                 promotion=promotion,
+                analysis=analysis,
+                generation=generation,
             )
-            if candidate.analysis_id != analysis.analysis_id:
-                raise RunValidationError(
-                    "content candidate must belong to the selected promotion analysis"
-                )
-            if candidate.generation_id != generation.generation_id:
-                raise RunValidationError(
-                    "content candidate must belong to the selected generation run"
-                )
-            if candidate.channel != promotion.channel:
-                raise RunValidationError("content candidate channel must match promotion")
             selected_content[segment.segment_id] = candidate
         return selected_content
+
+    def _select_fallback_content(
+        self,
+        *,
+        promotion: PromotionRecord,
+        analysis: PromotionAnalysisRecord,
+        generation: GenerationRunRecord,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
+        selected_content: dict[str, ContentCandidateRecord],
+        content_by_segment: dict[str, list[ContentCandidateRecord]],
+    ) -> ContentCandidateRecord:
+        fallback_candidates = content_by_segment.get(FALLBACK_SEGMENT_ID, [])
+        if len(fallback_candidates) > 1:
+            raise RunValidationError(
+                "fallback segment must have at most one approved or active "
+                "content candidate"
+            )
+        if fallback_candidates:
+            candidate = fallback_candidates[0]
+            _validate_content_candidate(
+                candidate=candidate,
+                promotion=promotion,
+                analysis=analysis,
+                generation=generation,
+            )
+            return candidate
+
+        for segment in target_segments:
+            if segment.segment_id != FALLBACK_SEGMENT_ID:
+                return selected_content[segment.segment_id]
+
+        raise RunValidationError("at least one non-fallback target segment is required")
 
     def _build_promotion_run(
         self,
@@ -350,34 +374,45 @@ class PromotionRunService:
         promotion_run_id: str,
         target_segments: Sequence[PromotionTargetSegmentRecord],
         selected_content: dict[str, ContentCandidateRecord],
+        content_by_segment: dict[str, list[ContentCandidateRecord]],
         loop_count: int,
     ) -> list[AdExperimentWrite]:
         experiments: list[AdExperimentWrite] = []
         for segment in target_segments:
             content = selected_content[segment.segment_id]
             experiments.append(
-                AdExperimentWrite(
-                    ad_experiment_id=build_bounded_decision_id(
-                        "adexp",
-                        promotion_run_id,
-                        segment.segment_id,
-                    ),
-                    project_id=promotion.project_id,
-                    campaign_id=promotion.campaign_id,
-                    promotion_id=promotion.promotion_id,
+                _build_ad_experiment(
+                    promotion=promotion,
+                    analysis=analysis,
+                    generation=generation,
                     promotion_run_id=promotion_run_id,
-                    analysis_id=analysis.analysis_id,
-                    generation_id=generation.generation_id,
                     segment_id=segment.segment_id,
                     segment_name=segment.segment_name,
-                    content_id=content.content_id,
-                    content_option_id=content.content_option_id,
-                    channel=promotion.channel,
+                    content=content,
                     loop_count=loop_count,
-                    status=AdExperimentStatus.PLANNED.value,
-                    goal_metric=promotion.goal_metric,
-                    goal_target_value=promotion.goal_target_value,
-                    goal_basis=promotion.goal_basis,
+                )
+            )
+        if not any(
+            experiment.segment_id == FALLBACK_SEGMENT_ID for experiment in experiments
+        ):
+            fallback_content = self._select_fallback_content(
+                promotion=promotion,
+                analysis=analysis,
+                generation=generation,
+                target_segments=target_segments,
+                selected_content=selected_content,
+                content_by_segment=content_by_segment,
+            )
+            experiments.append(
+                _build_ad_experiment(
+                    promotion=promotion,
+                    analysis=analysis,
+                    generation=generation,
+                    promotion_run_id=promotion_run_id,
+                    segment_id=FALLBACK_SEGMENT_ID,
+                    segment_name=FALLBACK_SEGMENT_NAME,
+                    content=fallback_content,
+                    loop_count=loop_count,
                 )
             )
         return experiments
@@ -419,6 +454,68 @@ def _build_goal_snapshot(
 
 def _decimal_to_snapshot_string(value: Decimal) -> str:
     return str(value)
+
+
+def _build_ad_experiment(
+    *,
+    promotion: PromotionRecord,
+    analysis: PromotionAnalysisRecord,
+    generation: GenerationRunRecord,
+    promotion_run_id: str,
+    segment_id: str,
+    segment_name: str | None,
+    content: ContentCandidateRecord,
+    loop_count: int,
+) -> AdExperimentWrite:
+    return AdExperimentWrite(
+        ad_experiment_id=build_bounded_decision_id(
+            "adexp",
+            promotion_run_id,
+            segment_id,
+        ),
+        project_id=promotion.project_id,
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        promotion_run_id=promotion_run_id,
+        analysis_id=analysis.analysis_id,
+        generation_id=generation.generation_id,
+        segment_id=segment_id,
+        segment_name=segment_name,
+        content_id=content.content_id,
+        content_option_id=content.content_option_id,
+        channel=promotion.channel,
+        loop_count=loop_count,
+        status=AdExperimentStatus.PLANNED.value,
+        goal_metric=promotion.goal_metric,
+        goal_target_value=promotion.goal_target_value,
+        goal_basis=promotion.goal_basis,
+    )
+
+
+def _validate_content_candidate(
+    *,
+    candidate: ContentCandidateRecord,
+    promotion: PromotionRecord,
+    analysis: PromotionAnalysisRecord,
+    generation: GenerationRunRecord,
+) -> None:
+    _validate_project_campaign_promotion(
+        label="content candidate",
+        project_id=candidate.project_id,
+        campaign_id=candidate.campaign_id,
+        promotion_id=candidate.promotion_id,
+        promotion=promotion,
+    )
+    if candidate.analysis_id != analysis.analysis_id:
+        raise RunValidationError(
+            "content candidate must belong to the selected promotion analysis"
+        )
+    if candidate.generation_id != generation.generation_id:
+        raise RunValidationError(
+            "content candidate must belong to the selected generation run"
+        )
+    if candidate.channel != promotion.channel:
+        raise RunValidationError("content candidate channel must match promotion")
 
 
 def _validate_project_campaign_promotion(

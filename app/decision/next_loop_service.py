@@ -18,6 +18,7 @@ from app.decision.repositories import (
     PromotionRunRecord,
     PromotionRunWriter,
 )
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.schemas import (
     NextLoopRequest,
     NextLoopResponse,
@@ -370,7 +371,9 @@ class NextLoopService:
             label="created ad_experiments",
             expected_segment_ids=failed_segment_ids,
             actual_segment_ids=[
-                experiment.segment_id for experiment in run_result.ad_experiments
+                experiment.segment_id
+                for experiment in run_result.ad_experiments
+                if experiment.segment_id != FALLBACK_SEGMENT_ID
             ],
         )
 
