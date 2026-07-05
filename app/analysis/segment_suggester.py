@@ -257,6 +257,8 @@ def _segment_definition_from_cluster(
     return SegmentDefinitionRecord(
         segment_id=segment_id,
         project_id=promotion.project_id,
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
         segment_name=f"AI suggested hotel audience {rank + 1}",
         source="ai_suggested",
         query_preview_id=None,

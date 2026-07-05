@@ -36,7 +36,7 @@ router = APIRouter(prefix="/decision/v1/promotions", tags=["analysis"])
 
 UNIQUE_CONSTRAINTS = {
     "promotion_analyses_pkey",
-    "uq_promotion_target_segments_analysis_segment",
+    "uq_promotion_segment_suggestions_analysis_segment",
 }
 
 
@@ -103,7 +103,7 @@ def analyze_promotion(
         if _is_unique_violation(exc):
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="promotion analysis already exists or contains duplicate target segments",
+                detail="promotion analysis already exists or contains duplicate segment suggestions",
             ) from exc
         raise
 
