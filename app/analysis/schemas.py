@@ -33,7 +33,6 @@ class AnalysisRequest(BaseModel):
     project_id: str
     campaign_id: str
     promotion_id: str
-    focus_segment_ids: list[str] | None = None
     operator_instruction: str | None = None
 
 

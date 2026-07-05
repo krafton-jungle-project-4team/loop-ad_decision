@@ -15,6 +15,7 @@ from app.analysis.repositories import (
 )
 from app.analysis.schemas import AnalysisRequest
 from app.analysis.service import (
+    NextLoopFocusAnalysisRequest,
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
@@ -205,13 +206,11 @@ def analysis_request(
     *,
     promotion_id: str,
     operator_instruction: str | None = None,
-    focus_segment_ids: list[str] | None = None,
 ) -> AnalysisRequest:
     return AnalysisRequest(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
-        focus_segment_ids=focus_segment_ids,
         operator_instruction=operator_instruction,
     )
 
@@ -337,10 +336,15 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
         segment_vector_service=vector_service,
     )
 
-    result = service.analyze(
-        analysis_request(
+    result = service.analyze_focus(
+        NextLoopFocusAnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
             promotion_id=promotion.promotion_id,
             focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_failed_ad_experiment_ids=["adexp_near_checkin_001"],
             operator_instruction="Stress breakfast.",
         ),
     )
@@ -356,12 +360,12 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
     assert saved_analysis.profile_summary_json["selection_mode"] == "focus"
     assert vector_service.calls == [
         SegmentVectorBuildRequest(
-            project_id="hotel-client-a",
-            promotion_id=promotion.promotion_id,
-            analysis_id=f"analysis_{promotion.promotion_id}",
-            segment_id="seg_near_checkin",
-            candidate_user_ids=[],
-        )
+                project_id="hotel-client-a",
+                promotion_id=promotion.promotion_id,
+                analysis_id=result.analysis.analysis_id,
+                segment_id="seg_near_checkin",
+                candidate_user_ids=[],
+            )
     ]
 
 

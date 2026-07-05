@@ -238,7 +238,11 @@ class PromotionAnalysisService:
         self._max_default_target_segments = max_default_target_segments
 
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
-        return self._analyze(request=request, next_loop_context=None)
+        return self._analyze(
+            request=request,
+            focus_segment_ids=None,
+            next_loop_context=None,
+        )
 
     def analyze_focus(
         self,
@@ -249,9 +253,9 @@ class PromotionAnalysisService:
                 project_id=request.project_id,
                 campaign_id=request.campaign_id,
                 promotion_id=request.promotion_id,
-                focus_segment_ids=list(request.focus_segment_ids),
                 operator_instruction=request.operator_instruction,
             ),
+            focus_segment_ids=list(request.focus_segment_ids),
             next_loop_context=NextLoopAnalysisContext(
                 loop_count=request.loop_count,
                 source_promotion_run_id=request.source_promotion_run_id,
@@ -265,6 +269,7 @@ class PromotionAnalysisService:
         self,
         *,
         request: AnalysisRequest,
+        focus_segment_ids: Sequence[str] | None,
         next_loop_context: NextLoopAnalysisContext | None,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
@@ -286,7 +291,7 @@ class PromotionAnalysisService:
         candidates = self._build_candidates(segment_definitions, hotel_profiles)
         selected_candidates = self._select_candidates(
             promotion=promotion,
-            request=request,
+            focus_segment_ids=focus_segment_ids,
             candidates=candidates,
         )
         if not selected_candidates:
@@ -300,6 +305,7 @@ class PromotionAnalysisService:
             analysis_id=analysis_id,
             promotion=promotion,
             request=request,
+            focus_segment_ids=focus_segment_ids,
             next_loop_context=next_loop_context,
             segment_definitions=segment_definitions,
             candidates=candidates,
@@ -368,10 +374,10 @@ class PromotionAnalysisService:
         self,
         *,
         promotion: PromotionRecord,
-        request: AnalysisRequest,
+        focus_segment_ids: Sequence[str] | None,
         candidates: Mapping[str, SegmentCandidate],
     ) -> list[SegmentCandidate]:
-        focus_segment_ids = _focus_segment_ids(request.focus_segment_ids)
+        focus_segment_ids = _focus_segment_ids(focus_segment_ids)
         if focus_segment_ids is not None:
             missing_segment_ids = [
                 segment_id
@@ -554,12 +560,13 @@ class PromotionAnalysisService:
         analysis_id: str,
         promotion: PromotionRecord,
         request: AnalysisRequest,
+        focus_segment_ids: Sequence[str] | None,
         next_loop_context: NextLoopAnalysisContext | None,
         segment_definitions: Sequence[SegmentDefinitionRecord],
         candidates: Mapping[str, SegmentCandidate],
         selected_segment_ids: Sequence[str],
     ) -> PromotionAnalysisWrite:
-        focus_segment_ids = _focus_segment_ids(request.focus_segment_ids)
+        focus_segment_ids = _focus_segment_ids(focus_segment_ids)
         input_snapshot_json: dict[str, Any] = {
             "promotion": _promotion_snapshot(promotion),
             "available_segment_definitions": [
