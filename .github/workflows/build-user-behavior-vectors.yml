@@ -1,0 +1,53 @@
+name: Build User Behavior Vectors
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: "Project id to build vectors for"
+        required: true
+        default: "demo_project"
+      vector_version:
+        description: "Vector version written to ClickHouse"
+        required: true
+        default: "v1"
+      window_days:
+        description: "Source event lookback window in days"
+        required: true
+        default: "90"
+  schedule:
+    - cron: "0 * * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  trigger-decision-batch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Decision user behavior vector batch
+        env:
+          DECISION_API_URL: https://decision.api.dev.loop-ad.org
+          LOOPAD_INTERNAL_API_KEY: ${{ secrets.LOOPAD_INTERNAL_API_KEY }}
+          PROJECT_ID: ${{ inputs.project_id || 'demo_project' }}
+          VECTOR_VERSION: ${{ inputs.vector_version || 'v1' }}
+          WINDOW_DAYS: ${{ inputs.window_days || '90' }}
+        run: |
+          test -n "$DECISION_API_URL"
+          test -n "$LOOPAD_INTERNAL_API_KEY"
+          payload="$(jq -n \
+            --arg project_id "$PROJECT_ID" \
+            --arg vector_version "$VECTOR_VERSION" \
+            --arg source "expedia_hotel_events" \
+            --argjson window_days "$WINDOW_DAYS" \
+            '{
+              project_id: $project_id,
+              vector_version: $vector_version,
+              source: $source,
+              window_days: $window_days
+            }')"
+          curl --fail-with-body --show-error --silent --max-time 900 \
+            -X POST "$DECISION_API_URL/internal/decision/v1/batches/user-behavior-vectors/build" \
+            -H "Content-Type: application/json" \
+            -H "X-Loop-Ad-Internal-Key: $LOOPAD_INTERNAL_API_KEY" \
+            -d "$payload"
