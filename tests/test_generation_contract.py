@@ -358,6 +358,13 @@ class FakeGenerationRunRepository:
         self.saved.append(record)
         return {"generation_id": record.generation_id}
 
+    def list_ids_by_promotion(self, promotion_id: str) -> list[str]:
+        return [
+            generation_run.generation_id
+            for generation_run in self.saved
+            if generation_run.promotion_id == promotion_id
+        ]
+
 
 class FakeContentCandidateRepository:
     def __init__(self) -> None:

@@ -23,12 +23,23 @@ from app.generation.service import (
 
 
 class FakeGenerationRunRepository:
-    def __init__(self) -> None:
+    def __init__(self, existing_generation_ids: list[str] | None = None) -> None:
+        self.existing_generation_ids = existing_generation_ids or []
         self.saved: list[GenerationRunRecord] = []
 
     def create(self, record: GenerationRunRecord) -> dict[str, object]:
         self.saved.append(record)
         return {"generation_id": record.generation_id}
+
+    def list_ids_by_promotion(self, promotion_id: str) -> list[str]:
+        return [
+            *self.existing_generation_ids,
+            *[
+                generation_run.generation_id
+                for generation_run in self.saved
+                if generation_run.promotion_id == promotion_id
+            ],
+        ]
 
 
 class FakeContentCandidateRepository:
@@ -169,6 +180,57 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     assert response.content_candidates[0].content_option_id == (
         "banner_repeat_hotel_option_001"
     )
+
+
+def test_generation_service_uses_new_generation_id_for_regeneration() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+    )
+
+    first_response = service.generate(generation_request(content_option_count=1))
+    second_response = service.generate(generation_request(content_option_count=1))
+
+    assert first_response.generation_id == "generation_banner_001"
+    assert second_response.generation_id == "generation_banner_001_run_2"
+    assert [
+        generation_run.generation_id
+        for generation_run in generation_run_repository.saved
+    ] == [
+        "generation_banner_001",
+        "generation_banner_001_run_2",
+    ]
+    assert [
+        candidate.generation_id for candidate in content_candidate_repository.saved
+    ] == [
+        "generation_banner_001",
+        "generation_banner_001_run_2",
+    ]
+    assert [
+        candidate.content_id for candidate in content_candidate_repository.saved
+    ] == [
+        "content_banner_repeat_hotel_001",
+        "content_banner_repeat_hotel_run_2_001",
+    ]
+    assert second_response.content_candidates[0].content_option_id == (
+        "banner_repeat_hotel_run_2_option_001"
+    )
+
+
+def test_generation_service_skips_existing_regeneration_ids() -> None:
+    generation_run_repository = FakeGenerationRunRepository(
+        existing_generation_ids=[
+            "generation_banner_001",
+            "generation_banner_001_run_2",
+        ]
+    )
+    service = GenerationService(generation_run_repository=generation_run_repository)
+
+    response = service.generate(generation_request(content_option_count=1))
+
+    assert response.generation_id == "generation_banner_001_run_3"
 
 
 def test_generation_service_requires_confirmed_target_segments_from_reader() -> None:
