@@ -8,6 +8,7 @@ from typing import Any, Mapping, Sequence
 from fastapi.testclient import TestClient
 
 from app.analysis.repositories import (
+    BookingTrainingRecord,
     HotelMarketingProfileRecord,
     PromotionAnalysisWrite,
     PromotionRecord,
@@ -105,6 +106,27 @@ class FakeHotelProfileRepository:
         project_id: str,
     ) -> list[HotelMarketingProfileRecord]:
         return [profile for profile in self.profiles if profile.project_id == project_id]
+
+    def summarize_user_ids(
+        self,
+        *,
+        project_id: str,
+        profile_name: str,
+        user_ids: Sequence[str],
+    ) -> HotelMarketingProfileRecord | None:
+        del user_ids
+        for profile in self.profiles:
+            if profile.project_id == project_id and profile.profile_name == profile_name:
+                return profile
+        return None
+
+    def list_booking_training_records(
+        self,
+        *,
+        limit: int = 500,
+    ) -> list[BookingTrainingRecord]:
+        del limit
+        return []
 
 
 class FakePromotionAnalysisRepository:
