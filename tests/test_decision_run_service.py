@@ -225,7 +225,7 @@ def test_run_service_creates_run_and_one_ad_experiment_per_target_segment() -> N
     ]
 
 
-def test_run_service_creates_next_loop_run_after_admin_approval() -> None:
+def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> None:
     analysis_id = "analysis_banner_001_loop_2"
     generation_id = "generation_banner_001_loop_2"
     service, repos = make_service(

@@ -20,11 +20,14 @@ from app.decision.repositories import (
     PromotionRunRecord,
 )
 from app.decision.schemas import (
+    AdExperimentCreateResponse,
     AdExperimentStatus,
     Channel,
     NextLoopRequest,
     PromotionEvaluationStatus,
     PromotionRunStatus,
+    RunCreateRequest,
+    RunCreateResponse,
 )
 
 
@@ -43,11 +46,13 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
 
     assert "status" not in response.model_dump()
     assert response.previous_promotion_run_id == "prun_banner_001_loop_1"
-    assert response.next_promotion_run_id is None
+    assert response.next_promotion_run_id == "prun_banner_001_loop_2"
     assert response.loop_count == 2
     assert response.next_analysis_id == "analysis_next_001"
     assert response.next_generation_id == "generation_next_001"
-    assert response.next_ad_experiments == []
+    assert [experiment.segment_id for experiment in response.next_ad_experiments] == [
+        "seg_luxury"
+    ]
     assert repos.analysis_gateway.calls == [
         (
             "hotel-client-a",
@@ -59,6 +64,9 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
             ("adexp_luxury_001",),
             "Emphasize breakfast benefits.",
         )
+    ]
+    assert repos.run_creator.calls == [
+        ("promo_banner_001", "analysis_next_001", "generation_next_001", 2)
     ]
     assert repos.generation_gateway.calls == [
         (
@@ -235,6 +243,22 @@ def test_next_loop_rejects_generation_that_is_not_completed() -> None:
         )
 
 
+def test_next_loop_rejects_created_ad_experiments_outside_failed_set() -> None:
+    repos = FakeNextLoopRepos(
+        run_creator=FakeRunCreator(created_segment_ids=["seg_spa"]),
+    )
+    service = make_service(repos)
+
+    with pytest.raises(NextLoopValidationError, match="created ad_experiments result"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=NextLoopRequest(
+                failed_segment_ids=["seg_luxury"],
+                failed_ad_experiment_ids=["adexp_luxury_001"],
+            ),
+        )
+
+
 
 def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> None:
     repos = FakeNextLoopRepos(
@@ -257,6 +281,9 @@ def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> N
         generation_gateway=FakeGenerationGateway(
             generated_segment_ids=["seg_family_trip", "seg_luxury"],
         ),
+        run_creator=FakeRunCreator(
+            created_segment_ids=["seg_family_trip", "seg_luxury"],
+        ),
     )
     service = make_service(repos)
 
@@ -272,8 +299,10 @@ def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> N
     )
 
     assert "status" not in response.model_dump()
-    assert response.next_promotion_run_id is None
-    assert response.next_ad_experiments == []
+    assert response.next_promotion_run_id == "prun_banner_001_loop_2"
+    assert {
+        experiment.segment_id for experiment in response.next_ad_experiments
+    } == {"seg_family_trip", "seg_luxury"}
     assert response.next_analysis_id == "analysis_next_001"
     assert response.next_generation_id == "generation_next_001"
     assert response.loop_count == 2
@@ -298,6 +327,7 @@ def make_service(repos: "FakeNextLoopRepos") -> NextLoopService:
         promotion_evaluation_repository=repos.evaluations,
         analysis_gateway=repos.analysis_gateway,
         generation_gateway=repos.generation_gateway,
+        run_creator=repos.run_creator,
     )
 
 
@@ -312,6 +342,7 @@ class FakeNextLoopRepos:
         existing_next_loop: bool = False,
         analysis_gateway: "FakeAnalysisGateway" | None = None,
         generation_gateway: "FakeGenerationGateway" | None = None,
+        run_creator: "FakeRunCreator" | None = None,
     ) -> None:
         self.promotions = FakePromotionRepository(promotion or promotion_record())
         self.runs = FakePromotionRunRepository(
@@ -326,6 +357,7 @@ class FakeNextLoopRepos:
         )
         self.analysis_gateway = analysis_gateway or FakeAnalysisGateway()
         self.generation_gateway = generation_gateway or FakeGenerationGateway()
+        self.run_creator = run_creator or FakeRunCreator()
 
 
 class FakePromotionRepository:
@@ -499,6 +531,56 @@ class FakeGenerationGateway:
             generation_id="generation_next_001",
             generated_segment_ids=self.generated_segment_ids,
             status=self.status,
+        )
+
+
+class FakeRunCreator:
+    def __init__(self, created_segment_ids: list[str] | None = None) -> None:
+        self.created_segment_ids = created_segment_ids or ["seg_luxury"]
+        self.calls: list[tuple[str, str | None, str | None, int]] = []
+
+    def create_run(
+        self,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+    ) -> RunCreateResponse:
+        self.calls.append(
+            (
+                promotion_id,
+                request.analysis_id,
+                request.generation_id,
+                request.loop_count,
+            )
+        )
+        return RunCreateResponse(
+            promotion_run_id=f"prun_banner_001_loop_{request.loop_count}",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion_id,
+            analysis_id=request.analysis_id or "analysis_next_001",
+            generation_id=request.generation_id or "generation_next_001",
+            loop_count=request.loop_count,
+            status=PromotionRunStatus.PLANNED,
+            goal_snapshot_json={
+                "goal_metric": "booking_conversion_rate",
+                "goal_target_value": "0.300000",
+                "goal_basis": "all_segments",
+                "min_sample_size": 10,
+            },
+            ad_experiments=[
+                AdExperimentCreateResponse(
+                    ad_experiment_id=f"adexp_{segment_id}_loop_{request.loop_count}",
+                    segment_id=segment_id,
+                    segment_name=f"Segment {segment_id}",
+                    content_id=f"content_{segment_id}_next",
+                    content_option_id=f"option_{segment_id}_next",
+                    channel=Channel.ONSITE_BANNER,
+                    loop_count=request.loop_count,
+                    status=AdExperimentStatus.PLANNED,
+                )
+                for segment_id in self.created_segment_ids
+            ],
         )
 
 

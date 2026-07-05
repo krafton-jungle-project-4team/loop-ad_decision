@@ -22,6 +22,13 @@ from app.decision.schemas import (
     NextLoopRequest,
     NextLoopResponse,
     PromotionEvaluationStatus,
+    RunCreateRequest,
+    RunCreateResponse,
+)
+from app.decision.service import (
+    PromotionNotFoundError as RunPromotionNotFoundError,
+    RunConflictError,
+    RunValidationError,
 )
 from app.generation.service import (
     GenerationService,
@@ -86,6 +93,16 @@ class NextLoopGenerationGateway(Protocol):
         source_generation_id: str,
         operator_instruction: str | None,
     ) -> NextLoopGenerationResult:
+        ...
+
+
+class PromotionRunCreator(Protocol):
+    def create_run(
+        self,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+    ) -> RunCreateResponse:
         ...
 
 
@@ -240,6 +257,7 @@ class NextLoopService:
         promotion_evaluation_repository: PromotionEvaluationWriter,
         analysis_gateway: NextLoopAnalysisGateway,
         generation_gateway: NextLoopGenerationGateway,
+        run_creator: PromotionRunCreator,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_run_repository = promotion_run_repository
@@ -247,6 +265,7 @@ class NextLoopService:
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._analysis_gateway = analysis_gateway
         self._generation_gateway = generation_gateway
+        self._run_creator = run_creator
 
     def create_next_loop(
         self,
@@ -333,14 +352,36 @@ class NextLoopService:
             actual_segment_ids=generation_result.generated_segment_ids,
         )
 
+        try:
+            run_result = self._run_creator.create_run(
+                promotion_id=previous_run.promotion_id,
+                request=RunCreateRequest(
+                    analysis_id=analysis_result.analysis_id,
+                    generation_id=generation_result.generation_id,
+                    loop_count=next_loop_count,
+                ),
+            )
+        except (RunPromotionNotFoundError, RunValidationError) as exc:
+            raise NextLoopValidationError(str(exc)) from exc
+        except RunConflictError as exc:
+            raise NextLoopConflictError(str(exc)) from exc
+
+        _validate_gateway_segments(
+            label="created ad_experiments",
+            expected_segment_ids=failed_segment_ids,
+            actual_segment_ids=[
+                experiment.segment_id for experiment in run_result.ad_experiments
+            ],
+        )
+
         return NextLoopResponse(
             previous_promotion_run_id=previous_run.promotion_run_id,
-            next_promotion_run_id=None,
-            promotion_id=previous_run.promotion_id,
-            loop_count=next_loop_count,
-            next_analysis_id=analysis_result.analysis_id,
-            next_generation_id=generation_result.generation_id,
-            next_ad_experiments=[],
+            next_promotion_run_id=run_result.promotion_run_id,
+            promotion_id=run_result.promotion_id,
+            loop_count=run_result.loop_count,
+            next_analysis_id=run_result.analysis_id,
+            next_generation_id=run_result.generation_id,
+            next_ad_experiments=run_result.ad_experiments,
         )
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:

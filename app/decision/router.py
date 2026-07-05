@@ -278,6 +278,17 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             generation_run_reader=generation_run_repository,
             content_generator=content_generator,
         )
+        run_creator = PromotionRunService(
+            promotion_repository=promotion_repository,
+            promotion_analysis_repository=PromotionAnalysisRepository(executor),
+            promotion_target_segment_repository=PromotionTargetSegmentRepository(
+                executor,
+            ),
+            generation_run_repository=GenerationRunRepository(executor),
+            content_candidate_repository=ContentCandidateRepository(executor),
+            promotion_run_repository=promotion_run_repository,
+            ad_experiment_repository=ad_experiment_repository,
+        )
         yield NextLoopService(
             promotion_repository=promotion_repository,
             promotion_run_repository=promotion_run_repository,
@@ -285,6 +296,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             promotion_evaluation_repository=promotion_evaluation_repository,
             analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
             generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
+            run_creator=run_creator,
         )
         connection.commit()
     except Exception:

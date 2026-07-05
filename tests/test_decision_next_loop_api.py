@@ -14,6 +14,9 @@ from app.decision.next_loop_service import (
 )
 from app.decision.router import get_next_loop_service
 from app.decision.schemas import (
+    AdExperimentCreateResponse,
+    AdExperimentStatus,
+    Channel,
     NextLoopRequest,
     NextLoopResponse,
     PromotionRunStatus,
@@ -64,12 +67,14 @@ def test_next_loop_api_returns_response_shape() -> None:
     assert response.status_code == 200
     body = response.json()
     assert body["previous_promotion_run_id"] == "prun_banner_001_loop_1"
-    assert body["next_promotion_run_id"] is None
+    assert body["next_promotion_run_id"] == "prun_banner_001_loop_2"
     assert body["promotion_id"] == "promo_banner_001"
     assert body["loop_count"] == 2
     assert body["next_analysis_id"] == "analysis_next_001"
     assert body["next_generation_id"] == "generation_next_001"
-    assert body["next_ad_experiments"] == []
+    assert [experiment["segment_id"] for experiment in body["next_ad_experiments"]] == [
+        "seg_luxury"
+    ]
     assert "status" not in body
     assert isinstance(service.calls[0][1], NextLoopRequest)
     assert service.calls[0][1].operator_instruction == "Emphasize breakfast benefits."
@@ -195,7 +200,7 @@ def test_next_loop_api_rolls_back_and_closes_on_failure(
     assert connection.close_count == 1
 
 
-def test_next_loop_api_wires_focus_analysis_generation_and_defers_run_creation(
+def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
@@ -227,11 +232,13 @@ def test_next_loop_api_wires_focus_analysis_generation_and_defers_run_creation(
     assert response.status_code == 200
     body = response.json()
     assert body["previous_promotion_run_id"] == "prun_banner_001_loop_1"
-    assert body["next_promotion_run_id"] is None
+    assert body["next_promotion_run_id"].startswith("prun_promo_banner_001_loop_2")
     assert body["loop_count"] == 2
     assert body["next_analysis_id"] == "analysis_banner_001_loop_2"
     assert body["next_generation_id"] == "generation_banner_001_loop_2"
-    assert body["next_ad_experiments"] == []
+    assert [
+        experiment["segment_id"] for experiment in body["next_ad_experiments"]
+    ] == ["seg_luxury"]
     assert "status" not in body
     connection = connections[0]
     assert connection.commit_count == 1
@@ -242,9 +249,15 @@ def test_next_loop_api_wires_focus_analysis_generation_and_defers_run_creation(
     assert any("insert into promotion_target_segments" in query for query in executed_sql)
     assert any("insert into generation_runs" in query for query in executed_sql)
     assert any("insert into content_candidates" in query for query in executed_sql)
-    assert not any("insert into promotion_runs" in query for query in executed_sql)
-    assert not any("insert into ad_experiments" in query for query in executed_sql)
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert any("insert into ad_experiments" in query for query in executed_sql)
     assert not any("update promotion_runs" in query for query in executed_sql)
+    content_insert_params = next(
+        params
+        for query, params in connection.executed
+        if "insert into content_candidates" in compact_sql(query)
+    )
+    assert content_insert_params["status"] == "approved"
 
 
 class FakeNextLoopService:
@@ -263,12 +276,23 @@ class FakeNextLoopService:
             raise self.exc
         return NextLoopResponse(
             previous_promotion_run_id=promotion_run_id,
-            next_promotion_run_id=None,
+            next_promotion_run_id="prun_banner_001_loop_2",
             promotion_id="promo_banner_001",
             loop_count=2,
             next_analysis_id="analysis_next_001",
             next_generation_id="generation_next_001",
-            next_ad_experiments=[],
+            next_ad_experiments=[
+                AdExperimentCreateResponse(
+                    ad_experiment_id="adexp_luxury_loop_2",
+                    segment_id="seg_luxury",
+                    segment_name="Luxury hotel users",
+                    content_id="content_luxury_next",
+                    content_option_id="option_luxury_next",
+                    channel=Channel.ONSITE_BANNER,
+                    loop_count=2,
+                    status=AdExperimentStatus.PLANNED,
+                )
+            ],
         )
 
 
@@ -295,8 +319,10 @@ class RecordingCursor:
             return generation_run_insert_row(self._last_params)
         if "insert into content_candidates" in sql:
             return content_candidate_insert_row(self._last_params)
+        if "from promotion_analyses" in sql:
+            return promotion_analysis_row()
         if "from generation_runs" in sql:
-            return source_generation_run_row()
+            return generation_run_row(self._last_params)
         if "from promotion_runs" in sql and "where promotion_run_id = %s" in sql:
             return self._connection.promotion_run_row
         if "from promotion_runs" in sql and "where promotion_id = %s" in sql:
@@ -316,7 +342,11 @@ class RecordingCursor:
         if "from segment_definitions" in sql:
             return [segment_definition_row()]
         if "from promotion_target_segments" in sql:
+            if "project_id" in sql:
+                return [decision_target_segment_row()]
             return [target_segment_row()]
+        if "from content_candidates" in sql:
+            return [approved_content_candidate_row()]
         return []
 
 
@@ -481,21 +511,61 @@ def target_segment_row() -> dict[str, object]:
     }
 
 
-def source_generation_run_row() -> dict[str, object]:
+def decision_target_segment_row() -> dict[str, object]:
     return {
-        "generation_id": "generation_banner_001",
-        "analysis_id": "analysis_banner_001",
+        **target_segment_row(),
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "rule_json": {"segment_id": "seg_luxury"},
+        "profile_json": {"primary_segment": "seg_luxury"},
+        "status": "active",
+    }
+
+
+def promotion_analysis_row() -> dict[str, object]:
+    return {
+        "analysis_id": "analysis_banner_001_loop_2",
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "content_option_count": 2,
+        "focus_segment_ids_json": ["seg_luxury"],
+        "operator_instruction": None,
+        "input_snapshot_json": {},
+        "profile_summary_json": {},
+        "output_json": {},
+        "status": "completed",
+    }
+
+
+def generation_run_row(params: Any) -> dict[str, object]:
+    generation_id = (params or ("generation_banner_001_loop_2",))[0]
+    return {
+        "generation_id": generation_id,
+        "analysis_id": "analysis_banner_001_loop_2",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "content_option_count": 1,
         "operator_instruction": None,
         "input_json": {},
         "output_json": {},
         "generation_report_json": {},
         "status": "completed",
-        "created_at": None,
-        "updated_at": None,
+    }
+
+
+def approved_content_candidate_row() -> dict[str, object]:
+    return {
+        "content_id": "content_banner_luxury_hotel_users_001",
+        "content_option_id": "banner_luxury_hotel_users_option_001",
+        "generation_id": "generation_banner_001_loop_2",
+        "analysis_id": "analysis_banner_001_loop_2",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "segment_id": "seg_luxury",
+        "channel": "onsite_banner",
+        "status": "approved",
     }
 
 
