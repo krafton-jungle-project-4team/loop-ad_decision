@@ -14,6 +14,8 @@ from app.decision.matcher import (
     HNSW_MAX_SCAN_TUPLES as DEFAULT_HNSW_MAX_SCAN_TUPLES,
 )
 
+EMAIL_CHANNEL = "email"
+
 
 class PostgresExecutor(Protocol):
     def fetchone(
@@ -1401,6 +1403,7 @@ class EvaluationMetricRepository:
         self,
         experiment: AdExperimentRecord,
     ) -> MetricCountRecord:
+        denominator_event_name = _booking_conversion_denominator_event(experiment)
         result = self._client.query(
             """
             SELECT
@@ -1420,16 +1423,23 @@ class EvaluationMetricRepository:
                     WHERE project_id = {project_id:String}
                       AND promotion_run_id = {promotion_run_id:String}
                       AND ad_experiment_id = {ad_experiment_id:String}
-                      AND event_name = 'promotion_click'
+                      AND event_name = {denominator_event_name:String}
                 ) AS denominator_count
             """,
             parameters={
                 "project_id": experiment.project_id,
                 "promotion_run_id": experiment.promotion_run_id,
                 "ad_experiment_id": experiment.ad_experiment_id,
+                "denominator_event_name": denominator_event_name,
             },
         )
         return _metric_count_from_result(result)
+
+
+def _booking_conversion_denominator_event(experiment: AdExperimentRecord) -> str:
+    if experiment.channel == EMAIL_CHANNEL:
+        return "campaign_landing"
+    return "promotion_click"
 
 
 def _clickhouse_rows(result: Any) -> list[Any]:

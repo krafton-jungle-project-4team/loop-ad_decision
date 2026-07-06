@@ -104,6 +104,29 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
     ]
 
 
+def test_email_booking_conversion_uses_campaign_landing_denominator() -> None:
+    repos = FakeEvaluationRepos(
+        experiment=ad_experiment_record(
+            goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            channel=Channel.EMAIL.value,
+        ),
+        counts=MetricCountRecord(numerator_count=1, denominator_count=2),
+    )
+    service = make_service(repos)
+
+    response = service.evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    assert response.actual_value == Decimal("0.500000")
+    inserted = repos.evaluations.inserted[0]
+    assert inserted.result_json["event_names"] == {
+        "numerator": "booking_complete",
+        "denominator": "campaign_landing",
+    }
+
+
 def test_ad_experiment_evaluation_preserves_denominator_when_no_bookings() -> None:
     repos = FakeEvaluationRepos(
         counts=MetricCountRecord(numerator_count=0, denominator_count=10),
@@ -288,6 +311,7 @@ class FakeEvaluationMetricRepository:
 def ad_experiment_record(
     *,
     goal_metric: str = GoalMetric.BOOKING_CONVERSION_RATE.value,
+    channel: str = Channel.ONSITE_BANNER.value,
 ) -> AdExperimentRecord:
     return AdExperimentRecord(
         ad_experiment_id="adexp_family_trip_001",
@@ -301,7 +325,7 @@ def ad_experiment_record(
         segment_name="Family hotel trip",
         content_id="content_family_trip_001",
         content_option_id="option_a",
-        channel=Channel.ONSITE_BANNER.value,
+        channel=channel,
         loop_count=1,
         status=AdExperimentStatus.RUNNING.value,
         goal_metric=goal_metric,

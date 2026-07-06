@@ -925,14 +925,32 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
     assert "from booking_outcome_events" in sql
     assert "from promotion_touch_events" in sql
     assert "booking_complete" in sql
-    assert "promotion_click" in sql
+    assert "denominator_event_name:string" in sql
     assert "promotion_run_id is not null" in sql
     assert "ad_experiment_id is not null" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_family_trip_001",
+        "denominator_event_name": "promotion_click",
     }
+
+
+def test_evaluation_metric_repository_counts_email_booking_conversion_from_landings() -> None:
+    client = FakeClickHouseClient(rows=[(1, 2)])
+    repo = EvaluationMetricRepository(client)
+
+    counts = repo.count_booking_conversion_rate(
+        ad_experiment_record(
+            goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            channel=Channel.EMAIL.value,
+        )
+    )
+
+    assert counts.numerator_count == 1
+    assert counts.denominator_count == 2
+    call = client.calls[0]
+    assert call.params["denominator_event_name"] == "campaign_landing"
 
 
 def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
@@ -967,6 +985,7 @@ def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
 def ad_experiment_record(
     *,
     goal_metric: str = GoalMetric.BOOKING_CONVERSION_RATE.value,
+    channel: str = Channel.ONSITE_BANNER.value,
 ) -> Any:
     return type(
         "AdExperimentLike",
@@ -983,7 +1002,7 @@ def ad_experiment_record(
             "segment_name": "Family hotel trip",
             "content_id": "content_family_trip_001",
             "content_option_id": "option_a",
-            "channel": Channel.ONSITE_BANNER.value,
+            "channel": channel,
             "loop_count": 1,
             "status": AdExperimentStatus.RUNNING.value,
             "goal_metric": goal_metric,

@@ -20,6 +20,7 @@ from app.decision.schemas import (
     AdExperimentEvaluateRequest,
     AdExperimentEvaluateResponse,
     AdExperimentStatus,
+    Channel,
     GoalBasis,
     GoalMetric,
     PromotionRunAdExperimentResult,
@@ -618,7 +619,7 @@ def _build_result_json(
 ) -> dict[str, Any]:
     return {
         "metric_source": _metric_source(experiment.goal_metric),
-        "event_names": _event_names(experiment.goal_metric),
+        "event_names": _event_names(experiment.goal_metric, experiment.channel),
         "status_reason": _status_reason(
             status=status,
             denominator_count=counts.denominator_count,
@@ -639,7 +640,7 @@ def _metric_source(metric: str) -> str:
     return "promotion_touch_events"
 
 
-def _event_names(metric: str) -> dict[str, str]:
+def _event_names(metric: str, channel: str | None = None) -> dict[str, str]:
     if metric == GoalMetric.INFLOW_RATE.value:
         return {
             "numerator": "campaign_landing",
@@ -648,9 +649,15 @@ def _event_names(metric: str) -> dict[str, str]:
     if metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
         return {
             "numerator": "booking_complete",
-            "denominator": "promotion_click",
+            "denominator": _booking_conversion_denominator_event(channel),
         }
     return {}
+
+
+def _booking_conversion_denominator_event(channel: str | None) -> str:
+    if channel == Channel.EMAIL.value:
+        return "campaign_landing"
+    return "promotion_click"
 
 
 def _status_reason(
