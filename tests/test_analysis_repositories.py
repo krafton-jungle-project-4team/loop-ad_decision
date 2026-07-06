@@ -395,21 +395,44 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
     )
     repo = SegmentVectorRepository(db)
 
-    loaded = repo.get_by_segment(
+    loaded = repo.get_by_segment_snapshot(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_version="v1",
+    )
+    assert loaded is not None
+    latest = repo.get_latest_by_segment(
         project_id="hotel-client-a",
         promotion_id="promo_banner_001",
         segment_id="seg_repeat_hotel_no_booking",
+        vector_version="v1",
     )
-    assert loaded is not None
+    assert latest is not None
     repo.save(loaded)
 
-    select_call, insert_call = db.calls
-    assert "from segment_vectors" in compact_sql(select_call.query)
-    assert "embedding::text as embedding" in compact_sql(select_call.query)
-    assert select_call.params == (
+    snapshot_select_call, latest_select_call, insert_call = db.calls
+    assert "from segment_vectors" in compact_sql(snapshot_select_call.query)
+    assert "embedding::text as embedding" in compact_sql(snapshot_select_call.query)
+    assert "analysis_id = %s" in compact_sql(snapshot_select_call.query)
+    assert "vector_version = %s" in compact_sql(snapshot_select_call.query)
+    assert snapshot_select_call.params == (
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        "seg_repeat_hotel_no_booking",
+        "v1",
+        64,
+    )
+    assert "from segment_vectors" in compact_sql(latest_select_call.query)
+    assert "analysis_id = %s" not in compact_sql(latest_select_call.query)
+    assert latest_select_call.params == (
         "hotel-client-a",
         "promo_banner_001",
         "seg_repeat_hotel_no_booking",
+        "v1",
+        64,
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
     assert "embedding" in compact_sql(insert_call.query)

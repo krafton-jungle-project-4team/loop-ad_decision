@@ -13,12 +13,24 @@ DEFAULT_VECTOR_VERSION = "v1"
 
 
 class SegmentVectorStore(Protocol):
-    def get_by_segment(
+    def get_by_segment_snapshot(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_id: str,
+        vector_version: str,
+    ) -> SegmentVectorRecord | None:
+        ...
+
+    def get_latest_by_segment(
         self,
         *,
         project_id: str,
         promotion_id: str,
         segment_id: str,
+        vector_version: str,
     ) -> SegmentVectorRecord | None:
         ...
 
@@ -69,10 +81,12 @@ class SegmentVectorService:
         self,
         request: SegmentVectorBuildRequest,
     ) -> SegmentVectorBuildResult:
-        existing = self._segment_vector_repository.get_by_segment(
+        existing = self._segment_vector_repository.get_by_segment_snapshot(
             project_id=request.project_id,
             promotion_id=request.promotion_id,
+            analysis_id=request.analysis_id,
             segment_id=request.segment_id,
+            vector_version=request.vector_version,
         )
         if existing is not None:
             _validate_vector(existing.vector_values, existing.vector_dim)
@@ -83,29 +97,40 @@ class SegmentVectorService:
                 source=existing.source,
             )
 
-        candidate_user_ids = _dedupe(request.candidate_user_ids)
-        user_vectors = (
-            self._user_behavior_vector_repository.list_by_user_ids(
-                project_id=request.project_id,
-                user_ids=candidate_user_ids,
-                vector_version=request.vector_version,
-            )
-            if candidate_user_ids
-            else []
+        reusable = self._segment_vector_repository.get_latest_by_segment(
+            project_id=request.project_id,
+            promotion_id=request.promotion_id,
+            segment_id=request.segment_id,
+            vector_version=request.vector_version,
         )
-
-        source = "decision_analysis"
-        if user_vectors:
-            vector_values = _mean_user_vectors(user_vectors)
+        if reusable is not None:
+            _validate_vector(reusable.vector_values, reusable.vector_dim)
+            source = reusable.source
+            normalized_values = [float(value) for value in reusable.vector_values]
         else:
-            source = "fixture"
-            vector_values = _fixture_vector(request.segment_id)
+            candidate_user_ids = _dedupe(request.candidate_user_ids)
+            user_vectors = (
+                self._user_behavior_vector_repository.list_by_user_ids(
+                    project_id=request.project_id,
+                    user_ids=candidate_user_ids,
+                    vector_version=request.vector_version,
+                )
+                if candidate_user_ids
+                else []
+            )
 
-        try:
-            normalized_values = _l2_normalize(vector_values)
-        except ValueError:
-            source = "fixture"
-            normalized_values = _l2_normalize(_fixture_vector(request.segment_id))
+            source = "decision_analysis"
+            if user_vectors:
+                vector_values = _mean_user_vectors(user_vectors)
+            else:
+                source = "fixture"
+                vector_values = _fixture_vector(request.segment_id)
+
+            try:
+                normalized_values = _l2_normalize(vector_values)
+            except ValueError:
+                source = "fixture"
+                normalized_values = _l2_normalize(_fixture_vector(request.segment_id))
 
         segment_vector_id = _segment_vector_id(
             analysis_id=request.analysis_id,

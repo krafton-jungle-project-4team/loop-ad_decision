@@ -484,12 +484,58 @@ class SegmentVectorRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
 
-    def get_by_segment(
+    def get_by_segment_snapshot(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_id: str,
+        vector_version: str,
+    ) -> SegmentVectorRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                segment_vector_id,
+                project_id,
+                promotion_id,
+                promotion_run_id,
+                analysis_id,
+                segment_id,
+                vector_dim,
+                vector_values,
+                vector_version,
+                source,
+                embedding::text AS embedding
+            FROM segment_vectors
+            WHERE project_id = %s
+              AND promotion_id = %s
+              AND analysis_id = %s
+              AND segment_id = %s
+              AND vector_version = %s
+              AND vector_dim = %s
+            ORDER BY created_at DESC, segment_vector_id DESC
+            """,
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                segment_id,
+                vector_version,
+                self.VECTOR_DIM,
+            ),
+        )
+        if row is None:
+            return None
+        return SegmentVectorRecord(**row)
+
+    def get_latest_by_segment(
         self,
         *,
         project_id: str,
         promotion_id: str,
         segment_id: str,
+        vector_version: str,
     ) -> SegmentVectorRecord | None:
         row = self._db.fetchone(
             """
@@ -509,8 +555,17 @@ class SegmentVectorRepository:
             WHERE project_id = %s
               AND promotion_id = %s
               AND segment_id = %s
+              AND vector_version = %s
+              AND vector_dim = %s
+            ORDER BY created_at DESC, segment_vector_id DESC
             """,
-            (project_id, promotion_id, segment_id),
+            (
+                project_id,
+                promotion_id,
+                segment_id,
+                vector_version,
+                self.VECTOR_DIM,
+            ),
         )
         if row is None:
             return None

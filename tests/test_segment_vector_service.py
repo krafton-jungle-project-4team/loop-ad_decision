@@ -13,26 +13,55 @@ from app.analysis.vector_service import (
 
 
 class FakeSegmentVectorRepository:
-    def __init__(self, existing: SegmentVectorRecord | None = None) -> None:
-        self.existing = existing
-        self.get_calls: list[Mapping[str, str]] = []
+    def __init__(
+        self,
+        *,
+        snapshot: SegmentVectorRecord | None = None,
+        latest: SegmentVectorRecord | None = None,
+    ) -> None:
+        self.snapshot = snapshot
+        self.latest = latest
+        self.snapshot_calls: list[Mapping[str, str]] = []
+        self.latest_calls: list[Mapping[str, str]] = []
         self.saved: list[SegmentVectorRecord] = []
 
-    def get_by_segment(
+    def get_by_segment_snapshot(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_id: str,
+        vector_version: str,
+    ) -> SegmentVectorRecord | None:
+        self.snapshot_calls.append(
+            {
+                "project_id": project_id,
+                "promotion_id": promotion_id,
+                "analysis_id": analysis_id,
+                "segment_id": segment_id,
+                "vector_version": vector_version,
+            }
+        )
+        return self.snapshot
+
+    def get_latest_by_segment(
         self,
         *,
         project_id: str,
         promotion_id: str,
         segment_id: str,
+        vector_version: str,
     ) -> SegmentVectorRecord | None:
-        self.get_calls.append(
+        self.latest_calls.append(
             {
                 "project_id": project_id,
                 "promotion_id": promotion_id,
                 "segment_id": segment_id,
+                "vector_version": vector_version,
             }
         )
-        return self.existing
+        return self.latest
 
     def save(self, vector: SegmentVectorRecord) -> None:
         self.saved.append(vector)
@@ -78,13 +107,14 @@ def vector_record(
 
 def build_request(
     *,
+    analysis_id: str = "analysis_banner_001",
     segment_id: str = "seg_repeat_hotel_no_booking",
     candidate_user_ids: Sequence[str] = ("user_001", "user_002"),
 ) -> SegmentVectorBuildRequest:
     return SegmentVectorBuildRequest(
         project_id="hotel-client-a",
         promotion_id="promo_banner_001",
-        analysis_id="analysis_banner_001",
+        analysis_id=analysis_id,
         segment_id=segment_id,
         candidate_user_ids=candidate_user_ids,
     )
@@ -161,7 +191,7 @@ def test_segment_vector_service_uses_deterministic_fixture_fallback() -> None:
     assert vector_norm(first_result.vector_values) == pytest.approx(1.0)
 
 
-def test_segment_vector_service_reuses_existing_vector() -> None:
+def test_segment_vector_service_reuses_existing_snapshot_vector() -> None:
     existing = SegmentVectorRecord(
         segment_vector_id="segvec_existing_v1",
         project_id="hotel-client-a",
@@ -174,7 +204,7 @@ def test_segment_vector_service_reuses_existing_vector() -> None:
         vector_version="v1",
         source="decision_analysis",
     )
-    store = FakeSegmentVectorRepository(existing=existing)
+    store = FakeSegmentVectorRepository(snapshot=existing)
     reader = FakeUserBehaviorVectorRepository([vector_record()])
     service = SegmentVectorService(
         segment_vector_repository=store,
@@ -187,6 +217,47 @@ def test_segment_vector_service_reuses_existing_vector() -> None:
     assert result.vector_values == existing.vector_values
     assert reader.calls == []
     assert store.saved == []
+    assert store.latest_calls == []
+
+
+def test_segment_vector_service_copies_latest_vector_into_new_analysis_snapshot() -> None:
+    latest = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="v1",
+        source="decision_analysis",
+    )
+    store = FakeSegmentVectorRepository(latest=latest)
+    reader = FakeUserBehaviorVectorRepository([vector_record()])
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
+    )
+
+    result = service.prepare_segment_vector(
+        build_request(analysis_id="analysis_banner_002")
+    )
+
+    assert result.segment_vector_id != latest.segment_vector_id
+    assert result.segment_vector_id.startswith(
+        "segvec_seg_repeat_hotel_no_booking_v1_"
+    )
+    assert result.vector_values == latest.vector_values
+    assert result.source == latest.source
+    assert reader.calls == []
+    assert len(store.saved) == 1
+    saved = store.saved[0]
+    assert saved.segment_vector_id == result.segment_vector_id
+    assert saved.analysis_id == "analysis_banner_002"
+    assert saved.segment_id == latest.segment_id
+    assert saved.vector_values == latest.vector_values
+    assert saved.source == latest.source
 
 
 def test_segment_vector_service_rejects_non_64_dimensional_user_vector() -> None:
