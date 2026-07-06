@@ -1382,14 +1382,21 @@ class EvaluationMetricRepository:
     def count_inflow_rate(self, experiment: AdExperimentRecord) -> MetricCountRecord:
         result = self._client.query(
             """
+            WITH
+                if(
+                    notEmpty(ifNull(redirect_id, '')),
+                    concat('redirect:', ifNull(redirect_id, '')),
+                    concat('user:', user_id)
+                ) AS attribution_key
             SELECT
-                countDistinctIf(user_id, event_name = 'campaign_landing') AS numerator_count,
-                countDistinctIf(user_id, event_name = 'campaign_redirect_click') AS denominator_count
+                countDistinctIf(attribution_key, event_name = 'campaign_landing') AS numerator_count,
+                countDistinctIf(attribution_key, event_name = 'campaign_redirect_click') AS denominator_count
             FROM promotion_touch_events
             WHERE project_id = {project_id:String}
               AND promotion_run_id = {promotion_run_id:String}
               AND ad_experiment_id = {ad_experiment_id:String}
               AND event_name IN ('campaign_redirect_click', 'campaign_landing')
+              AND (notEmpty(ifNull(redirect_id, '')) OR notEmpty(user_id))
             """,
             parameters={
                 "project_id": experiment.project_id,

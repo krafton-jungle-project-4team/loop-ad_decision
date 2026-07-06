@@ -898,6 +898,8 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "from promotion_touch_events" in sql
+    assert "attribution_key" in sql
+    assert "redirect_id" in sql
     assert "campaign_landing" in sql
     assert "campaign_redirect_click" in sql
     assert "project_id = {project_id:string}" in sql
