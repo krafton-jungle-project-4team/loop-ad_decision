@@ -355,6 +355,9 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
     assert {
         candidate.status for candidate in content_candidate_repository.saved
     } == {"approved"}
+    candidate = content_candidate_repository.saved[0]
+    assert candidate.content_id == "content_banner_near_checkin_loop_2_001"
+    assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
 
 
 def test_generation_service_records_failed_run_when_generator_fails() -> None:

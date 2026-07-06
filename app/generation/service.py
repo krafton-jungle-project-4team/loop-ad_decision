@@ -523,7 +523,7 @@ def _general_generation_attempt_slug(
     if not generation_id.startswith(prefix):
         return None
     attempt_slug = generation_id.removeprefix(prefix)
-    if re.fullmatch(r"run_[2-9][0-9]*", attempt_slug):
+    if re.fullmatch(r"(?:run|loop)_[2-9][0-9]*", attempt_slug):
         return attempt_slug
     return None
 
