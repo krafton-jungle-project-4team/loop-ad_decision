@@ -73,6 +73,35 @@ def test_external_content_generator_stores_banner_image_url() -> None:
     ]
 
 
+def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
+    image_client = FakeImageClient()
+    asset_storage = FakeAssetStorage()
+    generator = ExternalContentGenerator(
+        content_client=FakeContentClient(
+            {
+                "title": "Hotel rooms ready this weekend",
+                "body": "Compare refundable hotel stays before rooms run out.",
+                "cta": "View hotel deals",
+                "image_prompt": None,
+            }
+        ),
+        image_client=image_client,
+        asset_storage=asset_storage,
+    )
+
+    content = generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+    )
+
+    assert content.image_prompt is not None
+    assert content.image_prompt.startswith("Bright modern hotel booking onsite banner")
+    assert content.image_url == IMAGE_URL
+    assert image_client.prompts == [content.image_prompt]
+    assert len(asset_storage.saved) == 1
+
+
 def test_external_content_generator_does_not_create_images_for_email() -> None:
     image_client = FakeImageClient()
     asset_storage = FakeAssetStorage()
@@ -171,6 +200,11 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     schema = captured["payload"]["text"]["format"]["schema"]
     assert "landing_url" not in schema["properties"]
     assert "landing_url" not in schema["required"]
+    assert schema["properties"]["title"] == {"type": "string"}
+    assert schema["properties"]["body"] == {"type": "string"}
+    assert schema["properties"]["cta"] == {"type": "string"}
+    assert schema["properties"]["image_prompt"] == {"type": "string"}
+    assert schema["properties"]["subject"] == {"type": ["string", "null"]}
     assert OPENAI_FIXTURE_KEY not in str(captured["payload"])
 
 

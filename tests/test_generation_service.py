@@ -402,6 +402,31 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     assert "secret" not in str(generation_run.generation_report_json)
 
 
+def test_generation_service_records_validation_error_detail() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        content_generator=MissingImagePromptContentGenerator(),
+    )
+
+    response = service.generate(generation_request(content_option_count=1))
+
+    assert response.status == "failed"
+    assert response.content_candidates == []
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.generation_report_json["error_code"] == (
+        "content_generation_validation_failed"
+    )
+    assert generation_run.generation_report_json["error_detail"] == {
+        "reason": "missing_required_fields",
+        "channel": "onsite_banner",
+        "missing_fields": ["image_prompt"],
+    }
+    assert content_candidate_repository.saved == []
+
+
 def test_generation_service_uses_demo_default_landing_url_when_missing() -> None:
     content_candidate_repository = FakeContentCandidateRepository()
     service = GenerationService(
@@ -611,6 +636,23 @@ class FailingContentGenerator:
     ) -> GeneratedContent:
         del prompt_input, prompt_result, option_index
         raise RuntimeError("provider failed with secret-token-value")
+
+
+class MissingImagePromptContentGenerator:
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index
+        return GeneratedContent(
+            title="Hotel rooms ready this weekend",
+            body="Compare refundable hotel stays before rooms run out.",
+            cta="View hotel deals",
+            landing_url="https://demo-stay.example.com/summer",
+        )
 
 
 def target_segment_input(

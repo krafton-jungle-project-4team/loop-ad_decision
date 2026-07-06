@@ -143,6 +143,7 @@ class GenerationService:
                 content_candidates=[],
                 status=GenerationStatus.FAILED,
                 error_code=_safe_generation_error_code(exc),
+                error_detail=_safe_generation_error_detail(exc),
             )
             self._save_generation_run(generation_run)
             return GenerationResponse(
@@ -212,6 +213,7 @@ class GenerationService:
                 content_candidates=[],
                 status=GenerationStatus.FAILED,
                 error_code=_safe_generation_error_code(exc),
+                error_detail=_safe_generation_error_detail(exc),
                 source_context=_next_loop_source_context(request),
             )
             self._save_generation_run(generation_run)
@@ -249,6 +251,7 @@ class GenerationService:
         content_candidates: Sequence[ContentCandidateRecord],
         status: GenerationStatus,
         error_code: str | None = None,
+        error_detail: dict[str, Any] | None = None,
         source_context: dict[str, Any] | None = None,
     ) -> GenerationRunRecord:
         output_json = self._generation_report_builder.build_run_output(
@@ -270,6 +273,8 @@ class GenerationService:
         }
         if error_code:
             generation_report_json["error_code"] = error_code
+        if error_detail:
+            generation_report_json["error_detail"] = error_detail
 
         input_json: dict[str, Any] = {
             "project_id": request.project_id,
@@ -614,6 +619,33 @@ def _safe_generation_error_code(exc: Exception) -> str:
     if isinstance(exc, ValueError):
         return "content_generation_validation_failed"
     return "content_generation_failed"
+
+
+def _safe_generation_error_detail(exc: Exception) -> dict[str, Any] | None:
+    if not isinstance(exc, ValueError):
+        return None
+
+    message = str(exc)
+    missing_fields_match = re.fullmatch(
+        r"(?P<channel>[a-z_]+) generated content is missing required fields: "
+        r"(?P<fields>[a-z_, ]+)",
+        message,
+    )
+    if missing_fields_match:
+        return {
+            "reason": "missing_required_fields",
+            "channel": missing_fields_match.group("channel"),
+            "missing_fields": [
+                field.strip()
+                for field in missing_fields_match.group("fields").split(",")
+                if field.strip()
+            ],
+        }
+
+    if "landing_url" in message:
+        return {"reason": "missing_landing_url"}
+
+    return {"reason": "validation_failed"}
 
 
 def _prompt_input_with_resolved_landing_url(
