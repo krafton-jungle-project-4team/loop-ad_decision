@@ -1,3 +1,6 @@
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 from fastapi.testclient import TestClient
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
@@ -142,15 +145,18 @@ def test_generation_api_calls_generation_service() -> None:
 
 def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection()
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.generation.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
@@ -172,7 +178,9 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
     executed_queries = [query for query, _params in connection.executed]
     assert sum("INSERT INTO generation_runs" in query for query in executed_queries) == 1
@@ -186,15 +194,18 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
 
 def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection(target_segment_rows=[])
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.generation.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
@@ -221,25 +232,30 @@ def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -
     assert all("promotion_segment_suggestions" not in query for query in executed_queries)
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
 
 def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
     built_settings = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection()
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     def fake_build_external_content_generator(settings):
         built_settings.append(settings)
         return FakeExternalContentGenerator()
 
     monkeypatch.setattr(
-        "app.generation.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     monkeypatch.setattr(
         "app.generation.router.build_external_content_generator",
@@ -267,20 +283,24 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
         "https://gen-ai.asset.dev.loop-ad.org/generated/content_banner_001.png"
     )
     assert len(connections) == 1
+    assert pools[0].return_count == 1
     assert built_settings[0].env == "dev"
 
 
 def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection(fetchone_result=None)
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.generation.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app, raise_server_exceptions=False)
@@ -303,7 +323,9 @@ def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> N
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
 
 def test_health_returns_ok() -> None:
@@ -471,6 +493,25 @@ class RecordingConnection:
 
     def rollback(self) -> None:
         self.rollback_count += 1
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class RecordingPool:
+    def __init__(self, connection: RecordingConnection) -> None:
+        self.connection_object = connection
+        self.checkout_count = 0
+        self.return_count = 0
+        self.close_count = 0
+
+    @contextmanager
+    def connection(self) -> Iterator[RecordingConnection]:
+        self.checkout_count += 1
+        try:
+            yield self.connection_object
+        finally:
+            self.return_count += 1
 
     def close(self) -> None:
         self.close_count += 1

@@ -3,7 +3,11 @@ from __future__ import annotations
 from typing import Any
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
-from app.db import create_clickhouse_client, create_postgres_connection
+from app.db import (
+    create_clickhouse_client,
+    create_postgres_connection,
+    create_postgres_pool,
+)
 
 
 def valid_env() -> dict[str, str]:
@@ -44,6 +48,51 @@ def test_create_postgres_connection_uses_validated_aurora_settings(
             "autocommit": False,
         }
     ]
+
+
+def test_create_postgres_pool_uses_validated_aurora_and_pool_settings(
+    monkeypatch: Any,
+) -> None:
+    calls: list[dict[str, object]] = []
+    open_calls: list[dict[str, object]] = []
+
+    class FakeConnectionPool:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+        def open(self, **kwargs: object) -> None:
+            open_calls.append(kwargs)
+
+    monkeypatch.setattr("app.db.ConnectionPool", FakeConnectionPool)
+    env = valid_env()
+    env.update(
+        {
+            "LOOPAD_POSTGRES_POOL_MIN_SIZE": "2",
+            "LOOPAD_POSTGRES_POOL_MAX_SIZE": "7",
+            "LOOPAD_POSTGRES_POOL_TIMEOUT_SECONDS": "4.5",
+        }
+    )
+    settings = load_settings(env)
+
+    create_postgres_pool(settings)
+
+    assert calls == [
+        {
+            "kwargs": {
+                "host": settings.aurora_host,
+                "port": settings.aurora_port,
+                "dbname": settings.aurora_database,
+                "user": settings.aurora_username,
+                "password": settings.aurora_password,
+                "autocommit": False,
+            },
+            "min_size": 2,
+            "max_size": 7,
+            "timeout": 4.5,
+            "open": False,
+        }
+    ]
+    assert open_calls == [{"wait": False}]
 
 
 def test_create_clickhouse_client_uses_validated_clickhouse_settings(

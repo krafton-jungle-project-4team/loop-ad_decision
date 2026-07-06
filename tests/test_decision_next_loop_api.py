@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -54,6 +56,27 @@ def valid_env() -> dict[str, str]:
         }
     )
     return values
+
+
+def install_recording_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    connections: list["RecordingConnection"],
+    **connection_kwargs: Any,
+) -> list["RecordingPool"]:
+    pools: list[RecordingPool] = []
+
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
+        connection = RecordingConnection(**connection_kwargs)
+        connections.append(connection)
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
+
+    monkeypatch.setattr(
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
+    )
+    return pools
 
 
 def make_client(service: object | None = None) -> TestClient:
@@ -140,16 +163,7 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection()
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
-    )
+    pools = install_recording_pool(monkeypatch, connections)
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
         lambda _settings: FakeClickHouseClient(),
@@ -175,7 +189,9 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
 
@@ -184,15 +200,10 @@ def test_next_loop_api_rolls_back_and_closes_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection(promotion_run_row=None)
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+    pools = install_recording_pool(
+        monkeypatch,
+        connections,
+        promotion_run_row=None,
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -213,23 +224,16 @@ def test_next_loop_api_rolls_back_and_closes_on_failure(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
 
 def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection()
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
-    )
+    pools = install_recording_pool(monkeypatch, connections)
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
         lambda _settings: FakeClickHouseClient(),
@@ -259,7 +263,9 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into promotion_analyses" in query for query in executed_sql)
     assert any("insert into promotion_target_segments" in query for query in executed_sql)
@@ -280,17 +286,10 @@ def test_next_loop_api_maps_approved_content_unique_violation_to_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection(
-            raise_unique_on_content_candidate_insert=True,
-        )
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+    pools = install_recording_pool(
+        monkeypatch,
+        connections,
+        raise_unique_on_content_candidate_insert=True,
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -312,7 +311,9 @@ def test_next_loop_api_maps_approved_content_unique_violation_to_conflict(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into generation_runs" in query for query in executed_sql)
     assert any("insert into content_candidates" in query for query in executed_sql)
@@ -323,20 +324,13 @@ def test_next_loop_api_maps_approved_content_constraint_to_specific_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection(
-            raise_unique_on_content_candidate_insert=True,
-            content_candidate_unique_constraint_name=(
-                "uq_content_candidates_one_approved_per_segment"
-            ),
-        )
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+    pools = install_recording_pool(
+        monkeypatch,
+        connections,
+        raise_unique_on_content_candidate_insert=True,
+        content_candidate_unique_constraint_name=(
+            "uq_content_candidates_one_approved_per_segment"
+        ),
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -358,24 +352,19 @@ def test_next_loop_api_maps_approved_content_constraint_to_specific_conflict(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
 
 def test_next_loop_api_rolls_back_approved_content_when_run_creation_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection(
-            raise_unique_on_promotion_run_insert=True,
-        )
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+    pools = install_recording_pool(
+        monkeypatch,
+        connections,
+        raise_unique_on_promotion_run_insert=True,
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -397,7 +386,9 @@ def test_next_loop_api_rolls_back_approved_content_when_run_creation_fails(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into content_candidates" in query for query in executed_sql)
     assert any("insert into promotion_runs" in query for query in executed_sql)
@@ -561,6 +552,25 @@ class RecordingConnection:
         self.rollback_count += 1
         self.rolled_back_inserts.extend(self.pending_inserts)
         self.pending_inserts.clear()
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class RecordingPool:
+    def __init__(self, connection: RecordingConnection) -> None:
+        self.connection_object = connection
+        self.checkout_count = 0
+        self.return_count = 0
+        self.close_count = 0
+
+    @contextmanager
+    def connection(self) -> Iterator[RecordingConnection]:
+        self.checkout_count += 1
+        try:
+            yield self.connection_object
+        finally:
+            self.return_count += 1
 
     def close(self) -> None:
         self.close_count += 1

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -101,15 +103,18 @@ def test_run_api_maps_service_errors() -> None:
 
 def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection()
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
@@ -124,7 +129,9 @@ def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into promotion_runs" in query for query in executed_sql)
     assert any("insert into ad_experiments" in query for query in executed_sql)
@@ -132,15 +139,18 @@ def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:
 
 def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection(analysis_row=None)
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
@@ -155,22 +165,27 @@ def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
 
 
 def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
     monkeypatch,
 ) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection(raise_unique_on_insert=True)
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
@@ -185,7 +200,42 @@ def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
+
+
+def test_run_api_reuses_pool_and_closes_it_on_app_shutdown(monkeypatch) -> None:
+    connection = RecordingConnection()
+    pool = RecordingPool(connection)
+    calls: list[object] = []
+
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
+        calls.append(object())
+        return pool
+
+    monkeypatch.setattr(
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+
+    with TestClient(app) as client:
+        first_response = client.post(
+            "/decision/v1/promotions/promo_banner_001/runs",
+            json={},
+        )
+        second_response = client.post(
+            "/decision/v1/promotions/promo_banner_001/runs",
+            json={},
+        )
+
+    assert first_response.status_code == 200
+    assert second_response.status_code == 200
+    assert len(calls) == 1
+    assert pool.checkout_count == 2
+    assert pool.return_count == 2
+    assert pool.close_count == 1
 
 
 class FakeRunService:
@@ -301,6 +351,25 @@ class RecordingConnection:
 
     def rollback(self) -> None:
         self.rollback_count += 1
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class RecordingPool:
+    def __init__(self, connection: RecordingConnection) -> None:
+        self.connection_object = connection
+        self.checkout_count = 0
+        self.return_count = 0
+        self.close_count = 0
+
+    @contextmanager
+    def connection(self) -> Iterator[RecordingConnection]:
+        self.checkout_count += 1
+        try:
+            yield self.connection_object
+        finally:
+            self.return_count += 1
 
     def close(self) -> None:
         self.close_count += 1

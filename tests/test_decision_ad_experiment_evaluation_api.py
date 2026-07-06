@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from decimal import Decimal
 from typing import Any
 
@@ -110,12 +112,15 @@ def test_ad_experiment_evaluation_api_maps_service_errors(
 
 def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
     clickhouse_clients: list[RecordingClickHouseClient] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection()
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
         client = RecordingClickHouseClient(rows=[(2, 10)])
@@ -123,8 +128,8 @@ def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch
         return client
 
     monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -145,7 +150,9 @@ def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     assert clickhouse_clients[0].close_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from ad_experiments" in query for query in executed_sql)
@@ -158,12 +165,15 @@ def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
     monkeypatch,
 ) -> None:
     connections: list[RecordingConnection] = []
+    pools: list[RecordingPool] = []
     clickhouse_clients: list[RecordingClickHouseClient] = []
 
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+    def fake_create_postgres_pool(_settings) -> RecordingPool:
         connection = RecordingConnection(ad_experiment_row=None)
         connections.append(connection)
-        return connection
+        pool = RecordingPool(connection)
+        pools.append(pool)
+        return pool
 
     def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
         client = RecordingClickHouseClient(rows=[(0, 0)])
@@ -171,8 +181,8 @@ def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
         return client
 
     monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
+        "app.dependencies.create_postgres_pool",
+        fake_create_postgres_pool,
     )
     monkeypatch.setattr(
         "app.decision.router.create_clickhouse_client",
@@ -192,7 +202,9 @@ def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
     connection = connections[0]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
-    assert connection.close_count == 1
+    assert connection.close_count == 0
+    assert pools[0].checkout_count == 1
+    assert pools[0].return_count == 1
     assert clickhouse_clients[0].close_count == 1
 
 
@@ -286,6 +298,25 @@ class RecordingConnection:
 
     def rollback(self) -> None:
         self.rollback_count += 1
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+class RecordingPool:
+    def __init__(self, connection: RecordingConnection) -> None:
+        self.connection_object = connection
+        self.checkout_count = 0
+        self.return_count = 0
+        self.close_count = 0
+
+    @contextmanager
+    def connection(self) -> Iterator[RecordingConnection]:
+        self.checkout_count += 1
+        try:
+            yield self.connection_object
+        finally:
+            self.return_count += 1
 
     def close(self) -> None:
         self.close_count += 1
