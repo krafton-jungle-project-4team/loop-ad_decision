@@ -28,8 +28,8 @@ from app.analysis.service import (
     SegmentSelectionError,
 )
 from app.analysis.vector_service import SegmentVectorService
-from app.db import create_clickhouse_client, create_postgres_connection
-from app.dependencies import get_settings
+from app.db import create_clickhouse_client
+from app.dependencies import checkout_postgres_connection, get_settings
 
 router = APIRouter(prefix="/decision/v1/promotions", tags=["analysis"])
 
@@ -42,37 +42,38 @@ UNIQUE_CONSTRAINTS = {
 
 def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    clickhouse_client = None
-    try:
-        clickhouse_client = create_clickhouse_client(settings)
-        postgres_executor = PsycopgPostgresExecutor(connection)
-        user_behavior_vector_repository = UserBehaviorVectorRepository(clickhouse_client)
-        segment_vector_repository = SegmentVectorRepository(postgres_executor)
-        yield PromotionAnalysisService(
-            promotion_repository=PromotionRepository(postgres_executor),
-            segment_definition_repository=SegmentDefinitionRepository(
-                postgres_executor,
-            ),
-            hotel_profile_repository=HotelProfileRepository(clickhouse_client),
-            promotion_analysis_repository=PromotionAnalysisRepository(
-                postgres_executor,
-            ),
-            segment_vector_service=SegmentVectorService(
-                segment_vector_repository=segment_vector_repository,
-                user_behavior_vector_repository=user_behavior_vector_repository,
-            ),
-            segment_suggester=VectorClusterSegmentSuggester(
-                user_behavior_vector_repository=user_behavior_vector_repository,
-            ),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        _close_clickhouse_client(clickhouse_client)
+    with checkout_postgres_connection(request) as connection:
+        clickhouse_client = None
+        try:
+            clickhouse_client = create_clickhouse_client(settings)
+            postgres_executor = PsycopgPostgresExecutor(connection)
+            user_behavior_vector_repository = UserBehaviorVectorRepository(
+                clickhouse_client
+            )
+            segment_vector_repository = SegmentVectorRepository(postgres_executor)
+            yield PromotionAnalysisService(
+                promotion_repository=PromotionRepository(postgres_executor),
+                segment_definition_repository=SegmentDefinitionRepository(
+                    postgres_executor,
+                ),
+                hotel_profile_repository=HotelProfileRepository(clickhouse_client),
+                promotion_analysis_repository=PromotionAnalysisRepository(
+                    postgres_executor,
+                ),
+                segment_vector_service=SegmentVectorService(
+                    segment_vector_repository=segment_vector_repository,
+                    user_behavior_vector_repository=user_behavior_vector_repository,
+                ),
+                segment_suggester=VectorClusterSegmentSuggester(
+                    user_behavior_vector_repository=user_behavior_vector_repository,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            _close_clickhouse_client(clickhouse_client)
 
 
 @router.post("/{promotion_id}/analysis", response_model=AnalysisResponse)

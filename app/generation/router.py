@@ -5,8 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
-from app.db import create_postgres_connection
-from app.dependencies import get_settings
+from app.dependencies import checkout_postgres_connection, get_settings
 from app.generation.adapters import build_external_content_generator
 from app.generation.repositories import (
     ContentCandidateRepository,
@@ -32,23 +31,21 @@ router = APIRouter(
 
 def get_generation_service(request: Request) -> Iterator[GenerationRequestHandler]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    content_generator = None
-    if settings.env != "test":
-        content_generator = build_external_content_generator(settings)
-    try:
-        yield GenerationService(
-            generation_run_repository=GenerationRunRepository(connection),
-            content_candidate_repository=ContentCandidateRepository(connection),
-            generation_input_reader=GenerationInputRepository(connection),
-            content_generator=content_generator,
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    with checkout_postgres_connection(request) as connection:
+        try:
+            content_generator = None
+            if settings.env != "test":
+                content_generator = build_external_content_generator(settings)
+            yield GenerationService(
+                generation_run_repository=GenerationRunRepository(connection),
+                content_candidate_repository=ContentCandidateRepository(connection),
+                generation_input_reader=GenerationInputRepository(connection),
+                content_generator=content_generator,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
 
 @router.post(

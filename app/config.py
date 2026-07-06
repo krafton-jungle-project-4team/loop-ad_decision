@@ -8,6 +8,9 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
+DEFAULT_POSTGRES_POOL_MIN_SIZE = 1
+DEFAULT_POSTGRES_POOL_MAX_SIZE = 5
+DEFAULT_POSTGRES_POOL_TIMEOUT_SECONDS = 30.0
 
 
 class SettingsError(RuntimeError):
@@ -37,6 +40,9 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
+    postgres_pool_min_size: int = DEFAULT_POSTGRES_POOL_MIN_SIZE
+    postgres_pool_max_size: int = DEFAULT_POSTGRES_POOL_MAX_SIZE
+    postgres_pool_timeout_seconds: float = DEFAULT_POSTGRES_POOL_TIMEOUT_SECONDS
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
 
@@ -76,6 +82,22 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             f"LOOPAD_SERVICE_ID must be {DECISION_SERVICE_ID!r}, got {service_id!r}"
         )
 
+    postgres_pool_min_size = _read_non_negative_int(
+        source,
+        "LOOPAD_POSTGRES_POOL_MIN_SIZE",
+        DEFAULT_POSTGRES_POOL_MIN_SIZE,
+    )
+    postgres_pool_max_size = _read_positive_int_with_default(
+        source,
+        "LOOPAD_POSTGRES_POOL_MAX_SIZE",
+        DEFAULT_POSTGRES_POOL_MAX_SIZE,
+    )
+    if postgres_pool_min_size > postgres_pool_max_size:
+        raise SettingsError(
+            "LOOPAD_POSTGRES_POOL_MIN_SIZE must be less than or equal to "
+            "LOOPAD_POSTGRES_POOL_MAX_SIZE"
+        )
+
     return Settings(
         env=_read_required(source, "LOOPAD_ENV"),
         service_id=service_id,
@@ -97,6 +119,13 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
+        postgres_pool_min_size=postgres_pool_min_size,
+        postgres_pool_max_size=postgres_pool_max_size,
+        postgres_pool_timeout_seconds=_read_positive_float_with_default(
+            source,
+            "LOOPAD_POSTGRES_POOL_TIMEOUT_SECONDS",
+            DEFAULT_POSTGRES_POOL_TIMEOUT_SECONDS,
+        ),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
     )
@@ -125,4 +154,55 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
         raise SettingsError(f"{name} must be a positive integer") from exc
     if value <= 0:
         raise SettingsError(f"{name} must be a positive integer")
+    return value
+
+
+def _read_non_negative_int(
+    source: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise SettingsError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _read_positive_int_with_default(
+    source: Mapping[str, str],
+    name: str,
+    default: int,
+) -> int:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise SettingsError(f"{name} must be a positive integer")
+    return value
+
+
+def _read_positive_float_with_default(
+    source: Mapping[str, str],
+    name: str,
+    default: float,
+) -> float:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise SettingsError(f"{name} must be a positive number")
     return value

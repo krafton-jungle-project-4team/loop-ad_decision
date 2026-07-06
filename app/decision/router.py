@@ -20,7 +20,7 @@ from app.analysis.repositories import (
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 from app.analysis.service import PromotionAnalysisService
 from app.analysis.vector_service import SegmentVectorService
-from app.db import create_clickhouse_client, create_postgres_connection
+from app.db import create_clickhouse_client
 from app.decision.assignment_service import (
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
@@ -76,7 +76,7 @@ from app.decision.service import (
     RunConflictError,
     RunValidationError,
 )
-from app.dependencies import get_settings
+from app.dependencies import checkout_postgres_connection, get_settings
 from app.generation.adapters import build_external_content_generator
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
@@ -115,194 +115,196 @@ ad_experiment_router = APIRouter(
 
 
 def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]:
-    settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    executor = PsycopgPostgresExecutor(connection)
-    try:
-        yield PromotionRunService(
-            promotion_repository=PromotionRepository(executor),
-            promotion_analysis_repository=PromotionAnalysisRepository(executor),
-            promotion_target_segment_repository=PromotionTargetSegmentRepository(
-                executor,
-            ),
-            generation_run_repository=GenerationRunRepository(executor),
-            content_candidate_repository=ContentCandidateRepository(executor),
-            promotion_run_repository=PromotionRunRepository(executor),
-            ad_experiment_repository=AdExperimentRepository(executor),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    with checkout_postgres_connection(request) as connection:
+        executor = PsycopgPostgresExecutor(connection)
+        try:
+            yield PromotionRunService(
+                promotion_repository=PromotionRepository(executor),
+                promotion_analysis_repository=PromotionAnalysisRepository(executor),
+                promotion_target_segment_repository=PromotionTargetSegmentRepository(
+                    executor,
+                ),
+                generation_run_repository=GenerationRunRepository(executor),
+                content_candidate_repository=ContentCandidateRepository(executor),
+                promotion_run_repository=PromotionRunRepository(executor),
+                ad_experiment_repository=AdExperimentRepository(executor),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
 
 
 def get_segment_assignment_service(
     request: Request,
 ) -> Iterator[SegmentAssignmentService]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    clickhouse_client = create_clickhouse_client(settings)
-    executor = PsycopgPostgresExecutor(connection)
-    try:
-        yield SegmentAssignmentService(
-            promotion_run_repository=PromotionRunRepository(executor),
-            ad_experiment_repository=AdExperimentRepository(executor),
-            promotion_target_segment_repository=PromotionTargetSegmentRepository(
-                executor,
-            ),
-            segment_vector_repository=SegmentVectorRepository(executor),
-            user_behavior_vector_repository=UserBehaviorVectorRepository(
-                clickhouse_client,
-            ),
-            user_segment_assignment_repository=UserSegmentAssignmentRepository(
-                executor,
-            ),
-            reranker=SegmentCandidateReranker(),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        _close_clickhouse_client(clickhouse_client)
+    with checkout_postgres_connection(request) as connection:
+        clickhouse_client = None
+        executor = PsycopgPostgresExecutor(connection)
+        try:
+            clickhouse_client = create_clickhouse_client(settings)
+            yield SegmentAssignmentService(
+                promotion_run_repository=PromotionRunRepository(executor),
+                ad_experiment_repository=AdExperimentRepository(executor),
+                promotion_target_segment_repository=PromotionTargetSegmentRepository(
+                    executor,
+                ),
+                segment_vector_repository=SegmentVectorRepository(executor),
+                user_behavior_vector_repository=UserBehaviorVectorRepository(
+                    clickhouse_client,
+                ),
+                user_segment_assignment_repository=UserSegmentAssignmentRepository(
+                    executor,
+                ),
+                reranker=SegmentCandidateReranker(),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            _close_clickhouse_client(clickhouse_client)
 
 
 def get_ad_experiment_evaluation_service(
     request: Request,
 ) -> Iterator[AdExperimentEvaluationService]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    clickhouse_client = create_clickhouse_client(settings)
-    executor = PsycopgPostgresExecutor(connection)
-    try:
-        yield AdExperimentEvaluationService(
-            ad_experiment_repository=AdExperimentRepository(executor),
-            promotion_run_repository=PromotionRunRepository(executor),
-            promotion_evaluation_repository=PromotionEvaluationRepository(executor),
-            evaluation_metric_repository=EvaluationMetricRepository(
-                clickhouse_client,
-            ),
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        _close_clickhouse_client(clickhouse_client)
+    with checkout_postgres_connection(request) as connection:
+        clickhouse_client = None
+        executor = PsycopgPostgresExecutor(connection)
+        try:
+            clickhouse_client = create_clickhouse_client(settings)
+            yield AdExperimentEvaluationService(
+                ad_experiment_repository=AdExperimentRepository(executor),
+                promotion_run_repository=PromotionRunRepository(executor),
+                promotion_evaluation_repository=PromotionEvaluationRepository(executor),
+                evaluation_metric_repository=EvaluationMetricRepository(
+                    clickhouse_client,
+                ),
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            _close_clickhouse_client(clickhouse_client)
 
 
 def get_promotion_run_evaluation_service(
     request: Request,
 ) -> Iterator[PromotionRunEvaluationService]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    clickhouse_client = create_clickhouse_client(settings)
-    executor = PsycopgPostgresExecutor(connection)
-    ad_experiment_repository = AdExperimentRepository(executor)
-    promotion_run_repository = PromotionRunRepository(executor)
-    promotion_evaluation_repository = PromotionEvaluationRepository(executor)
-    try:
-        ad_experiment_evaluation_service = AdExperimentEvaluationService(
-            ad_experiment_repository=ad_experiment_repository,
-            promotion_run_repository=promotion_run_repository,
-            promotion_evaluation_repository=promotion_evaluation_repository,
-            evaluation_metric_repository=EvaluationMetricRepository(
-                clickhouse_client,
-            ),
-        )
-        yield PromotionRunEvaluationService(
-            promotion_run_repository=promotion_run_repository,
-            ad_experiment_repository=ad_experiment_repository,
-            promotion_evaluation_repository=promotion_evaluation_repository,
-            ad_experiment_evaluation_service=ad_experiment_evaluation_service,
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        _close_clickhouse_client(clickhouse_client)
+    with checkout_postgres_connection(request) as connection:
+        clickhouse_client = None
+        executor = PsycopgPostgresExecutor(connection)
+        ad_experiment_repository = AdExperimentRepository(executor)
+        promotion_run_repository = PromotionRunRepository(executor)
+        promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+        try:
+            clickhouse_client = create_clickhouse_client(settings)
+            ad_experiment_evaluation_service = AdExperimentEvaluationService(
+                ad_experiment_repository=ad_experiment_repository,
+                promotion_run_repository=promotion_run_repository,
+                promotion_evaluation_repository=promotion_evaluation_repository,
+                evaluation_metric_repository=EvaluationMetricRepository(
+                    clickhouse_client,
+                ),
+            )
+            yield PromotionRunEvaluationService(
+                promotion_run_repository=promotion_run_repository,
+                ad_experiment_repository=ad_experiment_repository,
+                promotion_evaluation_repository=promotion_evaluation_repository,
+                ad_experiment_evaluation_service=ad_experiment_evaluation_service,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            _close_clickhouse_client(clickhouse_client)
 
 
 def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
     settings = get_settings(request)
-    connection = create_postgres_connection(settings)
-    clickhouse_client = None
-    executor = PsycopgPostgresExecutor(connection)
-    promotion_repository = PromotionRepository(executor)
-    promotion_run_repository = PromotionRunRepository(executor)
-    ad_experiment_repository = AdExperimentRepository(executor)
-    promotion_evaluation_repository = PromotionEvaluationRepository(executor)
-    try:
-        clickhouse_client = create_clickhouse_client(settings)
-        analysis_executor = AnalysisPostgresExecutor(connection)
-        analysis_user_behavior_vector_repository = AnalysisUserBehaviorVectorRepository(
-            clickhouse_client
-        )
-        analysis_segment_vector_repository = AnalysisSegmentVectorRepository(
-            analysis_executor
-        )
-        analysis_service = PromotionAnalysisService(
-            promotion_repository=AnalysisPromotionRepository(analysis_executor),
-            segment_definition_repository=AnalysisSegmentDefinitionRepository(
-                analysis_executor,
-            ),
-            hotel_profile_repository=AnalysisHotelProfileRepository(clickhouse_client),
-            promotion_analysis_repository=AnalysisPromotionAnalysisRepository(
-                analysis_executor,
-            ),
-            segment_vector_service=SegmentVectorService(
-                segment_vector_repository=analysis_segment_vector_repository,
-                user_behavior_vector_repository=analysis_user_behavior_vector_repository,
-            ),
-            segment_suggester=VectorClusterSegmentSuggester(
-                user_behavior_vector_repository=analysis_user_behavior_vector_repository,
-            ),
-        )
-        content_generator = None
-        if settings.env != "test":
-            content_generator = build_external_content_generator(settings)
-        generation_run_repository = GenerationGenerationRunRepository(connection)
-        generation_service = GenerationService(
-            generation_run_repository=generation_run_repository,
-            content_candidate_repository=GenerationContentCandidateRepository(
-                connection
-            ),
-            generation_input_reader=GenerationInputRepository(connection),
-            content_generator=content_generator,
-        )
-        run_creator = PromotionRunService(
-            promotion_repository=promotion_repository,
-            promotion_analysis_repository=PromotionAnalysisRepository(executor),
-            promotion_target_segment_repository=PromotionTargetSegmentRepository(
-                executor,
-            ),
-            generation_run_repository=GenerationRunRepository(executor),
-            content_candidate_repository=ContentCandidateRepository(executor),
-            promotion_run_repository=promotion_run_repository,
-            ad_experiment_repository=ad_experiment_repository,
-        )
-        yield NextLoopService(
-            promotion_repository=promotion_repository,
-            promotion_run_repository=promotion_run_repository,
-            ad_experiment_repository=ad_experiment_repository,
-            promotion_evaluation_repository=promotion_evaluation_repository,
-            analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
-            generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
-            run_creator=run_creator,
-        )
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
-        _close_clickhouse_client(clickhouse_client)
+    with checkout_postgres_connection(request) as connection:
+        clickhouse_client = None
+        executor = PsycopgPostgresExecutor(connection)
+        promotion_repository = PromotionRepository(executor)
+        promotion_run_repository = PromotionRunRepository(executor)
+        ad_experiment_repository = AdExperimentRepository(executor)
+        promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+        try:
+            clickhouse_client = create_clickhouse_client(settings)
+            analysis_executor = AnalysisPostgresExecutor(connection)
+            analysis_user_behavior_vector_repository = (
+                AnalysisUserBehaviorVectorRepository(clickhouse_client)
+            )
+            analysis_segment_vector_repository = AnalysisSegmentVectorRepository(
+                analysis_executor
+            )
+            analysis_service = PromotionAnalysisService(
+                promotion_repository=AnalysisPromotionRepository(analysis_executor),
+                segment_definition_repository=AnalysisSegmentDefinitionRepository(
+                    analysis_executor,
+                ),
+                hotel_profile_repository=AnalysisHotelProfileRepository(
+                    clickhouse_client
+                ),
+                promotion_analysis_repository=AnalysisPromotionAnalysisRepository(
+                    analysis_executor,
+                ),
+                segment_vector_service=SegmentVectorService(
+                    segment_vector_repository=analysis_segment_vector_repository,
+                    user_behavior_vector_repository=(
+                        analysis_user_behavior_vector_repository
+                    ),
+                ),
+                segment_suggester=VectorClusterSegmentSuggester(
+                    user_behavior_vector_repository=(
+                        analysis_user_behavior_vector_repository
+                    ),
+                ),
+            )
+            content_generator = None
+            if settings.env != "test":
+                content_generator = build_external_content_generator(settings)
+            generation_run_repository = GenerationGenerationRunRepository(connection)
+            generation_service = GenerationService(
+                generation_run_repository=generation_run_repository,
+                content_candidate_repository=GenerationContentCandidateRepository(
+                    connection
+                ),
+                generation_input_reader=GenerationInputRepository(connection),
+                content_generator=content_generator,
+            )
+            run_creator = PromotionRunService(
+                promotion_repository=promotion_repository,
+                promotion_analysis_repository=PromotionAnalysisRepository(executor),
+                promotion_target_segment_repository=PromotionTargetSegmentRepository(
+                    executor,
+                ),
+                generation_run_repository=GenerationRunRepository(executor),
+                content_candidate_repository=ContentCandidateRepository(executor),
+                promotion_run_repository=promotion_run_repository,
+                ad_experiment_repository=ad_experiment_repository,
+            )
+            yield NextLoopService(
+                promotion_repository=promotion_repository,
+                promotion_run_repository=promotion_run_repository,
+                ad_experiment_repository=ad_experiment_repository,
+                promotion_evaluation_repository=promotion_evaluation_repository,
+                analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
+                generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
+                run_creator=run_creator,
+            )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            _close_clickhouse_client(clickhouse_client)
 
 
 @router.post(
@@ -591,7 +593,9 @@ def _next_loop_unique_violation_detail(exc: IntegrityError) -> str:
     return "next-loop output already exists"
 
 
-def _close_clickhouse_client(client: object) -> None:
+def _close_clickhouse_client(client: object | None) -> None:
+    if client is None:
+        return
     close = getattr(client, "close", None)
     if callable(close):
         close()

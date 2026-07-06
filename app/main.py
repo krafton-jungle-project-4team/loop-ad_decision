@@ -13,7 +13,11 @@ from app.decision.router import (
     promotion_run_router,
     router as decision_router,
 )
-from app.dependencies import require_internal_key
+from app.dependencies import (
+    close_postgres_pool,
+    initialize_postgres_pool_state,
+    require_internal_key,
+)
 from app.generation.router import router as generation_router
 from app.internal.router import router as internal_batch_router
 
@@ -22,7 +26,10 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _get_or_load_settings(app)
-        yield
+        try:
+            yield
+        finally:
+            close_postgres_pool(app)
 
     app = FastAPI(
         title="Loop-Ad Decision API",
@@ -30,6 +37,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    initialize_postgres_pool_state(app)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:
