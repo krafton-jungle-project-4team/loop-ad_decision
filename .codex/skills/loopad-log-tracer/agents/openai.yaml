@@ -1,0 +1,4 @@
+interface:
+  display_name: "LoopAd 로그 추적기"
+  short_description: "LoopAd CloudWatch 로그 조사"
+  default_prompt: "$loopad-log-tracer를 사용해 LoopAd 요청 ID, API 실패, 버그 증상을 AWS 로그에서 조사하세요."
