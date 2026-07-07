@@ -123,8 +123,8 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "status": "completed",
         "content_candidate_count": 2,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v1",
-        "content_generator": "dec-c3.deterministic.v1",
+        "prompt_builder": "dec-c2.v2",
+        "content_generator": "dec-c3.deterministic.v2",
         "report_builder": "dec-c4.v1",
     }
 
@@ -146,10 +146,10 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
     assert first_candidate.metadata_json["report_version"] == "dec-c4.v1"
-    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v1"
+    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v2"
     assert (
         first_candidate.metadata_json["content_generator_version"]
-        == "dec-c3.deterministic.v1"
+        == "dec-c3.deterministic.v2"
     )
     assert first_candidate.metadata_json["reason_summary"] == (
         first_candidate.reason_summary
@@ -165,6 +165,11 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["data_evidence"]["sample_size"] == 1342
     assert first_candidate.metadata_json["data_evidence"]["sample_ratio"] == 0.018
+    assert first_candidate.title == "이번 주말 호텔 특가"
+    assert first_candidate.body == (
+        "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요."
+    )
+    assert first_candidate.cta == "호텔 특가 보기"
     assert first_candidate.image_url is None
     assert first_candidate.metadata_json["image_url"] is None
     assert first_candidate.metadata_json["source_query_preview_id"] is None
@@ -392,8 +397,8 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
         "status": "failed",
         "content_candidate_count": 0,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v1",
-        "content_generator": "dec-c3.deterministic.v1",
+        "prompt_builder": "dec-c2.v2",
+        "content_generator": "dec-c3.deterministic.v2",
         "report_builder": "dec-c4.v1",
         "error_code": "content_generation_failed",
     }
@@ -472,11 +477,13 @@ def test_generation_service_saves_channel_specific_fields() -> None:
     assert email_candidate.subject
     assert email_candidate.preheader
     assert email_candidate.body
-    assert email_candidate.cta
+    assert "호텔" in email_candidate.subject
+    assert email_candidate.cta == "호텔 특가 보기"
     assert email_candidate.landing_url
 
     sms_candidate = sms_response.content_candidates[0]
     assert sms_candidate.message
+    assert "호텔" in sms_candidate.message
     assert sms_candidate.landing_url
 
 

@@ -212,7 +212,7 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
         "status": "completed",
         "content_candidate_count": 1,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v1",
+        "prompt_builder": "dec-c2.v2",
         "content_generator": "dec-c5.image-url-test.v1",
         "report_builder": "dec-c4.v1",
     }

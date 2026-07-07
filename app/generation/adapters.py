@@ -16,7 +16,7 @@ from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResu
 from app.generation.schemas import ContentChannel
 
 
-EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v1"
+EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v2"
 DEFAULT_OPENAI_CONTENT_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
@@ -380,6 +380,12 @@ def _generated_content_from_values(
 def _system_instruction(channel: ContentChannel) -> str:
     return (
         "You generate hotel booking advertisement content. "
+        "Write customer-facing copy values in natural Korean for a Korean "
+        "hotel booking audience. "
+        "Keep JSON field names in English, but write subject, preheader, "
+        "title, body, cta, and message values in Korean. "
+        "The image_prompt value may stay in English for the image generator "
+        "and must not request visible text in the image. "
         f"Return only the JSON fields for the {channel.value} channel contract. "
         "Do not generate, infer, or override landing URLs. "
         "Do not include legacy naming, marketplace language, or unrelated commerce terms."
@@ -398,7 +404,8 @@ def _user_instruction(
             f"Content option number: {option_index}",
             f"Fixed landing URL assigned by Loop-Ad: {prompt_input.promotion.landing_url or ''}",
             "Do not return landing_url in the JSON response.",
-            "Return concise hotel booking copy. Return JSON only.",
+            "Do not copy English source text verbatim; adapt it into natural Korean.",
+            "Return concise Korean hotel booking copy. Return JSON only.",
         ]
     )
 

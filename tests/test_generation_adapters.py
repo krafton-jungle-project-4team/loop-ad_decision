@@ -43,10 +43,10 @@ def test_external_content_generator_stores_banner_image_url() -> None:
     generator = ExternalContentGenerator(
         content_client=FakeContentClient(
             {
-                "title": "Hotel rooms ready this weekend",
-                "body": "Compare refundable hotel stays before rooms run out.",
-                "cta": "View hotel deals",
-                "image_prompt": "bright hotel suite banner",
+                "title": "이번 주말 호텔 특가",
+                "body": "환불 가능한 객실을 객실 마감 전에 비교해보세요.",
+                "cta": "호텔 특가 보기",
+                "image_prompt": "bright hotel suite banner, no visible text",
                 "landing_url": LLM_LANDING_URL,
             }
         ),
@@ -60,11 +60,11 @@ def test_external_content_generator_stores_banner_image_url() -> None:
         option_index=1,
     )
 
-    assert content.title == "Hotel rooms ready this weekend"
-    assert content.image_prompt == "bright hotel suite banner"
+    assert content.title == "이번 주말 호텔 특가"
+    assert content.image_prompt == "bright hotel suite banner, no visible text"
     assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url == IMAGE_URL
-    assert image_client.prompts == ["bright hotel suite banner"]
+    assert image_client.prompts == ["bright hotel suite banner, no visible text"]
     assert asset_storage.saved == [
         (
             "content_banner_repeat_hotel_001",
@@ -79,10 +79,10 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
     generator = ExternalContentGenerator(
         content_client=FakeContentClient(
             {
-                "subject": "Rooms picked for your next stay",
-                "preheader": "Refundable hotels are available now.",
-                "body": "Compare summer stays before rooms run out.",
-                "cta": "View hotel deals",
+                "subject": "환불 가능한 호텔 객실을 만나보세요",
+                "preheader": "지금 예약 가능한 숙박 혜택을 확인하세요.",
+                "body": "객실이 마감되기 전에 원하는 호텔을 비교해보세요.",
+                "cta": "호텔 특가 보기",
             }
         ),
         image_client=image_client,
@@ -95,7 +95,7 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
         option_index=1,
     )
 
-    assert content.subject == "Rooms picked for your next stay"
+    assert content.subject == "환불 가능한 호텔 객실을 만나보세요"
     assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url is None
     assert image_client.prompts == []
@@ -106,10 +106,10 @@ def test_external_content_generator_requires_promotion_landing_url() -> None:
     generator = ExternalContentGenerator(
         content_client=FakeContentClient(
             {
-                "subject": "Rooms picked for your next stay",
-                "preheader": "Refundable hotels are available now.",
-                "body": "Compare summer stays before rooms run out.",
-                "cta": "View hotel deals",
+                "subject": "환불 가능한 호텔 객실을 만나보세요",
+                "preheader": "지금 예약 가능한 숙박 혜택을 확인하세요.",
+                "body": "객실이 마감되기 전에 원하는 호텔을 비교해보세요.",
+                "cta": "호텔 특가 보기",
             }
         ),
         image_client=FakeImageClient(),
@@ -143,10 +143,10 @@ def test_openai_content_client_parses_responses_output_text() -> None:
         )
         return {
             "output_text": (
-                '{"title":"Hotel rooms ready this weekend",'
-                '"body":"Compare refundable hotel stays.",'
-                '"cta":"View hotel deals",'
-                '"image_prompt":"bright hotel suite banner"}'
+                '{"title":"이번 주말 호텔 특가",'
+                '"body":"환불 가능한 객실을 비교해보세요.",'
+                '"cta":"호텔 특가 보기",'
+                '"image_prompt":"bright hotel suite banner, no visible text"}'
             )
         }
 
@@ -162,12 +162,15 @@ def test_openai_content_client_parses_responses_output_text() -> None:
         option_index=2,
     )
 
-    assert content["title"] == "Hotel rooms ready this weekend"
-    assert content["image_prompt"] == "bright hotel suite banner"
+    assert content["title"] == "이번 주말 호텔 특가"
+    assert content["image_prompt"] == "bright hotel suite banner, no visible text"
     assert captured["endpoint"] == "https://api.openai.com/v1/responses"
     assert captured["headers"]["Authorization"] == f"Bearer {OPENAI_FIXTURE_KEY}"
     assert captured["payload"]["model"] == "gpt-test"
     assert captured["payload"]["text"]["format"]["type"] == "json_schema"
+    assert "natural Korean" in str(captured["payload"])
+    assert "Return concise Korean hotel booking copy" in str(captured["payload"])
+    assert "Do not copy English source text verbatim" in str(captured["payload"])
     schema = captured["payload"]["text"]["format"]["schema"]
     assert "landing_url" not in schema["properties"]
     assert "landing_url" not in schema["required"]

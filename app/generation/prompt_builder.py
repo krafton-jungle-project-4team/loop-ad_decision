@@ -7,7 +7,7 @@ from typing import Any
 from app.generation.schemas import ContentChannel, GenerationRequest
 
 
-PROMPT_BUILDER_VERSION = "dec-c2.v1"
+PROMPT_BUILDER_VERSION = "dec-c2.v2"
 
 
 @dataclass(frozen=True)
@@ -97,6 +97,15 @@ class PromptBuilder:
         generation_prompt = "\n".join(
             [
                 "Generate one Loop-Ad hotel marketing content candidate.",
+                "Output language: Korean (ko-KR).",
+                (
+                    "Write customer-facing copy fields in natural Korean; "
+                    "keep JSON field names in English."
+                ),
+                (
+                    "Use source segment details as context, but do not copy "
+                    "English source text verbatim into customer-facing copy."
+                ),
                 f"Channel: {promotion.channel.value}",
                 f"Required output fields: {', '.join(channel_contract)}.",
                 f"Project: {promotion.project_id}",
