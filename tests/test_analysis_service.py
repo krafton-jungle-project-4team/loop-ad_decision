@@ -739,6 +739,36 @@ def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -
     assert suggester.calls == [promotion]
 
 
+def test_service_skips_zero_size_default_segments() -> None:
+    promotion = promotion_record(channel="email")
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=[
+            segment_record("seg_mobile_user", sample_size=0),
+            segment_record("seg_family_trip", sample_size=0),
+            segment_record("seg_near_checkin", sample_size=35),
+            segment_record("seg_existing_all", sample_size=20),
+        ],
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert segment_ids(result.target_segments) == [
+        "seg_near_checkin",
+        "seg_existing_all",
+    ]
+    assert suggestion_segment_ids(result.segment_suggestions) == [
+        "seg_near_checkin",
+        "seg_existing_all",
+    ]
+    assert all(
+        suggestion.score_json["estimated_size"] > 0
+        for suggestion in analysis_repository.saved.segment_suggestions or []
+    )
+
+
 def test_service_reflects_operator_instruction_in_content_brief() -> None:
     promotion = promotion_record(channel="onsite_banner")
     service, _, _ = build_service(promotion=promotion, segments=default_segments())
