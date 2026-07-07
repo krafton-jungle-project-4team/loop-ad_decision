@@ -24,3 +24,10 @@ B6 next-loop currently defines the decision-side orchestration and the
 analysis/generation call boundary. The real analysis and generation adapters are
 left for a follow-up integration PR after the analysis and generation flows are
 ready to honor failed segment focus inputs end to end.
+
+## Logging Work Rule
+
+Before adding or changing application logs, read
+[docs/reference_logging.md](docs/reference_logging.md). Decision logs must stay
+JSON structured, use context propagation, keep stable snake_case `event` names,
+and follow the shared Loop-Ad logging standard from the Dashboard API reference.

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Protocol, Sequence
 
 from app.analysis.repositories import SegmentVectorRecord, UserBehaviorVectorRecord
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 VECTOR_DIM = 64
@@ -77,10 +78,21 @@ class SegmentVectorService:
         self._segment_vector_repository = segment_vector_repository
         self._user_behavior_vector_repository = user_behavior_vector_repository
 
+    @log_context_scope
     def prepare_segment_vector(
         self,
         request: SegmentVectorBuildRequest,
     ) -> SegmentVectorBuildResult:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "promotionId": request.promotion_id,
+                "analysisId": request.analysis_id,
+                "segmentId": request.segment_id,
+            }
+        )
+        log.info("started", {"request": request})
         existing = self._segment_vector_repository.get_by_segment_snapshot(
             project_id=request.project_id,
             promotion_id=request.promotion_id,
@@ -90,12 +102,16 @@ class SegmentVectorService:
         )
         if existing is not None:
             _validate_vector(existing.vector_values, existing.vector_dim)
-            return SegmentVectorBuildResult(
+            response = SegmentVectorBuildResult(
                 segment_id=existing.segment_id,
                 segment_vector_id=existing.segment_vector_id,
                 vector_values=[float(value) for value in existing.vector_values],
                 source=existing.source,
             )
+            log.assign_context({"segmentVectorId": response.segment_vector_id})
+            log.info("segment_vector_reused", {"source": response.source})
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+            return response
 
         reusable = self._segment_vector_repository.get_latest_by_segment(
             project_id=request.project_id,
@@ -107,6 +123,7 @@ class SegmentVectorService:
             _validate_vector(reusable.vector_values, reusable.vector_dim)
             source = reusable.source
             normalized_values = [float(value) for value in reusable.vector_values]
+            log.info("segment_vector_source_reused", {"segmentVectorId": reusable.segment_vector_id, "source": source})
         else:
             candidate_user_ids = _dedupe(request.candidate_user_ids)
             user_vectors = (
@@ -122,15 +139,18 @@ class SegmentVectorService:
             source = "decision_analysis"
             if user_vectors:
                 vector_values = _mean_user_vectors(user_vectors)
+                log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
             else:
                 source = "fixture"
                 vector_values = _fixture_vector(request.segment_id)
+                log.warn("user_vectors_empty", {"source": source})
 
             try:
                 normalized_values = _l2_normalize(vector_values)
             except ValueError:
                 source = "fixture"
                 normalized_values = _l2_normalize(_fixture_vector(request.segment_id))
+                log.warn("segment_vector_invalid", {"source": source})
 
         segment_vector_id = _segment_vector_id(
             analysis_id=request.analysis_id,
@@ -150,12 +170,16 @@ class SegmentVectorService:
             source=source,
         )
         self._segment_vector_repository.save(record)
-        return SegmentVectorBuildResult(
+        response = SegmentVectorBuildResult(
             segment_id=request.segment_id,
             segment_vector_id=segment_vector_id,
             vector_values=normalized_values,
             source=source,
         )
+        log.assign_context({"segmentVectorId": response.segment_vector_id})
+        log.info("segment_vector_created", {"source": source})
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
 
 def _mean_user_vectors(

@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping, Protocol
 
 from app.internal.schemas import UserBehaviorVectorBuildRequest
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 RAW_EVENTS_SOURCE = "raw_events"
@@ -43,10 +44,14 @@ class UserBehaviorVectorBatchService:
         self._repository = repository
         self._now = now
 
+    @log_context_scope
     def build(
         self,
         request: UserBehaviorVectorBuildRequest,
     ) -> UserBehaviorVectorBuildResult:
+        started_at = now_ms()
+        log.assign_context({"projectId": request.project_id})
+        log.info("started", {"request": request})
         window_end = self._resolve_now()
         window_start = window_end - timedelta(days=request.window_days)
         processed_user_count = self._repository.count_raw_event_users(
@@ -63,8 +68,11 @@ class UserBehaviorVectorBatchService:
                 window_start=window_start,
                 window_end=window_end,
             )
+            log.info("user_behavior_vectors_created", {"processedUserCount": processed_user_count, "vectorVersion": request.vector_version})
+        else:
+            log.info("raw_event_users_empty", {"processedUserCount": 0})
 
-        return UserBehaviorVectorBuildResult(
+        response = UserBehaviorVectorBuildResult(
             project_id=request.project_id,
             vector_version=request.vector_version,
             source=RAW_EVENTS_SOURCE,
@@ -74,6 +82,8 @@ class UserBehaviorVectorBatchService:
             window_end=window_end,
             status="completed",
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _resolve_now(self) -> datetime:
         value = self._now or datetime.now(UTC)

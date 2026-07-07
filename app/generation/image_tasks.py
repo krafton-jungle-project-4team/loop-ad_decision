@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 import threading
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -16,9 +15,7 @@ from app.generation.adapters import (
     S3AssetStorage,
 )
 from app.generation.repositories import ContentCandidateRepository
-
-
-logger = logging.getLogger(__name__)
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 @dataclass(frozen=True)
@@ -65,9 +62,12 @@ def dispatch_image_generation_jobs(
     try:
         thread.start()
     except Exception:
-        logger.exception("failed to dispatch deferred image generation")
+        log.error("image_generation_dispatch_failed", {"jobCount": len(job_list)})
+    else:
+        log.info("image_generation_dispatched", {"jobCount": len(job_list)})
 
 
+@log_context_scope
 def run_image_generation_jobs(
     *,
     settings: Settings,
@@ -79,10 +79,13 @@ def run_image_generation_jobs(
     if not jobs:
         return
 
+    started_at = now_ms()
+    log.assign_context({"jobType": "deferred_image_generation"})
+    log.info("started", {"jobCount": len(jobs)})
     try:
         connection = connection_factory(settings)
-    except Exception:
-        logger.exception("failed to connect for deferred image generation")
+    except Exception as exc:
+        log.error("image_generation_connection_failed", {"err": exc})
         return
 
     try:
@@ -104,6 +107,7 @@ def run_image_generation_jobs(
                 asset_storage=asset_storage,
                 connection=connection,
             )
+        log.info("completed", {"jobCount": len(jobs), "durationMs": duration_ms(started_at)})
     finally:
         connection.close()
 
@@ -116,23 +120,27 @@ def _run_single_image_generation_job(
     asset_storage: AssetStorageClient,
     connection: Any,
 ) -> None:
+    job_started_at = now_ms()
+    log.assign_context({"contentId": job.content_id})
     try:
         image = image_client.generate_image(image_prompt=job.image_prompt)
         image_url = asset_storage.store_image(content_id=job.content_id, image=image)
         repository.update_image_url(content_id=job.content_id, image_url=image_url)
         connection.commit()
+        log.info("image_generation_completed", {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)})
     except Exception as exc:
         connection.rollback()
-        logger.exception("deferred image generation failed")
+        log.warn("image_generation_failed", {"err": exc, "durationMs": duration_ms(job_started_at)})
         try:
             repository.mark_image_generation_failed(
                 content_id=job.content_id,
                 error_code=_safe_image_generation_error_code(exc),
             )
             connection.commit()
-        except Exception:
+            log.info("image_generation_failure_recorded")
+        except Exception as record_exc:
             connection.rollback()
-            logger.exception("failed to record deferred image generation failure")
+            log.error("image_generation_failure_record_failed", {"err": record_exc})
 
 
 def _safe_image_generation_error_code(exc: Exception) -> str:

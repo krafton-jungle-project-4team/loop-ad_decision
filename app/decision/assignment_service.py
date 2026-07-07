@@ -38,6 +38,7 @@ from app.decision.schemas import (
     SegmentAssignmentBuildRequest,
     SegmentAssignmentBuildResponse,
 )
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 INSUFFICIENT_REASON_STATUS = AdExperimentStatus.INSUFFICIENT_DATA.value
@@ -105,26 +106,43 @@ class SegmentAssignmentService:
         self._user_segment_assignment_repository = user_segment_assignment_repository
         self._reranker = reranker
 
+    @log_context_scope
     def build_assignments(
         self,
         *,
         promotion_run_id: str,
         request: SegmentAssignmentBuildRequest,
     ) -> SegmentAssignmentBuildResponse:
+        started_at = now_ms()
+        log.assign_context({"promotionRunId": promotion_run_id})
+        log.info("started", {"promotionRunId": promotion_run_id, "request": request})
         run = self._promotion_run_repository.get_by_id(promotion_run_id)
         if run is None:
+            log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
             raise SegmentAssignmentRunNotFoundError(
                 f"promotion run not found: {promotion_run_id}"
             )
+        log.assign_context(
+            {
+                "projectId": run.project_id,
+                "campaignId": run.campaign_id,
+                "promotionId": run.promotion_id,
+                "analysisId": run.analysis_id,
+                "generationId": run.generation_id,
+            }
+        )
+        log.info("promotion_run_loaded", {"promotionRun": run})
 
         min_sample_size = _extract_min_sample_size(run.goal_snapshot_json)
         experiments = _split_experiments(
             self._ad_experiment_repository.list_by_run(promotion_run_id)
         )
         if not experiments.non_fallback:
+            log.warn("ad_experiments_empty", {"promotionRunId": promotion_run_id})
             raise SegmentAssignmentValidationError(
                 "at least one non-fallback ad experiment is required"
             )
+        log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
 
         segment_vectors = self._load_segment_vectors(
             project_id=run.project_id,
@@ -135,10 +153,12 @@ class SegmentAssignmentService:
             ],
             vector_version=request.vector_version,
         )
+        log.info("segment_vectors_loaded", {"segmentVectorCount": len(segment_vectors)})
         eligible_users = self._load_eligible_users(
             project_id=run.project_id,
             request=request,
         )
+        log.info("eligible_users_loaded", {"eligibleUserCount": len(eligible_users)})
         existing_user_ids = (
             self._user_segment_assignment_repository.list_existing_user_ids(
                 promotion_run_id=run.promotion_run_id,
@@ -148,6 +168,8 @@ class SegmentAssignmentService:
         users_to_match = [
             user for user in eligible_users if user.user_id not in existing_user_ids
         ]
+        if existing_user_ids:
+            log.info("existing_assignments_skipped", {"userCount": len(existing_user_ids)})
 
         try:
             build_result = self._build_match_results(
@@ -159,15 +181,26 @@ class SegmentAssignmentService:
                 segment_vectors=segment_vectors,
             )
         except (SegmentMatchValidationError, ValueError) as exc:
+            log.warn("segment_matching_invalid", {"err": exc})
             raise SegmentAssignmentValidationError(str(exc)) from exc
 
         fallback_needed = any(
             result.fallback for result in build_result.matches.values()
         )
         if fallback_needed and experiments.fallback is None:
+            log.warn("fallback_ad_experiment_missing", {"fallbackCount": build_result.fallback_count})
             raise SegmentAssignmentValidationError(
                 "fallback ad experiment is required when fallback assignments exist"
             )
+        log.info(
+            "segment_matches_created",
+            {
+                "matchCount": len(build_result.matches),
+                "fallbackCount": build_result.fallback_count,
+                "annCandidateCount": build_result.ann_candidate_count,
+                "exactRerankedPairCount": build_result.exact_reranked_pair_count,
+            },
+        )
 
         assignments = _build_assignment_writes(
             project_id=run.project_id,
@@ -180,6 +213,7 @@ class SegmentAssignmentService:
         inserted_count = self._user_segment_assignment_repository.insert_many(
             assignments
         )
+        log.info("segment_assignments_created", {"assignmentCount": inserted_count})
 
         segment_counts = (
             self._user_segment_assignment_repository.count_by_run_segments(
@@ -195,8 +229,10 @@ class SegmentAssignmentService:
             segment_counts=segment_counts,
             min_sample_size=min_sample_size,
         )
+        if insufficient_count:
+            log.info("segments_marked_insufficient", {"insufficientSegmentCount": insufficient_count})
 
-        return SegmentAssignmentBuildResponse(
+        response = SegmentAssignmentBuildResponse(
             promotion_run_id=run.promotion_run_id,
             matching_mode=MATCHING_MODE,
             vector_version=request.vector_version,
@@ -218,6 +254,8 @@ class SegmentAssignmentService:
             insufficient_segment_count=insufficient_count,
             status="completed",
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _build_match_results(
         self,
@@ -230,6 +268,7 @@ class SegmentAssignmentService:
         segment_vectors: Sequence[SegmentVector],
     ) -> _BuildMatchResult:
         if not segment_vectors:
+            log.warn("segment_vectors_empty", {"analysisId": analysis_id})
             raise SegmentMatchValidationError(
                 "at least one non-fallback segment vector is required"
             )
@@ -314,6 +353,7 @@ class SegmentAssignmentService:
         for segment_id in segment_ids:
             segment_records = records_by_segment.get(segment_id, [])
             if len(segment_records) != 1:
+                log.warn("segment_vector_invalid", {"segmentId": segment_id, "segmentVectorCount": len(segment_records)})
                 raise SegmentAssignmentValidationError(
                     "each non-fallback segment must have exactly one segment vector: "
                     f"{segment_id}"
@@ -340,6 +380,7 @@ class SegmentAssignmentService:
             )
         else:
             if request.eligible_user_limit is None:
+                log.warn("eligible_user_limit_missing", {"projectId": project_id})
                 raise SegmentAssignmentValidationError(
                     "eligible_user_limit is required when user_ids is omitted"
                 )
@@ -386,6 +427,7 @@ class SegmentAssignmentService:
 
 def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _ExperimentSet:
     if not experiments:
+        log.warn("ad_experiments_empty")
         raise SegmentAssignmentValidationError("ad experiments are required")
 
     fallback: AdExperimentRecord | None = None

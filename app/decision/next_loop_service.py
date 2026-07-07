@@ -35,6 +35,7 @@ from app.generation.service import (
     GenerationService,
     NextLoopFocusGenerationRequest,
 )
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 COMPLETED_STATUS = "completed"
 
@@ -268,13 +269,27 @@ class NextLoopService:
         self._generation_gateway = generation_gateway
         self._run_creator = run_creator
 
+    @log_context_scope
     def create_next_loop(
         self,
         *,
         promotion_run_id: str,
         request: NextLoopRequest,
     ) -> NextLoopResponse:
+        started_at = now_ms()
+        log.assign_context({"promotionRunId": promotion_run_id})
+        log.info("started", {"promotionRunId": promotion_run_id, "request": request})
         previous_run = self._get_previous_run(promotion_run_id)
+        log.assign_context(
+            {
+                "projectId": previous_run.project_id,
+                "campaignId": previous_run.campaign_id,
+                "promotionId": previous_run.promotion_id,
+                "analysisId": previous_run.analysis_id,
+                "generationId": previous_run.generation_id,
+            }
+        )
+        log.info("promotion_run_loaded", {"promotionRun": previous_run})
         failed_segment_ids = _deduplicate_or_raise(
             request.failed_segment_ids,
             "failed_segment_ids",
@@ -284,20 +299,26 @@ class NextLoopService:
             "failed_ad_experiment_ids",
         )
         if not failed_segment_ids and not failed_ad_experiment_ids:
-            return _no_op_response(previous_run)
+            response = _no_op_response(previous_run)
+            log.info("next_loop_skipped", {"reason": "no_failed_targets"})
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+            return response
 
         promotion = self._promotion_repository.get_by_id(previous_run.promotion_id)
         if promotion is None:
+            log.warn("promotion_not_found", {"promotionId": previous_run.promotion_id})
             raise NextLoopValidationError(
                 "promotion for previous promotion_run was not found"
             )
         next_loop_count = previous_run.loop_count + 1
         if next_loop_count > promotion.max_loop_count:
+            log.warn("promotion_loop_limit_exceeded", {"loopCount": next_loop_count, "maxLoopCount": promotion.max_loop_count})
             raise NextLoopValidationError("promotion max_loop_count exceeded")
         if self._promotion_run_repository.exists_for_promotion_loop(
             promotion_id=previous_run.promotion_id,
             loop_count=next_loop_count,
         ):
+            log.warn("promotion_run_conflict", {"promotionId": previous_run.promotion_id, "loopCount": next_loop_count})
             raise NextLoopConflictError(
                 "promotion_run already exists for next loop_count"
             )
@@ -306,9 +327,11 @@ class NextLoopService:
             previous_run.promotion_run_id,
         )
         if not experiments:
+            log.warn("ad_experiments_empty", {"promotionRunId": previous_run.promotion_run_id})
             raise NextLoopValidationError(
                 "previous promotion_run must have ad experiments"
             )
+        log.info("ad_experiments_loaded", {"adExperimentCount": len(experiments)})
         _validate_failed_ids(
             failed_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
@@ -330,6 +353,8 @@ class NextLoopService:
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             operator_instruction=request.operator_instruction,
         )
+        log.assign_context({"analysisId": analysis_result.analysis_id})
+        log.info("next_loop_analysis_created", {"analysis": analysis_result})
         _validate_gateway_segments(
             label="analysis",
             expected_segment_ids=failed_segment_ids,
@@ -346,6 +371,8 @@ class NextLoopService:
             source_generation_id=previous_run.generation_id,
             operator_instruction=request.operator_instruction,
         )
+        log.assign_context({"generationId": generation_result.generation_id})
+        log.info("next_loop_generation_created", {"generation": generation_result})
         _validate_generation_completed(generation_result)
         _validate_gateway_segments(
             label="generation",
@@ -363,8 +390,10 @@ class NextLoopService:
                 ),
             )
         except (RunPromotionNotFoundError, RunValidationError) as exc:
+            log.warn("next_loop_run_invalid", {"err": exc})
             raise NextLoopValidationError(str(exc)) from exc
         except RunConflictError as exc:
+            log.warn("next_loop_run_conflict", {"err": exc})
             raise NextLoopConflictError(str(exc)) from exc
 
         _validate_gateway_segments(
@@ -377,7 +406,7 @@ class NextLoopService:
             ],
         )
 
-        return NextLoopResponse(
+        response = NextLoopResponse(
             previous_promotion_run_id=previous_run.promotion_run_id,
             next_promotion_run_id=run_result.promotion_run_id,
             promotion_id=run_result.promotion_id,
@@ -386,10 +415,14 @@ class NextLoopService:
             next_generation_id=run_result.generation_id,
             next_ad_experiments=run_result.ad_experiments,
         )
+        log.assign_context({"nextPromotionRunId": response.next_promotion_run_id})
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:
         run = self._promotion_run_repository.get_by_id(promotion_run_id)
         if run is None:
+            log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
             raise NextLoopNotFoundError(f"promotion_run not found: {promotion_run_id}")
         return run
 
@@ -409,8 +442,10 @@ def _no_op_response(run: PromotionRunRecord) -> NextLoopResponse:
 def _deduplicate_or_raise(values: Sequence[str], field_name: str) -> list[str]:
     cleaned = [str(value).strip() for value in values]
     if any(not value for value in cleaned):
+        log.warn("next_loop_request_invalid", {"fieldName": field_name})
         raise NextLoopValidationError(f"{field_name} must not contain empty values")
     if len(set(cleaned)) != len(cleaned):
+        log.warn("next_loop_request_conflict", {"fieldName": field_name})
         raise NextLoopValidationError(f"{field_name} must not contain duplicates")
     return cleaned
 
@@ -423,6 +458,7 @@ def _validate_failed_ids(
     evaluations: Sequence[PromotionEvaluationRecord],
 ) -> list[AdExperimentRecord]:
     if not failed_segment_ids or not failed_ad_experiment_ids:
+        log.warn("failed_target_mismatch", {"failedSegmentCount": len(failed_segment_ids), "failedAdExperimentCount": len(failed_ad_experiment_ids)})
         raise NextLoopValidationError(
             "failed_segment_ids and failed_ad_experiment_ids must be provided together"
         )
@@ -437,6 +473,7 @@ def _validate_failed_ids(
         if ad_experiment_id not in experiments_by_id
     ]
     if missing_ad_experiment_ids:
+        log.warn("failed_ad_experiments_invalid", {"missingAdExperimentIds": missing_ad_experiment_ids})
         raise NextLoopValidationError(
             "failed_ad_experiment_ids must belong to the previous promotion_run"
         )
@@ -446,6 +483,7 @@ def _validate_failed_ids(
         if segment_id not in experiments_by_segment
     ]
     if missing_segment_ids:
+        log.warn("failed_segments_invalid", {"missingSegmentIds": missing_segment_ids})
         raise NextLoopValidationError(
             "failed_segment_ids must belong to the previous promotion_run"
         )
@@ -456,6 +494,7 @@ def _validate_failed_ids(
     ]
     selected_segment_ids = [experiment.segment_id for experiment in selected_experiments]
     if set(selected_segment_ids) != set(failed_segment_ids):
+        log.warn("failed_target_mismatch", {"failedSegmentIds": failed_segment_ids, "selectedSegmentIds": selected_segment_ids})
         raise NextLoopValidationError(
             "failed_segment_ids must match failed_ad_experiment_ids"
         )
@@ -468,10 +507,12 @@ def _validate_failed_ids(
     for experiment in selected_experiments:
         evaluation = latest_by_experiment_id.get(experiment.ad_experiment_id)
         if evaluation is None:
+            log.warn("ad_experiment_evaluation_not_found", {"adExperimentId": experiment.ad_experiment_id})
             raise NextLoopValidationError(
                 "latest goal_not_met evaluation is required for each failed ad_experiment"
             )
         if evaluation.status != PromotionEvaluationStatus.GOAL_NOT_MET.value:
+            log.warn("ad_experiment_evaluation_invalid", {"adExperimentId": experiment.ad_experiment_id, "status": evaluation.status})
             raise NextLoopValidationError(
                 "only goal_not_met ad_experiments can enter next-loop"
             )
@@ -487,8 +528,17 @@ def _validate_gateway_segments(
     expected = set(expected_segment_ids)
     actual = set(actual_segment_ids)
     if len(actual_segment_ids) != len(actual):
+        log.warn("gateway_segments_conflict", {"label": label, "actualSegmentIds": actual_segment_ids})
         raise NextLoopValidationError(f"{label} returned duplicate segment ids")
     if actual != expected:
+        log.warn(
+            "gateway_segments_mismatch",
+            {
+                "label": label,
+                "expectedSegmentIds": expected_segment_ids,
+                "actualSegmentIds": actual_segment_ids,
+            },
+        )
         raise NextLoopValidationError(
             f"{label} result must contain only failed segment ids"
         )
@@ -496,6 +546,7 @@ def _validate_gateway_segments(
 
 def _validate_generation_completed(result: NextLoopGenerationResult) -> None:
     if result.status != COMPLETED_STATUS:
+        log.warn("next_loop_generation_invalid", {"status": result.status})
         raise NextLoopValidationError(
             "next-loop generation result must be completed before run creation"
         )
