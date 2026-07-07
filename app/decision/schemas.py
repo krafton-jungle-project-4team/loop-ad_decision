@@ -2,7 +2,7 @@ from enum import StrEnum
 from decimal import Decimal
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Channel(StrEnum):
@@ -102,12 +102,6 @@ class SegmentAssignmentBuildRequest(BaseModel):
     eligible_user_limit: int | None = Field(default=None, ge=1)
     vector_version: str = Field(default="v1", min_length=1)
     expires_in_days: int | None = Field(default=None, ge=1)
-
-    @model_validator(mode="after")
-    def require_scope(self) -> "SegmentAssignmentBuildRequest":
-        if not self.user_ids and self.eligible_user_limit is None:
-            raise ValueError("eligible_user_limit is required when user_ids is omitted")
-        return self
 
 
 class SegmentAssignmentBuildResponse(BaseModel):
