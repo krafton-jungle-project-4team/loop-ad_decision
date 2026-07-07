@@ -9,6 +9,7 @@ from app.generation.generator import (
     ContentGenerator,
     DeterministicContentGenerator,
 )
+from app.generation.image_tasks import ImageGenerationJob
 from app.generation.repositories import (
     ContentCandidateRecord,
     GenerationRunRecord,
@@ -45,6 +46,11 @@ class GenerationRunWriter(Protocol):
 
 class ContentCandidateWriter(Protocol):
     def create(self, record: ContentCandidateRecord) -> dict[str, Any]:
+        ...
+
+
+class ImageGenerationScheduler(Protocol):
+    def enqueue(self, job: ImageGenerationJob) -> None:
         ...
 
 
@@ -109,6 +115,7 @@ class GenerationService:
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
+        image_generation_scheduler: ImageGenerationScheduler | None = None,
         generation_report_builder: GenerationReportBuilder | None = None,
     ) -> None:
         self._generation_run_repository = generation_run_repository
@@ -122,6 +129,7 @@ class GenerationService:
         self._content_generator_version = _content_generator_version(
             self._content_generator
         )
+        self._image_generation_scheduler = image_generation_scheduler
         self._generation_report_builder = (
             generation_report_builder or GenerationReportBuilder()
         )
@@ -162,6 +170,7 @@ class GenerationService:
         )
         self._save_generation_run(generation_run)
         self._save_content_candidates(content_candidates)
+        self._schedule_image_generation(content_candidates)
 
         return GenerationResponse(
             generation_id=generation_id,
@@ -233,6 +242,7 @@ class GenerationService:
         )
         self._save_generation_run(generation_run)
         self._save_content_candidates(content_candidates)
+        self._schedule_image_generation(content_candidates)
 
         return NextLoopFocusGenerationResult(
             generation_id=generation_id,
@@ -479,6 +489,29 @@ class GenerationService:
             return
         for content_candidate in content_candidates:
             self._content_candidate_repository.create(content_candidate)
+
+    def _schedule_image_generation(
+        self,
+        content_candidates: Sequence[ContentCandidateRecord],
+    ) -> None:
+        if (
+            self._content_candidate_repository is None
+            or self._image_generation_scheduler is None
+        ):
+            return
+
+        for content_candidate in content_candidates:
+            if (
+                content_candidate.channel == ContentChannel.ONSITE_BANNER
+                and content_candidate.image_prompt
+                and not content_candidate.image_url
+            ):
+                self._image_generation_scheduler.enqueue(
+                    ImageGenerationJob(
+                        content_id=content_candidate.content_id,
+                        image_prompt=content_candidate.image_prompt,
+                    )
+                )
 
     def _next_generation_id(self, promotion_id: str) -> str:
         base_generation_id = _generation_id_from_promotion(promotion_id)
