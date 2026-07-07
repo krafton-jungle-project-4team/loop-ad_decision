@@ -590,6 +590,17 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
+    ai_report = result.segment_suggestions[0].metadata_json["ai_report"]
+    assert ai_report["version"] == "dec-c8.segment-report.v1"
+    assert ai_report["title"] == "예약 가능성이 높은 프로모션 반응 고객"
+    assert ai_report["summary"]
+    assert ai_report["why_recommended"]
+    assert ai_report["evidence"]
+    assert ai_report["action_hint"]
+    assert all(
+        forbidden not in str(ai_report)
+        for forbidden in ("벡터", "군집", "클러스터", "centroid", "유사도")
+    )
     assert vector_service.calls[0] == SegmentVectorBuildRequest(
         project_id="hotel-client-a",
         promotion_id=promotion.promotion_id,
