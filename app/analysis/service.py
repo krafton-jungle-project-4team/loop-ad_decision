@@ -615,7 +615,10 @@ class PromotionAnalysisService:
         for segment_id in ordered_ids:
             if segment_id in seen or segment_id not in candidates:
                 continue
-            selected.append(candidates[segment_id])
+            candidate = candidates[segment_id]
+            if not _has_recommendable_audience(candidate):
+                continue
+            selected.append(candidate)
             seen.add(segment_id)
             if len(selected) == self._max_default_target_segments:
                 break
@@ -909,6 +912,10 @@ def _ai_candidate_sort_key(
         -candidate.estimated_size,
         candidate.segment_id,
     )
+
+
+def _has_recommendable_audience(candidate: SegmentCandidate) -> bool:
+    return candidate.estimated_size > 0
 
 
 def _promotion_snapshot(promotion: PromotionRecord) -> dict[str, Any]:
