@@ -219,10 +219,12 @@ class ExternalContentGenerator:
         content_client: ContentTextClient,
         image_client: ImageClient,
         asset_storage: AssetStorage,
+        generate_images: bool = True,
     ) -> None:
         self._content_client = content_client
         self._image_client = image_client
         self._asset_storage = asset_storage
+        self._generate_images = generate_images
 
     def generate(
         self,
@@ -245,7 +247,7 @@ class ExternalContentGenerator:
             landing_url=prompt_input.promotion.landing_url,
         )
 
-        if channel != ContentChannel.ONSITE_BANNER:
+        if channel != ContentChannel.ONSITE_BANNER or not self._generate_images:
             return content
 
         image_prompt = content.image_prompt
@@ -260,7 +262,11 @@ class ExternalContentGenerator:
         return replace(content, image_url=image_url)
 
 
-def build_external_content_generator(settings: Settings) -> ExternalContentGenerator:
+def build_external_content_generator(
+    settings: Settings,
+    *,
+    generate_images: bool = True,
+) -> ExternalContentGenerator:
     return ExternalContentGenerator(
         content_client=OpenAIResponsesContentClient(
             api_key=settings.openai_api_key,
@@ -274,6 +280,7 @@ def build_external_content_generator(settings: Settings) -> ExternalContentGener
             bucket_name=settings.data_storage_bucket,
             base_prefix=settings.genai_assets_base_prefix,
         ),
+        generate_images=generate_images,
     )
 
 

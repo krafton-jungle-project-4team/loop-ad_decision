@@ -188,6 +188,46 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
 
 
+def test_content_candidate_repository_updates_image_url() -> None:
+    cursor = FakeCursor(fetchone_result={"content_id": "content_banner_001"})
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.update_image_url(
+        content_id="content_banner_001",
+        image_url="https://gen-ai.asset.dev.loop-ad.org/generated/content_banner_001.png",
+    )
+
+    assert result == {"content_id": "content_banner_001"}
+    query, params = cursor.executed[0]
+    assert "UPDATE content_candidates" in query
+    assert "image_generation_status" in query
+    assert params == {
+        "content_id": "content_banner_001",
+        "image_url": (
+            "https://gen-ai.asset.dev.loop-ad.org/generated/content_banner_001.png"
+        ),
+    }
+
+
+def test_content_candidate_repository_marks_image_generation_failed() -> None:
+    cursor = FakeCursor(fetchone_result={"content_id": "content_banner_001"})
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.mark_image_generation_failed(
+        content_id="content_banner_001",
+        error_code="image_generation_failed",
+    )
+
+    assert result == {"content_id": "content_banner_001"}
+    query, params = cursor.executed[0]
+    assert "UPDATE content_candidates" in query
+    assert "image_generation_status" in query
+    assert params == {
+        "content_id": "content_banner_001",
+        "error_code": "image_generation_failed",
+    }
+
+
 def test_content_candidate_repository_lists_by_generation() -> None:
     rows = [{"content_id": "content_banner_001"}]
     cursor = FakeCursor(fetchall_result=rows)

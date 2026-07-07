@@ -1,6 +1,7 @@
 import pytest
 
 from app.generation.generator import GeneratedContent
+from app.generation.image_tasks import ImageGenerationJob
 from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
@@ -51,6 +52,14 @@ class FakeContentCandidateRepository:
     def create(self, record: ContentCandidateRecord) -> dict[str, object]:
         self.saved.append(record)
         return {"content_id": record.content_id}
+
+
+class FakeImageGenerationScheduler:
+    def __init__(self) -> None:
+        self.jobs: list[ImageGenerationJob] = []
+
+    def enqueue(self, job: ImageGenerationJob) -> None:
+        self.jobs.append(job)
 
 
 def generation_request(
@@ -186,6 +195,32 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     assert response.content_candidates[0].content_option_id == (
         "banner_repeat_hotel_option_001"
     )
+
+
+def test_generation_service_enqueues_deferred_banner_image_generation() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    image_generation_scheduler = FakeImageGenerationScheduler()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        image_generation_scheduler=image_generation_scheduler,
+    )
+
+    response = service.generate(generation_request(content_option_count=2))
+
+    assert [candidate.image_url for candidate in response.content_candidates] == [
+        None,
+        None,
+    ]
+    assert image_generation_scheduler.jobs == [
+        ImageGenerationJob(
+            content_id="content_banner_repeat_hotel_001",
+            image_prompt=response.content_candidates[0].image_prompt or "",
+        ),
+        ImageGenerationJob(
+            content_id="content_banner_repeat_hotel_002",
+            image_prompt=response.content_candidates[1].image_prompt or "",
+        ),
+    ]
 
 
 def test_generation_service_uses_new_generation_id_for_regeneration() -> None:

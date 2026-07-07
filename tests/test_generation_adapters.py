@@ -73,6 +73,36 @@ def test_external_content_generator_stores_banner_image_url() -> None:
     ]
 
 
+def test_external_content_generator_can_defer_banner_image_generation() -> None:
+    image_client = FakeImageClient()
+    asset_storage = FakeAssetStorage()
+    generator = ExternalContentGenerator(
+        content_client=FakeContentClient(
+            {
+                "title": "이번 주말 호텔 특가",
+                "body": "환불 가능한 객실을 객실 마감 전에 비교해보세요.",
+                "cta": "호텔 특가 보기",
+                "image_prompt": "bright hotel suite banner, no visible text",
+            }
+        ),
+        image_client=image_client,
+        asset_storage=asset_storage,
+        generate_images=False,
+    )
+
+    content = generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+    )
+
+    assert content.title == "이번 주말 호텔 특가"
+    assert content.image_prompt == "bright hotel suite banner, no visible text"
+    assert content.image_url is None
+    assert image_client.prompts == []
+    assert asset_storage.saved == []
+
+
 def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
     image_client = FakeImageClient()
     asset_storage = FakeAssetStorage()
