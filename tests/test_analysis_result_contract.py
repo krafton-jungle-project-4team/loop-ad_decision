@@ -466,6 +466,12 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
     assert [segment.segment_id for segment in saved_suggestions] == expected_segment_ids
     assert [segment.segment_id for segment in saved_segments] == expected_segment_ids
     assert len(saved_suggestions) == saved_analysis.output_json["target_segment_count"]
+    expected_signal_chips = {
+        "seg_family_trip": ["가족 여행 관심"],
+        "seg_mobile_user": ["모바일 이용"],
+        "seg_repeat_hotel_no_booking": ["반복 조회"],
+        "seg_near_checkin": ["임박 예약 관심"],
+    }
     assert saved_analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
         "target_segment_count": 4,
@@ -544,6 +550,22 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         assert suggestion.metadata_json["segment_vector_id"] == (
             f"segvec_{suggestion.segment_id}_v1"
         )
+        assert suggestion.reason_json["primary_signals"]
+        display_copy = suggestion.metadata_json["display_copy"]
+        assert set(display_copy) == {
+            "title",
+            "audience_summary",
+            "signal_chips",
+            "reason",
+            "action_hint",
+        }
+        assert display_copy["signal_chips"] == expected_signal_chips[
+            suggestion.segment_id
+        ]
+        assert display_copy["audience_summary"].startswith("분석 대상 74200명 중 ")
+        assert display_copy["reason"] == (
+            "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다."
+        )
 
     family_segment = saved_segments[0]
     repeat_hotel_segment = saved_segments[2]
@@ -586,5 +608,16 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
                 "status": segment.status,
             }
             for segment in saved_segments
+        ]
+    )
+    assert_no_forbidden_public_terms(
+        [
+            {
+                "suggestion_source": suggestion.suggestion_source,
+                "score_json": suggestion.score_json,
+                "reason_json": suggestion.reason_json,
+                "metadata_json": suggestion.metadata_json,
+            }
+            for suggestion in saved_suggestions
         ]
     )
