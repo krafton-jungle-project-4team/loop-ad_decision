@@ -997,6 +997,30 @@ def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> N
     }
 
 
+def test_user_behavior_vector_repository_filters_user_ids_by_source() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    repo.list_by_user_ids(
+        project_id="hotel-client-a",
+        user_ids=["user_001"],
+        vector_version="v1",
+        source="booking_profile",
+    )
+
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "source = {source:string}" in sql
+    assert "user_id in {user_ids:array(string)}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v1",
+        "vector_dim": 64,
+        "user_ids": ["user_001"],
+        "source": "booking_profile",
+    }
+
+
 def test_user_behavior_vector_repository_limits_project_scope() -> None:
     client = FakeClickHouseClient(rows=[])
     repo = UserBehaviorVectorRepository(client)
@@ -1019,6 +1043,30 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
         "vector_version": "v1",
         "vector_dim": 64,
         "limit": 500,
+    }
+
+
+def test_user_behavior_vector_repository_filters_project_scope_by_source() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    repo.list_for_project(
+        project_id="hotel-client-a",
+        vector_version="v1",
+        limit=500,
+        source="booking_profile",
+    )
+
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "source = {source:string}" in sql
+    assert "limit {limit:uint32}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v1",
+        "vector_dim": 64,
+        "limit": 500,
+        "source": "booking_profile",
     }
 
 

@@ -5,6 +5,7 @@ from decimal import Decimal
 import pytest
 
 from app.decision.assignment_service import (
+    DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
@@ -74,9 +75,15 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     ]
     regular, fallback = repos.assignments.inserted
     assert regular.segment_id == "seg_family_trip"
+    assert regular.ad_experiment_id == "adexp_seg_family_trip"
+    assert regular.content_id == "content_seg_family_trip"
+    assert regular.content_option_id == "option_seg_family_trip"
     assert regular.assignment_source == AssignmentSource.DECISION_BATCH.value
     assert regular.fallback is False
     assert fallback.segment_id == "seg_existing_all"
+    assert fallback.ad_experiment_id == "adexp_seg_existing_all"
+    assert fallback.content_id == "content_seg_existing_all"
+    assert fallback.content_option_id == "option_seg_existing_all"
     assert fallback.assignment_source == AssignmentSource.FALLBACK.value
     assert fallback.fallback is True
     assert fallback.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
@@ -341,8 +348,153 @@ def test_assignment_service_uses_project_limit_when_user_ids_omitted() -> None:
         request=SegmentAssignmentBuildRequest(eligible_user_limit=50),
     )
 
-    assert repos.user_vectors.project_calls == [("hotel-client-a", "v1", 50)]
+    assert repos.user_vectors.project_calls == [("hotel-client-a", "v1", 50, None)]
     assert repos.user_vectors.user_id_calls == []
+
+
+def test_assignment_service_uses_default_limit_for_implicit_project_scope() -> None:
+    service, repos = make_service(user_vectors=[])
+
+    service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert repos.user_vectors.project_calls == [
+        (
+            "hotel-client-a",
+            "v1",
+            DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT,
+            None,
+        )
+    ]
+
+
+def test_assignment_service_uses_audience_scope_vector_version_when_request_omits_it() -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {
+                "vector_version": "v2",
+                "selection_policy": {"limit": 10},
+            },
+        }
+    )
+    service, repos = make_service(run=run)
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert response.vector_version == "v2"
+    assert repos.user_vectors.project_calls == [("hotel-client-a", "v2", 10, None)]
+    assert repos.segment_vectors.ann_calls[0]["vector_version"] == "v2"
+
+
+def test_assignment_service_rejects_conflicting_scope_and_request_vector_versions() -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {"vector_version": "v2"},
+        }
+    )
+    service, repos = make_service(run=run)
+
+    with pytest.raises(SegmentAssignmentValidationError, match="vector_version"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(vector_version="v1"),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_rejects_audience_scope_with_user_ids_for_mvp() -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {"selection_policy": {"limit": 10}},
+        }
+    )
+    service, repos = make_service(run=run)
+
+    with pytest.raises(SegmentAssignmentValidationError, match="user_ids"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_rejects_project_id_filter() -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {"filters": {"project_id": "other-project"}},
+        }
+    )
+    service, repos = make_service(run=run)
+
+    with pytest.raises(SegmentAssignmentValidationError, match="project_id"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+@pytest.mark.parametrize(
+    "audience_scope",
+    [
+        {"base": "promotion_run_eligible_users"},
+        {"selection_policy": {"ordering": "stable_hash"}},
+        {"filters": {"country": "KR"}},
+        {"filters": {"has_valid_vector": False}},
+    ],
+)
+def test_assignment_service_rejects_unsupported_audience_scope_values(
+    audience_scope: dict[str, object],
+) -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": audience_scope,
+        }
+    )
+    service, repos = make_service(run=run)
+
+    with pytest.raises(SegmentAssignmentValidationError):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_applies_scope_source_filter_and_min_limit() -> None:
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {
+                "filters": {"source": "booking_profile"},
+                "selection_policy": {"limit": 20, "ordering": "user_id_asc"},
+            },
+        }
+    )
+    service, repos = make_service(run=run, user_vectors=[])
+
+    service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(eligible_user_limit=5),
+    )
+
+    assert repos.user_vectors.project_calls == [
+        ("hotel-client-a", "v1", 5, "booking_profile")
+    ]
 
 
 def test_assignment_service_requires_min_sample_snapshot() -> None:
@@ -446,8 +598,8 @@ class FakeSegmentVectorRepository:
 class FakeUserBehaviorVectorRepository:
     def __init__(self, vectors: list[UserBehaviorVectorRecord]) -> None:
         self.vectors = vectors
-        self.user_id_calls: list[tuple[str, tuple[str, ...], str]] = []
-        self.project_calls: list[tuple[str, str, int]] = []
+        self.user_id_calls: list[tuple[str, tuple[str, ...], str, str | None]] = []
+        self.project_calls: list[tuple[str, str, int, str | None]] = []
 
     def list_by_user_ids(
         self,
@@ -455,8 +607,9 @@ class FakeUserBehaviorVectorRepository:
         project_id: str,
         user_ids: list[str],
         vector_version: str,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        self.user_id_calls.append((project_id, tuple(user_ids), vector_version))
+        self.user_id_calls.append((project_id, tuple(user_ids), vector_version, source))
         return self.vectors
 
     def list_for_project(
@@ -465,8 +618,9 @@ class FakeUserBehaviorVectorRepository:
         project_id: str,
         vector_version: str,
         limit: int,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        self.project_calls.append((project_id, vector_version, limit))
+        self.project_calls.append((project_id, vector_version, limit, source))
         return self.vectors
 
 

@@ -77,16 +77,19 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
     assert service.calls[0][1].user_ids == ["user_001"]
 
 
-def test_segment_assignment_api_rejects_missing_scope() -> None:
-    client = make_client(FakeAssignmentService())
+def test_segment_assignment_api_allows_empty_json_body_to_reach_service() -> None:
+    service = FakeAssignmentService()
+    client = make_client(service)
 
     response = client.post(
         "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
         json={},
     )
 
-    assert response.status_code == 400
-    assert "eligible_user_limit" in str(response.json()["detail"])
+    assert response.status_code == 200
+    assert service.calls[0][0] == "prun_banner_001_loop_1"
+    assert service.calls[0][1].user_ids is None
+    assert service.calls[0][1].eligible_user_limit is None
 
 
 def test_segment_assignment_api_maps_service_errors() -> None:

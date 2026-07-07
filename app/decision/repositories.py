@@ -472,6 +472,7 @@ class UserBehaviorVectorReader(Protocol):
         project_id: str,
         user_ids: Sequence[str],
         vector_version: str,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
@@ -481,6 +482,7 @@ class UserBehaviorVectorReader(Protocol):
         project_id: str,
         vector_version: str,
         limit: int,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
@@ -1368,11 +1370,26 @@ class UserBehaviorVectorRepository:
         project_id: str,
         user_ids: Sequence[str],
         vector_version: str,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         if not user_ids:
             return []
 
-        result = self._client.query(
+        source_filter = (
+            "                  AND source = {source:String}\n"
+            if source is not None
+            else ""
+        )
+        parameters: dict[str, Any] = {
+            "project_id": project_id,
+            "vector_version": vector_version,
+            "vector_dim": self.VECTOR_DIM,
+            "user_ids": list(user_ids),
+        }
+        if source is not None:
+            parameters["source"] = source
+
+        query = (
             """
             SELECT
                 project_id,
@@ -1394,17 +1411,18 @@ class UserBehaviorVectorRepository:
                 WHERE project_id = {project_id:String}
                   AND vector_version = {vector_version:String}
                   AND vector_dim = {vector_dim:UInt16}
+            """
+            + source_filter
+            + """
                   AND user_id IN {user_ids:Array(String)}
             )
             GROUP BY project_id, user_id, vector_version
             ORDER BY user_id ASC
-            """,
-            parameters={
-                "project_id": project_id,
-                "vector_version": vector_version,
-                "vector_dim": self.VECTOR_DIM,
-                "user_ids": list(user_ids),
-            },
+            """
+        )
+        result = self._client.query(
+            query,
+            parameters=parameters,
         )
         return self._records_from_result(result)
 
@@ -1414,8 +1432,23 @@ class UserBehaviorVectorRepository:
         project_id: str,
         vector_version: str,
         limit: int,
+        source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        result = self._client.query(
+        source_filter = (
+            "                  AND source = {source:String}\n"
+            if source is not None
+            else ""
+        )
+        parameters: dict[str, Any] = {
+            "project_id": project_id,
+            "vector_version": vector_version,
+            "vector_dim": self.VECTOR_DIM,
+            "limit": limit,
+        }
+        if source is not None:
+            parameters["source"] = source
+
+        query = (
             """
             SELECT
                 project_id,
@@ -1437,17 +1470,18 @@ class UserBehaviorVectorRepository:
                 WHERE project_id = {project_id:String}
                   AND vector_version = {vector_version:String}
                   AND vector_dim = {vector_dim:UInt16}
+            """
+            + source_filter
+            + """
             )
             GROUP BY project_id, user_id, vector_version
             ORDER BY user_id ASC
             LIMIT {limit:UInt32}
-            """,
-            parameters={
-                "project_id": project_id,
-                "vector_version": vector_version,
-                "vector_dim": self.VECTOR_DIM,
-                "limit": limit,
-            },
+            """
+        )
+        result = self._client.query(
+            query,
+            parameters=parameters,
         )
         return self._records_from_result(result)
 
