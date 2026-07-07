@@ -162,6 +162,11 @@ def test_prompt_builder_includes_channel_contract_and_operator_instruction(
         result.generation_prompt
     )
     assert "Do not generate or override landing_url" in result.generation_prompt
+    assert "Output language: Korean (ko-KR)." in result.generation_prompt
+    assert "customer-facing copy fields in natural Korean" in (
+        result.generation_prompt
+    )
+    assert "do not copy English source text verbatim" in result.generation_prompt
     assert "Use a calm premium hotel tone." in result.generation_prompt
     assert "booking_conversion_rate" in result.generation_prompt
     assert "Repeat hotel viewers without booking" in result.generation_prompt

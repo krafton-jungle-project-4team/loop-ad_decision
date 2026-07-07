@@ -124,8 +124,8 @@ def test_recommendation_word_is_not_banned_unless_exposed_as_public_api_object()
 def test_public_outputs_use_hotel_booking_language_not_shopping_terms() -> None:
     payload_text = public_payload_text(make_client())
 
-    assert "booking" in payload_text
-    assert "hotel" in payload_text
+    assert "호텔" in payload_text
+    assert "특가" in payload_text
     for label, pattern in FORBIDDEN_SHOPPING_PATTERNS.items():
         assert not pattern.search(payload_text), f"shopping term leaked: {label}"
 

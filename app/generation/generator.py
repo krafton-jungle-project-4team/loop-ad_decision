@@ -7,7 +7,7 @@ from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResu
 from app.generation.schemas import ContentChannel, missing_channel_fields
 
 
-CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v1"
+CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v2"
 
 
 @dataclass(frozen=True)
@@ -98,19 +98,46 @@ def _email_content(
     option_index: int,
     prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
-    subject = f"Hotel rooms picked for {segment_name}"
+    del segment_name, prompt_result
+
     return GeneratedContent(
-        subject=_compact(subject, max_length=88),
+        subject=_compact(
+            _variant(
+                option_index,
+                (
+                    "이번 주말 호텔 특가를 확인해보세요",
+                    "환불 가능한 호텔 객실을 만나보세요",
+                    "여름 숙박 혜택이 준비됐어요",
+                ),
+            ),
+            max_length=88,
+        ),
         preheader=_compact(
-            f"Option {option_index}: refundable stays and clear booking steps.",
+            _variant(
+                option_index,
+                (
+                    "원하는 일정에 맞는 숙소와 예약 혜택을 비교해보세요.",
+                    "지금 예약 가능한 호텔 상품을 한눈에 확인하세요.",
+                    "객실이 마감되기 전에 숙박 혜택을 살펴보세요.",
+                ),
+            ),
             max_length=96,
         ),
         body=_compact(
-            f"{prompt_result.message_strategy} Invite {segment_name} to compare "
-            "available hotel stays before rooms fill.",
+            _variant(
+                option_index,
+                (
+                    "환불 가능한 객실과 여름 숙박 혜택을 지금 확인하고, "
+                    "여행 일정에 맞는 호텔을 놓치지 마세요.",
+                    "최근 관심을 보인 호텔 상품을 다시 살펴보고, "
+                    "예약 가능한 객실을 편하게 비교해보세요.",
+                    "준비된 호텔 혜택을 확인하고 원하는 날짜에 맞는 "
+                    "숙소를 빠르게 예약해보세요.",
+                ),
+            ),
             max_length=280,
         ),
-        cta="View hotel deals",
+        cta="호텔 특가 보기",
         landing_url=landing_url,
     )
 
@@ -121,10 +148,19 @@ def _sms_content(
     landing_url: str,
     option_index: int,
 ) -> GeneratedContent:
+    del segment_name
+
+    message = _variant(
+        option_index,
+        (
+            "환불 가능한 호텔 특가가 준비되어 있어요.",
+            "지금 예약 가능한 호텔 혜택을 확인해보세요.",
+            "원하는 일정에 맞는 숙박 혜택을 놓치지 마세요.",
+        ),
+    )
     return GeneratedContent(
         message=_compact(
-            f"Option {option_index}: {segment_name}, refundable hotel deals are "
-            f"available now. {landing_url}",
+            f"{message} {landing_url}",
             max_length=220,
         ),
         landing_url=landing_url,
@@ -138,21 +174,42 @@ def _banner_content(
     option_index: int,
     prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
+    del segment_name, prompt_result
+
     return GeneratedContent(
         title=_compact(
-            f"Hotel stays ready for {segment_name}",
+            _variant(
+                option_index,
+                (
+                    "이번 주말 호텔 특가",
+                    "지금 예약 가능한 호텔",
+                    "여름 숙박 혜택 확인",
+                ),
+            ),
             max_length=72,
         ),
         body=_compact(
-            f"Option {option_index}: {prompt_result.message_strategy}",
+            _variant(
+                option_index,
+                (
+                    "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요.",
+                    "원하는 일정에 맞는 객실을 객실 마감 전에 확인하세요.",
+                    "편하게 비교하고 바로 예약할 수 있는 호텔 혜택을 만나보세요.",
+                ),
+            ),
             max_length=180,
         ),
-        cta="View hotel deals",
+        cta="호텔 특가 보기",
         image_prompt=(
-            "modern hotel room summer promotion banner, clean bright travel layout"
+            "modern hotel room summer promotion banner, clean bright travel "
+            "layout, no visible text"
         ),
         landing_url=landing_url,
     )
+
+
+def _variant(option_index: int, values: tuple[str, ...]) -> str:
+    return values[(option_index - 1) % len(values)]
 
 
 def _compact(value: str, *, max_length: int) -> str:
