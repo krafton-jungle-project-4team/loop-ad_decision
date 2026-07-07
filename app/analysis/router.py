@@ -13,6 +13,7 @@ from app.analysis.repositories import (
     SegmentVectorRepository,
     UserBehaviorVectorRepository,
 )
+from app.analysis.report_generator import build_segment_suggestion_report_generator
 from app.analysis.schemas import (
     AnalysisRequest,
     AnalysisResponse,
@@ -49,6 +50,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
         postgres_executor = PsycopgPostgresExecutor(connection)
         user_behavior_vector_repository = UserBehaviorVectorRepository(clickhouse_client)
         segment_vector_repository = SegmentVectorRepository(postgres_executor)
+        segment_report_generator = build_segment_suggestion_report_generator(settings)
         yield PromotionAnalysisService(
             promotion_repository=PromotionRepository(postgres_executor),
             segment_definition_repository=SegmentDefinitionRepository(
@@ -65,6 +67,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=user_behavior_vector_repository,
             ),
+            segment_report_generator=segment_report_generator,
         )
         connection.commit()
     except Exception:
