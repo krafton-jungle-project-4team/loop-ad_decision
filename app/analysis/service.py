@@ -114,6 +114,96 @@ RELATED_TERMS_BY_GOAL = {
     ),
 }
 
+SIGNAL_COPY_BY_FEATURE = {
+    "Booking conversion ready users": {
+        "key": "booking_conversion_ready",
+        "chip": "예약 완료 경험",
+    },
+    "Promotion-engaged hotel users": {
+        "key": "promotion_engaged",
+        "chip": "프로모션 반응",
+    },
+    "Campaign redirect users": {
+        "key": "campaign_redirect",
+        "chip": "이메일 링크 클릭",
+    },
+    "Campaign landing users": {
+        "key": "campaign_landing",
+        "chip": "캠페인 랜딩",
+    },
+    "Experiment-exposed hotel users": {
+        "key": "experiment_exposed",
+        "chip": "광고 노출 이력",
+    },
+    "Hotel page viewers": {
+        "key": "hotel_browsing",
+        "chip": "호텔 탐색",
+    },
+    "Hotel search users": {
+        "key": "hotel_search",
+        "chip": "숙소 검색",
+    },
+    "Hotel click users": {
+        "key": "hotel_click",
+        "chip": "숙소 클릭",
+    },
+    "Hotel detail viewers": {
+        "key": "hotel_detail",
+        "chip": "상세 조회",
+    },
+    "Booking starters": {
+        "key": "booking_start",
+        "chip": "예약 시작",
+    },
+    "Booking converters": {
+        "key": "booking_complete",
+        "chip": "예약 완료",
+    },
+    "Mobile hotel users": {
+        "key": "mobile_hotel_user",
+        "chip": "모바일 이용",
+    },
+}
+
+DEFAULT_SIGNAL_COPY_BY_SEGMENT_ID = {
+    "seg_mobile_user": ("mobile_hotel_user", "모바일 이용"),
+    "seg_family_trip": ("family_trip", "가족 여행 관심"),
+    "seg_near_checkin": ("near_checkin", "임박 예약 관심"),
+    "seg_existing_all": ("existing_users", "기존 사용자"),
+    "seg_repeat_hotel_no_booking": ("repeat_hotel_viewer", "반복 조회"),
+}
+
+SEGMENT_TITLE_BY_SIGNAL = {
+    ("booking_conversion_ready", "promotion_engaged"): "예약 가능성이 높은 프로모션 반응 고객",
+    ("campaign_redirect", "promotion_engaged"): "캠페인 링크 반응이 높은 고객",
+    ("campaign_landing", "promotion_engaged"): "캠페인 랜딩 후 관심 고객",
+    ("hotel_browsing", "promotion_engaged"): "호텔 탐색이 활발한 프로모션 반응 고객",
+    ("hotel_search", "promotion_engaged"): "숙소 검색이 활발한 프로모션 반응 고객",
+    ("mobile_hotel_user",): "모바일 예약 선호 고객",
+    ("family_trip",): "가족 여행 관심 고객",
+    ("near_checkin",): "임박 예약 가능성이 높은 고객",
+    ("existing_users",): "기존 사용자 전체 고객",
+    ("repeat_hotel_viewer",): "반복 조회 후 예약 전환이 필요한 고객",
+}
+
+GOAL_REASON_COPY = {
+    GoalMetric.BOOKING_CONVERSION_RATE.value: (
+        "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다."
+    ),
+    GoalMetric.INFLOW_RATE.value: (
+        "유입 확대 목표에 맞는 방문과 클릭 반응이 확인된 고객군입니다."
+    ),
+    GoalMetric.FUNNEL_STEP_RATE.value: (
+        "예약 퍼널의 다음 단계로 이동할 가능성이 있는 행동 패턴입니다."
+    ),
+}
+
+CHANNEL_ACTION_COPY = {
+    Channel.EMAIL.value: "이메일 예약 혜택 메시지의 우선 타겟으로 적합합니다.",
+    Channel.SMS.value: "짧은 예약 혜택 메시지로 재방문을 유도하기 적합합니다.",
+    Channel.ONSITE_BANNER.value: "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
+}
+
 
 class PromotionReader(Protocol):
     def get_for_analysis(
@@ -607,6 +697,12 @@ class PromotionAnalysisService:
         rank: int,
     ) -> PromotionSegmentSuggestionWrite:
         segment = candidate.definition
+        primary_signals = _primary_signals(segment)
+        display_copy = _display_copy(
+            promotion=promotion,
+            target_segment=target_segment,
+            primary_signals=primary_signals,
+        )
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -643,6 +739,7 @@ class PromotionAnalysisService:
                 "channel": promotion.channel,
                 "goal_metric": promotion.goal_metric,
                 "segment_source": segment.source,
+                "primary_signals": [signal["key"] for signal in primary_signals],
                 "has_hotel_profile": candidate.profile is not None,
                 "ml_model": (
                     booking_model.model_version if booking_model else "unavailable"
@@ -658,6 +755,7 @@ class PromotionAnalysisService:
                 "segment_vector_id": target_segment.segment_vector_id,
                 "content_brief": target_segment.content_brief_json,
                 "data_evidence": target_segment.data_evidence_json,
+                "display_copy": display_copy,
             },
         )
 
@@ -886,6 +984,98 @@ def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
     if len(set(cleaned)) != len(cleaned):
         raise SegmentSelectionError("focus_segment_ids must not contain duplicates")
     return cleaned
+
+
+def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
+    signals: list[dict[str, str]] = []
+    seen: set[str] = set()
+    top_features = segment.profile_json.get("top_common_features")
+    if isinstance(top_features, Sequence) and not isinstance(top_features, str):
+        for feature in top_features:
+            signal = _signal_from_feature(str(feature))
+            if signal is None or signal["key"] in seen:
+                continue
+            signals.append(signal)
+            seen.add(signal["key"])
+
+    default_signal = DEFAULT_SIGNAL_COPY_BY_SEGMENT_ID.get(segment.segment_id)
+    if default_signal is not None and default_signal[0] not in seen:
+        signals.append({"key": default_signal[0], "chip": default_signal[1]})
+        seen.add(default_signal[0])
+
+    if not signals:
+        signals.append({"key": "hotel_booking_interest", "chip": "호텔 예약 관심"})
+    return signals[:3]
+
+
+def _signal_from_feature(feature: str) -> dict[str, str] | None:
+    signal_copy = SIGNAL_COPY_BY_FEATURE.get(feature)
+    if signal_copy is not None:
+        return {"key": signal_copy["key"], "chip": signal_copy["chip"]}
+    if feature.startswith("Hotel page path bucket"):
+        return {"key": "hotel_browsing", "chip": "호텔 탐색"}
+    if feature.startswith("Hotel cluster bucket"):
+        return {"key": "hotel_preference", "chip": "호텔 선호"}
+    if feature.startswith("Hotel market bucket"):
+        return {"key": "market_preference", "chip": "지역 선호"}
+    return None
+
+
+def _display_copy(
+    *,
+    promotion: PromotionRecord,
+    target_segment: PromotionTargetSegmentWrite,
+    primary_signals: Sequence[Mapping[str, str]],
+) -> dict[str, Any]:
+    signal_keys = tuple(signal["key"] for signal in primary_signals)
+    signal_chips = [signal["chip"] for signal in primary_signals]
+    evidence = target_segment.data_evidence_json
+    sample_size = int(evidence.get("sample_size", target_segment.estimated_size) or 0)
+    total_users = int(evidence.get("total_eligible_user_count", 0) or 0)
+    sample_ratio = _format_percent(evidence.get("sample_ratio", 0))
+    return {
+        "title": _display_title(signal_keys),
+        "audience_summary": (
+            f"분석 대상 {total_users}명 중 {sample_size}명 · {sample_ratio}"
+        ),
+        "signal_chips": signal_chips,
+        "reason": GOAL_REASON_COPY.get(
+            promotion.goal_metric,
+            "호텔 예약 관심 행동이 확인된 고객군입니다.",
+        ),
+        "action_hint": CHANNEL_ACTION_COPY.get(
+            promotion.channel,
+            "프로모션 메시지의 우선 타겟으로 적합합니다.",
+        ),
+    }
+
+
+def _display_title(signal_keys: Sequence[str]) -> str:
+    key_set = set(signal_keys)
+    if {"booking_conversion_ready", "promotion_engaged"}.issubset(key_set):
+        return "예약 가능성이 높은 프로모션 반응 고객"
+    if {"campaign_redirect", "promotion_engaged"}.issubset(key_set):
+        return "캠페인 링크 반응이 높은 고객"
+    if {"campaign_landing", "promotion_engaged"}.issubset(key_set):
+        return "캠페인 랜딩 후 관심 고객"
+    if {"hotel_browsing", "promotion_engaged"}.issubset(key_set):
+        return "호텔 탐색이 활발한 프로모션 반응 고객"
+    if {"hotel_search", "promotion_engaged"}.issubset(key_set):
+        return "숙소 검색이 활발한 프로모션 반응 고객"
+
+    for key in signal_keys:
+        title = SEGMENT_TITLE_BY_SIGNAL.get((key,))
+        if title is not None:
+            return title
+    return "호텔 예약 관심 고객"
+
+
+def _format_percent(value: Any) -> str:
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        ratio = 0.0
+    return f"{ratio * 100:g}%"
 
 
 def _analysis_reason(focus_segment_ids: Sequence[str] | None) -> str:

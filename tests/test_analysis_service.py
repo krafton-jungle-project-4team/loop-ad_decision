@@ -527,6 +527,11 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
             "primary_segment": ai_segment.segment_id,
             "source": "user_vector_clustering",
             "cluster_score": 0.99,
+            "top_common_features": [
+                "Booking conversion ready users",
+                "Promotion-engaged hotel users",
+                "Hotel page viewers",
+            ],
         },
     )
     vector_service = FakeSegmentVectorService()
@@ -573,6 +578,18 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     assert result.segment_suggestions[0].suggestion_source == "ai_generated"
     assert result.segment_suggestions[0].status == "suggested"
     assert result.segment_suggestions[0].suggested_rank == 1
+    assert result.segment_suggestions[0].reason_json["primary_signals"] == [
+        "booking_conversion_ready",
+        "promotion_engaged",
+        "hotel_browsing",
+    ]
+    assert result.segment_suggestions[0].metadata_json["display_copy"] == {
+        "title": "예약 가능성이 높은 프로모션 반응 고객",
+        "audience_summary": "분석 대상 74200명 중 1800명 · 2%",
+        "signal_chips": ["예약 완료 경험", "프로모션 반응", "호텔 탐색"],
+        "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
+        "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
+    }
     assert vector_service.calls[0] == SegmentVectorBuildRequest(
         project_id="hotel-client-a",
         promotion_id=promotion.promotion_id,
