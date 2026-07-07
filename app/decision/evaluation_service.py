@@ -30,6 +30,7 @@ from app.decision.schemas import (
     PromotionEvaluationStatus,
 )
 from app.decision.service import build_bounded_decision_id
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 DECIMAL_SCALE = Decimal("0.000001")
@@ -78,27 +79,47 @@ class AdExperimentEvaluationService:
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._evaluation_metric_repository = evaluation_metric_repository
 
+    @log_context_scope
     def evaluate(
         self,
         *,
         ad_experiment_id: str,
         request: AdExperimentEvaluateRequest,
     ) -> AdExperimentEvaluateResponse:
+        started_at = now_ms()
+        log.assign_context({"adExperimentId": ad_experiment_id})
+        log.info("started", {"adExperimentId": ad_experiment_id, "request": request})
         _ = request
         experiment = self._ad_experiment_repository.get_by_id(ad_experiment_id)
         if experiment is None:
+            log.warn("ad_experiment_not_found", {"adExperimentId": ad_experiment_id})
             raise AdExperimentEvaluationNotFoundError(
                 f"ad experiment not found: {ad_experiment_id}"
             )
+        log.assign_context(
+            {
+                "projectId": experiment.project_id,
+                "campaignId": experiment.campaign_id,
+                "promotionId": experiment.promotion_id,
+                "promotionRunId": experiment.promotion_run_id,
+                "segmentId": experiment.segment_id,
+                "contentId": experiment.content_id,
+                "contentOptionId": experiment.content_option_id,
+            }
+        )
+        log.info("ad_experiment_loaded", {"adExperiment": experiment})
 
         run = self._promotion_run_repository.get_by_id(experiment.promotion_run_id)
         if run is None:
+            log.warn("promotion_run_not_found", {"promotionRunId": experiment.promotion_run_id})
             raise AdExperimentEvaluationValidationError(
                 f"promotion run not found: {experiment.promotion_run_id}"
             )
+        log.info("promotion_run_loaded", {"promotionRun": run})
 
         metric = experiment.goal_metric
         if metric == GoalMetric.FUNNEL_STEP_RATE.value:
+            log.warn("goal_metric_unsupported", {"metric": metric})
             raise AdExperimentEvaluationValidationError(
                 "funnel_step_rate is out of Owner 2 MVP evaluation scope"
             )
@@ -106,6 +127,7 @@ class AdExperimentEvaluationService:
         target_value = _parse_target_value(run.goal_snapshot_json)
         min_sample_size = _parse_min_sample_size(run.goal_snapshot_json)
         counts = self._load_counts(experiment)
+        log.info("metric_counts_loaded", {"counts": counts})
         sample_size = counts.denominator_count
         actual_value = _calculate_actual_value(counts)
         status = _decide_status(
@@ -156,8 +178,9 @@ class AdExperimentEvaluationService:
             ad_experiment_id=experiment.ad_experiment_id,
             status=status,
         )
+        log.info("promotion_evaluation_created", {"evaluation": evaluation, "status": status})
 
-        return AdExperimentEvaluateResponse(
+        response = AdExperimentEvaluateResponse(
             evaluation_id=evaluation.evaluation_id,
             ad_experiment_id=experiment.ad_experiment_id,
             promotion_run_id=experiment.promotion_run_id,
@@ -174,6 +197,8 @@ class AdExperimentEvaluationService:
             next_loop_required=evaluation.next_loop_required,
             feedback=evaluation.feedback,
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _load_counts(self, experiment: AdExperimentRecord) -> MetricCountRecord:
         if experiment.goal_metric == GoalMetric.INFLOW_RATE.value:
@@ -182,6 +207,7 @@ class AdExperimentEvaluationService:
             return self._evaluation_metric_repository.count_booking_conversion_rate(
                 experiment
             )
+        log.warn("goal_metric_unsupported", {"metric": experiment.goal_metric})
         raise AdExperimentEvaluationValidationError(
             f"unsupported goal metric: {experiment.goal_metric}"
         )
@@ -201,27 +227,45 @@ class PromotionRunEvaluationService:
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._ad_experiment_evaluation_service = ad_experiment_evaluation_service
 
+    @log_context_scope
     def evaluate(
         self,
         *,
         promotion_run_id: str,
         request: PromotionRunEvaluateRequest,
     ) -> PromotionRunEvaluateResponse:
+        started_at = now_ms()
+        log.assign_context({"promotionRunId": promotion_run_id})
+        log.info("started", {"promotionRunId": promotion_run_id, "request": request})
         _ = request
         run = self._promotion_run_repository.get_by_id(promotion_run_id)
         if run is None:
+            log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
             raise PromotionRunEvaluationNotFoundError(
                 f"promotion run not found: {promotion_run_id}"
             )
+        log.assign_context(
+            {
+                "projectId": run.project_id,
+                "campaignId": run.campaign_id,
+                "promotionId": run.promotion_id,
+                "analysisId": run.analysis_id,
+                "generationId": run.generation_id,
+            }
+        )
+        log.info("promotion_run_loaded", {"promotionRun": run})
 
         experiments = self._ad_experiment_repository.list_by_run(promotion_run_id)
         if not experiments:
+            log.warn("ad_experiments_empty", {"promotionRunId": promotion_run_id})
             raise PromotionRunEvaluationValidationError(
                 f"ad experiments not found for promotion run: {promotion_run_id}"
             )
+        log.info("ad_experiments_loaded", {"adExperimentCount": len(experiments)})
 
         metric = _parse_goal_metric(run.goal_snapshot_json)
         if metric == GoalMetric.FUNNEL_STEP_RATE.value:
+            log.warn("goal_metric_unsupported", {"metric": metric})
             raise PromotionRunEvaluationValidationError(
                 "funnel_step_rate is out of Owner 2 MVP evaluation scope"
             )
@@ -236,6 +280,7 @@ class PromotionRunEvaluationService:
             if experiment.ad_experiment_id not in latest_by_experiment
         ]
         for experiment in missing_experiments:
+            log.info("ad_experiment_evaluation_missing", {"adExperimentId": experiment.ad_experiment_id})
             self._ad_experiment_evaluation_service.evaluate(
                 ad_experiment_id=experiment.ad_experiment_id,
                 request=AdExperimentEvaluateRequest(),
@@ -248,6 +293,7 @@ class PromotionRunEvaluationService:
         for experiment in experiments:
             evaluation = latest_by_experiment.get(experiment.ad_experiment_id)
             if evaluation is None:
+                log.warn("ad_experiment_evaluation_not_found", {"adExperimentId": experiment.ad_experiment_id})
                 raise PromotionRunEvaluationValidationError(
                     "latest ad experiment evaluation is required before aggregate"
                 )
@@ -297,8 +343,9 @@ class PromotionRunEvaluationService:
             promotion_run_id=run.promotion_run_id,
             status=aggregate.status,
         )
+        log.info("promotion_run_evaluation_created", {"evaluation": evaluation, "status": aggregate.status})
 
-        return PromotionRunEvaluateResponse(
+        response = PromotionRunEvaluateResponse(
             promotion_run_id=run.promotion_run_id,
             promotion_id=run.promotion_id,
             status=PromotionRunStatus(aggregate.status),
@@ -315,6 +362,8 @@ class PromotionRunEvaluationService:
             failed_segment_ids=aggregate.failed_segment_ids,
             failed_ad_experiment_ids=aggregate.failed_ad_experiment_ids,
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _latest_by_experiment(
         self,

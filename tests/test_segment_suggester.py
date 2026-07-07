@@ -190,6 +190,79 @@ def test_vector_cluster_suggester_names_segments_from_dominant_features() -> Non
     assert "Promotion click responders" in segment_names
 
 
+def test_vector_cluster_suggester_ranks_clusters_by_promotion_intent() -> None:
+    reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("booking_user_001", vector_values(62)),
+            user_vector("booking_user_002", vector_values(62)),
+            user_vector("redirect_user_001", vector_values(6)),
+            user_vector("redirect_user_002", vector_values(6)),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=reader,
+        vector_pool_limit=4,
+        vector_sample_limit=4,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "여름 호텔 예약 전환을 높이기 위한 이메일 예약 혜택 캠페인"
+            ),
+        )
+    )
+
+    assert segments[0].segment_name == "Booking conversion ready users"
+    assert segments[0].profile_json["promotion_matched_features"] == [
+        "Booking conversion ready users"
+    ]
+    assert segments[0].profile_json["promotion_cluster_similarity"] > segments[
+        1
+    ].profile_json["promotion_cluster_similarity"]
+    assert segments[0].profile_json["recommendation_score"] > segments[
+        1
+    ].profile_json["recommendation_score"]
+
+
+def test_vector_cluster_suggester_stores_promotion_vector_basis() -> None:
+    reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("jeju_user_001", vector_values(32)),
+            user_vector("jeju_user_002", vector_values(32)),
+            user_vector("booking_user_001", vector_values(9)),
+            user_vector("booking_user_002", vector_values(9)),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=reader,
+        vector_pool_limit=4,
+        vector_sample_limit=4,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="제주 호텔 특가 예약 혜택을 안내한다.",
+        )
+    )
+
+    profile_json = segments[0].profile_json
+    assert profile_json["score_components"]["weights"] == {
+        "promotion_cluster_similarity": 0.65,
+        "cluster_quality": 0.20,
+        "sample_size": 0.15,
+    }
+    assert profile_json["promotion_vector_basis"]["goal_metric"] == (
+        "booking_conversion_rate"
+    )
+    assert "제주" in profile_json["promotion_vector_basis"]["message_keywords"]
+    assert profile_json["promotion_vector_basis"]["weighted_features"]
+
+
 def test_vector_cluster_suggester_returns_empty_when_vectors_are_insufficient() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [user_vector("user_001", vector_values(0))]

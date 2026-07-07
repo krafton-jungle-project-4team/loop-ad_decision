@@ -34,6 +34,7 @@ from app.generation.schemas import (
     GenerationResponse,
     GenerationStatus,
 )
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 class GenerationRunWriter(Protocol):
@@ -134,9 +135,22 @@ class GenerationService:
             generation_report_builder or GenerationReportBuilder()
         )
 
+    @log_context_scope
     def generate(self, request: GenerationRequest) -> GenerationResponse:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+                "analysisId": request.analysis_id,
+            }
+        )
+        log.info("started", {"request": request})
         generation_id = self._next_generation_id(request.promotion_id)
+        log.assign_context({"generationId": generation_id})
         prompt_inputs = self._build_prompt_inputs(request)
+        log.info("generation_inputs_prepared", {"promptInputCount": len(prompt_inputs)})
         try:
             content_candidates = self._build_content_candidate_records(
                 request=request,
@@ -144,6 +158,7 @@ class GenerationService:
                 prompt_inputs=prompt_inputs,
             )
         except Exception as exc:
+            log.warn("content_generation_failed", {"err": exc})
             generation_run = self._build_generation_run_record(
                 request=request,
                 generation_id=generation_id,
@@ -154,12 +169,14 @@ class GenerationService:
                 error_detail=_safe_generation_error_detail(exc),
             )
             self._save_generation_run(generation_run)
-            return GenerationResponse(
+            response = GenerationResponse(
                 generation_id=generation_id,
                 promotion_id=request.promotion_id,
                 status=GenerationStatus.FAILED,
                 content_candidates=[],
             )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+            return response
 
         generation_run = self._build_generation_run_record(
             request=request,
@@ -172,7 +189,7 @@ class GenerationService:
         self._save_content_candidates(content_candidates)
         self._schedule_image_generation(content_candidates)
 
-        return GenerationResponse(
+        response = GenerationResponse(
             generation_id=generation_id,
             promotion_id=request.promotion_id,
             status=GenerationStatus.COMPLETED,
@@ -181,11 +198,26 @@ class GenerationService:
                 for candidate in content_candidates
             ],
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
+    @log_context_scope
     def generate_focus(
         self,
         request: NextLoopFocusGenerationRequest,
     ) -> NextLoopFocusGenerationResult:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+                "analysisId": request.analysis_id,
+                "promotionRunId": request.source_promotion_run_id,
+                "generationId": request.source_generation_id,
+            }
+        )
+        log.info("started", {"request": request})
         generation_request = GenerationRequest(
             project_id=request.project_id,
             campaign_id=request.campaign_id,
@@ -198,10 +230,12 @@ class GenerationService:
             request.promotion_id,
             loop_count=request.loop_count,
         )
+        log.assign_context({"generationId": generation_id})
         prompt_inputs = self._build_focus_prompt_inputs(
             request=generation_request,
             focus_segment_ids=request.focus_segment_ids,
         )
+        log.info("generation_inputs_prepared", {"promptInputCount": len(prompt_inputs)})
         try:
             content_candidates = self._build_content_candidate_records(
                 request=generation_request,
@@ -215,6 +249,7 @@ class GenerationService:
                 candidate_status=ContentCandidateStatus.APPROVED,
             )
         except Exception as exc:
+            log.warn("content_generation_failed", {"err": exc})
             generation_run = self._build_generation_run_record(
                 request=generation_request,
                 generation_id=generation_id,
@@ -226,11 +261,13 @@ class GenerationService:
                 source_context=_next_loop_source_context(request),
             )
             self._save_generation_run(generation_run)
-            return NextLoopFocusGenerationResult(
+            response = NextLoopFocusGenerationResult(
                 generation_id=generation_id,
                 generated_segment_ids=[],
                 status=GenerationStatus.FAILED,
             )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+            return response
 
         generation_run = self._build_generation_run_record(
             request=generation_request,
@@ -244,13 +281,15 @@ class GenerationService:
         self._save_content_candidates(content_candidates)
         self._schedule_image_generation(content_candidates)
 
-        return NextLoopFocusGenerationResult(
+        response = NextLoopFocusGenerationResult(
             generation_id=generation_id,
             generated_segment_ids=[
                 prompt_input.target_segment.segment_id for prompt_input in prompt_inputs
             ],
             status=GenerationStatus.COMPLETED,
         )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _build_generation_run_record(
         self,
@@ -325,6 +364,7 @@ class GenerationService:
         if self._generation_input_reader is not None:
             promotion = self._generation_input_reader.get_promotion_input(request)
             if promotion is None:
+                log.warn("promotion_input_not_found", {"promotionId": request.promotion_id})
                 raise GenerationInputUnavailable(
                     "promotion input was not found for generation"
                 )
@@ -333,6 +373,7 @@ class GenerationService:
                 self._generation_input_reader.list_target_segment_inputs(request)
             )
             if not target_segments:
+                log.warn("target_segments_empty", {"analysisId": request.analysis_id})
                 raise GenerationInputUnavailable(
                     "confirmed promotion_target_segments are required for generation"
                 )
@@ -356,16 +397,19 @@ class GenerationService:
         focus_segment_ids: Sequence[str],
     ) -> list[GenerationPromptInput]:
         if self._generation_input_reader is None:
+            log.warn("generation_input_reader_missing")
             raise ValueError("generation input reader is required for focus generation")
 
         promotion = self._generation_input_reader.get_promotion_input(request)
         if promotion is None:
+            log.warn("promotion_input_not_found", {"promotionId": request.promotion_id})
             raise ValueError("promotion input was not found for focus generation")
 
         target_segments = self._generation_input_reader.list_target_segment_inputs(
             request
         )
         if not target_segments:
+            log.warn("target_segments_empty", {"analysisId": request.analysis_id})
             raise ValueError(
                 "confirmed promotion_target_segments are required for focus generation"
             )
@@ -380,6 +424,7 @@ class GenerationService:
             if segment_id not in target_segments_by_id
         ]
         if missing_segment_ids:
+            log.warn("focus_segments_invalid", {"missingSegmentIds": missing_segment_ids})
             raise ValueError("focus_segment_ids must match promotion_target_segments")
 
         return self._generation_input_builder.build(
@@ -480,6 +525,7 @@ class GenerationService:
         if self._generation_run_repository is None:
             return
         self._generation_run_repository.create(generation_run)
+        log.info("generation_run_created", {"generationRun": generation_run})
 
     def _save_content_candidates(
         self,
@@ -489,6 +535,7 @@ class GenerationService:
             return
         for content_candidate in content_candidates:
             self._content_candidate_repository.create(content_candidate)
+        log.info("content_candidates_created", {"contentCandidateCount": len(content_candidates)})
 
     def _schedule_image_generation(
         self,
@@ -512,6 +559,7 @@ class GenerationService:
                         image_prompt=content_candidate.image_prompt,
                     )
                 )
+                log.info("image_generation_queued", {"contentId": content_candidate.content_id})
 
     def _next_generation_id(self, promotion_id: str) -> str:
         base_generation_id = _generation_id_from_promotion(promotion_id)

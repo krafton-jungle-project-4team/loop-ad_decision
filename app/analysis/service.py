@@ -23,6 +23,7 @@ from app.analysis.repositories import (
 )
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
 from app.analysis.vector_service import SegmentVectorBuildRequest, SegmentVectorBuildResult
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 MAX_DEFAULT_TARGET_SEGMENTS = 4
@@ -117,7 +118,7 @@ RELATED_TERMS_BY_GOAL = {
 SIGNAL_COPY_BY_FEATURE = {
     "Booking conversion ready users": {
         "key": "booking_conversion_ready",
-        "chip": "예약 완료 경험",
+        "chip": "예약 가능성 높음",
     },
     "Promotion-engaged hotel users": {
         "key": "promotion_engaged",
@@ -159,6 +160,30 @@ SIGNAL_COPY_BY_FEATURE = {
         "key": "booking_complete",
         "chip": "예약 완료",
     },
+    "Booking cancellation risk users": {
+        "key": "booking_cancel_risk",
+        "chip": "취소 위험",
+    },
+    "Mixed event hotel users": {
+        "key": "mixed_hotel_behavior",
+        "chip": "복합 행동",
+    },
+    "Free cancellation seekers": {
+        "key": "free_cancellation",
+        "chip": "무료 취소 선호",
+    },
+    "Breakfast-included seekers": {
+        "key": "breakfast_included",
+        "chip": "조식 선호",
+    },
+    "Higher-price hotel shoppers": {
+        "key": "higher_price",
+        "chip": "고가 숙소 탐색",
+    },
+    "Promotion click responsive users": {
+        "key": "promotion_click_responsive",
+        "chip": "클릭 반응 높음",
+    },
     "Mobile hotel users": {
         "key": "mobile_hotel_user",
         "chip": "모바일 이용",
@@ -184,6 +209,17 @@ SEGMENT_TITLE_BY_SIGNAL = {
     ("near_checkin",): "임박 예약 가능성이 높은 고객",
     ("existing_users",): "기존 사용자 전체 고객",
     ("repeat_hotel_viewer",): "반복 조회 후 예약 전환이 필요한 고객",
+    ("booking_start",): "예약을 시작한 고객",
+    ("booking_complete",): "예약 완료 경험 고객",
+    ("campaign_redirect",): "이메일 링크 반응 고객",
+    ("campaign_landing",): "캠페인 랜딩 고객",
+    ("free_cancellation",): "무료 취소 혜택 선호 고객",
+    ("breakfast_included",): "조식 혜택 관심 고객",
+    ("higher_price",): "프리미엄 숙소 관심 고객",
+    ("hotel_market_affinity",): "특정 지역 선호 고객",
+    ("hotel_cluster_affinity",): "숙소 취향이 뚜렷한 고객",
+    ("hotel_path_pattern",): "탐색 경로가 유사한 고객",
+    ("promotion_click_responsive",): "프로모션 클릭 반응이 높은 고객",
 }
 
 GOAL_REASON_COPY = {
@@ -361,18 +397,42 @@ class PromotionAnalysisService:
         self._segment_suggester = segment_suggester
         self._max_default_target_segments = max_default_target_segments
 
+    @log_context_scope
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
-        return self._analyze(
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+            }
+        )
+        log.info("started", {"request": request})
+        response = self._analyze(
             request=request,
             focus_segment_ids=None,
             next_loop_context=None,
         )
+        log.assign_context({"analysisId": response.analysis.analysis_id})
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
+    @log_context_scope
     def analyze_focus(
         self,
         request: NextLoopFocusAnalysisRequest,
     ) -> PromotionAnalysisResult:
-        return self._analyze(
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+                "promotionRunId": request.source_promotion_run_id,
+            }
+        )
+        log.info("started", {"request": request})
+        response = self._analyze(
             request=AnalysisRequest(
                 project_id=request.project_id,
                 campaign_id=request.campaign_id,
@@ -388,6 +448,9 @@ class PromotionAnalysisService:
                 ),
             ),
         )
+        log.assign_context({"analysisId": response.analysis.analysis_id})
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
     def _analyze(
         self,
@@ -397,11 +460,13 @@ class PromotionAnalysisService:
         next_loop_context: NextLoopAnalysisContext | None,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
+        log.info("promotion_loaded", {"promotion": promotion})
         segment_definitions = self._segment_definition_repository.list_active(
             project_id=request.project_id,
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
         )
+        log.info("segment_definitions_loaded", {"segmentDefinitionCount": len(segment_definitions)})
         suggested_segment_definitions = self._suggest_segment_definitions(promotion)
         if suggested_segment_definitions:
             self._segment_definition_repository.save_ai_suggested(
@@ -411,15 +476,22 @@ class PromotionAnalysisService:
                 segment_definitions,
                 suggested_segment_definitions,
             )
+            log.info("segment_definitions_created", {"segmentDefinitions": suggested_segment_definitions})
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
+        log.info("hotel_profiles_loaded", {"hotelProfileCount": len(hotel_profiles)})
         candidates = self._build_candidates(
             project_id=request.project_id,
             segment_definitions=segment_definitions,
             hotel_profiles=hotel_profiles,
         )
+        log.info("segment_candidates_prepared", {"candidateCount": len(candidates)})
         booking_model = self._train_booking_model()
+        if booking_model is None:
+            log.warn("booking_model_unavailable")
+        else:
+            log.info("booking_model_trained", {"modelVersion": booking_model.model_version, "trainingSampleCount": booking_model.training_sample_count})
         booking_predictions = _predict_booking_propensity(
             model=booking_model,
             candidates=candidates,
@@ -431,6 +503,7 @@ class PromotionAnalysisService:
             booking_predictions=booking_predictions,
         )
         if not selected_candidates:
+            log.warn("segment_candidates_empty", {"candidateCount": len(candidates)})
             raise SegmentSelectionError("no active segment candidates matched analysis request")
 
         analysis_id = _analysis_id(
@@ -451,6 +524,8 @@ class PromotionAnalysisService:
         )
 
         self._promotion_analysis_repository.save_analysis(analysis)
+        log.assign_context({"analysisId": analysis.analysis_id})
+        log.info("promotion_analysis_created", {"analysis": analysis})
         target_segments = [
             self._build_target_segment(
                 analysis_id=analysis_id,
@@ -482,7 +557,9 @@ class PromotionAnalysisService:
         ]
         if next_loop_context is not None:
             self._promotion_analysis_repository.save_target_segments(target_segments)
+            log.info("promotion_target_segments_created", {"targetSegments": target_segments})
         self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
+        log.info("promotion_segment_suggestions_created", {"segmentSuggestions": segment_suggestions})
         return PromotionAnalysisResult(
             analysis=analysis,
             target_segments=target_segments,
@@ -508,6 +585,7 @@ class PromotionAnalysisService:
             promotion_id=request.promotion_id,
         )
         if promotion is None:
+            log.warn("promotion_not_found", {"projectId": request.project_id, "campaignId": request.campaign_id, "promotionId": request.promotion_id})
             raise PromotionNotFoundError(
                 f"promotion not found for analysis: {request.promotion_id}"
             )
@@ -566,6 +644,7 @@ class PromotionAnalysisService:
                 if segment_id not in candidates
             ]
             if missing_segment_ids:
+                log.warn("focus_segments_invalid", {"missingSegmentIds": missing_segment_ids})
                 raise SegmentSelectionError(
                     "focus_segment_ids must match active segment definitions"
                 )
@@ -706,6 +785,7 @@ class PromotionAnalysisService:
             target_segment=target_segment,
             primary_signals=primary_signals,
         )
+        ai_score_details = _ai_score_details(segment)
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -724,6 +804,7 @@ class PromotionAnalysisService:
                 "estimated_size": target_segment.estimated_size,
                 "priority": target_segment.priority,
                 "cluster_score": _ai_segment_score(segment),
+                **ai_score_details,
                 "booking_propensity_score": (
                     booking_prediction.probability if booking_prediction else None
                 ),
@@ -743,6 +824,10 @@ class PromotionAnalysisService:
                 "goal_metric": promotion.goal_metric,
                 "segment_source": segment.source,
                 "primary_signals": [signal["key"] for signal in primary_signals],
+                "promotion_vector_basis": segment.profile_json.get(
+                    "promotion_vector_basis",
+                    {},
+                ),
                 "has_hotel_profile": candidate.profile is not None,
                 "ml_model": (
                     booking_model.model_version if booking_model else "unavailable"
@@ -758,6 +843,14 @@ class PromotionAnalysisService:
                 "segment_vector_id": target_segment.segment_vector_id,
                 "content_brief": target_segment.content_brief_json,
                 "data_evidence": target_segment.data_evidence_json,
+                "promotion_vector_basis": segment.profile_json.get(
+                    "promotion_vector_basis",
+                    {},
+                ),
+                "promotion_matched_features": segment.profile_json.get(
+                    "promotion_matched_features",
+                    [],
+                ),
                 "display_copy": display_copy,
             },
         )
@@ -794,6 +887,15 @@ class PromotionAnalysisService:
             "sample_ratio": _json_decimal(segment.sample_ratio),
             "total_eligible_user_count": segment.total_eligible_user_count,
         }
+        for key in (
+            "promotion_cluster_similarity",
+            "recommendation_score",
+            "cluster_quality_score",
+            "sample_size_score",
+        ):
+            value = segment.profile_json.get(key)
+            if value is not None:
+                evidence[key] = value
         if candidate.profile is not None:
             evidence["hotel_profile"] = dict(candidate.profile.profile_json)
         return evidence
@@ -996,6 +1098,15 @@ def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
 def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
     signals: list[dict[str, str]] = []
     seen: set[str] = set()
+    matched_features = segment.profile_json.get("promotion_matched_features")
+    if isinstance(matched_features, Sequence) and not isinstance(matched_features, str):
+        for feature in matched_features:
+            signal = _signal_from_feature(str(feature))
+            if signal is None or signal["key"] in seen:
+                continue
+            signals.append(signal)
+            seen.add(signal["key"])
+
     top_features = segment.profile_json.get("top_common_features")
     if isinstance(top_features, Sequence) and not isinstance(top_features, str):
         for feature in top_features:
@@ -1020,11 +1131,11 @@ def _signal_from_feature(feature: str) -> dict[str, str] | None:
     if signal_copy is not None:
         return {"key": signal_copy["key"], "chip": signal_copy["chip"]}
     if feature.startswith("Hotel page path bucket"):
-        return {"key": "hotel_browsing", "chip": "호텔 탐색"}
+        return {"key": "hotel_path_pattern", "chip": "탐색 경로"}
     if feature.startswith("Hotel cluster bucket"):
-        return {"key": "hotel_preference", "chip": "호텔 선호"}
+        return {"key": "hotel_cluster_affinity", "chip": "숙소 취향"}
     if feature.startswith("Hotel market bucket"):
-        return {"key": "market_preference", "chip": "지역 선호"}
+        return {"key": "hotel_market_affinity", "chip": "지역 선호"}
     return None
 
 
@@ -1095,11 +1206,31 @@ def _analysis_reason(focus_segment_ids: Sequence[str] | None) -> str:
 
 
 def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:
-    raw_score = segment.profile_json.get("cluster_score", 0.0)
+    raw_score = segment.profile_json.get(
+        "recommendation_score",
+        segment.profile_json.get("cluster_score", 0.0),
+    )
     try:
         return float(raw_score)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    for key in (
+        "promotion_cluster_similarity",
+        "recommendation_score",
+        "cluster_quality_score",
+        "sample_size_score",
+    ):
+        value = segment.profile_json.get(key)
+        if value is not None:
+            details[key] = value
+    score_components = segment.profile_json.get("score_components")
+    if isinstance(score_components, Mapping):
+        details["score_components"] = dict(score_components)
+    return details
 
 
 def _suggestion_source(segment: SegmentDefinitionRecord) -> str:

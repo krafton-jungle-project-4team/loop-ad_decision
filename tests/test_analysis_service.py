@@ -586,7 +586,7 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     assert result.segment_suggestions[0].metadata_json["display_copy"] == {
         "title": "예약 가능성이 높은 프로모션 반응 고객",
         "audience_summary": "분석 대상 74200명 중 1800명 · 2%",
-        "signal_chips": ["예약 완료 경험", "프로모션 반응", "호텔 탐색"],
+        "signal_chips": ["예약 가능성 높음", "프로모션 반응", "호텔 탐색"],
         "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
@@ -597,6 +597,79 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
     )
+
+
+def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> None:
+    promotion = promotion_record(channel="email")
+    ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_email_001_1_intent",
+            source="ai_suggested",
+            sample_size=120,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_email_001_1_intent",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.7,
+            "promotion_cluster_similarity": 0.92,
+            "cluster_quality_score": 0.7,
+            "sample_size_score": 0.5,
+            "recommendation_score": 0.88,
+            "score_components": {
+                "promotion_cluster_similarity": 0.92,
+                "cluster_quality": 0.7,
+                "sample_size": 0.5,
+                "final_score": 0.88,
+            },
+            "promotion_matched_features": [
+                "Campaign redirect users",
+                "Hotel market bucket 2 affinity users",
+                "Free cancellation seekers",
+            ],
+            "top_common_features": ["Hotel search users"],
+            "promotion_vector_basis": {
+                "channel": "email",
+                "goal_metric": "booking_conversion_rate",
+            },
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester([ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    first_suggestion = result.segment_suggestions[0]
+    assert first_suggestion.segment_id == ai_segment.segment_id
+    assert first_suggestion.reason_json["primary_signals"] == [
+        "campaign_redirect",
+        "hotel_market_affinity",
+        "free_cancellation",
+    ]
+    assert first_suggestion.score_json["promotion_cluster_similarity"] == 0.92
+    assert first_suggestion.score_json["recommendation_score"] == 0.88
+    assert first_suggestion.metadata_json["promotion_matched_features"] == [
+        "Campaign redirect users",
+        "Hotel market bucket 2 affinity users",
+        "Free cancellation seekers",
+    ]
+    assert first_suggestion.metadata_json["display_copy"] == {
+        "title": "이메일 링크 반응 고객",
+        "audience_summary": "분석 대상 74200명 중 120명 · 2%",
+        "signal_chips": ["이메일 링크 클릭", "지역 선호", "무료 취소 선호"],
+        "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
+        "action_hint": "이메일 예약 혜택 메시지의 우선 타겟으로 적합합니다.",
+    }
 
 
 def test_service_ranks_ai_clusters_by_booking_propensity_model() -> None:
