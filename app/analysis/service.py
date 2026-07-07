@@ -379,10 +379,7 @@ class PromotionAnalysisService:
             next_loop_context=None,
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     @log_context_scope
@@ -417,10 +414,7 @@ class PromotionAnalysisService:
             ),
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _analyze(
@@ -437,10 +431,7 @@ class PromotionAnalysisService:
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
         )
-        log.info(
-            "segment_definitions_loaded",
-            {"segmentDefinitionCount": len(segment_definitions)},
-        )
+        log.info("segment_definitions_loaded", {"segmentDefinitionCount": len(segment_definitions)})
         suggested_segment_definitions = self._suggest_segment_definitions(promotion)
         if suggested_segment_definitions:
             self._segment_definition_repository.save_ai_suggested(
@@ -450,10 +441,7 @@ class PromotionAnalysisService:
                 segment_definitions,
                 suggested_segment_definitions,
             )
-            log.info(
-                "segment_definitions_created",
-                {"segmentDefinitions": suggested_segment_definitions},
-            )
+            log.info("segment_definitions_created", {"segmentDefinitions": suggested_segment_definitions})
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
@@ -468,13 +456,7 @@ class PromotionAnalysisService:
         if booking_model is None:
             log.warn("booking_model_unavailable")
         else:
-            log.info(
-                "booking_model_trained",
-                {
-                    "modelVersion": booking_model.model_version,
-                    "trainingSampleCount": booking_model.training_sample_count,
-                },
-            )
+            log.info("booking_model_trained", {"modelVersion": booking_model.model_version, "trainingSampleCount": booking_model.training_sample_count})
         booking_predictions = _predict_booking_propensity(
             model=booking_model,
             candidates=candidates,
@@ -540,15 +522,9 @@ class PromotionAnalysisService:
         ]
         if next_loop_context is not None:
             self._promotion_analysis_repository.save_target_segments(target_segments)
-            log.info(
-                "promotion_target_segments_created",
-                {"targetSegments": target_segments},
-            )
+            log.info("promotion_target_segments_created", {"targetSegments": target_segments})
         self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
-        log.info(
-            "promotion_segment_suggestions_created",
-            {"segmentSuggestions": segment_suggestions},
-        )
+        log.info("promotion_segment_suggestions_created", {"segmentSuggestions": segment_suggestions})
         return PromotionAnalysisResult(
             analysis=analysis,
             target_segments=target_segments,
@@ -574,14 +550,7 @@ class PromotionAnalysisService:
             promotion_id=request.promotion_id,
         )
         if promotion is None:
-            log.warn(
-                "promotion_not_found",
-                {
-                    "projectId": request.project_id,
-                    "campaignId": request.campaign_id,
-                    "promotionId": request.promotion_id,
-                },
-            )
+            log.warn("promotion_not_found", {"projectId": request.project_id, "campaignId": request.campaign_id, "promotionId": request.promotion_id})
             raise PromotionNotFoundError(
                 f"promotion not found for analysis: {request.promotion_id}"
             )
@@ -640,10 +609,7 @@ class PromotionAnalysisService:
                 if segment_id not in candidates
             ]
             if missing_segment_ids:
-                log.warn(
-                    "focus_segments_invalid",
-                    {"missingSegmentIds": missing_segment_ids},
-                )
+                log.warn("focus_segments_invalid", {"missingSegmentIds": missing_segment_ids})
                 raise SegmentSelectionError(
                     "focus_segment_ids must match active segment definitions"
                 )

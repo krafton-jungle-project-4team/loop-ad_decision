@@ -180,14 +180,7 @@ async def request_logging_middleware(
     try:
         response = await call_next(request)
     except Exception:
-        log.error(
-            "http_request_completed",
-            {
-                "statusCode": 500,
-                "outcome": "error",
-                "durationMs": duration_ms(started_at),
-            },
-        )
+        log.error("http_request_completed", {"statusCode": 500, "outcome": "error", "durationMs": duration_ms(started_at)})
         raise
     else:
         response.headers[REQUEST_ID_HEADER] = request_id

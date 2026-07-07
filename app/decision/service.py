@@ -111,24 +111,15 @@ class PromotionRunService:
             promotion_id=promotion.promotion_id,
             loop_count=request.loop_count,
         ):
-            log.warn(
-                "promotion_run_conflict",
-                {"promotionId": promotion.promotion_id, "loopCount": request.loop_count},
-            )
+            log.warn("promotion_run_conflict", {"promotionId": promotion.promotion_id, "loopCount": request.loop_count})
             raise RunConflictError(
                 "promotion_run already exists for promotion_id and loop_count"
             )
 
         target_segments = self._load_target_segments(analysis, promotion)
-        log.info(
-            "target_segments_loaded",
-            {"targetSegmentCount": len(target_segments)},
-        )
+        log.info("target_segments_loaded", {"targetSegmentCount": len(target_segments)})
         content_by_segment = self._load_content_by_segment(generation.generation_id)
-        log.info(
-            "content_candidates_loaded",
-            {"segmentCount": len(content_by_segment)},
-        )
+        log.info("content_candidates_loaded", {"segmentCount": len(content_by_segment)})
         selected_content = self._select_content_for_segments(
             promotion=promotion,
             analysis=analysis,
@@ -136,10 +127,7 @@ class PromotionRunService:
             target_segments=target_segments,
             content_by_segment=content_by_segment,
         )
-        log.info(
-            "content_candidates_selected",
-            {"selectedSegmentCount": len(selected_content)},
-        )
+        log.info("content_candidates_selected", {"selectedSegmentCount": len(selected_content)})
 
         run = self._build_promotion_run(
             promotion=promotion,
@@ -159,39 +147,21 @@ class PromotionRunService:
             loop_count=request.loop_count,
         )
         log.assign_context({"promotionRunId": run.promotion_run_id})
-        log.info(
-            "promotion_run_prepared",
-            {
-                "promotionRun": run,
-                "adExperimentCount": len(ad_experiments),
-            },
-        )
+        log.info("promotion_run_prepared", {"promotionRun": run, "adExperimentCount": len(ad_experiments)})
 
         for experiment in ad_experiments:
             if self._ad_experiment_repository.exists_for_run_segment(
                 promotion_run_id=experiment.promotion_run_id,
                 segment_id=experiment.segment_id,
             ):
-                log.warn(
-                    "ad_experiment_conflict",
-                    {
-                        "promotionRunId": experiment.promotion_run_id,
-                        "segmentId": experiment.segment_id,
-                    },
-                )
+                log.warn("ad_experiment_conflict", {"promotionRunId": experiment.promotion_run_id, "segmentId": experiment.segment_id})
                 raise RunConflictError(
                     "ad_experiment already exists for promotion_run_id and segment_id"
                 )
 
         self._promotion_run_repository.insert(run)
         self._ad_experiment_repository.insert_many(ad_experiments)
-        log.info(
-            "promotion_run_created",
-            {
-                "promotionRun": run,
-                "adExperiments": ad_experiments,
-            },
-        )
+        log.info("promotion_run_created", {"promotionRun": run, "adExperiments": ad_experiments})
 
         response = RunCreateResponse(
             promotion_run_id=run.promotion_run_id,
@@ -217,10 +187,7 @@ class PromotionRunService:
                 for experiment in ad_experiments
             ],
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _get_promotion(self, promotion_id: str) -> PromotionRecord:
@@ -252,10 +219,7 @@ class PromotionRunService:
                 raise RunValidationError(f"promotion analysis not found: {analysis_id}")
 
         if analysis.status != COMPLETED_STATUS:
-            log.warn(
-                "promotion_analysis_invalid",
-                {"analysisId": analysis.analysis_id, "status": analysis.status},
-            )
+            log.warn("promotion_analysis_invalid", {"analysisId": analysis.analysis_id, "status": analysis.status})
             raise RunValidationError("promotion analysis must be completed")
         _validate_project_campaign_promotion(
             label="promotion analysis",
@@ -289,10 +253,7 @@ class PromotionRunService:
                 raise RunValidationError(f"generation run not found: {generation_id}")
 
         if generation.status != COMPLETED_STATUS:
-            log.warn(
-                "generation_run_invalid",
-                {"generationId": generation.generation_id, "status": generation.status},
-            )
+            log.warn("generation_run_invalid", {"generationId": generation.generation_id, "status": generation.status})
             raise RunValidationError("generation run must be completed")
         _validate_project_campaign_promotion(
             label="generation run",
@@ -329,10 +290,7 @@ class PromotionRunService:
                 promotion=promotion,
             )
             if segment.analysis_id != analysis.analysis_id:
-                log.warn(
-                    "target_segment_mismatch",
-                    {"segmentId": segment.segment_id, "analysisId": segment.analysis_id},
-                )
+                log.warn("target_segment_mismatch", {"segmentId": segment.segment_id, "analysisId": segment.analysis_id})
                 raise RunValidationError(
                     "target segment must belong to the selected promotion analysis"
                 )
@@ -371,13 +329,7 @@ class PromotionRunService:
         for segment in target_segments:
             candidates = content_by_segment.get(segment.segment_id, [])
             if len(candidates) != 1:
-                log.warn(
-                    "content_candidate_invalid",
-                    {
-                        "segmentId": segment.segment_id,
-                        "contentCandidateCount": len(candidates),
-                    },
-                )
+                log.warn("content_candidate_invalid", {"segmentId": segment.segment_id, "contentCandidateCount": len(candidates)})
                 raise RunValidationError(
                     "each target segment must have exactly one approved or active "
                     f"content candidate: {segment.segment_id}"

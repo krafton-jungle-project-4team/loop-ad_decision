@@ -55,6 +55,17 @@ def run_use_case(project_id: str, promotion_id: str, request: object) -> object:
 
 Use `None` in `assign_context` only when intentionally removing a context field.
 
+## Log Call Formatting
+
+Keep a log call on one line when it is 140 characters or shorter.
+
+```py
+log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+```
+
+Use multi-line formatting only when the call exceeds 140 characters or the
+payload is large enough that one line is harder to scan.
+
 ## FastAPI Placement Rules
 
 HTTP middleware owns request-level logs:

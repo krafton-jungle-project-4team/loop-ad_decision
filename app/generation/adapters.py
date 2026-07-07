@@ -200,10 +200,7 @@ class GeminiImageClient:
     def generate_image(self, *, image_prompt: str) -> ImageArtifact:
         client = self._client or _create_gemini_client(self._api_key)
         started_at = perf_counter()
-        log.info(
-            "provider_request_prepared",
-            {"provider": "gemini", "model": self._model, "request": {"imagePrompt": image_prompt}},
-        )
+        log.info("provider_request_prepared", {"provider": "gemini", "model": self._model, "request": {"imagePrompt": image_prompt}})
         try:
             response = client.models.generate_content(
                 model=self._model,
@@ -212,15 +209,7 @@ class GeminiImageClient:
             )
             artifact = _extract_gemini_image(response)
         except Exception as exc:
-            log.warn(
-                "provider_request_failed",
-                {
-                    "provider": "gemini",
-                    "model": self._model,
-                    "err": exc,
-                    "durationMs": duration_ms(started_at),
-                },
-            )
+            log.warn("provider_request_failed", {"provider": "gemini", "model": self._model, "err": exc, "durationMs": duration_ms(started_at)})
             raise
         log.info(
             "provider_request_completed",

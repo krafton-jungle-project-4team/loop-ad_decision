@@ -301,10 +301,7 @@ class NextLoopService:
         if not failed_segment_ids and not failed_ad_experiment_ids:
             response = _no_op_response(previous_run)
             log.info("next_loop_skipped", {"reason": "no_failed_targets"})
-            log.info(
-                "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
-            )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
 
         promotion = self._promotion_repository.get_by_id(previous_run.promotion_id)
@@ -315,22 +312,13 @@ class NextLoopService:
             )
         next_loop_count = previous_run.loop_count + 1
         if next_loop_count > promotion.max_loop_count:
-            log.warn(
-                "promotion_loop_limit_exceeded",
-                {
-                    "loopCount": next_loop_count,
-                    "maxLoopCount": promotion.max_loop_count,
-                },
-            )
+            log.warn("promotion_loop_limit_exceeded", {"loopCount": next_loop_count, "maxLoopCount": promotion.max_loop_count})
             raise NextLoopValidationError("promotion max_loop_count exceeded")
         if self._promotion_run_repository.exists_for_promotion_loop(
             promotion_id=previous_run.promotion_id,
             loop_count=next_loop_count,
         ):
-            log.warn(
-                "promotion_run_conflict",
-                {"promotionId": previous_run.promotion_id, "loopCount": next_loop_count},
-            )
+            log.warn("promotion_run_conflict", {"promotionId": previous_run.promotion_id, "loopCount": next_loop_count})
             raise NextLoopConflictError(
                 "promotion_run already exists for next loop_count"
             )
@@ -428,10 +416,7 @@ class NextLoopService:
             next_ad_experiments=run_result.ad_experiments,
         )
         log.assign_context({"nextPromotionRunId": response.next_promotion_run_id})
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:
@@ -473,13 +458,7 @@ def _validate_failed_ids(
     evaluations: Sequence[PromotionEvaluationRecord],
 ) -> list[AdExperimentRecord]:
     if not failed_segment_ids or not failed_ad_experiment_ids:
-        log.warn(
-            "failed_target_mismatch",
-            {
-                "failedSegmentCount": len(failed_segment_ids),
-                "failedAdExperimentCount": len(failed_ad_experiment_ids),
-            },
-        )
+        log.warn("failed_target_mismatch", {"failedSegmentCount": len(failed_segment_ids), "failedAdExperimentCount": len(failed_ad_experiment_ids)})
         raise NextLoopValidationError(
             "failed_segment_ids and failed_ad_experiment_ids must be provided together"
         )
@@ -494,10 +473,7 @@ def _validate_failed_ids(
         if ad_experiment_id not in experiments_by_id
     ]
     if missing_ad_experiment_ids:
-        log.warn(
-            "failed_ad_experiments_invalid",
-            {"missingAdExperimentIds": missing_ad_experiment_ids},
-        )
+        log.warn("failed_ad_experiments_invalid", {"missingAdExperimentIds": missing_ad_experiment_ids})
         raise NextLoopValidationError(
             "failed_ad_experiment_ids must belong to the previous promotion_run"
         )
@@ -507,10 +483,7 @@ def _validate_failed_ids(
         if segment_id not in experiments_by_segment
     ]
     if missing_segment_ids:
-        log.warn(
-            "failed_segments_invalid",
-            {"missingSegmentIds": missing_segment_ids},
-        )
+        log.warn("failed_segments_invalid", {"missingSegmentIds": missing_segment_ids})
         raise NextLoopValidationError(
             "failed_segment_ids must belong to the previous promotion_run"
         )
@@ -521,13 +494,7 @@ def _validate_failed_ids(
     ]
     selected_segment_ids = [experiment.segment_id for experiment in selected_experiments]
     if set(selected_segment_ids) != set(failed_segment_ids):
-        log.warn(
-            "failed_target_mismatch",
-            {
-                "failedSegmentIds": failed_segment_ids,
-                "selectedSegmentIds": selected_segment_ids,
-            },
-        )
+        log.warn("failed_target_mismatch", {"failedSegmentIds": failed_segment_ids, "selectedSegmentIds": selected_segment_ids})
         raise NextLoopValidationError(
             "failed_segment_ids must match failed_ad_experiment_ids"
         )
@@ -540,21 +507,12 @@ def _validate_failed_ids(
     for experiment in selected_experiments:
         evaluation = latest_by_experiment_id.get(experiment.ad_experiment_id)
         if evaluation is None:
-            log.warn(
-                "ad_experiment_evaluation_not_found",
-                {"adExperimentId": experiment.ad_experiment_id},
-            )
+            log.warn("ad_experiment_evaluation_not_found", {"adExperimentId": experiment.ad_experiment_id})
             raise NextLoopValidationError(
                 "latest goal_not_met evaluation is required for each failed ad_experiment"
             )
         if evaluation.status != PromotionEvaluationStatus.GOAL_NOT_MET.value:
-            log.warn(
-                "ad_experiment_evaluation_invalid",
-                {
-                    "adExperimentId": experiment.ad_experiment_id,
-                    "status": evaluation.status,
-                },
-            )
+            log.warn("ad_experiment_evaluation_invalid", {"adExperimentId": experiment.ad_experiment_id, "status": evaluation.status})
             raise NextLoopValidationError(
                 "only goal_not_met ad_experiments can enter next-loop"
             )
@@ -570,10 +528,7 @@ def _validate_gateway_segments(
     expected = set(expected_segment_ids)
     actual = set(actual_segment_ids)
     if len(actual_segment_ids) != len(actual):
-        log.warn(
-            "gateway_segments_conflict",
-            {"label": label, "actualSegmentIds": actual_segment_ids},
-        )
+        log.warn("gateway_segments_conflict", {"label": label, "actualSegmentIds": actual_segment_ids})
         raise NextLoopValidationError(f"{label} returned duplicate segment ids")
     if actual != expected:
         log.warn(

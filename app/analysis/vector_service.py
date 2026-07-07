@@ -110,10 +110,7 @@ class SegmentVectorService:
             )
             log.assign_context({"segmentVectorId": response.segment_vector_id})
             log.info("segment_vector_reused", {"source": response.source})
-            log.info(
-                "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
-            )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
 
         reusable = self._segment_vector_repository.get_latest_by_segment(
@@ -126,10 +123,7 @@ class SegmentVectorService:
             _validate_vector(reusable.vector_values, reusable.vector_dim)
             source = reusable.source
             normalized_values = [float(value) for value in reusable.vector_values]
-            log.info(
-                "segment_vector_source_reused",
-                {"segmentVectorId": reusable.segment_vector_id, "source": source},
-            )
+            log.info("segment_vector_source_reused", {"segmentVectorId": reusable.segment_vector_id, "source": source})
         else:
             candidate_user_ids = _dedupe(request.candidate_user_ids)
             user_vectors = (
@@ -145,10 +139,7 @@ class SegmentVectorService:
             source = "decision_analysis"
             if user_vectors:
                 vector_values = _mean_user_vectors(user_vectors)
-                log.info(
-                    "user_vectors_loaded",
-                    {"userVectorCount": len(user_vectors)},
-                )
+                log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
             else:
                 source = "fixture"
                 vector_values = _fixture_vector(request.segment_id)
@@ -187,10 +178,7 @@ class SegmentVectorService:
         )
         log.assign_context({"segmentVectorId": response.segment_vector_id})
         log.info("segment_vector_created", {"source": source})
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
 

@@ -62,10 +62,7 @@ def dispatch_image_generation_jobs(
     try:
         thread.start()
     except Exception:
-        log.error(
-            "image_generation_dispatch_failed",
-            {"jobCount": len(job_list)},
-        )
+        log.error("image_generation_dispatch_failed", {"jobCount": len(job_list)})
     else:
         log.info("image_generation_dispatched", {"jobCount": len(job_list)})
 
@@ -130,16 +127,10 @@ def _run_single_image_generation_job(
         image_url = asset_storage.store_image(content_id=job.content_id, image=image)
         repository.update_image_url(content_id=job.content_id, image_url=image_url)
         connection.commit()
-        log.info(
-            "image_generation_completed",
-            {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)},
-        )
+        log.info("image_generation_completed", {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)})
     except Exception as exc:
         connection.rollback()
-        log.warn(
-            "image_generation_failed",
-            {"err": exc, "durationMs": duration_ms(job_started_at)},
-        )
+        log.warn("image_generation_failed", {"err": exc, "durationMs": duration_ms(job_started_at)})
         try:
             repository.mark_image_generation_failed(
                 content_id=job.content_id,

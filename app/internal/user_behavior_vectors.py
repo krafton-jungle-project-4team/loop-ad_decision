@@ -68,13 +68,7 @@ class UserBehaviorVectorBatchService:
                 window_start=window_start,
                 window_end=window_end,
             )
-            log.info(
-                "user_behavior_vectors_created",
-                {
-                    "processedUserCount": processed_user_count,
-                    "vectorVersion": request.vector_version,
-                },
-            )
+            log.info("user_behavior_vectors_created", {"processedUserCount": processed_user_count, "vectorVersion": request.vector_version})
         else:
             log.info("raw_event_users_empty", {"processedUserCount": 0})
 
@@ -88,10 +82,7 @@ class UserBehaviorVectorBatchService:
             window_end=window_end,
             status="completed",
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _resolve_now(self) -> datetime:

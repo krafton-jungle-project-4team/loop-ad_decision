@@ -142,13 +142,7 @@ class SegmentAssignmentService:
             raise SegmentAssignmentValidationError(
                 "at least one non-fallback ad experiment is required"
             )
-        log.info(
-            "ad_experiments_loaded",
-            {
-                "nonFallbackCount": len(experiments.non_fallback),
-                "hasFallback": experiments.fallback is not None,
-            },
-        )
+        log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
 
         segment_vectors = self._load_segment_vectors(
             project_id=run.project_id,
@@ -159,10 +153,7 @@ class SegmentAssignmentService:
             ],
             vector_version=request.vector_version,
         )
-        log.info(
-            "segment_vectors_loaded",
-            {"segmentVectorCount": len(segment_vectors)},
-        )
+        log.info("segment_vectors_loaded", {"segmentVectorCount": len(segment_vectors)})
         eligible_users = self._load_eligible_users(
             project_id=run.project_id,
             request=request,
@@ -197,10 +188,7 @@ class SegmentAssignmentService:
             result.fallback for result in build_result.matches.values()
         )
         if fallback_needed and experiments.fallback is None:
-            log.warn(
-                "fallback_ad_experiment_missing",
-                {"fallbackCount": build_result.fallback_count},
-            )
+            log.warn("fallback_ad_experiment_missing", {"fallbackCount": build_result.fallback_count})
             raise SegmentAssignmentValidationError(
                 "fallback ad experiment is required when fallback assignments exist"
             )
@@ -242,10 +230,7 @@ class SegmentAssignmentService:
             min_sample_size=min_sample_size,
         )
         if insufficient_count:
-            log.info(
-                "segments_marked_insufficient",
-                {"insufficientSegmentCount": insufficient_count},
-            )
+            log.info("segments_marked_insufficient", {"insufficientSegmentCount": insufficient_count})
 
         response = SegmentAssignmentBuildResponse(
             promotion_run_id=run.promotion_run_id,
@@ -269,10 +254,7 @@ class SegmentAssignmentService:
             insufficient_segment_count=insufficient_count,
             status="completed",
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _build_match_results(
@@ -371,13 +353,7 @@ class SegmentAssignmentService:
         for segment_id in segment_ids:
             segment_records = records_by_segment.get(segment_id, [])
             if len(segment_records) != 1:
-                log.warn(
-                    "segment_vector_invalid",
-                    {
-                        "segmentId": segment_id,
-                        "segmentVectorCount": len(segment_records),
-                    },
-                )
+                log.warn("segment_vector_invalid", {"segmentId": segment_id, "segmentVectorCount": len(segment_records)})
                 raise SegmentAssignmentValidationError(
                     "each non-fallback segment must have exactly one segment vector: "
                     f"{segment_id}"

@@ -175,10 +175,7 @@ class GenerationService:
                 status=GenerationStatus.FAILED,
                 content_candidates=[],
             )
-            log.info(
-                "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
-            )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
 
         generation_run = self._build_generation_run_record(
@@ -201,10 +198,7 @@ class GenerationService:
                 for candidate in content_candidates
             ],
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     @log_context_scope
@@ -272,10 +266,7 @@ class GenerationService:
                 generated_segment_ids=[],
                 status=GenerationStatus.FAILED,
             )
-            log.info(
-                "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
-            )
+            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
 
         generation_run = self._build_generation_run_record(
@@ -297,10 +288,7 @@ class GenerationService:
             ],
             status=GenerationStatus.COMPLETED,
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _build_generation_run_record(
@@ -547,10 +535,7 @@ class GenerationService:
             return
         for content_candidate in content_candidates:
             self._content_candidate_repository.create(content_candidate)
-        log.info(
-            "content_candidates_created",
-            {"contentCandidateCount": len(content_candidates)},
-        )
+        log.info("content_candidates_created", {"contentCandidateCount": len(content_candidates)})
 
     def _schedule_image_generation(
         self,
@@ -574,10 +559,7 @@ class GenerationService:
                         image_prompt=content_candidate.image_prompt,
                     )
                 )
-                log.info(
-                    "image_generation_queued",
-                    {"contentId": content_candidate.content_id},
-                )
+                log.info("image_generation_queued", {"contentId": content_candidate.content_id})
 
     def _next_generation_id(self, promotion_id: str) -> str:
         base_generation_id = _generation_id_from_promotion(promotion_id)

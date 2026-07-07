@@ -115,17 +115,8 @@ class VectorClusterSegmentSuggester:
         sample_seed = _promotion_sample_seed(promotion)
         user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
-            log.warn(
-                "user_vector_sample_insufficient",
-                {
-                    "userVectorCount": len(user_vectors),
-                    "minClusterSize": self._min_cluster_size,
-                },
-            )
-            log.info(
-                "completed",
-                {"response": [], "durationMs": duration_ms(started_at)},
-            )
+            log.warn("user_vector_sample_insufficient", {"userVectorCount": len(user_vectors), "minClusterSize": self._min_cluster_size})
+            log.info("completed", {"response": [], "durationMs": duration_ms(started_at)})
             return []
 
         cluster_count = min(
@@ -135,10 +126,7 @@ class VectorClusterSegmentSuggester:
         clusters = _cluster_user_vectors(user_vectors, cluster_count)
         if not clusters:
             log.warn("vector_clusters_empty", {"userVectorCount": len(user_vectors)})
-            log.info(
-                "completed",
-                {"response": [], "durationMs": duration_ms(started_at)},
-            )
+            log.info("completed", {"response": [], "durationMs": duration_ms(started_at)})
             return []
 
         total_eligible_user_count = len(user_vectors)
@@ -171,10 +159,7 @@ class VectorClusterSegmentSuggester:
                 "totalEligibleUserCount": total_eligible_user_count,
             },
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _load_user_vectors(

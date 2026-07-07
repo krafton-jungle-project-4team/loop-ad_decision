@@ -111,10 +111,7 @@ class AdExperimentEvaluationService:
 
         run = self._promotion_run_repository.get_by_id(experiment.promotion_run_id)
         if run is None:
-            log.warn(
-                "promotion_run_not_found",
-                {"promotionRunId": experiment.promotion_run_id},
-            )
+            log.warn("promotion_run_not_found", {"promotionRunId": experiment.promotion_run_id})
             raise AdExperimentEvaluationValidationError(
                 f"promotion run not found: {experiment.promotion_run_id}"
             )
@@ -181,10 +178,7 @@ class AdExperimentEvaluationService:
             ad_experiment_id=experiment.ad_experiment_id,
             status=status,
         )
-        log.info(
-            "promotion_evaluation_created",
-            {"evaluation": evaluation, "status": status},
-        )
+        log.info("promotion_evaluation_created", {"evaluation": evaluation, "status": status})
 
         response = AdExperimentEvaluateResponse(
             evaluation_id=evaluation.evaluation_id,
@@ -203,10 +197,7 @@ class AdExperimentEvaluationService:
             next_loop_required=evaluation.next_loop_required,
             feedback=evaluation.feedback,
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _load_counts(self, experiment: AdExperimentRecord) -> MetricCountRecord:
@@ -289,10 +280,7 @@ class PromotionRunEvaluationService:
             if experiment.ad_experiment_id not in latest_by_experiment
         ]
         for experiment in missing_experiments:
-            log.info(
-                "ad_experiment_evaluation_missing",
-                {"adExperimentId": experiment.ad_experiment_id},
-            )
+            log.info("ad_experiment_evaluation_missing", {"adExperimentId": experiment.ad_experiment_id})
             self._ad_experiment_evaluation_service.evaluate(
                 ad_experiment_id=experiment.ad_experiment_id,
                 request=AdExperimentEvaluateRequest(),
@@ -305,10 +293,7 @@ class PromotionRunEvaluationService:
         for experiment in experiments:
             evaluation = latest_by_experiment.get(experiment.ad_experiment_id)
             if evaluation is None:
-                log.warn(
-                    "ad_experiment_evaluation_not_found",
-                    {"adExperimentId": experiment.ad_experiment_id},
-                )
+                log.warn("ad_experiment_evaluation_not_found", {"adExperimentId": experiment.ad_experiment_id})
                 raise PromotionRunEvaluationValidationError(
                     "latest ad experiment evaluation is required before aggregate"
                 )
@@ -358,10 +343,7 @@ class PromotionRunEvaluationService:
             promotion_run_id=run.promotion_run_id,
             status=aggregate.status,
         )
-        log.info(
-            "promotion_run_evaluation_created",
-            {"evaluation": evaluation, "status": aggregate.status},
-        )
+        log.info("promotion_run_evaluation_created", {"evaluation": evaluation, "status": aggregate.status})
 
         response = PromotionRunEvaluateResponse(
             promotion_run_id=run.promotion_run_id,
@@ -380,10 +362,7 @@ class PromotionRunEvaluationService:
             failed_segment_ids=aggregate.failed_segment_ids,
             failed_ad_experiment_ids=aggregate.failed_ad_experiment_ids,
         )
-        log.info(
-            "completed",
-            {"response": response, "durationMs": duration_ms(started_at)},
-        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
 
     def _latest_by_experiment(
