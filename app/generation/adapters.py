@@ -13,7 +13,7 @@ import boto3
 from app.config import Settings
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
-from app.generation.schemas import ContentChannel
+from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel
 
 
 EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v2"
@@ -31,6 +31,7 @@ TEXT_FIELD_NAMES = (
     "message",
     "image_prompt",
 )
+FALLBACK_IMAGE_PROMPT_MAX_LENGTH = 240
 
 
 class ContentTextClient(Protocol):
@@ -363,6 +364,7 @@ def _generated_content_from_values(
 ) -> GeneratedContent:
     if not landing_url:
         raise ValueError("promotion.landing_url is required to generate content")
+    values = _values_with_banner_image_prompt(channel=channel, values=values)
     content = GeneratedContent(
         subject=values.get("subject"),
         preheader=values.get("preheader"),
@@ -377,6 +379,37 @@ def _generated_content_from_values(
     return content
 
 
+def _values_with_banner_image_prompt(
+    *,
+    channel: ContentChannel,
+    values: Mapping[str, str | None],
+) -> Mapping[str, str | None]:
+    if channel != ContentChannel.ONSITE_BANNER or _optional_text(
+        values.get("image_prompt")
+    ):
+        return values
+
+    image_prompt = _fallback_banner_image_prompt(values)
+    if not image_prompt:
+        return values
+    return {**values, "image_prompt": image_prompt}
+
+
+def _fallback_banner_image_prompt(values: Mapping[str, str | None]) -> str | None:
+    title = _optional_text(values.get("title"))
+    body = _optional_text(values.get("body"))
+    cta = _optional_text(values.get("cta"))
+    prompt_parts = [part for part in (title, body, cta) if part]
+    if not prompt_parts:
+        return None
+
+    prompt = (
+        "Bright modern hotel booking onsite banner image, clean travel layout, "
+        + " ".join(prompt_parts)
+    )
+    return _compact_text(prompt, max_length=FALLBACK_IMAGE_PROMPT_MAX_LENGTH)
+
+
 def _system_instruction(channel: ContentChannel) -> str:
     return (
         "You generate hotel booking advertisement content. "
@@ -387,6 +420,7 @@ def _system_instruction(channel: ContentChannel) -> str:
         "The image_prompt value may stay in English for the image generator "
         "and must not request visible text in the image. "
         f"Return only the JSON fields for the {channel.value} channel contract. "
+        "Return non-empty strings for every required channel field. "
         "Do not generate, infer, or override landing URLs. "
         "Do not include legacy naming, marketplace language, or unrelated commerce terms."
     )
@@ -398,6 +432,8 @@ def _user_instruction(
     prompt_result: PromptBuildResult,
     option_index: int,
 ) -> str:
+    channel = prompt_input.promotion.channel
+    required_fields = ", ".join(_required_text_fields(channel))
     return "\n".join(
         [
             prompt_result.generation_prompt,
@@ -405,14 +441,18 @@ def _user_instruction(
             f"Fixed landing URL assigned by Loop-Ad: {prompt_input.promotion.landing_url or ''}",
             "Do not return landing_url in the JSON response.",
             "Do not copy English source text verbatim; adapt it into natural Korean.",
+            f"Required JSON string fields: {required_fields}.",
             "Return concise Korean hotel booking copy. Return JSON only.",
         ]
     )
 
 
 def _content_schema(channel: ContentChannel) -> dict[str, Any]:
+    required_text_fields = set(_required_text_fields(channel))
     properties = {
-        field_name: {"type": ["string", "null"]}
+        field_name: {"type": "string"}
+        if field_name in required_text_fields
+        else {"type": ["string", "null"]}
         for field_name in TEXT_FIELD_NAMES
     }
     return {
@@ -424,11 +464,26 @@ def _content_schema(channel: ContentChannel) -> dict[str, Any]:
     }
 
 
+def _required_text_fields(channel: ContentChannel) -> tuple[str, ...]:
+    return tuple(
+        field_name
+        for field_name in CHANNEL_REQUIRED_FIELDS[channel]
+        if field_name in TEXT_FIELD_NAMES
+    )
+
+
 def _optional_text(value: object) -> str | None:
     if value is None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _compact_text(value: str, *, max_length: int) -> str:
+    compacted = " ".join(value.split())
+    if len(compacted) <= max_length:
+        return compacted
+    return compacted[: max_length - 1].rstrip() + "."
 
 
 def _asset_key(
