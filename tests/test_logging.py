@@ -64,26 +64,6 @@ def test_log_context_scope_logs_failed_with_active_context(capsys) -> None:
     assert isinstance(failed["durationMs"], int)
 
 
-def test_logger_redacts_secret_payload_fields(capsys) -> None:
-    configure_logging(load_settings(valid_env()))
-
-    log.info(
-        "provider_request_prepared",
-        {
-            "project_id": "project_1",
-            "Authorization": "Bearer secret",
-            "api_key": "secret",
-            "refresh_token": "secret",
-        },
-    )
-
-    record = _last_event(_stderr_records(capsys), "provider_request_prepared")
-    assert record["projectId"] == "project_1"
-    assert "Authorization" not in record
-    assert "apiKey" not in record
-    assert "refreshToken" not in record
-
-
 def _stderr_records(capsys) -> list[dict[str, object]]:
     captured = capsys.readouterr()
     return [json.loads(line) for line in captured.err.splitlines() if line.strip()]

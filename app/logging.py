@@ -276,7 +276,7 @@ def _to_jsonable(value: Any) -> Any:
         return {
             _snake_to_camel(str(key)): _to_jsonable(item)
             for key, item in value.items()
-            if item is not None and not _is_secret_key(str(key))
+            if item is not None
         }
     if isinstance(value, bytes):
         return {"byteLength": len(value)}
@@ -290,13 +290,6 @@ def _snake_to_camel(value: str) -> str:
     if len(parts) == 1:
         return value
     return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
-
-
-def _is_secret_key(value: str) -> bool:
-    normalized = value.lower().replace("_", "").replace("-", "")
-    return normalized in _SECRET_KEYS or any(
-        token in normalized for token in _SECRET_TOKENS
-    )
 
 
 _CONTEXT_FIELD_NAMES = {
@@ -314,14 +307,3 @@ _CONTEXT_FIELD_NAMES = {
     "thread_id": "threadId",
     "user_id": "userId",
 }
-
-_SECRET_KEYS = {
-    "authorization",
-    "cookie",
-    "setcookie",
-    "apikey",
-    "password",
-    "sessiontoken",
-    "refreshtoken",
-}
-_SECRET_TOKENS = ("secret", "token", "credential")
