@@ -227,15 +227,19 @@ def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -
 def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
     built_settings = []
+    dispatched_jobs = []
 
     def fake_create_postgres_connection(_settings) -> RecordingConnection:
         connection = RecordingConnection()
         connections.append(connection)
         return connection
 
-    def fake_build_external_content_generator(settings):
-        built_settings.append(settings)
+    def fake_build_external_content_generator(settings, *, generate_images=True):
+        built_settings.append((settings, generate_images))
         return FakeExternalContentGenerator()
+
+    def fake_dispatch_image_generation_jobs(*, settings, jobs):
+        dispatched_jobs.append((settings, list(jobs)))
 
     monkeypatch.setattr(
         "app.generation.router.create_postgres_connection",
@@ -244,6 +248,10 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
     monkeypatch.setattr(
         "app.generation.router.build_external_content_generator",
         fake_build_external_content_generator,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.dispatch_image_generation_jobs",
+        fake_dispatch_image_generation_jobs,
     )
     env = valid_env()
     env["LOOPAD_ENV"] = "dev"
@@ -263,11 +271,18 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
     )
 
     assert response.status_code == 200
-    assert response.json()["content_candidates"][0]["image_url"] == (
-        "https://gen-ai.asset.dev.loop-ad.org/generated/content_banner_001.png"
-    )
+    assert response.json()["content_candidates"][0]["image_url"] is None
     assert len(connections) == 1
-    assert built_settings[0].env == "dev"
+    assert built_settings[0][0].env == "dev"
+    assert built_settings[0][1] is False
+    assert len(dispatched_jobs) == 1
+    assert dispatched_jobs[0][0].env == "dev"
+    assert [job.content_id for job in dispatched_jobs[0][1]] == [
+        "content_banner_repeat_hotel_no_booking_001"
+    ]
+    assert [job.image_prompt for job in dispatched_jobs[0][1]] == [
+        "bright hotel suite banner"
+    ]
 
 
 def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
@@ -366,10 +381,6 @@ class FakeExternalContentGenerator:
             body="Compare refundable hotel stays before rooms run out.",
             cta="View hotel deals",
             image_prompt="bright hotel suite banner",
-            image_url=(
-                "https://gen-ai.asset.dev.loop-ad.org/generated/"
-                "content_banner_001.png"
-            ),
             landing_url="https://demo-stay.example.com/summer",
         )
 

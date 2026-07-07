@@ -8,6 +8,10 @@ from pydantic import ValidationError
 from app.db import create_postgres_connection
 from app.dependencies import get_settings
 from app.generation.adapters import build_external_content_generator
+from app.generation.image_tasks import (
+    ImageGenerationJobCollector,
+    dispatch_image_generation_jobs,
+)
 from app.generation.repositories import (
     ContentCandidateRepository,
     GenerationInputRepository,
@@ -34,16 +38,27 @@ def get_generation_service(request: Request) -> Iterator[GenerationRequestHandle
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
     content_generator = None
+    image_generation_scheduler = None
     if settings.env != "test":
-        content_generator = build_external_content_generator(settings)
+        content_generator = build_external_content_generator(
+            settings,
+            generate_images=False,
+        )
+        image_generation_scheduler = ImageGenerationJobCollector()
     try:
         yield GenerationService(
             generation_run_repository=GenerationRunRepository(connection),
             content_candidate_repository=ContentCandidateRepository(connection),
             generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
+            image_generation_scheduler=image_generation_scheduler,
         )
         connection.commit()
+        if image_generation_scheduler is not None:
+            dispatch_image_generation_jobs(
+                settings=settings,
+                jobs=image_generation_scheduler.jobs,
+            )
     except Exception:
         connection.rollback()
         raise

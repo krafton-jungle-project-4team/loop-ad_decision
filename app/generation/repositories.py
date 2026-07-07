@@ -488,6 +488,33 @@ class ContentCandidateRepository:
             updated_at
     """
 
+    UPDATE_IMAGE_URL_SQL = """
+        UPDATE content_candidates
+        SET
+            image_url = %(image_url)s,
+            metadata_json = COALESCE(metadata_json, '{}'::jsonb) ||
+                jsonb_build_object(
+                    'image_url', %(image_url)s,
+                    'image_generation_status', 'completed'
+                ),
+            updated_at = now()
+        WHERE content_id = %(content_id)s
+        RETURNING content_id
+    """
+
+    MARK_IMAGE_GENERATION_FAILED_SQL = """
+        UPDATE content_candidates
+        SET
+            metadata_json = COALESCE(metadata_json, '{}'::jsonb) ||
+                jsonb_build_object(
+                    'image_generation_status', 'failed',
+                    'image_generation_error_code', %(error_code)s
+                ),
+            updated_at = now()
+        WHERE content_id = %(content_id)s
+        RETURNING content_id
+    """
+
     SELECT_BY_GENERATION_SQL = """
         SELECT
             content_id,
@@ -532,6 +559,37 @@ class ContentCandidateRepository:
         if created is None:
             raise RuntimeError("content_candidates insert returned no row")
         return created
+
+    def update_image_url(self, *, content_id: str, image_url: str) -> dict[str, Any]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.UPDATE_IMAGE_URL_SQL,
+                {"content_id": content_id, "image_url": image_url},
+            )
+            updated = cursor.fetchone()
+
+        if updated is None:
+            raise RuntimeError("content_candidates image_url update returned no row")
+        return updated
+
+    def mark_image_generation_failed(
+        self,
+        *,
+        content_id: str,
+        error_code: str,
+    ) -> dict[str, Any]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.MARK_IMAGE_GENERATION_FAILED_SQL,
+                {"content_id": content_id, "error_code": error_code},
+            )
+            updated = cursor.fetchone()
+
+        if updated is None:
+            raise RuntimeError(
+                "content_candidates image generation failure update returned no row"
+            )
+        return updated
 
     def list_by_generation(self, generation_id: str) -> list[dict[str, Any]]:
         with self._connection.cursor(row_factory=dict_row) as cursor:

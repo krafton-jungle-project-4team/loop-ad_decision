@@ -135,7 +135,7 @@ FORBIDDEN_PUBLIC_TERMS = (
 )
 
 IMAGE_URL = (
-    "https://gen-ai.asset.dev.loop-ad.org/genai/generated/"
+    "https://gen-ai.asset.dev.loop-ad.org/generated/"
     "content_banner_repeat_hotel_001.png"
 )
 
