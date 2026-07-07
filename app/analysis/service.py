@@ -118,7 +118,7 @@ RELATED_TERMS_BY_GOAL = {
 SIGNAL_COPY_BY_FEATURE = {
     "Booking conversion ready users": {
         "key": "booking_conversion_ready",
-        "chip": "예약 완료 경험",
+        "chip": "예약 가능성 높음",
     },
     "Promotion-engaged hotel users": {
         "key": "promotion_engaged",
@@ -160,6 +160,30 @@ SIGNAL_COPY_BY_FEATURE = {
         "key": "booking_complete",
         "chip": "예약 완료",
     },
+    "Booking cancellation risk users": {
+        "key": "booking_cancel_risk",
+        "chip": "취소 위험",
+    },
+    "Mixed event hotel users": {
+        "key": "mixed_hotel_behavior",
+        "chip": "복합 행동",
+    },
+    "Free cancellation seekers": {
+        "key": "free_cancellation",
+        "chip": "무료 취소 선호",
+    },
+    "Breakfast-included seekers": {
+        "key": "breakfast_included",
+        "chip": "조식 선호",
+    },
+    "Higher-price hotel shoppers": {
+        "key": "higher_price",
+        "chip": "고가 숙소 탐색",
+    },
+    "Promotion click responsive users": {
+        "key": "promotion_click_responsive",
+        "chip": "클릭 반응 높음",
+    },
     "Mobile hotel users": {
         "key": "mobile_hotel_user",
         "chip": "모바일 이용",
@@ -185,6 +209,17 @@ SEGMENT_TITLE_BY_SIGNAL = {
     ("near_checkin",): "임박 예약 가능성이 높은 고객",
     ("existing_users",): "기존 사용자 전체 고객",
     ("repeat_hotel_viewer",): "반복 조회 후 예약 전환이 필요한 고객",
+    ("booking_start",): "예약을 시작한 고객",
+    ("booking_complete",): "예약 완료 경험 고객",
+    ("campaign_redirect",): "이메일 링크 반응 고객",
+    ("campaign_landing",): "캠페인 랜딩 고객",
+    ("free_cancellation",): "무료 취소 혜택 선호 고객",
+    ("breakfast_included",): "조식 혜택 관심 고객",
+    ("higher_price",): "프리미엄 숙소 관심 고객",
+    ("hotel_market_affinity",): "특정 지역 선호 고객",
+    ("hotel_cluster_affinity",): "숙소 취향이 뚜렷한 고객",
+    ("hotel_path_pattern",): "탐색 경로가 유사한 고객",
+    ("promotion_click_responsive",): "프로모션 클릭 반응이 높은 고객",
 }
 
 GOAL_REASON_COPY = {
@@ -750,6 +785,7 @@ class PromotionAnalysisService:
             target_segment=target_segment,
             primary_signals=primary_signals,
         )
+        ai_score_details = _ai_score_details(segment)
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -768,6 +804,7 @@ class PromotionAnalysisService:
                 "estimated_size": target_segment.estimated_size,
                 "priority": target_segment.priority,
                 "cluster_score": _ai_segment_score(segment),
+                **ai_score_details,
                 "booking_propensity_score": (
                     booking_prediction.probability if booking_prediction else None
                 ),
@@ -787,6 +824,10 @@ class PromotionAnalysisService:
                 "goal_metric": promotion.goal_metric,
                 "segment_source": segment.source,
                 "primary_signals": [signal["key"] for signal in primary_signals],
+                "promotion_vector_basis": segment.profile_json.get(
+                    "promotion_vector_basis",
+                    {},
+                ),
                 "has_hotel_profile": candidate.profile is not None,
                 "ml_model": (
                     booking_model.model_version if booking_model else "unavailable"
@@ -802,6 +843,14 @@ class PromotionAnalysisService:
                 "segment_vector_id": target_segment.segment_vector_id,
                 "content_brief": target_segment.content_brief_json,
                 "data_evidence": target_segment.data_evidence_json,
+                "promotion_vector_basis": segment.profile_json.get(
+                    "promotion_vector_basis",
+                    {},
+                ),
+                "promotion_matched_features": segment.profile_json.get(
+                    "promotion_matched_features",
+                    [],
+                ),
                 "display_copy": display_copy,
             },
         )
@@ -838,6 +887,15 @@ class PromotionAnalysisService:
             "sample_ratio": _json_decimal(segment.sample_ratio),
             "total_eligible_user_count": segment.total_eligible_user_count,
         }
+        for key in (
+            "promotion_cluster_similarity",
+            "recommendation_score",
+            "cluster_quality_score",
+            "sample_size_score",
+        ):
+            value = segment.profile_json.get(key)
+            if value is not None:
+                evidence[key] = value
         if candidate.profile is not None:
             evidence["hotel_profile"] = dict(candidate.profile.profile_json)
         return evidence
@@ -1040,6 +1098,15 @@ def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
 def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
     signals: list[dict[str, str]] = []
     seen: set[str] = set()
+    matched_features = segment.profile_json.get("promotion_matched_features")
+    if isinstance(matched_features, Sequence) and not isinstance(matched_features, str):
+        for feature in matched_features:
+            signal = _signal_from_feature(str(feature))
+            if signal is None or signal["key"] in seen:
+                continue
+            signals.append(signal)
+            seen.add(signal["key"])
+
     top_features = segment.profile_json.get("top_common_features")
     if isinstance(top_features, Sequence) and not isinstance(top_features, str):
         for feature in top_features:
@@ -1064,11 +1131,11 @@ def _signal_from_feature(feature: str) -> dict[str, str] | None:
     if signal_copy is not None:
         return {"key": signal_copy["key"], "chip": signal_copy["chip"]}
     if feature.startswith("Hotel page path bucket"):
-        return {"key": "hotel_browsing", "chip": "호텔 탐색"}
+        return {"key": "hotel_path_pattern", "chip": "탐색 경로"}
     if feature.startswith("Hotel cluster bucket"):
-        return {"key": "hotel_preference", "chip": "호텔 선호"}
+        return {"key": "hotel_cluster_affinity", "chip": "숙소 취향"}
     if feature.startswith("Hotel market bucket"):
-        return {"key": "market_preference", "chip": "지역 선호"}
+        return {"key": "hotel_market_affinity", "chip": "지역 선호"}
     return None
 
 
@@ -1139,11 +1206,31 @@ def _analysis_reason(focus_segment_ids: Sequence[str] | None) -> str:
 
 
 def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:
-    raw_score = segment.profile_json.get("cluster_score", 0.0)
+    raw_score = segment.profile_json.get(
+        "recommendation_score",
+        segment.profile_json.get("cluster_score", 0.0),
+    )
     try:
         return float(raw_score)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
+    details: dict[str, Any] = {}
+    for key in (
+        "promotion_cluster_similarity",
+        "recommendation_score",
+        "cluster_quality_score",
+        "sample_size_score",
+    ):
+        value = segment.profile_json.get(key)
+        if value is not None:
+            details[key] = value
+    score_components = segment.profile_json.get("score_components")
+    if isinstance(score_components, Mapping):
+        details["score_components"] = dict(score_components)
+    return details
 
 
 def _suggestion_source(segment: SegmentDefinitionRecord) -> str:
