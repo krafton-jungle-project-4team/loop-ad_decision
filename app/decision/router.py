@@ -17,6 +17,7 @@ from app.analysis.repositories import (
     SegmentVectorRepository as AnalysisSegmentVectorRepository,
     UserBehaviorVectorRepository as AnalysisUserBehaviorVectorRepository,
 )
+from app.analysis.report_generator import build_segment_suggestion_report_generator
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 from app.analysis.service import PromotionAnalysisService
 from app.analysis.vector_service import SegmentVectorService
@@ -263,6 +264,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=analysis_user_behavior_vector_repository,
             ),
+            segment_report_generator=build_segment_suggestion_report_generator(settings),
         )
         content_generator = None
         if settings.env != "test":

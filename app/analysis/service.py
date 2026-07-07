@@ -21,6 +21,11 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
+from app.analysis.report_generator import (
+    DeterministicSegmentSuggestionReportGenerator,
+    SegmentSuggestionReportGenerator,
+    SegmentSuggestionReportInput,
+)
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
 from app.analysis.vector_service import SegmentVectorBuildRequest, SegmentVectorBuildResult
 from app.logging import log, log_context_scope, now_ms, duration_ms
@@ -387,6 +392,7 @@ class PromotionAnalysisService:
         promotion_analysis_repository: PromotionAnalysisWriter,
         segment_vector_service: SegmentVectorPreparer | None = None,
         segment_suggester: SegmentDefinitionSuggester | None = None,
+        segment_report_generator: SegmentSuggestionReportGenerator | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
     ) -> None:
         self._promotion_repository = promotion_repository
@@ -395,6 +401,10 @@ class PromotionAnalysisService:
         self._promotion_analysis_repository = promotion_analysis_repository
         self._segment_vector_service = segment_vector_service
         self._segment_suggester = segment_suggester
+        self._segment_report_generator = (
+            segment_report_generator
+            or DeterministicSegmentSuggestionReportGenerator()
+        )
         self._max_default_target_segments = max_default_target_segments
 
     @log_context_scope
@@ -786,6 +796,72 @@ class PromotionAnalysisService:
             primary_signals=primary_signals,
         )
         ai_score_details = _ai_score_details(segment)
+        score_json = {
+            "rank": rank + 1,
+            "estimated_size": target_segment.estimated_size,
+            "priority": target_segment.priority,
+            "cluster_score": _ai_segment_score(segment),
+            **ai_score_details,
+            "booking_propensity_score": (
+                booking_prediction.probability if booking_prediction else None
+            ),
+            "booking_propensity_model": (
+                booking_prediction.model_version
+                if booking_prediction
+                else "unavailable"
+            ),
+            "booking_propensity_training_sample_count": (
+                booking_prediction.training_sample_count
+                if booking_prediction
+                else 0
+            ),
+        }
+        reason_json = {
+            "channel": promotion.channel,
+            "goal_metric": promotion.goal_metric,
+            "segment_source": segment.source,
+            "primary_signals": [signal["key"] for signal in primary_signals],
+            "promotion_vector_basis": segment.profile_json.get(
+                "promotion_vector_basis",
+                {},
+            ),
+            "has_hotel_profile": candidate.profile is not None,
+            "ml_model": (
+                booking_model.model_version if booking_model else "unavailable"
+            ),
+            "ml_features": (
+                dict(booking_prediction.feature_values)
+                if booking_prediction
+                else {}
+            ),
+        }
+        metadata_json: dict[str, Any] = {
+            "segment_name": target_segment.segment_name,
+            "segment_vector_id": target_segment.segment_vector_id,
+            "content_brief": target_segment.content_brief_json,
+            "data_evidence": target_segment.data_evidence_json,
+            "promotion_vector_basis": segment.profile_json.get(
+                "promotion_vector_basis",
+                {},
+            ),
+            "promotion_matched_features": segment.profile_json.get(
+                "promotion_matched_features",
+                [],
+            ),
+            "display_copy": display_copy,
+        }
+        if segment.source == "ai_suggested":
+            metadata_json["ai_report"] = self._segment_report_generator.generate_report(
+                SegmentSuggestionReportInput(
+                    promotion=promotion,
+                    segment=segment,
+                    target_segment=target_segment,
+                    display_copy=display_copy,
+                    primary_signals=primary_signals,
+                    score_json=score_json,
+                    reason_json=reason_json,
+                )
+            )
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -799,60 +875,9 @@ class PromotionAnalysisService:
             suggested_rank=rank + 1,
             suggestion_source=_suggestion_source(segment),
             status="suggested",
-            score_json={
-                "rank": rank + 1,
-                "estimated_size": target_segment.estimated_size,
-                "priority": target_segment.priority,
-                "cluster_score": _ai_segment_score(segment),
-                **ai_score_details,
-                "booking_propensity_score": (
-                    booking_prediction.probability if booking_prediction else None
-                ),
-                "booking_propensity_model": (
-                    booking_prediction.model_version
-                    if booking_prediction
-                    else "unavailable"
-                ),
-                "booking_propensity_training_sample_count": (
-                    booking_prediction.training_sample_count
-                    if booking_prediction
-                    else 0
-                ),
-            },
-            reason_json={
-                "channel": promotion.channel,
-                "goal_metric": promotion.goal_metric,
-                "segment_source": segment.source,
-                "primary_signals": [signal["key"] for signal in primary_signals],
-                "promotion_vector_basis": segment.profile_json.get(
-                    "promotion_vector_basis",
-                    {},
-                ),
-                "has_hotel_profile": candidate.profile is not None,
-                "ml_model": (
-                    booking_model.model_version if booking_model else "unavailable"
-                ),
-                "ml_features": (
-                    dict(booking_prediction.feature_values)
-                    if booking_prediction
-                    else {}
-                ),
-            },
-            metadata_json={
-                "segment_name": target_segment.segment_name,
-                "segment_vector_id": target_segment.segment_vector_id,
-                "content_brief": target_segment.content_brief_json,
-                "data_evidence": target_segment.data_evidence_json,
-                "promotion_vector_basis": segment.profile_json.get(
-                    "promotion_vector_basis",
-                    {},
-                ),
-                "promotion_matched_features": segment.profile_json.get(
-                    "promotion_matched_features",
-                    [],
-                ),
-                "display_copy": display_copy,
-            },
+            score_json=score_json,
+            reason_json=reason_json,
+            metadata_json=metadata_json,
         )
 
     def _build_content_brief_json(
