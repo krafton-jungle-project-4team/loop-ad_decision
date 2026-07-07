@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import math
-from typing import Any, Mapping, NamedTuple, Protocol, Sequence
+from typing import Any, Mapping, NamedTuple, Protocol, Sequence, TypeVar
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -15,6 +15,9 @@ from app.decision.matcher import (
 )
 
 EMAIL_CHANNEL = "email"
+
+
+_T = TypeVar("_T")
 
 
 class PostgresExecutor(Protocol):
@@ -445,6 +448,20 @@ class SegmentVectorReader(Protocol):
         query_vector: Sequence[float],
         limit: int,
     ) -> list[SegmentVectorRecord]:
+        ...
+
+    def list_ann_candidates_for_users(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        user_ids: Sequence[str],
+        query_vectors: Sequence[Sequence[float]],
+        limit: int,
+    ) -> dict[str, list[SegmentVectorRecord]]:
         ...
 
 
@@ -1072,8 +1089,118 @@ class SegmentVectorRepository:
         )
         return [SegmentVectorRecord(**row) for row in rows]
 
+    def list_ann_candidates_for_users(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_vector_ids: Sequence[str],
+        vector_version: str,
+        user_ids: Sequence[str],
+        query_vectors: Sequence[Sequence[float]],
+        limit: int,
+    ) -> dict[str, list[SegmentVectorRecord]]:
+        if len(user_ids) != len(query_vectors):
+            raise ValueError("user_ids and query_vectors must have the same length")
+        if len(set(user_ids)) != len(user_ids):
+            raise ValueError("user_ids must not contain duplicates")
+
+        candidates_by_user = {user_id: [] for user_id in user_ids}
+        if not user_ids or not segment_vector_ids:
+            return candidates_by_user
+
+        query_vector_literals = [
+            _vector_literal(query_vector, self.VECTOR_DIM)
+            for query_vector in query_vectors
+        ]
+        rows = self._db.fetchall(
+            """
+            WITH query_users AS (
+                SELECT
+                    user_id,
+                    query_vector,
+                    query_ordinal
+                FROM unnest(%s::text[], %s::text[]) WITH ORDINALITY
+                    AS q(user_id, query_vector, query_ordinal)
+            )
+            SELECT
+                q.user_id AS query_user_id,
+                q.query_ordinal AS query_ordinal,
+                sv.segment_vector_id,
+                sv.project_id,
+                sv.promotion_id,
+                sv.promotion_run_id,
+                sv.analysis_id,
+                sv.segment_id,
+                sv.vector_dim,
+                sv.vector_values,
+                sv.vector_version,
+                sv.source,
+                sv.embedding::text AS embedding
+            FROM query_users q
+            CROSS JOIN LATERAL (
+                SELECT
+                    segment_vector_id,
+                    project_id,
+                    promotion_id,
+                    promotion_run_id,
+                    analysis_id,
+                    segment_id,
+                    vector_dim,
+                    vector_values,
+                    vector_version,
+                    source,
+                    embedding
+                FROM segment_vectors
+                WHERE project_id = %s
+                  AND promotion_id = %s
+                  AND analysis_id = %s
+                  AND segment_vector_id = ANY(%s)
+                  AND vector_version = %s
+                  AND vector_dim = %s
+                ORDER BY embedding <=> q.query_vector::vector, segment_id ASC
+                LIMIT %s
+            ) sv
+            ORDER BY q.query_ordinal ASC, sv.segment_id ASC
+            """,
+            (
+                list(user_ids),
+                query_vector_literals,
+                project_id,
+                promotion_id,
+                analysis_id,
+                list(segment_vector_ids),
+                vector_version,
+                self.VECTOR_DIM,
+                limit,
+            ),
+        )
+        for row in rows:
+            query_user_id = str(row["query_user_id"])
+            if query_user_id not in candidates_by_user:
+                raise ValueError("unexpected query_user_id returned by ANN query")
+            candidates_by_user[query_user_id].append(
+                SegmentVectorRecord(
+                    segment_vector_id=row["segment_vector_id"],
+                    project_id=row["project_id"],
+                    promotion_id=row["promotion_id"],
+                    promotion_run_id=row["promotion_run_id"],
+                    analysis_id=row["analysis_id"],
+                    segment_id=row["segment_id"],
+                    vector_dim=row["vector_dim"],
+                    vector_values=row["vector_values"],
+                    vector_version=row["vector_version"],
+                    source=row["source"],
+                    embedding=row["embedding"],
+                )
+            )
+        return candidates_by_user
+
 
 class UserSegmentAssignmentRepository:
+    INSERT_BATCH_SIZE = 1000
+
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
 
@@ -1099,9 +1226,56 @@ class UserSegmentAssignmentRepository:
 
     def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
         inserted_count = 0
-        for assignment in assignments:
-            row = self._db.fetchone(
+        for chunk in _chunks(assignments, self.INSERT_BATCH_SIZE):
+            rows = self._db.fetchall(
                 """
+                WITH assignment_rows AS (
+                    SELECT
+                        project_id,
+                        promotion_run_id,
+                        user_id,
+                        segment_id,
+                        ad_experiment_id,
+                        content_id,
+                        content_option_id,
+                        similarity_score,
+                        fallback_value,
+                        fallback_reason,
+                        assignment_source,
+                        assigned_at,
+                        expires_at,
+                        row_ordinal
+                    FROM unnest(
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::text[],
+                        %s::numeric[],
+                        %s::boolean[],
+                        %s::text[],
+                        %s::text[],
+                        %s::timestamptz[],
+                        %s::timestamptz[]
+                    ) WITH ORDINALITY AS assignment_input(
+                        project_id,
+                        promotion_run_id,
+                        user_id,
+                        segment_id,
+                        ad_experiment_id,
+                        content_id,
+                        content_option_id,
+                        similarity_score,
+                        fallback_value,
+                        fallback_reason,
+                        assignment_source,
+                        assigned_at,
+                        expires_at,
+                        row_ordinal
+                    )
+                )
                 INSERT INTO user_segment_assignments (
                     project_id,
                     promotion_run_id,
@@ -1117,28 +1291,42 @@ class UserSegmentAssignmentRepository:
                     assigned_at,
                     expires_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                SELECT
+                    project_id,
+                    promotion_run_id,
+                    user_id,
+                    segment_id,
+                    ad_experiment_id,
+                    content_id,
+                    content_option_id,
+                    similarity_score,
+                    fallback_value,
+                    fallback_reason,
+                    assignment_source,
+                    assigned_at,
+                    expires_at
+                FROM assignment_rows
+                ORDER BY row_ordinal ASC
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
                 RETURNING id
                 """,
                 (
-                    assignment.project_id,
-                    assignment.promotion_run_id,
-                    assignment.user_id,
-                    assignment.segment_id,
-                    assignment.ad_experiment_id,
-                    assignment.content_id,
-                    assignment.content_option_id,
-                    assignment.similarity_score,
-                    assignment.fallback,
-                    assignment.fallback_reason,
-                    assignment.assignment_source,
-                    assignment.assigned_at,
-                    assignment.expires_at,
+                    [assignment.project_id for assignment in chunk],
+                    [assignment.promotion_run_id for assignment in chunk],
+                    [assignment.user_id for assignment in chunk],
+                    [assignment.segment_id for assignment in chunk],
+                    [assignment.ad_experiment_id for assignment in chunk],
+                    [assignment.content_id for assignment in chunk],
+                    [assignment.content_option_id for assignment in chunk],
+                    [assignment.similarity_score for assignment in chunk],
+                    [assignment.fallback for assignment in chunk],
+                    [assignment.fallback_reason for assignment in chunk],
+                    [assignment.assignment_source for assignment in chunk],
+                    [assignment.assigned_at for assignment in chunk],
+                    [assignment.expires_at for assignment in chunk],
                 ),
             )
-            if row is not None:
-                inserted_count += 1
+            inserted_count += len(rows)
         return inserted_count
 
     def count_by_run_segments(
@@ -1479,3 +1667,7 @@ def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
     if not all(math.isfinite(value) for value in numeric_values):
         raise ValueError("vector literal values must be finite")
     return "[" + ",".join(str(value) for value in numeric_values) + "]"
+
+
+def _chunks(items: Sequence[_T], size: int) -> list[Sequence[_T]]:
+    return [items[index : index + size] for index in range(0, len(items), size)]

@@ -5,6 +5,8 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
+import pytest
+
 from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
@@ -48,9 +50,11 @@ class FakePostgresExecutor:
         *,
         fetchone_result: Mapping[str, Any] | None = None,
         fetchall_result: list[Mapping[str, Any]] | None = None,
+        fetchall_results: list[list[Mapping[str, Any]]] | None = None,
     ) -> None:
         self.fetchone_result = fetchone_result
         self.fetchall_result = fetchall_result or []
+        self.fetchall_results = list(fetchall_results or [])
         self.calls: list[DbCall] = []
 
     def fetchone(
@@ -67,6 +71,8 @@ class FakePostgresExecutor:
         params: Sequence[Any] | Mapping[str, Any] = (),
     ) -> list[Mapping[str, Any]]:
         self.calls.append(DbCall("fetchall", query, params))
+        if self.fetchall_results:
+            return self.fetchall_results.pop(0)
         return self.fetchall_result
 
     def execute(
@@ -497,6 +503,40 @@ def test_user_segment_assignment_write_carries_assignment_source() -> None:
     assert assignment.assigned_at == assigned_at
 
 
+def assignment_write(
+    user_id: str,
+    *,
+    segment_id: str = "seg_existing_all",
+    ad_experiment_id: str = "adexp_existing_all_001",
+    content_id: str = "content_existing_all_001",
+    content_option_id: str = "option_a",
+    similarity_score: Decimal | None = Decimal("0.410000"),
+    fallback: bool = True,
+    fallback_reason: str | None = "below_threshold",
+    assigned_at: datetime | None = None,
+    expires_at: datetime | None = None,
+) -> UserSegmentAssignmentWrite:
+    return UserSegmentAssignmentWrite(
+        project_id="hotel-client-a",
+        promotion_run_id="prun_banner_001_loop_1",
+        user_id=user_id,
+        segment_id=segment_id,
+        ad_experiment_id=ad_experiment_id,
+        content_id=content_id,
+        content_option_id=content_option_id,
+        similarity_score=similarity_score,
+        fallback=fallback,
+        fallback_reason=fallback_reason,
+        assignment_source=(
+            AssignmentSource.FALLBACK.value
+            if fallback
+            else AssignmentSource.DECISION_BATCH.value
+        ),
+        assigned_at=assigned_at or datetime(2026, 7, 3, tzinfo=UTC),
+        expires_at=expires_at,
+    )
+
+
 def test_segment_vector_repository_filters_run_context_and_version() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[
@@ -611,17 +651,150 @@ def test_segment_vector_repository_reads_ann_candidates_by_frozen_ids() -> None:
     )
 
 
-def test_user_segment_assignment_repository_inserts_official_columns_only() -> None:
+def test_segment_vector_repository_reads_batch_ann_candidates_by_users() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "query_user_id": "user_family",
+                "query_ordinal": 1,
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    candidates_by_user = repo.list_ann_candidates_for_users(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_vector_ids=["segvec_family_v1"],
+        vector_version="v1",
+        user_ids=["user_family", "user_no_candidate"],
+        query_vectors=[
+            [1.0] + [0.0] * 63,
+            [0.0, 1.0, *([0.0] * 62)],
+        ],
+        limit=50,
+    )
+
+    assert set(candidates_by_user) == {"user_family", "user_no_candidate"}
+    assert candidates_by_user["user_family"][0].segment_vector_id == "segvec_family_v1"
+    assert not hasattr(candidates_by_user["user_family"][0], "query_user_id")
+    assert candidates_by_user["user_no_candidate"] == []
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "with query_users as" in sql
+    assert "with ordinality" in sql
+    assert "cross join lateral" in sql
+    assert "select *" not in sql
+    assert "embedding <=> q.query_vector::vector" in sql
+    assert "order by q.query_ordinal asc, sv.segment_id asc" in sql
+    assert call.params == (
+        ["user_family", "user_no_candidate"],
+        [
+            "[" + ",".join(["1.0", *["0.0"] * 63]) + "]",
+            "[" + ",".join(["0.0", "1.0", *["0.0"] * 62]) + "]",
+        ],
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        ["segvec_family_v1"],
+        "v1",
+        64,
+        50,
+    )
+
+
+def test_segment_vector_repository_rejects_mismatched_batch_inputs() -> None:
+    repo = SegmentVectorRepository(FakePostgresExecutor())
+
+    with pytest.raises(ValueError, match="same length"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family"],
+            query_vectors=[],
+            limit=50,
+        )
+
+
+def test_segment_vector_repository_rejects_duplicate_batch_user_ids() -> None:
+    repo = SegmentVectorRepository(FakePostgresExecutor())
+
+    with pytest.raises(ValueError, match="duplicates"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family", "user_family"],
+            query_vectors=[
+                [1.0] + [0.0] * 63,
+                [1.0] + [0.0] * 63,
+            ],
+            limit=50,
+        )
+
+
+def test_segment_vector_repository_rejects_unexpected_batch_query_user() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "query_user_id": "user_unrequested",
+                "query_ordinal": 1,
+                "segment_vector_id": "segvec_family_v1",
+                "project_id": "hotel-client-a",
+                "promotion_id": "promo_banner_001",
+                "promotion_run_id": None,
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_family_trip",
+                "vector_dim": 64,
+                "vector_values": [1.0] + [0.0] * 63,
+                "vector_version": "v1",
+                "source": "decision_analysis",
+                "embedding": [1.0] + [0.0] * 63,
+            }
+        ]
+    )
+    repo = SegmentVectorRepository(db)
+
+    with pytest.raises(ValueError, match="unexpected query_user_id"):
+        repo.list_ann_candidates_for_users(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001",
+            segment_vector_ids=["segvec_family_v1"],
+            vector_version="v1",
+            user_ids=["user_family"],
+            query_vectors=[[1.0] + [0.0] * 63],
+            limit=50,
+        )
+
+
+def test_user_segment_assignment_repository_bulk_inserts_official_columns_only() -> None:
     assigned_at = datetime(2026, 7, 3, tzinfo=UTC)
-    db = FakePostgresExecutor(fetchone_result={"id": 1})
+    expires_at = datetime(2026, 8, 3, tzinfo=UTC)
+    db = FakePostgresExecutor(fetchall_result=[{"id": 1}, {"id": 2}])
     repo = UserSegmentAssignmentRepository(db)
 
     inserted_count = repo.insert_many(
         [
-            UserSegmentAssignmentWrite(
-                project_id="hotel-client-a",
-                promotion_run_id="prun_banner_001_loop_1",
-                user_id="user_001",
+            assignment_write(
+                "user_001",
                 segment_id="seg_existing_all",
                 ad_experiment_id="adexp_existing_all_001",
                 content_id="content_existing_all_001",
@@ -629,17 +802,32 @@ def test_user_segment_assignment_repository_inserts_official_columns_only() -> N
                 similarity_score=Decimal("0.410000"),
                 fallback=True,
                 fallback_reason="below_threshold",
-                assignment_source=AssignmentSource.FALLBACK.value,
                 assigned_at=assigned_at,
                 expires_at=None,
-            )
+            ),
+            assignment_write(
+                "user_002",
+                segment_id="seg_family_trip",
+                ad_experiment_id="adexp_family_trip_001",
+                content_id="content_family_trip_001",
+                content_option_id="option_b",
+                similarity_score=None,
+                fallback=False,
+                fallback_reason=None,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+            ),
         ]
     )
 
-    assert inserted_count == 1
+    assert inserted_count == 2
     call = db.calls[0]
+    assert call.operation == "fetchall"
     sql = compact_sql(call.query)
+    assert "with assignment_rows as" in sql
     assert "insert into user_segment_assignments" in sql
+    assert "from unnest(" in sql
+    assert "with ordinality" in sql
     assert "promotion_run_id" in sql
     assert "user_id" in sql
     assert "segment_id" in sql
@@ -653,6 +841,66 @@ def test_user_segment_assignment_repository_inserts_official_columns_only() -> N
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
     assert "returning id" in sql
+    assert "%s::text[]" in sql
+    assert "%s::numeric[]" in sql
+    assert "%s::boolean[]" in sql
+    assert "%s::timestamptz[]" in sql
+    assert call.params == (
+        ["hotel-client-a", "hotel-client-a"],
+        ["prun_banner_001_loop_1", "prun_banner_001_loop_1"],
+        ["user_001", "user_002"],
+        ["seg_existing_all", "seg_family_trip"],
+        ["adexp_existing_all_001", "adexp_family_trip_001"],
+        ["content_existing_all_001", "content_family_trip_001"],
+        ["option_a", "option_b"],
+        [Decimal("0.410000"), None],
+        [True, False],
+        ["below_threshold", None],
+        [AssignmentSource.FALLBACK.value, AssignmentSource.DECISION_BATCH.value],
+        [assigned_at, assigned_at],
+        [None, expires_at],
+    )
+
+
+def test_user_segment_assignment_repository_skips_empty_bulk_insert() -> None:
+    db = FakePostgresExecutor()
+    repo = UserSegmentAssignmentRepository(db)
+
+    assert repo.insert_many([]) == 0
+    assert db.calls == []
+
+
+def test_user_segment_assignment_repository_splits_bulk_insert_chunks() -> None:
+    db = FakePostgresExecutor(
+        fetchall_results=[
+            [{"id": index} for index in range(1000)],
+            [{"id": 1001}],
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    inserted_count = repo.insert_many(
+        [assignment_write(f"user_{index:04d}") for index in range(1001)]
+    )
+
+    assert inserted_count == 1001
+    assert len(db.calls) == 2
+    assert len(db.calls[0].params[0]) == 1000
+    assert len(db.calls[1].params[0]) == 1
+
+
+def test_user_segment_assignment_repository_counts_returned_bulk_rows() -> None:
+    db = FakePostgresExecutor(fetchall_result=[{"id": 1}])
+    repo = UserSegmentAssignmentRepository(db)
+
+    inserted_count = repo.insert_many(
+        [
+            assignment_write("user_001"),
+            assignment_write("user_002"),
+        ]
+    )
+
+    assert inserted_count == 1
 
 
 def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:

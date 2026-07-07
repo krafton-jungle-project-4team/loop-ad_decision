@@ -70,9 +70,9 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert first_candidate["segment_id"] == "seg_repeat_hotel_no_booking"
     assert first_candidate["channel"] == "onsite_banner"
     assert first_candidate["status"] == "draft"
-    assert first_candidate["title"]
-    assert first_candidate["body"]
-    assert first_candidate["cta"]
+    assert first_candidate["title"] == "이번 주말 호텔 특가"
+    assert first_candidate["body"] == "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요."
+    assert first_candidate["cta"] == "호텔 특가 보기"
     assert first_candidate["image_prompt"]
     assert first_candidate["image_url"] is None
     assert first_candidate["landing_url"] == "https://demo-stay.example.com/summer"
