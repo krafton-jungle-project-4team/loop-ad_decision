@@ -43,6 +43,12 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 INSUFFICIENT_REASON_STATUS = AdExperimentStatus.INSUFFICIENT_DATA.value
 MATCHING_MODE = "pgvector_hnsw_rerank"
+DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT = 10000
+DEFAULT_VECTOR_VERSION = "v1"
+AUDIENCE_SCOPE_BASE = "user_behavior_vectors"
+AUDIENCE_SCOPE_SOURCE_AUDIENCE_SCOPE = "audience_scope"
+AUDIENCE_SCOPE_SOURCE_EXPLICIT_USER_IDS = "explicit_user_ids"
+AUDIENCE_SCOPE_SOURCE_IMPLICIT_PROJECT_SCOPE = "implicit_project_scope"
 
 
 class SegmentAssignmentRunNotFoundError(Exception):
@@ -57,6 +63,15 @@ class SegmentAssignmentValidationError(Exception):
 class _ExperimentSet:
     non_fallback: list[AdExperimentRecord]
     fallback: AdExperimentRecord | None
+
+
+@dataclass(frozen=True)
+class _EffectiveAudienceScope:
+    effective_vector_version: str
+    effective_limit: int | None
+    source: str | None
+    user_ids: list[str] | None
+    scope_source: str
 
 
 @dataclass(frozen=True)
@@ -134,6 +149,11 @@ class SegmentAssignmentService:
         log.info("promotion_run_loaded", {"promotionRun": run})
 
         min_sample_size = _extract_min_sample_size(run.goal_snapshot_json)
+        audience_scope = _build_effective_audience_scope(
+            goal_snapshot_json=run.goal_snapshot_json,
+            request=request,
+            project_id=run.project_id,
+        )
         experiments = _split_experiments(
             self._ad_experiment_repository.list_by_run(promotion_run_id)
         )
@@ -151,12 +171,12 @@ class SegmentAssignmentService:
             segment_ids=[
                 experiment.segment_id for experiment in experiments.non_fallback
             ],
-            vector_version=request.vector_version,
+            vector_version=audience_scope.effective_vector_version,
         )
         log.info("segment_vectors_loaded", {"segmentVectorCount": len(segment_vectors)})
         eligible_users = self._load_eligible_users(
             project_id=run.project_id,
-            request=request,
+            audience_scope=audience_scope,
         )
         log.info("eligible_users_loaded", {"eligibleUserCount": len(eligible_users)})
         existing_user_ids = (
@@ -176,7 +196,7 @@ class SegmentAssignmentService:
                 project_id=run.project_id,
                 promotion_id=run.promotion_id,
                 analysis_id=run.analysis_id,
-                vector_version=request.vector_version,
+                vector_version=audience_scope.effective_vector_version,
                 users=users_to_match,
                 segment_vectors=segment_vectors,
             )
@@ -235,7 +255,7 @@ class SegmentAssignmentService:
         response = SegmentAssignmentBuildResponse(
             promotion_run_id=run.promotion_run_id,
             matching_mode=MATCHING_MODE,
-            vector_version=request.vector_version,
+            vector_version=audience_scope.effective_vector_version,
             ann_candidate_limit=ANN_CANDIDATE_LIMIT,
             ann_candidate_count=build_result.ann_candidate_count,
             exact_reranked_pair_count=build_result.exact_reranked_pair_count,
@@ -370,24 +390,32 @@ class SegmentAssignmentService:
         self,
         *,
         project_id: str,
-        request: SegmentAssignmentBuildRequest,
+        audience_scope: _EffectiveAudienceScope,
     ) -> list[UserVector]:
-        if request.user_ids:
+        if audience_scope.user_ids:
             records = self._user_behavior_vector_repository.list_by_user_ids(
                 project_id=project_id,
-                user_ids=request.user_ids,
-                vector_version=request.vector_version,
+                user_ids=audience_scope.user_ids,
+                vector_version=audience_scope.effective_vector_version,
+                source=audience_scope.source,
             )
         else:
-            if request.eligible_user_limit is None:
-                log.warn("eligible_user_limit_missing", {"projectId": project_id})
+            if audience_scope.effective_limit is None:
+                log.warn(
+                    "effective_audience_limit_missing",
+                    {
+                        "projectId": project_id,
+                        "scopeSource": audience_scope.scope_source,
+                    },
+                )
                 raise SegmentAssignmentValidationError(
-                    "eligible_user_limit is required when user_ids is omitted"
+                    "effective audience limit is required when user_ids is omitted"
                 )
             records = self._user_behavior_vector_repository.list_for_project(
                 project_id=project_id,
-                vector_version=request.vector_version,
-                limit=request.eligible_user_limit,
+                vector_version=audience_scope.effective_vector_version,
+                limit=audience_scope.effective_limit,
+                source=audience_scope.source,
             )
         return [
             UserVector(
@@ -449,6 +477,175 @@ def _deduplicate_users_by_id(users: Sequence[UserVector]) -> list[UserVector]:
         seen_user_ids.add(user.user_id)
         deduplicated.append(user)
     return deduplicated
+
+
+def _build_effective_audience_scope(
+    *,
+    goal_snapshot_json: Mapping[str, Any],
+    request: SegmentAssignmentBuildRequest,
+    project_id: str,
+) -> _EffectiveAudienceScope:
+    del project_id  # promotion_run.project_id is the only allowed project context.
+    raw_scope = goal_snapshot_json.get("audience_scope")
+    if raw_scope is not None and not isinstance(raw_scope, Mapping):
+        raise SegmentAssignmentValidationError("audience_scope must be an object")
+
+    request_vector_version_is_explicit = "vector_version" in request.model_fields_set
+    request_user_ids = list(request.user_ids) if request.user_ids else None
+    request_limit = request.eligible_user_limit
+
+    if raw_scope is None:
+        scope_source = (
+            AUDIENCE_SCOPE_SOURCE_EXPLICIT_USER_IDS
+            if request_user_ids
+            else AUDIENCE_SCOPE_SOURCE_IMPLICIT_PROJECT_SCOPE
+        )
+        return _EffectiveAudienceScope(
+            effective_vector_version=request.vector_version or DEFAULT_VECTOR_VERSION,
+            effective_limit=(
+                None
+                if request_user_ids
+                else request_limit or DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT
+            ),
+            source=None,
+            user_ids=request_user_ids,
+            scope_source=scope_source,
+        )
+
+    if request_user_ids:
+        raise SegmentAssignmentValidationError(
+            "audience_scope and user_ids cannot be combined in MVP"
+        )
+
+    base = raw_scope.get("base", AUDIENCE_SCOPE_BASE)
+    if base != AUDIENCE_SCOPE_BASE:
+        raise SegmentAssignmentValidationError(
+            "audience_scope.base must be user_behavior_vectors"
+        )
+
+    scope_vector_version = raw_scope.get("vector_version")
+    if scope_vector_version is not None:
+        if not isinstance(scope_vector_version, str) or not scope_vector_version:
+            raise SegmentAssignmentValidationError(
+                "audience_scope.vector_version must be a non-empty string"
+            )
+        if (
+            request_vector_version_is_explicit
+            and request.vector_version != scope_vector_version
+        ):
+            raise SegmentAssignmentValidationError(
+                "request.vector_version must match audience_scope.vector_version"
+            )
+        effective_vector_version = scope_vector_version
+    else:
+        effective_vector_version = request.vector_version or DEFAULT_VECTOR_VERSION
+
+    filters = raw_scope.get("filters", {})
+    source = _parse_audience_filters(filters)
+    selection_policy = raw_scope.get("selection_policy", {})
+    scope_limit = _parse_selection_policy_limit(selection_policy)
+    _validate_selection_policy_ordering(selection_policy)
+
+    if scope_limit is not None and request_limit is not None:
+        effective_limit = min(scope_limit, request_limit)
+    elif scope_limit is not None:
+        effective_limit = scope_limit
+    else:
+        effective_limit = request_limit or DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT
+
+    return _EffectiveAudienceScope(
+        effective_vector_version=effective_vector_version,
+        effective_limit=effective_limit,
+        source=source,
+        user_ids=None,
+        scope_source=AUDIENCE_SCOPE_SOURCE_AUDIENCE_SCOPE,
+    )
+
+
+def _parse_audience_filters(raw_filters: Any) -> str | None:
+    if raw_filters is None:
+        return None
+    if not isinstance(raw_filters, Mapping):
+        raise SegmentAssignmentValidationError(
+            "audience_scope.filters must be an object"
+        )
+    if "project_id" in raw_filters:
+        raise SegmentAssignmentValidationError(
+            "audience_scope.filters.project_id is not allowed"
+        )
+
+    allowed_keys = {"has_valid_vector", "source"}
+    unknown_keys = sorted(set(raw_filters) - allowed_keys)
+    if unknown_keys:
+        raise SegmentAssignmentValidationError(
+            "unsupported audience_scope.filters keys: " + ", ".join(unknown_keys)
+        )
+
+    if "has_valid_vector" in raw_filters and raw_filters["has_valid_vector"] is not True:
+        raise SegmentAssignmentValidationError(
+            "audience_scope.filters.has_valid_vector must be true"
+        )
+
+    source = raw_filters.get("source")
+    if source is None:
+        return None
+    if not isinstance(source, str) or not source.strip():
+        raise SegmentAssignmentValidationError(
+            "audience_scope.filters.source must be a non-empty string"
+        )
+    return source.strip()
+
+
+def _parse_selection_policy_limit(raw_selection_policy: Any) -> int | None:
+    selection_policy = _selection_policy_mapping(raw_selection_policy)
+    raw_limit = selection_policy.get("limit")
+    if raw_limit is None:
+        return None
+    if isinstance(raw_limit, bool):
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy.limit must be a positive integer"
+        )
+    try:
+        limit = int(raw_limit)
+    except (TypeError, ValueError) as exc:
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy.limit must be a positive integer"
+        ) from exc
+    if limit < 1:
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy.limit must be a positive integer"
+        )
+    return limit
+
+
+def _validate_selection_policy_ordering(raw_selection_policy: Any) -> None:
+    selection_policy = _selection_policy_mapping(raw_selection_policy)
+    unknown_keys = sorted(set(selection_policy) - {"limit", "ordering", "mode"})
+    if unknown_keys:
+        raise SegmentAssignmentValidationError(
+            "unsupported audience_scope.selection_policy keys: "
+            + ", ".join(unknown_keys)
+        )
+    mode = selection_policy.get("mode")
+    if mode is not None and mode != "batch":
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy.mode must be batch"
+        )
+    ordering = selection_policy.get("ordering")
+    if ordering is not None and ordering != "user_id_asc":
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy.ordering must be user_id_asc"
+        )
+
+
+def _selection_policy_mapping(raw_selection_policy: Any) -> Mapping[str, Any]:
+    if raw_selection_policy is None:
+        return {}
+    if not isinstance(raw_selection_policy, Mapping):
+        raise SegmentAssignmentValidationError(
+            "audience_scope.selection_policy must be an object"
+        )
+    return raw_selection_policy
 
 
 def _chunks(
