@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import contextvars
 import functools
 import inspect
 import json
@@ -17,6 +16,7 @@ from enum import Enum
 from importlib import metadata
 from typing import Any, ParamSpec, TypeVar
 
+import structlog
 from fastapi import Request
 from starlette.middleware.base import RequestResponseEndpoint
 from starlette.responses import Response
@@ -26,84 +26,35 @@ from app.config import Settings
 
 LOGGER_NAME = "loopad"
 REQUEST_ID_HEADER = "X-Request-Id"
-_LOG_CONTEXT: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
-    "loopad_log_context",
-    default={},
-)
 
 P = ParamSpec("P")
 R = TypeVar("R")
 
 
 class ContextLogger:
-    def __init__(self, logger: logging.Logger) -> None:
-        self._logger = logger
-
     def assign_context(self, fields: Mapping[str, Any]) -> None:
-        context = dict(_LOG_CONTEXT.get())
+        context = structlog.contextvars.get_contextvars()
         _apply_context_fields(context, fields)
-        _LOG_CONTEXT.set(context)
+        _replace_context(context)
 
     def debug(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._emit(logging.DEBUG, event, payload)
+        self._logger.debug(event, **_event_fields(payload))
 
     def info(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._emit(logging.INFO, event, payload)
+        self._logger.info(event, **_event_fields(payload))
 
     def warn(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._emit(logging.WARNING, event, payload)
+        self._logger.warning(event, **_event_fields(payload))
 
     def error(self, event: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._emit(logging.ERROR, event, payload)
+        self._logger.error(event, **_event_fields(payload))
 
-    def _emit(
-        self,
-        level: int,
-        event: str,
-        payload: Mapping[str, Any] | None,
-    ) -> None:
-        if not self._logger.isEnabledFor(level):
-            return
-        record = {
-            **_LOG_CONTEXT.get(),
-            "event": event,
-            **_remove_none_values(dict(payload or {})),
-        }
-        self._logger.log(level, "", extra={"loopad_record": record})
+    @property
+    def _logger(self) -> Any:
+        return structlog.get_logger(LOGGER_NAME)
 
 
-class JsonLogFormatter(logging.Formatter):
-    def __init__(self, *, settings: Settings) -> None:
-        super().__init__()
-        self._base = _remove_none_values(
-            {
-                "service": settings.service_id,
-                "environment": settings.env,
-                "version": _package_version(),
-                "region": os.environ.get("AWS_REGION")
-                or os.environ.get("AWS_DEFAULT_REGION"),
-                "runtime": os.environ.get("AWS_EXECUTION_ENV") or _runtime_name(),
-            }
-        )
-
-    def format(self, record: logging.LogRecord) -> str:
-        payload = getattr(record, "loopad_record", {})
-        if not isinstance(payload, Mapping):
-            payload = {"event": str(record.getMessage())}
-        body = {
-            "timestamp": datetime.now(UTC)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
-            "level": record.levelname.lower(),
-            **self._base,
-            **dict(payload),
-        }
-        if record.exc_info and "err" not in body:
-            body["err"] = record.exc_info[1] or record.getMessage()
-        return json.dumps(_to_jsonable(body), ensure_ascii=False, separators=(",", ":"))
-
-
-log = ContextLogger(logging.getLogger(LOGGER_NAME))
+log = ContextLogger()
 
 
 def configure_logging(settings: Settings) -> None:
@@ -111,10 +62,23 @@ def configure_logging(settings: Settings) -> None:
     logger.handlers.clear()
 
     handler = logging.StreamHandler()
-    handler.setFormatter(JsonLogFormatter(settings=settings))
+    handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
     logger.setLevel(logging.DEBUG)
     logger.propagate = False
+    structlog.reset_defaults()
+    structlog.contextvars.clear_contextvars()
+    structlog.configure(
+        processors=[
+            structlog.stdlib.filter_by_level,
+            structlog.contextvars.merge_contextvars,
+            _event_processor(settings),
+            structlog.processors.JSONRenderer(serializer=_json_dumps),
+        ],
+        wrapper_class=structlog.stdlib.BoundLogger,
+        logger_factory=structlog.stdlib.LoggerFactory(),
+        cache_logger_on_first_use=False,
+    )
 
 
 def assign_context(fields: Mapping[str, Any]) -> None:
@@ -137,28 +101,28 @@ def log_context_scope(func: Callable[P, R]) -> Callable[P, R]:
         @functools.wraps(func)
         async def async_wrapper(*args: P.args, **kwargs: P.kwargs) -> Any:
             started_at = now_ms()
-            token = _push_context({"operation": operation})
+            previous_context = _push_context({"operation": operation})
             try:
                 return await func(*args, **kwargs)
             except Exception as exc:
                 log.error("failed", {"err": exc, "durationMs": duration_ms(started_at)})
                 raise
             finally:
-                _LOG_CONTEXT.reset(token)
+                _replace_context(previous_context)
 
         return async_wrapper  # type: ignore[return-value]
 
     @functools.wraps(func)
     def wrapper(*args: P.args, **kwargs: P.kwargs) -> R:
         started_at = now_ms()
-        token = _push_context({"operation": operation})
+        previous_context = _push_context({"operation": operation})
         try:
             return func(*args, **kwargs)
         except Exception as exc:
             log.error("failed", {"err": exc, "durationMs": duration_ms(started_at)})
             raise
         finally:
-            _LOG_CONTEXT.reset(token)
+            _replace_context(previous_context)
 
     return wrapper
 
@@ -169,7 +133,7 @@ async def request_logging_middleware(
 ) -> Response:
     started_at = now_ms()
     request_id = _request_id(request)
-    token = _push_context(
+    previous_context = _replace_context(
         {
             "requestId": request_id,
             "method": request.method,
@@ -196,13 +160,22 @@ async def request_logging_middleware(
             log.info("http_request_completed", payload)
         return response
     finally:
-        _LOG_CONTEXT.reset(token)
+        _replace_context(previous_context)
 
 
-def _push_context(fields: Mapping[str, Any]) -> contextvars.Token[dict[str, Any]]:
-    context = dict(_LOG_CONTEXT.get())
+def _push_context(fields: Mapping[str, Any]) -> dict[str, Any]:
+    previous_context = structlog.contextvars.get_contextvars()
+    context = dict(previous_context)
     _apply_context_fields(context, fields)
-    return _LOG_CONTEXT.set(context)
+    _replace_context(context)
+    return previous_context
+
+
+def _replace_context(fields: Mapping[str, Any]) -> dict[str, Any]:
+    previous_context = structlog.contextvars.get_contextvars()
+    structlog.contextvars.clear_contextvars()
+    structlog.contextvars.bind_contextvars(**_remove_none_values(dict(fields)))
+    return previous_context
 
 
 def _apply_context_fields(context: dict[str, Any], fields: Mapping[str, Any]) -> None:
@@ -215,6 +188,49 @@ def _apply_context_fields(context: dict[str, Any], fields: Mapping[str, Any]) ->
 
 def _remove_none_values(fields: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in fields.items() if value is not None}
+
+
+def _event_fields(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    return _remove_none_values(dict(payload or {}))
+
+
+def _event_processor(settings: Settings) -> Callable[[Any, str, dict[str, Any]], dict[str, Any]]:
+    base_fields = _base_fields(settings)
+
+    def processor(logger: Any, method_name: str, event_dict: dict[str, Any]) -> dict[str, Any]:
+        body = {
+            "timestamp": datetime.now(UTC)
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z"),
+            "level": _level_name(method_name),
+            **base_fields,
+            **event_dict,
+        }
+        return _to_jsonable(_remove_none_values(body))
+
+    return processor
+
+
+def _base_fields(settings: Settings) -> dict[str, Any]:
+    return _remove_none_values(
+        {
+            "service": settings.service_id,
+            "environment": settings.env,
+            "version": _package_version(),
+            "region": os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"),
+            "runtime": os.environ.get("AWS_EXECUTION_ENV") or _runtime_name(),
+        }
+    )
+
+
+def _level_name(method_name: str) -> str:
+    if method_name == "warn":
+        return "warning"
+    return method_name
+
+
+def _json_dumps(value: Any, **kwargs: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), **kwargs)
 
 
 def _request_id(request: Request) -> str:
