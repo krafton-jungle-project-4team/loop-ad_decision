@@ -25,6 +25,7 @@ from app.config import Settings
 
 
 LOGGER_NAME = "loopad"
+LOG_LEVEL = logging.DEBUG
 REQUEST_ID_HEADER = "X-Request-Id"
 
 P = ParamSpec("P")
@@ -64,7 +65,7 @@ def configure_logging(settings: Settings) -> None:
     handler = logging.StreamHandler()
     handler.setFormatter(logging.Formatter("%(message)s"))
     logger.addHandler(handler)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(LOG_LEVEL)
     logger.propagate = False
     structlog.reset_defaults()
     structlog.contextvars.clear_contextvars()
