@@ -6,6 +6,7 @@ import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
+from time import perf_counter
 from typing import Any, Callable, Mapping, Protocol
 
 import boto3
@@ -14,6 +15,7 @@ from app.config import Settings
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel
+from app.logging import log, duration_ms
 
 
 EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v2"
@@ -136,13 +138,47 @@ class OpenAIResponsesContentClient:
             "Content-Type": "application/json",
         }
 
-        response_payload = self._transport(
-            self._endpoint,
-            headers,
-            payload,
-            self._timeout_seconds,
+        started_at = perf_counter()
+        log.info(
+            "provider_request_prepared",
+            {
+                "provider": "openai",
+                "endpoint": self._endpoint,
+                "model": self._model,
+                "channel": prompt_input.promotion.channel.value,
+                "optionIndex": option_index,
+                "request": payload,
+            },
         )
-        content_payload = _parse_output_json(response_payload)
+        try:
+            response_payload = self._transport(
+                self._endpoint,
+                headers,
+                payload,
+                self._timeout_seconds,
+            )
+            content_payload = _parse_output_json(response_payload)
+        except Exception as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    "provider": "openai",
+                    "endpoint": self._endpoint,
+                    "model": self._model,
+                    "err": exc,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            raise
+        log.info(
+            "provider_request_completed",
+            {
+                "provider": "openai",
+                "endpoint": self._endpoint,
+                "model": self._model,
+                "durationMs": duration_ms(started_at),
+            },
+        )
         return {
             field_name: _optional_text(content_payload.get(field_name))
             for field_name in TEXT_FIELD_NAMES
@@ -163,12 +199,40 @@ class GeminiImageClient:
 
     def generate_image(self, *, image_prompt: str) -> ImageArtifact:
         client = self._client or _create_gemini_client(self._api_key)
-        response = client.models.generate_content(
-            model=self._model,
-            contents=image_prompt,
-            config=_gemini_image_config(),
+        started_at = perf_counter()
+        log.info(
+            "provider_request_prepared",
+            {"provider": "gemini", "model": self._model, "request": {"imagePrompt": image_prompt}},
         )
-        return _extract_gemini_image(response)
+        try:
+            response = client.models.generate_content(
+                model=self._model,
+                contents=image_prompt,
+                config=_gemini_image_config(),
+            )
+            artifact = _extract_gemini_image(response)
+        except Exception as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    "provider": "gemini",
+                    "model": self._model,
+                    "err": exc,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            raise
+        log.info(
+            "provider_request_completed",
+            {
+                "provider": "gemini",
+                "model": self._model,
+                "contentType": artifact.content_type,
+                "byteLength": len(artifact.data),
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return artifact
 
 
 class S3AssetStorage:
@@ -196,18 +260,54 @@ class S3AssetStorage:
             content_id=content_id,
             content_type=image.content_type,
         )
-        self._s3_client.put_object(
-            Bucket=self._bucket_name,
-            Key=key,
-            Body=image.data,
-            ContentType=image.content_type,
-            CacheControl="public, max-age=31536000, immutable",
+        started_at = perf_counter()
+        log.info(
+            "provider_request_prepared",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "contentType": image.content_type,
+            },
         )
-        return _public_asset_url(
+        try:
+            self._s3_client.put_object(
+                Bucket=self._bucket_name,
+                Key=key,
+                Body=image.data,
+                ContentType=image.content_type,
+                CacheControl="public, max-age=31536000, immutable",
+            )
+        except Exception as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    "provider": "s3",
+                    "endpoint": "put_object",
+                    "bucket": self._bucket_name,
+                    "key": key,
+                    "err": exc,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            raise
+        image_url = _public_asset_url(
             public_base_url=self._public_base_url,
             base_prefix=self._base_prefix,
             key=key,
         )
+        log.info(
+            "provider_request_completed",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return image_url
 
 
 class ExternalContentGenerator:
@@ -345,8 +445,10 @@ def _parse_output_json(response_payload: Mapping[str, Any]) -> Mapping[str, Any]
     try:
         parsed = json.loads(output_text)
     except json.JSONDecodeError as exc:
+        log.warn("provider_response_invalid", {"provider": "openai", "err": exc})
         raise RuntimeError("openai content generation returned invalid JSON") from exc
     if not isinstance(parsed, dict):
+        log.warn("provider_response_invalid", {"provider": "openai", "body": parsed})
         raise RuntimeError("openai content generation returned a non-object payload")
     return parsed
 

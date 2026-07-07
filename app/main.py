@@ -16,12 +16,13 @@ from app.decision.router import (
 from app.dependencies import require_internal_key
 from app.generation.router import router as generation_router
 from app.internal.router import router as internal_batch_router
+from app.logging import configure_logging, request_logging_middleware
 
 
 def create_app(*, settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        _get_or_load_settings(app)
+        configure_logging(_get_or_load_settings(app))
         yield
 
     app = FastAPI(
@@ -30,6 +31,10 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    if settings is not None:
+        configure_logging(settings)
+
+    app.middleware("http")(request_logging_middleware)
 
     @app.get("/health", tags=["system"])
     def health() -> dict[str, str]:

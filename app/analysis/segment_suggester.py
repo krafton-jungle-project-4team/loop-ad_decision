@@ -12,6 +12,7 @@ from app.analysis.repositories import (
     UserBehaviorVectorRecord,
 )
 from app.analysis.vector_service import DEFAULT_VECTOR_VERSION, VECTOR_DIM
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 DEFAULT_VECTOR_POOL_LIMIT = 1000
@@ -100,10 +101,31 @@ class VectorClusterSegmentSuggester:
         self._min_cluster_size = min_cluster_size
         self._vector_version = vector_version
 
+    @log_context_scope
     def suggest_segments(self, *, promotion: PromotionRecord) -> list[SegmentDefinitionRecord]:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": promotion.project_id,
+                "campaignId": promotion.campaign_id,
+                "promotionId": promotion.promotion_id,
+            }
+        )
+        log.info("started", {"promotion": promotion})
         sample_seed = _promotion_sample_seed(promotion)
         user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
+            log.warn(
+                "user_vector_sample_insufficient",
+                {
+                    "userVectorCount": len(user_vectors),
+                    "minClusterSize": self._min_cluster_size,
+                },
+            )
+            log.info(
+                "completed",
+                {"response": [], "durationMs": duration_ms(started_at)},
+            )
             return []
 
         cluster_count = min(
@@ -112,10 +134,15 @@ class VectorClusterSegmentSuggester:
         )
         clusters = _cluster_user_vectors(user_vectors, cluster_count)
         if not clusters:
+            log.warn("vector_clusters_empty", {"userVectorCount": len(user_vectors)})
+            log.info(
+                "completed",
+                {"response": [], "durationMs": duration_ms(started_at)},
+            )
             return []
 
         total_eligible_user_count = len(user_vectors)
-        return [
+        response = [
             _segment_definition_from_cluster(
                 promotion=promotion,
                 cluster=cluster,
@@ -136,6 +163,19 @@ class VectorClusterSegmentSuggester:
             )
             if len(cluster.users) >= self._min_cluster_size
         ][: self._max_suggested_segments]
+        log.info(
+            "vector_clusters_created",
+            {
+                "clusterCount": len(clusters),
+                "suggestedSegmentCount": len(response),
+                "totalEligibleUserCount": total_eligible_user_count,
+            },
+        )
+        log.info(
+            "completed",
+            {"response": response, "durationMs": duration_ms(started_at)},
+        )
+        return response
 
     def _load_user_vectors(
         self,
@@ -147,6 +187,7 @@ class VectorClusterSegmentSuggester:
             limit=self._vector_pool_limit,
             vector_version=self._vector_version,
         )
+        log.info("user_vectors_loaded", {"userVectorCount": len(records)})
         sampled_records = sorted(
             records,
             key=lambda record: (

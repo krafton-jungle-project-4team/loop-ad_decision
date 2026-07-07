@@ -23,6 +23,7 @@ from app.analysis.repositories import (
 )
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
 from app.analysis.vector_service import SegmentVectorBuildRequest, SegmentVectorBuildResult
+from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 MAX_DEFAULT_TARGET_SEGMENTS = 4
@@ -361,18 +362,45 @@ class PromotionAnalysisService:
         self._segment_suggester = segment_suggester
         self._max_default_target_segments = max_default_target_segments
 
+    @log_context_scope
     def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
-        return self._analyze(
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+            }
+        )
+        log.info("started", {"request": request})
+        response = self._analyze(
             request=request,
             focus_segment_ids=None,
             next_loop_context=None,
         )
+        log.assign_context({"analysisId": response.analysis.analysis_id})
+        log.info(
+            "completed",
+            {"response": response, "durationMs": duration_ms(started_at)},
+        )
+        return response
 
+    @log_context_scope
     def analyze_focus(
         self,
         request: NextLoopFocusAnalysisRequest,
     ) -> PromotionAnalysisResult:
-        return self._analyze(
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+                "promotionRunId": request.source_promotion_run_id,
+            }
+        )
+        log.info("started", {"request": request})
+        response = self._analyze(
             request=AnalysisRequest(
                 project_id=request.project_id,
                 campaign_id=request.campaign_id,
@@ -388,6 +416,12 @@ class PromotionAnalysisService:
                 ),
             ),
         )
+        log.assign_context({"analysisId": response.analysis.analysis_id})
+        log.info(
+            "completed",
+            {"response": response, "durationMs": duration_ms(started_at)},
+        )
+        return response
 
     def _analyze(
         self,
@@ -397,10 +431,15 @@ class PromotionAnalysisService:
         next_loop_context: NextLoopAnalysisContext | None,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
+        log.info("promotion_loaded", {"promotion": promotion})
         segment_definitions = self._segment_definition_repository.list_active(
             project_id=request.project_id,
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
+        )
+        log.info(
+            "segment_definitions_loaded",
+            {"segmentDefinitionCount": len(segment_definitions)},
         )
         suggested_segment_definitions = self._suggest_segment_definitions(promotion)
         if suggested_segment_definitions:
@@ -411,15 +450,31 @@ class PromotionAnalysisService:
                 segment_definitions,
                 suggested_segment_definitions,
             )
+            log.info(
+                "segment_definitions_created",
+                {"segmentDefinitions": suggested_segment_definitions},
+            )
         hotel_profiles = self._hotel_profile_repository.list_marketing_profiles(
             project_id=request.project_id,
         )
+        log.info("hotel_profiles_loaded", {"hotelProfileCount": len(hotel_profiles)})
         candidates = self._build_candidates(
             project_id=request.project_id,
             segment_definitions=segment_definitions,
             hotel_profiles=hotel_profiles,
         )
+        log.info("segment_candidates_prepared", {"candidateCount": len(candidates)})
         booking_model = self._train_booking_model()
+        if booking_model is None:
+            log.warn("booking_model_unavailable")
+        else:
+            log.info(
+                "booking_model_trained",
+                {
+                    "modelVersion": booking_model.model_version,
+                    "trainingSampleCount": booking_model.training_sample_count,
+                },
+            )
         booking_predictions = _predict_booking_propensity(
             model=booking_model,
             candidates=candidates,
@@ -431,6 +486,7 @@ class PromotionAnalysisService:
             booking_predictions=booking_predictions,
         )
         if not selected_candidates:
+            log.warn("segment_candidates_empty", {"candidateCount": len(candidates)})
             raise SegmentSelectionError("no active segment candidates matched analysis request")
 
         analysis_id = _analysis_id(
@@ -451,6 +507,8 @@ class PromotionAnalysisService:
         )
 
         self._promotion_analysis_repository.save_analysis(analysis)
+        log.assign_context({"analysisId": analysis.analysis_id})
+        log.info("promotion_analysis_created", {"analysis": analysis})
         target_segments = [
             self._build_target_segment(
                 analysis_id=analysis_id,
@@ -482,7 +540,15 @@ class PromotionAnalysisService:
         ]
         if next_loop_context is not None:
             self._promotion_analysis_repository.save_target_segments(target_segments)
+            log.info(
+                "promotion_target_segments_created",
+                {"targetSegments": target_segments},
+            )
         self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
+        log.info(
+            "promotion_segment_suggestions_created",
+            {"segmentSuggestions": segment_suggestions},
+        )
         return PromotionAnalysisResult(
             analysis=analysis,
             target_segments=target_segments,
@@ -508,6 +574,14 @@ class PromotionAnalysisService:
             promotion_id=request.promotion_id,
         )
         if promotion is None:
+            log.warn(
+                "promotion_not_found",
+                {
+                    "projectId": request.project_id,
+                    "campaignId": request.campaign_id,
+                    "promotionId": request.promotion_id,
+                },
+            )
             raise PromotionNotFoundError(
                 f"promotion not found for analysis: {request.promotion_id}"
             )
@@ -566,6 +640,10 @@ class PromotionAnalysisService:
                 if segment_id not in candidates
             ]
             if missing_segment_ids:
+                log.warn(
+                    "focus_segments_invalid",
+                    {"missingSegmentIds": missing_segment_ids},
+                )
                 raise SegmentSelectionError(
                     "focus_segment_ids must match active segment definitions"
                 )
