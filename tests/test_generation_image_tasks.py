@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 from app.config import load_settings
 from app.generation.adapters import ImageArtifact
 from app.generation.image_tasks import (
@@ -55,6 +57,7 @@ def test_run_image_generation_jobs_updates_candidate_image_url() -> None:
     assert connection.close_count == 1
     query, params = connection.executed[0]
     assert "UPDATE content_candidates" in query
+    assert "%(image_url)s::text" in query
     assert params == {
         "content_id": "content_banner_repeat_hotel_001",
         "image_url": (
@@ -64,22 +67,114 @@ def test_run_image_generation_jobs_updates_candidate_image_url() -> None:
     }
 
 
+def test_run_image_generation_jobs_records_image_generation_failure() -> None:
+    connection = FakeConnection()
+
+    run_image_generation_jobs(
+        settings=load_settings(valid_env()),
+        jobs=[
+            ImageGenerationJob(
+                content_id="content_banner_repeat_hotel_001",
+                image_prompt="bright hotel suite banner",
+            )
+        ],
+        image_client=FailingImageClient(),
+        asset_storage=FakeAssetStorage(),
+        connection_factory=lambda _settings: connection,
+    )
+
+    assert connection.rollback_count == 1
+    assert connection.commit_count == 1
+    assert connection.close_count == 1
+    query, params = connection.executed[0]
+    assert "UPDATE content_candidates" in query
+    assert "%(error_code)s::text" in query
+    assert params == {
+        "content_id": "content_banner_repeat_hotel_001",
+        "error_code": "image_generation_failed",
+    }
+
+
+def test_run_image_generation_jobs_processes_multiple_jobs_in_parallel() -> None:
+    connections: list[FakeConnection] = []
+    connection_lock = threading.Lock()
+    image_client = BarrierImageClient(job_count=3)
+    asset_storage = FakeAssetStorage()
+
+    def connection_factory(_settings: object) -> FakeConnection:
+        connection = FakeConnection()
+        with connection_lock:
+            connections.append(connection)
+        return connection
+
+    run_image_generation_jobs(
+        settings=load_settings(valid_env()),
+        jobs=[
+            ImageGenerationJob(
+                content_id=f"content_banner_repeat_hotel_00{index}",
+                image_prompt=f"bright hotel suite banner {index}",
+            )
+            for index in range(1, 4)
+        ],
+        image_client=image_client,
+        asset_storage=asset_storage,
+        connection_factory=connection_factory,
+    )
+
+    assert sorted(image_client.prompts) == [
+        "bright hotel suite banner 1",
+        "bright hotel suite banner 2",
+        "bright hotel suite banner 3",
+    ]
+    assert sorted(asset_storage.saved_content_ids) == [
+        "content_banner_repeat_hotel_001",
+        "content_banner_repeat_hotel_002",
+        "content_banner_repeat_hotel_003",
+    ]
+    assert len(connections) == 3
+    assert sum(connection.commit_count for connection in connections) == 3
+    assert sum(connection.rollback_count for connection in connections) == 0
+    assert sum(connection.close_count for connection in connections) == 3
+
+
 class FakeImageClient:
     def __init__(self) -> None:
         self.prompts: list[str] = []
+        self._lock = threading.Lock()
 
     def generate_image(self, *, image_prompt: str) -> ImageArtifact:
-        self.prompts.append(image_prompt)
+        with self._lock:
+            self.prompts.append(image_prompt)
         return ImageArtifact(data=b"image-bytes", content_type="image/png")
+
+
+class BarrierImageClient(FakeImageClient):
+    def __init__(self, *, job_count: int) -> None:
+        super().__init__()
+        self._barrier = threading.Barrier(job_count)
+
+    def generate_image(self, *, image_prompt: str) -> ImageArtifact:
+        with self._lock:
+            self.prompts.append(image_prompt)
+        self._barrier.wait(timeout=1)
+        return ImageArtifact(data=b"image-bytes", content_type="image/png")
+
+
+class FailingImageClient:
+    def generate_image(self, *, image_prompt: str) -> ImageArtifact:
+        del image_prompt
+        raise RuntimeError("image provider unavailable")
 
 
 class FakeAssetStorage:
     def __init__(self) -> None:
         self.saved_content_ids: list[str] = []
+        self._lock = threading.Lock()
 
     def store_image(self, *, content_id: str, image: ImageArtifact) -> str:
         del image
-        self.saved_content_ids.append(content_id)
+        with self._lock:
+            self.saved_content_ids.append(content_id)
         return f"https://gen-ai.asset.dev.loop-ad.org/generated/{content_id}.png"
 
 

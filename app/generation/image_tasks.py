@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -15,7 +16,7 @@ from app.generation.adapters import (
     S3AssetStorage,
 )
 from app.generation.repositories import ContentCandidateRepository
-from app.logging import log, log_context_scope, now_ms, duration_ms
+from app.logging import duration_ms, log, log_context_scope, now_ms
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,7 @@ class AssetStorageClient(Protocol):
 
 
 ConnectionFactory = Callable[[Settings], Any]
+MAX_IMAGE_GENERATION_WORKERS = 3
 
 
 def dispatch_image_generation_jobs(
@@ -81,33 +83,81 @@ def run_image_generation_jobs(
 
     started_at = now_ms()
     log.assign_context({"jobType": "deferred_image_generation"})
-    log.info("started", {"jobCount": len(jobs)})
+    worker_count = _image_generation_worker_count(len(jobs))
+    log.info("started", {"jobCount": len(jobs), "workerCount": worker_count})
+
+    succeeded_job_count = 0
+    failed_job_count = 0
+    with ThreadPoolExecutor(
+        max_workers=worker_count,
+        thread_name_prefix="loop-ad-image-worker",
+    ) as executor:
+        futures = [
+            executor.submit(
+                _run_image_generation_job_with_connection,
+                settings=settings,
+                job=job,
+                image_client=image_client,
+                asset_storage=asset_storage,
+                connection_factory=connection_factory,
+            )
+            for job in jobs
+        ]
+        for future in as_completed(futures):
+            try:
+                if future.result():
+                    succeeded_job_count += 1
+                else:
+                    failed_job_count += 1
+            except Exception as exc:
+                failed_job_count += 1
+                log.error("image_generation_worker_failed", {"err": exc})
+
+    log.info(
+        "completed",
+        {
+            "jobCount": len(jobs),
+            "succeededJobCount": succeeded_job_count,
+            "failedJobCount": failed_job_count,
+            "durationMs": duration_ms(started_at),
+        },
+    )
+
+
+def _run_image_generation_job_with_connection(
+    *,
+    settings: Settings,
+    job: ImageGenerationJob,
+    image_client: ImageClient | None,
+    asset_storage: AssetStorageClient | None,
+    connection_factory: ConnectionFactory,
+) -> bool:
+    log.assign_context(
+        {"jobType": "deferred_image_generation", "contentId": job.content_id}
+    )
     try:
         connection = connection_factory(settings)
     except Exception as exc:
         log.error("image_generation_connection_failed", {"err": exc})
-        return
+        return False
 
     try:
         repository = ContentCandidateRepository(connection)
-        image_client = image_client or GeminiImageClient(
+        resolved_image_client = image_client or GeminiImageClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_image_model or DEFAULT_GEMINI_IMAGE_MODEL,
         )
-        asset_storage = asset_storage or S3AssetStorage(
+        resolved_asset_storage = asset_storage or S3AssetStorage(
             bucket_name=settings.data_storage_bucket,
             base_prefix=settings.genai_assets_base_prefix,
         )
-
-        for job in jobs:
-            _run_single_image_generation_job(
-                job=job,
-                repository=repository,
-                image_client=image_client,
-                asset_storage=asset_storage,
-                connection=connection,
-            )
-        log.info("completed", {"jobCount": len(jobs), "durationMs": duration_ms(started_at)})
+        return _run_single_image_generation_job(
+            job=job,
+            repository=repository,
+            image_client=resolved_image_client,
+            asset_storage=resolved_asset_storage,
+            connection=connection,
+        )
     finally:
         connection.close()
 
@@ -119,7 +169,7 @@ def _run_single_image_generation_job(
     image_client: ImageClient,
     asset_storage: AssetStorageClient,
     connection: Any,
-) -> None:
+) -> bool:
     job_started_at = now_ms()
     log.assign_context({"contentId": job.content_id})
     try:
@@ -127,10 +177,17 @@ def _run_single_image_generation_job(
         image_url = asset_storage.store_image(content_id=job.content_id, image=image)
         repository.update_image_url(content_id=job.content_id, image_url=image_url)
         connection.commit()
-        log.info("image_generation_completed", {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)})
+        log.info(
+            "image_generation_completed",
+            {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)},
+        )
+        return True
     except Exception as exc:
         connection.rollback()
-        log.warn("image_generation_failed", {"err": exc, "durationMs": duration_ms(job_started_at)})
+        log.warn(
+            "image_generation_failed",
+            {"err": exc, "durationMs": duration_ms(job_started_at)},
+        )
         try:
             repository.mark_image_generation_failed(
                 content_id=job.content_id,
@@ -141,8 +198,13 @@ def _run_single_image_generation_job(
         except Exception as record_exc:
             connection.rollback()
             log.error("image_generation_failure_record_failed", {"err": record_exc})
+        return False
 
 
 def _safe_image_generation_error_code(exc: Exception) -> str:
     del exc
     return "image_generation_failed"
+
+
+def _image_generation_worker_count(job_count: int) -> int:
+    return max(1, min(job_count, MAX_IMAGE_GENERATION_WORKERS))
