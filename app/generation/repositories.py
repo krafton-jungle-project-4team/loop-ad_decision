@@ -491,10 +491,10 @@ class ContentCandidateRepository:
     UPDATE_IMAGE_URL_SQL = """
         UPDATE content_candidates
         SET
-            image_url = %(image_url)s,
+            image_url = %(image_url)s::text,
             metadata_json = COALESCE(metadata_json, '{}'::jsonb) ||
                 jsonb_build_object(
-                    'image_url', %(image_url)s,
+                    'image_url', %(image_url)s::text,
                     'image_generation_status', 'completed'
                 ),
             updated_at = now()
@@ -508,7 +508,7 @@ class ContentCandidateRepository:
             metadata_json = COALESCE(metadata_json, '{}'::jsonb) ||
                 jsonb_build_object(
                     'image_generation_status', 'failed',
-                    'image_generation_error_code', %(error_code)s
+                    'image_generation_error_code', %(error_code)s::text
                 ),
             updated_at = now()
         WHERE content_id = %(content_id)s
