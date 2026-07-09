@@ -102,6 +102,7 @@ class EmailHtmlSource(BaseModel):
     subject: str = Field(min_length=1)
     preheader: str = Field(min_length=1)
     text_body: str = Field(min_length=1)
+    html_body: str = Field(min_length=1)
     required_placeholders: tuple[str, str] = ("{{redirect_url}}", "{{open_pixel_url}}")
 
 
@@ -117,6 +118,7 @@ class BannerHtmlSource(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     creative_format: Literal["banner_html"] = "banner_html"
+    html_body: str = Field(min_length=1)
     width: int = Field(ge=1)
     height: int = Field(ge=1)
     click_protocol: Literal["post_message"] = "post_message"

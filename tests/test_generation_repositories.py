@@ -188,6 +188,51 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
 
 
+def test_content_candidate_public_values_backfills_legacy_email_html_source() -> None:
+    candidate = ContentCandidateRecord(
+        content_id="content_email_repeat_hotel_001",
+        content_option_id="email_repeat_hotel_option_001",
+        generation_id="generation_email_001",
+        analysis_id="analysis_email_001",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_email_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        channel=ContentChannel.EMAIL,
+        subject="이번 주말 호텔 특가를 확인해보세요",
+        preheader="원하는 일정에 맞는 숙소와 예약 혜택을 비교해보세요.",
+        body="환불 가능한 객실과 여름 숙박 혜택을 지금 확인해보세요.",
+        cta="호텔 특가 보기",
+        landing_url="https://demo-stay.example.com/summer",
+        metadata_json={
+            "creative": {
+                "source": {
+                    "creative_format": "email_html",
+                    "subject": "이번 주말 호텔 특가를 확인해보세요",
+                    "preheader": (
+                        "원하는 일정에 맞는 숙소와 예약 혜택을 비교해보세요."
+                    ),
+                    "text_body": (
+                        "환불 가능한 객실과 여름 숙박 혜택을 지금 확인해보세요."
+                    ),
+                    "required_placeholders": [
+                        "{{redirect_url}}",
+                        "{{open_pixel_url}}",
+                    ],
+                }
+            }
+        },
+    )
+
+    public_values = candidate.to_public_values()
+
+    source = public_values["source"]
+    assert source["creative_format"] == "email_html"
+    assert source["html_body"].startswith("<!doctype html>")
+    assert "{{redirect_url}}" in source["html_body"]
+    assert "{{open_pixel_url}}" in source["html_body"]
+
+
 def test_content_candidate_repository_updates_image_url() -> None:
     cursor = FakeCursor(fetchone_result={"content_id": "content_banner_001"})
     repository = ContentCandidateRepository(FakeConnection(cursor))

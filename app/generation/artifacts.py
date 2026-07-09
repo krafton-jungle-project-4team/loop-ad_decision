@@ -130,6 +130,7 @@ def source_for_channel(
             "subject": required_value(content_values, "subject"),
             "preheader": required_value(content_values, "preheader"),
             "text_body": required_value(content_values, "body"),
+            "html_body": render_email_html(content_values),
             "required_placeholders": ["{{redirect_url}}", "{{open_pixel_url}}"],
         }
     if channel == ContentChannel.SMS:
@@ -140,6 +141,7 @@ def source_for_channel(
         }
     return {
         "creative_format": creative_format.value,
+        "html_body": render_banner_html(content_values),
         "width": DEFAULT_BANNER_WIDTH,
         "height": DEFAULT_BANNER_HEIGHT,
         "click_protocol": "post_message",
