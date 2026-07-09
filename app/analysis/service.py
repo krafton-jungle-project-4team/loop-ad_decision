@@ -926,6 +926,7 @@ class PromotionAnalysisService:
             "sample_size_score",
             "candidate_type",
             "rank_role",
+            "performance_estimate",
             "matched_conditions",
             "missing_conditions",
             "signal_metrics",
@@ -1353,6 +1354,7 @@ def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
         "sample_size_score",
         "candidate_type",
         "rank_role",
+        "performance_estimate",
     ):
         value = segment.profile_json.get(key)
         if value is not None:

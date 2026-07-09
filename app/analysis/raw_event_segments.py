@@ -867,10 +867,15 @@ def _segment_definition_from_candidate(
         f"분석 대상 {total_eligible_user_count}명 중 {candidate.sample_size}명 · "
         f"{float(sample_ratio) * 100:g}%"
     )
+    performance_estimate = _performance_estimate(
+        promotion=promotion,
+        candidate=candidate,
+    )
     display_copy = {
         "title": candidate.title,
         "rank_role": candidate.rank_role,
         "audience_summary": audience_summary,
+        "performance_estimate": performance_estimate,
         "signal_chips": list(candidate.signal_chips),
         "reason": candidate.reason,
         "difference_summary": _difference_summary(candidate, rank=rank),
@@ -912,6 +917,7 @@ def _segment_definition_from_candidate(
             "matched_conditions": matched_conditions,
             "missing_conditions": missing_conditions,
             "signal_chips": list(candidate.signal_chips),
+            "performance_estimate": performance_estimate,
             "signal_metrics": {
                 **dict(candidate.signal_metrics),
                 "sample_size": candidate.sample_size,
@@ -1358,6 +1364,34 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, float]:
             "rank_distinctiveness": 0.10,
         },
     }
+
+
+def _performance_estimate(
+    *,
+    promotion: PromotionRecord,
+    candidate: _RawEventCandidate,
+) -> dict[str, Any]:
+    value = _clamp01(candidate.expected_goal_performance)
+    return {
+        "metric": promotion.goal_metric,
+        "label": _performance_estimate_label(promotion.goal_metric),
+        "value": round(value, 6),
+        "formatted": _format_percent(value),
+    }
+
+
+def _performance_estimate_label(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return "예상 전환율"
+    if goal_metric == "inflow_rate":
+        return "예상 유입률"
+    if goal_metric == "funnel_progression_rate":
+        return "예상 퍼널 이동률"
+    return "예상 성과"
+
+
+def _format_percent(value: float) -> str:
+    return f"{_clamp01(value) * 100:.1f}%"
 
 
 def _final_score(candidate: _RawEventCandidate) -> float:

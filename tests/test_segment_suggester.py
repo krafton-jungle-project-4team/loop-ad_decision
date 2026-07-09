@@ -64,13 +64,14 @@ def promotion_record(
     *,
     promotion_id: str = "promo_banner_001",
     message_brief: str = "Drive hotel booking conversion for summer stays.",
+    goal_metric: str = "booking_conversion_rate",
 ) -> PromotionRecord:
     return PromotionRecord(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
         channel="onsite_banner",
-        goal_metric="booking_conversion_rate",
+        goal_metric=goal_metric,
         goal_target_value=Decimal("0.030000"),
         goal_basis="all_segments",
         min_sample_size=2,
@@ -244,9 +245,61 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert all(segment.profile_json["source"] == "raw_event_intent" for segment in segments)
     assert all("rank_role" in segment.profile_json for segment in segments)
     assert all("display_copy" in segment.profile_json for segment in segments)
+    assert all("performance_estimate" in segment.profile_json for segment in segments)
+    assert all(
+        segment.profile_json["display_copy"]["performance_estimate"]["label"]
+        == "예상 전환율"
+        for segment in segments
+    )
     assert all(
         "final_score" in segment.profile_json["score_components"]
         for segment in segments
+    )
+
+
+def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository([])
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "promo_001",
+                hotel_search_count=2,
+                promotion_impression_count=4,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+            ),
+            raw_signal(
+                "promo_002",
+                hotel_search_count=1,
+                promotion_impression_count=5,
+                promotion_click_count=2,
+                campaign_landing_count=1,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            goal_metric="inflow_rate",
+            message_brief="여름 호텔 할인 프로모션 랜딩 유입을 높인다.",
+        )
+    )
+
+    assert len(segments) == 1
+    performance_estimate = segments[0].profile_json["performance_estimate"]
+    assert performance_estimate["label"] == "예상 유입률"
+    assert performance_estimate["metric"] == "inflow_rate"
+    assert segments[0].profile_json["display_copy"]["performance_estimate"] == (
+        performance_estimate
     )
 
 
