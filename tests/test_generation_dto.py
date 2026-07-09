@@ -52,71 +52,95 @@ def test_generation_request_rejects_extra_fields() -> None:
     "candidate",
     [
         {
-            "content_id": "content_email_repeat_hotel_001",
-            "content_option_id": "email_repeat_hotel_option_001",
-            "segment_id": "seg_repeat_hotel_no_booking",
             "channel": "email",
-            "subject": "Weekend rooms are still available",
-            "preheader": "See refundable summer hotel offers.",
-            "body": "Return to the hotels you viewed and compare today's offer.",
-            "cta": "View hotel deals",
-            "landing_url": "https://demo-stay.example.com/summer",
+            "creative_format": "email_html",
+            "source": {
+                "creative_format": "email_html",
+                "subject": "Weekend rooms are still available",
+                "preheader": "See refundable summer hotel offers.",
+                "text_body": "Return to the hotels you viewed and compare today's offer.",
+            },
+            "artifact": {
+                "creative_format": "email_html",
+                "artifact_status": "published",
+                "storage_key": "genai/content_email_repeat_hotel_001.html",
+                "public_url": "https://gen-ai.asset.dev.loop-ad.org/genai/content_email_repeat_hotel_001.html",
+                "sha256": "abc123",
+                "bytes": 128,
+                "content_type": "text/html; charset=utf-8",
+            },
         },
         {
-            "content_id": "content_sms_repeat_hotel_001",
-            "content_option_id": "sms_repeat_hotel_option_001",
-            "segment_id": "seg_repeat_hotel_no_booking",
             "channel": "sms",
-            "message": "The hotel you viewed still has refundable summer rooms.",
-            "landing_url": "https://demo-stay.example.com/summer",
+            "creative_format": "sms_text",
+            "source": {
+                "creative_format": "sms_text",
+                "message": "The hotel you viewed still has refundable summer rooms. {{redirect_url}}",
+            },
+            "artifact": {
+                "creative_format": "sms_text",
+                "artifact_status": "not_required",
+            },
         },
         {
-            "content_id": "content_banner_repeat_hotel_001",
-            "content_option_id": "banner_repeat_hotel_option_001",
-            "segment_id": "seg_repeat_hotel_no_booking",
             "channel": "onsite_banner",
-            "title": "Book this weekend's rooms",
-            "body": "Compare refundable summer offers before rooms run out.",
-            "cta": "View hotel deals",
-            "image_prompt": "bright modern hotel room, summer travel banner",
-            "image_url": "https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_repeat_hotel_001.png",
-            "landing_url": "https://demo-stay.example.com/summer",
+            "creative_format": "banner_html",
+            "source": {
+                "creative_format": "banner_html",
+                "width": 320,
+                "height": 100,
+                "click_protocol": "post_message",
+                "allowed_message_type": "loopad:click",
+            },
+            "artifact": {
+                "creative_format": "banner_html",
+                "artifact_status": "pending",
+            },
         },
     ],
 )
 def test_content_candidate_response_accepts_channel_required_fields(candidate) -> None:
+    candidate["attribution"] = attribution_for_candidate(candidate["channel"])
+
     dto = ContentCandidateResponse.model_validate(candidate)
 
-    assert dto.status == "draft"
-    if dto.channel == ContentChannel.ONSITE_BANNER:
-        assert dto.image_url == (
-            "https://gen-ai.asset.dev.loop-ad.org/generated-assets/content_banner_repeat_hotel_001.png"
-        )
+    assert dto.channel == candidate["channel"]
+    assert dto.artifact.creative_format == candidate["creative_format"]
 
 
 def test_content_candidate_response_rejects_unknown_channel() -> None:
     with pytest.raises(ValidationError):
         ContentCandidateResponse(
-            content_id="content_push_repeat_hotel_001",
-            content_option_id="push_repeat_hotel_option_001",
-            segment_id="seg_repeat_hotel_no_booking",
             channel="push",
-            message="Unsupported channel",
-            landing_url="https://demo-stay.example.com/summer",
+            creative_format="sms_text",
+            attribution=attribution_for_candidate("sms"),
+            source={
+                "creative_format": "sms_text",
+                "message": "Unsupported channel {{redirect_url}}",
+            },
+            artifact={
+                "creative_format": "sms_text",
+                "artifact_status": "not_required",
+            },
         )
 
 
 def test_content_candidate_response_rejects_missing_channel_fields() -> None:
     with pytest.raises(ValidationError):
         ContentCandidateResponse(
-            content_id="content_banner_repeat_hotel_001",
-            content_option_id="banner_repeat_hotel_option_001",
-            segment_id="seg_repeat_hotel_no_booking",
-            channel=ContentChannel.ONSITE_BANNER,
-            title="Book this weekend's rooms",
-            body="Compare refundable summer offers before rooms run out.",
-            cta="View hotel deals",
-            landing_url="https://demo-stay.example.com/summer",
+            channel="onsite_banner",
+            creative_format="banner_html",
+            attribution=attribution_for_candidate("onsite_banner"),
+            source={
+                "creative_format": "banner_html",
+                "height": 100,
+                "click_protocol": "post_message",
+                "allowed_message_type": "loopad:click",
+            },
+            artifact={
+                "creative_format": "banner_html",
+                "artifact_status": "pending",
+            },
         )
 
 
@@ -133,3 +157,19 @@ def test_content_candidate_record_rejects_missing_channel_fields() -> None:
             segment_id="seg_repeat_hotel_no_booking",
             channel=ContentChannel.SMS,
         )
+
+
+def attribution_for_candidate(channel: str) -> dict[str, str]:
+    return {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "promotion_run_id": "run_promo_banner_001",
+        "ad_experiment_id": "exp_promo_banner_001",
+        "segment_id": "seg_repeat_hotel_no_booking",
+        "content_id": "content_repeat_hotel_001",
+        "content_option_id": "option_repeat_hotel_001",
+        "creative_id": "content_repeat_hotel_001",
+        "promotion_channel": channel,
+        "target_url": "https://demo-stay.example.com/summer",
+    }

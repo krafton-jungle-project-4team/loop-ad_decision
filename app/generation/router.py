@@ -7,7 +7,10 @@ from pydantic import ValidationError
 
 from app.db import create_postgres_connection
 from app.dependencies import get_settings
-from app.generation.adapters import build_external_content_generator
+from app.generation.adapters import (
+    build_external_content_generator,
+    build_s3_creative_artifact_publisher,
+)
 from app.generation.image_tasks import (
     ImageGenerationJobCollector,
     dispatch_image_generation_jobs,
@@ -38,12 +41,14 @@ def get_generation_service(request: Request) -> Iterator[GenerationRequestHandle
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
     content_generator = None
+    artifact_publisher = None
     image_generation_scheduler = None
     if settings.env != "test":
         content_generator = build_external_content_generator(
             settings,
             generate_images=False,
         )
+        artifact_publisher = build_s3_creative_artifact_publisher(settings)
         image_generation_scheduler = ImageGenerationJobCollector()
     try:
         yield GenerationService(
@@ -51,6 +56,7 @@ def get_generation_service(request: Request) -> Iterator[GenerationRequestHandle
             content_candidate_repository=ContentCandidateRepository(connection),
             generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
+            artifact_publisher=artifact_publisher,
             image_generation_scheduler=image_generation_scheduler,
         )
         connection.commit()

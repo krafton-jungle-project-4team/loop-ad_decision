@@ -31,20 +31,11 @@ GENERATION_RESPONSE_KEYS = {
 }
 
 CONTENT_CANDIDATE_RESPONSE_KEYS = {
-    "content_id",
-    "content_option_id",
-    "segment_id",
     "channel",
-    "subject",
-    "preheader",
-    "title",
-    "body",
-    "cta",
-    "message",
-    "image_prompt",
-    "image_url",
-    "landing_url",
-    "status",
+    "creative_format",
+    "attribution",
+    "source",
+    "artifact",
 }
 
 GENERATION_RUN_DB_PARAM_KEYS = {
@@ -114,6 +105,7 @@ CANDIDATE_METADATA_KEYS = {
     "image_prompt",
     "image_url",
     "landing_url",
+    "creative",
 }
 
 RUN_OUTPUT_KEYS = {
@@ -125,7 +117,6 @@ RUN_OUTPUT_KEYS = {
 }
 
 FORBIDDEN_PUBLIC_TERMS = (
-    "creative_id",
     "variant_id",
     "generated_contents",
     "shopping mall",
@@ -158,17 +149,22 @@ def test_generation_api_response_contract_for_dashboard() -> None:
 
     candidate = payload["content_candidates"][0]
     assert set(candidate) == CONTENT_CANDIDATE_RESPONSE_KEYS
-    assert candidate["content_id"] == "content_banner_repeat_hotel_001"
-    assert candidate["content_option_id"] == "banner_repeat_hotel_option_001"
-    assert candidate["segment_id"] == "seg_repeat_hotel_no_booking"
     assert candidate["channel"] == "onsite_banner"
-    assert candidate["status"] == "draft"
-    assert candidate["title"]
-    assert candidate["body"]
-    assert candidate["cta"]
-    assert candidate["image_prompt"]
-    assert candidate["image_url"] is None
-    assert candidate["landing_url"] == "https://demo-stay.example.com/summer"
+    assert candidate["creative_format"] == "banner_html"
+    assert candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
+    assert candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
+    assert candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
+    assert candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
+    assert candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
+    assert candidate["source"] == {
+        "creative_format": "banner_html",
+        "width": 320,
+        "height": 100,
+        "click_protocol": "post_message",
+        "allowed_message_type": "loopad:click",
+    }
+    assert candidate["artifact"]["creative_format"] == "banner_html"
+    assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
 
     _assert_no_forbidden_terms(payload)
 
@@ -184,7 +180,7 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
 
     response = service.generate(_generation_request(content_option_count=1))
 
-    assert response.content_candidates[0].image_url == IMAGE_URL
+    assert response.content_candidates[0].artifact.public_url
     assert len(generation_run_repository.saved) == 1
     assert len(content_candidate_repository.saved) == 1
 
@@ -224,6 +220,7 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
     assert candidate_params["status"] == "draft"
     assert candidate_params["image_url"] == IMAGE_URL
     assert candidate_params["metadata_json"].obj["image_url"] == IMAGE_URL
+    assert candidate_params["metadata_json"].obj["creative"]["artifact"]["public_url"]
     assert candidate_params["data_evidence_json"].obj == (
         candidate.metadata_json["data_evidence"]
     )
@@ -277,10 +274,21 @@ def test_generation_channel_contract_fields_are_stable(
 
     candidate = response.content_candidates[0].model_dump()
     assert candidate["channel"] == channel.value
-    for field in required_fields:
-        assert candidate[field]
-    for field in empty_fields:
-        assert candidate[field] is None
+    assert candidate["attribution"]["promotion_channel"] == channel.value
+    assert candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
+    assert candidate["source"]["creative_format"] == candidate["creative_format"]
+    if channel == ContentChannel.EMAIL:
+        assert candidate["source"]["subject"]
+        assert candidate["source"]["preheader"]
+        assert candidate["source"]["text_body"]
+        assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
+    elif channel == ContentChannel.SMS:
+        assert candidate["source"]["message"]
+        assert candidate["artifact"]["artifact_status"] == "not_required"
+    else:
+        assert candidate["source"]["width"] == 320
+        assert candidate["source"]["height"] == 100
+        assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
 
     saved_candidate = content_candidate_repository.saved[0]
     assert saved_candidate.channel == channel

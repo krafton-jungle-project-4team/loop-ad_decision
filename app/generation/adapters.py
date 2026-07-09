@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import urllib.error
@@ -12,9 +13,15 @@ from typing import Any, Callable, Mapping, Protocol
 import boto3
 
 from app.config import Settings
+from app.generation.artifacts import (
+    HTML_CONTENT_TYPE,
+    S3CreativeArtifactPublisher,
+    html_artifact_key,
+    public_asset_url,
+)
 from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
-from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel
+from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel, CreativeFormat
 from app.logging import log, duration_ms
 
 
@@ -59,6 +66,15 @@ class AssetStorage(Protocol):
         content_id: str,
         image: "ImageArtifact",
     ) -> str:
+        ...
+
+    def store_html(
+        self,
+        *,
+        content_id: str,
+        creative_format: CreativeFormat,
+        html_body: str,
+    ) -> Mapping[str, Any]:
         ...
 
 
@@ -298,6 +314,78 @@ class S3AssetStorage:
         )
         return image_url
 
+    def store_html(
+        self,
+        *,
+        content_id: str,
+        creative_format: CreativeFormat,
+        html_body: str,
+    ) -> Mapping[str, Any]:
+        key = html_artifact_key(
+            base_prefix=self._base_prefix,
+            content_id=content_id,
+            creative_format=creative_format,
+        )
+        body = html_body.encode("utf-8")
+        started_at = perf_counter()
+        log.info(
+            "provider_request_prepared",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "contentType": HTML_CONTENT_TYPE,
+            },
+        )
+        try:
+            self._s3_client.put_object(
+                Bucket=self._bucket_name,
+                Key=key,
+                Body=body,
+                ContentType=HTML_CONTENT_TYPE,
+                CacheControl="public, max-age=31536000, immutable",
+            )
+        except Exception as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    "provider": "s3",
+                    "endpoint": "put_object",
+                    "bucket": self._bucket_name,
+                    "key": key,
+                    "err": exc,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            raise
+        public_url = public_asset_url(
+            public_base_url=self._public_base_url,
+            base_prefix=self._base_prefix,
+            key=key,
+        )
+        log.info(
+            "provider_request_completed",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        metadata: dict[str, Any] = {
+            "storage_key": key,
+            "public_url": public_url,
+            "sha256": hashlib.sha256(body).hexdigest(),
+            "bytes": len(body),
+            "content_type": HTML_CONTENT_TYPE,
+        }
+        if creative_format == CreativeFormat.BANNER_HTML:
+            metadata["width"] = 320
+            metadata["height"] = 100
+        return metadata
+
 
 class ExternalContentGenerator:
     version = EXTERNAL_CONTENT_GENERATOR_VERSION
@@ -370,6 +458,15 @@ def build_external_content_generator(
             base_prefix=settings.genai_assets_base_prefix,
         ),
         generate_images=generate_images,
+    )
+
+
+def build_s3_creative_artifact_publisher(settings: Settings) -> S3CreativeArtifactPublisher:
+    return S3CreativeArtifactPublisher(
+        storage=S3AssetStorage(
+            bucket_name=settings.data_storage_bucket,
+            base_prefix=settings.genai_assets_base_prefix,
+        )
     )
 
 
@@ -463,6 +560,7 @@ def _generated_content_from_values(
     if not landing_url:
         raise ValueError("promotion.landing_url is required to generate content")
     values = _values_with_banner_image_prompt(channel=channel, values=values)
+    values = _values_with_sms_redirect_placeholder(channel=channel, values=values)
     content = GeneratedContent(
         subject=values.get("subject"),
         preheader=values.get("preheader"),
@@ -475,6 +573,20 @@ def _generated_content_from_values(
     )
     content.to_record_values(channel)
     return content
+
+
+def _values_with_sms_redirect_placeholder(
+    *,
+    channel: ContentChannel,
+    values: Mapping[str, str | None],
+) -> Mapping[str, str | None]:
+    if channel != ContentChannel.SMS:
+        return values
+
+    message = _optional_text(values.get("message"))
+    if not message or "{{redirect_url}}" in message:
+        return values
+    return {**values, "message": f"{message} {{{{redirect_url}}}}"}
 
 
 def _values_with_banner_image_prompt(

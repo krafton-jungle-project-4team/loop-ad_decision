@@ -2,10 +2,10 @@ from fastapi.testclient import TestClient
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.generation.generator import GeneratedContent
+from app.generation.artifacts import StaticCreativeArtifactPublisher
 from app.generation.router import get_generation_service
 from app.generation.schemas import (
     ContentCandidateResponse,
-    ContentCandidateStatus,
     ContentChannel,
     GenerationRequest,
     GenerationResponse,
@@ -15,7 +15,7 @@ from app.generation.service import GenerationService
 from app.main import create_app
 
 
-FORBIDDEN_PUBLIC_KEYS = {"creative_id", "variant_id", "experiment_id"}
+FORBIDDEN_PUBLIC_KEYS = {"variant_id", "experiment_id"}
 DEFAULT_FETCHONE_RESULT = object()
 
 
@@ -65,17 +65,22 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert_no_forbidden_public_keys(payload)
 
     first_candidate = payload["content_candidates"][0]
-    assert first_candidate["content_id"] == "content_banner_repeat_hotel_001"
-    assert first_candidate["content_option_id"] == "banner_repeat_hotel_option_001"
-    assert first_candidate["segment_id"] == "seg_repeat_hotel_no_booking"
     assert first_candidate["channel"] == "onsite_banner"
-    assert first_candidate["status"] == "draft"
-    assert first_candidate["title"] == "이번 주말 호텔 특가"
-    assert first_candidate["body"] == "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요."
-    assert first_candidate["cta"] == "호텔 특가 보기"
-    assert first_candidate["image_prompt"]
-    assert first_candidate["image_url"] is None
-    assert first_candidate["landing_url"] == "https://demo-stay.example.com/summer"
+    assert first_candidate["creative_format"] == "banner_html"
+    assert first_candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
+    assert first_candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
+    assert first_candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
+    assert first_candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
+    assert first_candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
+    assert first_candidate["source"] == {
+        "creative_format": "banner_html",
+        "width": 320,
+        "height": 100,
+        "click_protocol": "post_message",
+        "allowed_message_type": "loopad:click",
+    }
+    assert first_candidate["artifact"]["creative_format"] == "banner_html"
+    assert first_candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
 
 
 def test_generation_api_rejects_path_body_promotion_mismatch() -> None:
@@ -253,6 +258,10 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
         "app.generation.router.dispatch_image_generation_jobs",
         fake_dispatch_image_generation_jobs,
     )
+    monkeypatch.setattr(
+        "app.generation.router.build_s3_creative_artifact_publisher",
+        lambda _settings: StaticCreativeArtifactPublisher(),
+    )
     env = valid_env()
     env["LOOPAD_ENV"] = "dev"
     app = create_app(settings=load_settings(env))
@@ -271,7 +280,9 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
     )
 
     assert response.status_code == 200
-    assert response.json()["content_candidates"][0]["image_url"] is None
+    candidate = response.json()["content_candidates"][0]
+    assert candidate["creative_format"] == "banner_html"
+    assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
     assert len(connections) == 1
     assert built_settings[0][0].env == "dev"
     assert built_settings[0][1] is False
@@ -356,17 +367,32 @@ class FakeGenerationService:
             status=GenerationStatus.COMPLETED,
             content_candidates=[
                 ContentCandidateResponse(
-                    content_id="content_banner_fake_001",
-                    content_option_id="banner_fake_option_001",
-                    segment_id="seg_repeat_hotel_no_booking",
                     channel=ContentChannel.ONSITE_BANNER,
-                    title="Book this weekend's rooms",
-                    body="Compare refundable summer offers before rooms run out.",
-                    cta="View hotel deals",
-                    image_prompt="bright modern hotel room, summer travel banner",
-                    image_url=None,
-                    landing_url="https://demo-stay.example.com/summer",
-                    status=ContentCandidateStatus.DRAFT,
+                    creative_format="banner_html",
+                    attribution={
+                        "project_id": request.project_id,
+                        "campaign_id": request.campaign_id,
+                        "promotion_id": request.promotion_id,
+                        "promotion_run_id": "run_fake",
+                        "ad_experiment_id": "exp_fake",
+                        "segment_id": "seg_repeat_hotel_no_booking",
+                        "content_id": "content_banner_fake_001",
+                        "content_option_id": "banner_fake_option_001",
+                        "creative_id": "content_banner_fake_001",
+                        "promotion_channel": "onsite_banner",
+                        "target_url": "https://demo-stay.example.com/summer",
+                    },
+                    source={
+                        "creative_format": "banner_html",
+                        "width": 320,
+                        "height": 100,
+                        "click_protocol": "post_message",
+                        "allowed_message_type": "loopad:click",
+                    },
+                    artifact={
+                        "creative_format": "banner_html",
+                        "artifact_status": "pending",
+                    },
                 )
             ],
         )

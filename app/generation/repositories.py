@@ -6,6 +6,12 @@ from typing import Any, Protocol
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.generation.artifacts import (
+    attribution_for_candidate,
+    creative_format_for_channel,
+    default_artifact,
+    source_for_channel,
+)
 from app.generation.prompt_builder import (
     PromotionPromptInput,
     TargetSegmentPromptInput,
@@ -350,7 +356,7 @@ class ContentCandidateRecord:
             else ContentChannel(self.channel)
         )
         object.__setattr__(self, "channel", channel)
-        missing = missing_channel_fields(channel, self.to_public_values())
+        missing = missing_channel_fields(channel, self.to_record_values())
         if missing:
             missing_fields = ", ".join(missing)
             raise ValueError(
@@ -358,7 +364,7 @@ class ContentCandidateRecord:
                 f"{missing_fields}"
             )
 
-    def to_public_values(self) -> dict[str, Any]:
+    def to_record_values(self) -> dict[str, Any]:
         return {
             "content_id": self.content_id,
             "content_option_id": self.content_option_id,
@@ -374,6 +380,27 @@ class ContentCandidateRecord:
             "image_url": self.image_url,
             "landing_url": self.landing_url,
             "status": self.status,
+        }
+
+    def to_public_values(self) -> dict[str, Any]:
+        content_values = self.to_record_values()
+        creative = _creative_metadata(self.metadata_json)
+        return {
+            "channel": self.channel,
+            "creative_format": creative_format_for_channel(self.channel),
+            "attribution": attribution_for_candidate(
+                project_id=self.project_id,
+                campaign_id=self.campaign_id,
+                promotion_id=self.promotion_id,
+                segment_id=self.segment_id,
+                content_id=self.content_id,
+                content_option_id=self.content_option_id,
+                channel=self.channel,
+                target_url=str(self.landing_url or ""),
+            ),
+            "source": creative.get("source")
+            or source_for_channel(channel=self.channel, content_values=content_values),
+            "artifact": creative.get("artifact") or default_artifact(self.channel),
         }
 
     def to_db_params(self) -> dict[str, Any]:
@@ -654,6 +681,11 @@ def _optional_text(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _creative_metadata(value: Mapping[str, Any]) -> Mapping[str, Any]:
+    creative = value.get("creative") if isinstance(value, Mapping) else None
+    return creative if isinstance(creative, Mapping) else {}
 
 
 def _positive_int(value: object, *, fallback: int = 0) -> int:

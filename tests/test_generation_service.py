@@ -192,7 +192,7 @@ def test_generation_service_can_generate_response_without_repositories() -> None
 
     assert response.generation_id == "generation_banner_001"
     assert len(response.content_candidates) == 1
-    assert response.content_candidates[0].content_option_id == (
+    assert response.content_candidates[0].attribution.content_option_id == (
         "banner_repeat_hotel_option_001"
     )
 
@@ -207,18 +207,18 @@ def test_generation_service_enqueues_deferred_banner_image_generation() -> None:
 
     response = service.generate(generation_request(content_option_count=2))
 
-    assert [candidate.image_url for candidate in response.content_candidates] == [
-        None,
-        None,
+    assert [candidate.artifact.artifact_status for candidate in response.content_candidates] == [
+        "published",
+        "published",
     ]
     assert image_generation_scheduler.jobs == [
         ImageGenerationJob(
             content_id="content_banner_repeat_hotel_001",
-            image_prompt=response.content_candidates[0].image_prompt or "",
+            image_prompt=content_candidate_repository.saved[0].image_prompt or "",
         ),
         ImageGenerationJob(
             content_id="content_banner_repeat_hotel_002",
-            image_prompt=response.content_candidates[1].image_prompt or "",
+            image_prompt=content_candidate_repository.saved[1].image_prompt or "",
         ),
     ]
 
@@ -255,7 +255,7 @@ def test_generation_service_uses_new_generation_id_for_regeneration() -> None:
         "content_banner_repeat_hotel_001",
         "content_banner_repeat_hotel_run_2_001",
     ]
-    assert second_response.content_candidates[0].content_option_id == (
+    assert second_response.content_candidates[0].attribution.content_option_id == (
         "banner_repeat_hotel_run_2_option_001"
     )
 
@@ -331,7 +331,7 @@ def test_generation_service_creates_candidates_for_focus_segment_only() -> None:
 
     assert len(response.content_candidates) == 3
     assert {
-        candidate.content_id for candidate in response.content_candidates
+        candidate.attribution.content_id for candidate in response.content_candidates
     } == {
         "content_banner_failed_focus_001",
         "content_banner_failed_focus_002",
@@ -482,7 +482,7 @@ def test_generation_service_uses_demo_default_landing_url_when_missing() -> None
     )
 
     assert response.status == "completed"
-    assert response.content_candidates[0].landing_url == DEMO_DEFAULT_LANDING_URL
+    assert response.content_candidates[0].attribution.target_url == DEMO_DEFAULT_LANDING_URL
     candidate = content_candidate_repository.saved[0]
     assert candidate.landing_url == DEMO_DEFAULT_LANDING_URL
     assert f"Fixed landing URL: {DEMO_DEFAULT_LANDING_URL}" in (
@@ -534,17 +534,19 @@ def test_generation_service_saves_channel_specific_fields() -> None:
     sms_response = sms_service.generate(generation_request(content_option_count=1))
 
     email_candidate = email_response.content_candidates[0]
-    assert email_candidate.subject
-    assert email_candidate.preheader
-    assert email_candidate.body
-    assert "호텔" in email_candidate.subject
-    assert email_candidate.cta == "호텔 특가 보기"
-    assert email_candidate.landing_url
+    assert email_candidate.source.creative_format == "email_html"
+    assert email_candidate.source.subject
+    assert email_candidate.source.preheader
+    assert email_candidate.source.text_body
+    assert "호텔" in email_candidate.source.subject
+    assert email_candidate.attribution.target_url
 
     sms_candidate = sms_response.content_candidates[0]
-    assert sms_candidate.message
-    assert "호텔" in sms_candidate.message
-    assert sms_candidate.landing_url
+    assert sms_candidate.source.creative_format == "sms_text"
+    assert sms_candidate.source.message
+    assert "호텔" in sms_candidate.source.message
+    assert "{{redirect_url}}" in sms_candidate.source.message
+    assert sms_candidate.attribution.target_url
 
 
 def test_generation_service_saves_source_report_references() -> None:
