@@ -39,6 +39,7 @@ class TargetSegmentPromptInput:
     sample_ratio: str | None = None
     source: str | None = None
     query_preview_id: str | None = None
+    status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +217,7 @@ def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
         "segment_vector_id": target_segment.segment_vector_id,
         "estimated_size": target_segment.estimated_size,
         "priority": target_segment.priority,
+        "target_segment_status": target_segment.status,
         "sample_ratio": target_segment.sample_ratio,
         "goal_metric": promotion.goal_metric,
         "goal_basis": promotion.goal_basis,

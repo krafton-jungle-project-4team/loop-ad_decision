@@ -73,6 +73,12 @@ class GenerationInputReader(Protocol):
     ) -> list[TargetSegmentPromptInput]:
         ...
 
+    def list_focus_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        ...
+
 
 class GenerationRequestHandler(Protocol):
     def generate(self, request: GenerationRequest) -> GenerationResponse:
@@ -412,13 +418,21 @@ class GenerationService:
             log.warn("promotion_input_not_found", {"promotionId": request.promotion_id})
             raise ValueError("promotion input was not found for focus generation")
 
-        target_segments = self._generation_input_reader.list_target_segment_inputs(
-            request
+        focus_segment_reader = getattr(
+            self._generation_input_reader,
+            "list_focus_target_segment_inputs",
+            None,
         )
+        if callable(focus_segment_reader):
+            target_segments = focus_segment_reader(request)
+        else:
+            target_segments = self._generation_input_reader.list_target_segment_inputs(
+                request
+            )
         if not target_segments:
             log.warn("target_segments_empty", {"analysisId": request.analysis_id})
             raise ValueError(
-                "confirmed promotion_target_segments are required for focus generation"
+                "promotion_target_segments are required for focus generation"
             )
         focus_ids = _focus_segment_ids(focus_segment_ids)
         target_segments_by_id = {

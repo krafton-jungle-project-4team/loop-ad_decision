@@ -400,6 +400,47 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
     assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
 
 
+def test_generation_service_focus_generation_bypasses_confirmed_status_filter() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [],
+            focus_target_segments=[
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                    status="planned",
+                )
+            ],
+        ),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+            operator_instruction=None,
+        )
+    )
+
+    assert result.generated_segment_ids == ["seg_near_checkin"]
+    assert len(content_candidate_repository.saved) == 1
+    candidate = content_candidate_repository.saved[0]
+    assert candidate.segment_id == "seg_near_checkin"
+    assert candidate.status == "approved"
+    assert candidate.metadata_json["data_evidence"]["target_segment_status"] == (
+        "planned"
+    )
+
+
 def test_generation_service_records_failed_run_when_generator_fails() -> None:
     generation_run_repository = FakeGenerationRunRepository()
     content_candidate_repository = FakeContentCandidateRepository()
@@ -641,8 +682,10 @@ class StaticGenerationInputReader:
         *,
         channel: ContentChannel = ContentChannel.ONSITE_BANNER,
         landing_url: str | None = "https://demo-stay.example.com/summer",
+        focus_target_segments: list[TargetSegmentPromptInput] | None = None,
     ) -> None:
         self._target_segments = target_segments
+        self._focus_target_segments = focus_target_segments or target_segments
         self._channel = channel
         self._landing_url = landing_url
 
@@ -668,6 +711,13 @@ class StaticGenerationInputReader:
     ) -> list[TargetSegmentPromptInput]:
         del request
         return list(self._target_segments)
+
+    def list_focus_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        del request
+        return list(self._focus_target_segments)
 
 
 class FailingContentGenerator:
@@ -707,6 +757,7 @@ def target_segment_input(
     content_slug: str = "repeat_hotel",
     generated_sql: str | None = None,
     query_preview_id: str | None = None,
+    status: str | None = None,
 ) -> TargetSegmentPromptInput:
     return TargetSegmentPromptInput(
         analysis_id=analysis_id,
@@ -732,4 +783,5 @@ def target_segment_input(
         sample_ratio="0.018000",
         source="system_default",
         query_preview_id=query_preview_id,
+        status=status,
     )

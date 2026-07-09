@@ -123,6 +123,7 @@ def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
         ),
         "top_common_features": top_common_features or keywords,
         "priority": target_segment.priority,
+        "target_segment_status": target_segment.status,
         "goal_metric": promotion.goal_metric,
         "goal_basis": promotion.goal_basis,
         "goal_target_value": goal_target_value
