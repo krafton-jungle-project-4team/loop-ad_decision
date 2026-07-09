@@ -8,6 +8,7 @@ import pytest
 from app.analysis.repositories import SegmentVectorRecord, UserBehaviorVectorRecord
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
+    SegmentVectorDataUnavailableError,
     SegmentVectorService,
 )
 
@@ -165,30 +166,40 @@ def test_segment_vector_service_averages_candidate_user_vectors() -> None:
     assert saved.vector_values[1] == pytest.approx(1 / math.sqrt(2))
 
 
-def test_segment_vector_service_uses_deterministic_fixture_fallback() -> None:
-    first_store = FakeSegmentVectorRepository()
-    second_store = FakeSegmentVectorRepository()
-    first_service = SegmentVectorService(
-        segment_vector_repository=first_store,
-        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
-    )
-    second_service = SegmentVectorService(
-        segment_vector_repository=second_store,
-        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+def test_segment_vector_service_rejects_missing_candidate_user_ids() -> None:
+    store = FakeSegmentVectorRepository()
+    reader = FakeUserBehaviorVectorRepository([])
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
     )
 
-    first_result = first_service.prepare_segment_vector(
-        build_request(candidate_user_ids=())
-    )
-    second_result = second_service.prepare_segment_vector(
-        build_request(candidate_user_ids=())
+    with pytest.raises(SegmentVectorDataUnavailableError, match="candidate user ids"):
+        service.prepare_segment_vector(build_request(candidate_user_ids=()))
+
+    assert reader.calls == []
+    assert store.saved == []
+
+
+def test_segment_vector_service_rejects_empty_user_vectors() -> None:
+    store = FakeSegmentVectorRepository()
+    reader = FakeUserBehaviorVectorRepository([])
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
     )
 
-    assert first_store.saved[0].source == "fixture"
-    assert first_result.source == "fixture"
-    assert first_result.segment_vector_id == second_result.segment_vector_id
-    assert first_result.vector_values == second_result.vector_values
-    assert vector_norm(first_result.vector_values) == pytest.approx(1.0)
+    with pytest.raises(SegmentVectorDataUnavailableError, match="user behavior vectors"):
+        service.prepare_segment_vector(build_request())
+
+    assert reader.calls == [
+        {
+            "project_id": "hotel-client-a",
+            "user_ids": ["user_001", "user_002"],
+            "vector_version": "v1",
+        }
+    ]
+    assert store.saved == []
 
 
 def test_segment_vector_service_reuses_existing_snapshot_vector() -> None:
@@ -215,6 +226,34 @@ def test_segment_vector_service_reuses_existing_snapshot_vector() -> None:
 
     assert result.segment_vector_id == "segvec_existing_v1"
     assert result.vector_values == existing.vector_values
+    assert reader.calls == []
+    assert store.saved == []
+    assert store.latest_calls == []
+
+
+def test_segment_vector_service_rejects_existing_fixture_snapshot_vector() -> None:
+    existing = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="v1",
+        source="fixture",
+    )
+    store = FakeSegmentVectorRepository(snapshot=existing)
+    reader = FakeUserBehaviorVectorRepository([vector_record()])
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
+    )
+
+    with pytest.raises(SegmentVectorDataUnavailableError, match="existing snapshot"):
+        service.prepare_segment_vector(build_request())
+
     assert reader.calls == []
     assert store.saved == []
     assert store.latest_calls == []
@@ -260,6 +299,45 @@ def test_segment_vector_service_copies_latest_vector_into_new_analysis_snapshot(
     assert saved.source == latest.source
 
 
+def test_segment_vector_service_ignores_latest_fixture_and_rebuilds_from_user_vectors() -> None:
+    latest = SegmentVectorRecord(
+        segment_vector_id="segvec_existing_v1",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_banner_001",
+        segment_id="seg_repeat_hotel_no_booking",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="v1",
+        source="fixture",
+    )
+    store = FakeSegmentVectorRepository(latest=latest)
+    reader = FakeUserBehaviorVectorRepository(
+        [vector_record(values=[0.0, 1.0, *([0.0] * 62)])]
+    )
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
+    )
+
+    result = service.prepare_segment_vector(build_request())
+
+    assert result.source == "decision_analysis"
+    assert result.vector_values == [0.0, 1.0, *([0.0] * 62)]
+    assert reader.calls == [
+        {
+            "project_id": "hotel-client-a",
+            "user_ids": ["user_001", "user_002"],
+            "vector_version": "v1",
+        }
+    ]
+    assert len(store.saved) == 1
+    saved = store.saved[0]
+    assert saved.source == "decision_analysis"
+    assert saved.vector_values == result.vector_values
+
+
 def test_segment_vector_service_rejects_non_64_dimensional_user_vector() -> None:
     store = FakeSegmentVectorRepository()
     reader = FakeUserBehaviorVectorRepository(
@@ -271,6 +349,22 @@ def test_segment_vector_service_rejects_non_64_dimensional_user_vector() -> None
     )
 
     with pytest.raises(ValueError, match="64 values"):
+        service.prepare_segment_vector(build_request())
+
+    assert store.saved == []
+
+
+def test_segment_vector_service_rejects_zero_vector_without_fixture_fallback() -> None:
+    store = FakeSegmentVectorRepository()
+    reader = FakeUserBehaviorVectorRepository(
+        [vector_record(values=[0.0] * 64)]
+    )
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
+    )
+
+    with pytest.raises(ValueError, match="zero vector"):
         service.prepare_segment_vector(build_request())
 
     assert store.saved == []

@@ -168,7 +168,7 @@ class FakeSegmentVectorService:
             segment_id=request.segment_id,
             segment_vector_id=f"segvec_{request.segment_id}_v1",
             vector_values=[1.0, *([0.0] * 63)],
-            source="fixture",
+            source="decision_analysis",
         )
 
 

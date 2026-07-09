@@ -144,6 +144,46 @@ def test_analysis_api_rolls_back_when_promotion_is_missing(monkeypatch) -> None:
     assert clickhouse_clients[0].close_count == 1
 
 
+def test_analysis_api_rolls_back_when_segment_vector_data_is_unavailable(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+    clickhouse_clients: list[RecordingClickHouseClient] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
+        client = RecordingClickHouseClient(user_vector_rows=[])
+        clickhouse_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "app.analysis.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.analysis.router.create_clickhouse_client",
+        fake_create_clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/analysis",
+        json=analysis_payload(),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "segment vector data unavailable"
+    assert len(connections) == 1
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+    assert clickhouse_clients[0].close_count == 1
+
+
 class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
@@ -202,12 +242,24 @@ class RecordingConnection:
 
 
 class RecordingClickHouseClient:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        user_vector_rows: list[dict[str, object]] | None = None,
+    ) -> None:
         self.queries: list[tuple[str, Any]] = []
         self.close_count = 0
+        self.user_vector_rows = (
+            user_behavior_vector_rows()
+            if user_vector_rows is None
+            else user_vector_rows
+        )
 
     def query(self, query: str, parameters: Any = None) -> "ClickHouseResult":
         self.queries.append((query, parameters))
+        sql = compact_sql(query)
+        if "from user_behavior_vectors" in sql and "user_id in" in sql:
+            return ClickHouseResult(self.user_vector_rows)
         return ClickHouseResult([])
 
     def close(self) -> None:
@@ -255,13 +307,32 @@ def segment_definition_row(segment_id: str, sample_size: int) -> dict[str, objec
         "query_preview_id": None,
         "natural_language_query": f"{segment_id} hotel audience",
         "generated_sql": None,
-        "rule_json": {"segment_id": segment_id},
+        "rule_json": {
+            "segment_id": segment_id,
+            "candidate_user_ids": [
+                f"user_{segment_id}_001",
+                f"user_{segment_id}_002",
+            ],
+        },
         "profile_json": {"primary_segment": segment_id},
         "sample_size": sample_size,
         "total_eligible_user_count": 74200,
         "sample_ratio": Decimal("0.020000"),
         "status": "active",
     }
+
+
+def user_behavior_vector_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "project_id": "hotel-client-a",
+            "user_id": "user_vector_fixture_001",
+            "vector_dim": 64,
+            "vector_values": [1.0, *([0.0] * 63)],
+            "vector_version": "v1",
+            "source": "batch_profile",
+        }
+    ]
 
 
 def compact_sql(query: str) -> str:
