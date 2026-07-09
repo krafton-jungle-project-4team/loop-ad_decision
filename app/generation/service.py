@@ -4,6 +4,11 @@ import re
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence
 
+from app.generation.artifacts import (
+    CreativeArtifactPublisher,
+    StaticCreativeArtifactPublisher,
+    build_creative_metadata,
+)
 from app.generation.generator import (
     CONTENT_GENERATOR_VERSION,
     ContentGenerator,
@@ -116,6 +121,7 @@ class GenerationService:
         generation_input_builder: GenerationInputBuilder | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
+        artifact_publisher: CreativeArtifactPublisher | None = None,
         image_generation_scheduler: ImageGenerationScheduler | None = None,
         generation_report_builder: GenerationReportBuilder | None = None,
     ) -> None:
@@ -127,6 +133,7 @@ class GenerationService:
         )
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._content_generator = content_generator or DeterministicContentGenerator()
+        self._artifact_publisher = artifact_publisher or StaticCreativeArtifactPublisher()
         self._content_generator_version = _content_generator_version(
             self._content_generator
         )
@@ -493,6 +500,12 @@ class GenerationService:
             content_values=content_values,
             status=status.value,
         )
+        creative_metadata = build_creative_metadata(
+            channel=channel,
+            content_id=content_id,
+            content_values=content_values,
+            artifact_publisher=self._artifact_publisher,
+        )
 
         return ContentCandidateRecord(
             content_id=content_id,
@@ -517,7 +530,10 @@ class GenerationService:
             reason_summary=candidate_report.reason_summary,
             data_evidence_json=candidate_report.data_evidence_json,
             message_strategy=candidate_report.message_strategy,
-            metadata_json=candidate_report.metadata_json,
+            metadata_json={
+                **candidate_report.metadata_json,
+                "creative": creative_metadata,
+            },
             status=status.value,
         )
 

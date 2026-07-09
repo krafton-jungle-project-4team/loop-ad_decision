@@ -1,7 +1,7 @@
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ContentChannel(StrEnum):
@@ -23,6 +23,19 @@ class ContentCandidateStatus(StrEnum):
     REJECTED = "rejected"
     ACTIVE = "active"
     ARCHIVED = "archived"
+
+
+class CreativeFormat(StrEnum):
+    EMAIL_HTML = "email_html"
+    SMS_TEXT = "sms_text"
+    BANNER_HTML = "banner_html"
+
+
+class ArtifactStatus(StrEnum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    PUBLISHED = "published"
+    FAILED = "failed"
 
 
 CHANNEL_REQUIRED_FIELDS: dict[ContentChannel, tuple[str, ...]] = {
@@ -49,34 +62,75 @@ class GenerationRequest(BaseModel):
     operator_instruction: str | None = None
 
 
+class CreativeArtifact(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    creative_format: CreativeFormat
+    artifact_status: ArtifactStatus
+    storage_key: str | None = None
+    public_url: str | None = None
+    sha256: str | None = None
+    bytes: int | None = Field(default=None, ge=0)
+    content_type: str | None = None
+    width: int | None = Field(default=None, ge=1)
+    height: int | None = Field(default=None, ge=1)
+    error_code: str | None = None
+
+
+class LoopAdAttribution(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    project_id: str = Field(min_length=1)
+    campaign_id: str = Field(min_length=1)
+    promotion_id: str = Field(min_length=1)
+    promotion_run_id: str = Field(min_length=1)
+    ad_experiment_id: str = Field(min_length=1)
+    segment_id: str = Field(min_length=1)
+    content_id: str = Field(min_length=1)
+    content_option_id: str = Field(min_length=1)
+    creative_id: str = Field(min_length=1)
+    promotion_channel: ContentChannel
+    target_url: str = Field(min_length=1)
+    placement_id: str | None = None
+    redirect_id: str | None = None
+
+
+class EmailHtmlSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    creative_format: Literal["email_html"] = "email_html"
+    subject: str = Field(min_length=1)
+    preheader: str = Field(min_length=1)
+    text_body: str = Field(min_length=1)
+    required_placeholders: tuple[str, str] = ("{{redirect_url}}", "{{open_pixel_url}}")
+
+
+class SmsTextSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    creative_format: Literal["sms_text"] = "sms_text"
+    message: str = Field(min_length=1)
+    required_placeholders: tuple[str] = ("{{redirect_url}}",)
+
+
+class BannerHtmlSource(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    creative_format: Literal["banner_html"] = "banner_html"
+    width: int = Field(ge=1)
+    height: int = Field(ge=1)
+    click_protocol: Literal["post_message"] = "post_message"
+    allowed_message_type: Literal["loopad:click"] = "loopad:click"
+
+
 class ContentCandidateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    content_id: str = Field(min_length=1)
-    content_option_id: str = Field(min_length=1)
-    segment_id: str = Field(min_length=1)
     channel: ContentChannel
-    subject: str | None = None
-    preheader: str | None = None
-    title: str | None = None
-    body: str | None = None
-    cta: str | None = None
-    message: str | None = None
-    image_prompt: str | None = None
-    image_url: str | None = None
-    landing_url: str | None = None
-    status: ContentCandidateStatus = ContentCandidateStatus.DRAFT
-
-    @model_validator(mode="after")
-    def validate_channel_fields(self) -> "ContentCandidateResponse":
-        missing = missing_channel_fields(self.channel, self.model_dump())
-        if missing:
-            missing_fields = ", ".join(missing)
-            raise ValueError(
-                f"{self.channel.value} content candidate is missing required fields: "
-                f"{missing_fields}"
-            )
-        return self
+    creative_format: CreativeFormat
+    attribution: LoopAdAttribution
+    source: EmailHtmlSource | SmsTextSource | BannerHtmlSource
+    artifact: CreativeArtifact
 
 
 class GenerationResponse(BaseModel):

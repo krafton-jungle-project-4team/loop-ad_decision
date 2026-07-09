@@ -160,7 +160,7 @@ def _sms_content(
     )
     return GeneratedContent(
         message=_compact(
-            f"{message} {landing_url}",
+            f"{message} {{{{redirect_url}}}}",
             max_length=220,
         ),
         landing_url=landing_url,
