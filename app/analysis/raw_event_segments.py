@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from decimal import Decimal
 from time import perf_counter
@@ -27,6 +27,8 @@ from app.logging import duration_ms, log
 RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v1"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v1"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
+RAW_EVENT_CANDIDATE_USER_LIMIT = 160
+EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 
 CANDIDATE_TYPE_ORDER = (
     "intent_matched",
@@ -689,6 +691,7 @@ def _candidate_from_profiles(
 ) -> _RawEventCandidate | None:
     if len(profiles) < min_sample_size:
         return None
+    matching_profile_count = len(profiles)
     ordered_profiles = sorted(
         profiles,
         key=lambda profile: (
@@ -696,8 +699,12 @@ def _candidate_from_profiles(
             profile.user_id,
         ),
     )
-    candidate_user_ids = tuple(profile.user_id for profile in ordered_profiles)
-    signal_metrics = _signal_metrics(ordered_profiles, total_profile_count=len(profiles))
+    selected_profiles = ordered_profiles[:RAW_EVENT_CANDIDATE_USER_LIMIT]
+    candidate_user_ids = tuple(profile.user_id for profile in selected_profiles)
+    signal_metrics = _signal_metrics(
+        selected_profiles,
+        matching_profile_count=matching_profile_count,
+    )
     type_labels = CANDIDATE_TYPE_LABELS[candidate_type]
     matched_condition_labels = [
         CONDITION_LABELS.get(condition_key, (condition_key, condition_key))[0]
@@ -727,15 +734,16 @@ def _candidate_from_profiles(
         promotion_condition_match=promotion_condition_match,
         expected_goal_performance=_expected_goal_performance(
             promotion=promotion,
-            profiles=ordered_profiles,
+            profiles=selected_profiles,
+            baseline=baseline,
         ),
         behavior_lift_vs_baseline=_behavior_lift(
-            profiles=ordered_profiles,
+            profiles=selected_profiles,
             baseline=baseline,
             candidate_type=candidate_type,
         ),
         sample_reliability=_sample_reliability(
-            sample_size=len(ordered_profiles),
+            sample_size=len(selected_profiles),
             min_sample_size=min_sample_size,
         ),
     )
@@ -819,11 +827,11 @@ def _with_distinctiveness(
                 1,
             )
             if overlap >= 0.7:
-                distinctiveness -= 0.25
+                distinctiveness -= 0.45
             elif overlap >= 0.4:
-                distinctiveness -= 0.12
+                distinctiveness -= 0.2
         if candidate_chips == set(selected.signal_chips):
-            distinctiveness -= 0.2
+            distinctiveness -= 0.25
     return _RawEventCandidate(
         candidate_type=candidate.candidate_type,
         rank_role=candidate.rank_role,
@@ -1170,6 +1178,30 @@ def _baseline_metrics(
         "campaign_landing": sum(profile.campaign_landing_count for profile in profiles) / total,
         "booking_start": sum(profile.booking_start_count for profile in profiles) / total,
         "booking_complete": sum(profile.booking_complete_count for profile in profiles) / total,
+        "hotel_search_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.hotel_search_count > 0,
+        ),
+        "hotel_detail_view_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.hotel_detail_view_count > 0,
+        ),
+        "promotion_click_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.promotion_click_count > 0,
+        ),
+        "campaign_landing_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.campaign_landing_count > 0,
+        ),
+        "booking_start_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count > 0,
+        ),
+        "booking_complete_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.booking_complete_count > 0,
+        ),
         "benefit": sum(
             profile.deal_event_count
             + profile.free_cancellation_count
@@ -1220,14 +1252,38 @@ def _profile_strength(profile: RawEventUserSignalRecord, *, candidate_type: str)
 def _signal_metrics(
     profiles: Sequence[RawEventUserSignalRecord],
     *,
-    total_profile_count: int,
+    matching_profile_count: int,
 ) -> dict[str, Any]:
+    sample_size = len(profiles)
+    hotel_search_user_count = _user_count(
+        profiles,
+        lambda profile: profile.hotel_search_count > 0,
+    )
+    hotel_detail_view_user_count = _user_count(
+        profiles,
+        lambda profile: profile.hotel_detail_view_count > 0,
+    )
+    campaign_landing_user_count = _user_count(
+        profiles,
+        lambda profile: profile.campaign_landing_count > 0,
+    )
+    booking_start_user_count = _user_count(
+        profiles,
+        lambda profile: profile.booking_start_count > 0,
+    )
+    booking_complete_user_count = _user_count(
+        profiles,
+        lambda profile: profile.booking_complete_count > 0,
+    )
     return {
-        "profile_count": total_profile_count,
+        "profile_count": sample_size,
+        "matching_profile_count": matching_profile_count,
         "hotel_search_count": sum(profile.hotel_search_count for profile in profiles),
+        "hotel_search_user_count": hotel_search_user_count,
         "hotel_detail_view_count": sum(
             profile.hotel_detail_view_count for profile in profiles
         ),
+        "hotel_detail_view_user_count": hotel_detail_view_user_count,
         "promotion_impression_count": sum(
             profile.promotion_impression_count for profile in profiles
         ),
@@ -1237,9 +1293,16 @@ def _signal_metrics(
         "campaign_landing_count": sum(
             profile.campaign_landing_count for profile in profiles
         ),
+        "campaign_landing_user_count": campaign_landing_user_count,
         "booking_start_count": sum(profile.booking_start_count for profile in profiles),
+        "booking_start_user_count": booking_start_user_count,
         "booking_complete_count": sum(
             profile.booking_complete_count for profile in profiles
+        ),
+        "booking_complete_user_count": booking_complete_user_count,
+        "booking_complete_user_rate": _safe_rate(
+            booking_complete_user_count,
+            sample_size,
         ),
         "destination_match_count": sum(
             profile.destination_match_count for profile in profiles
@@ -1280,31 +1343,79 @@ def _expected_goal_performance(
     *,
     promotion: PromotionRecord,
     profiles: Sequence[RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
 ) -> float:
-    total = max(len(profiles), 1)
     if promotion.goal_metric == "booking_conversion_rate":
-        return _clamp01(
-            (
-                sum(profile.booking_start_count for profile in profiles)
-                + 0.5 * sum(profile.hotel_detail_view_count for profile in profiles)
-                + 2.0 * sum(profile.booking_complete_count for profile in profiles)
-            )
-            / (total * 3.0)
+        complete_rate = _smoothed_user_rate(
+            profiles,
+            lambda profile: profile.booking_complete_count > 0,
+            baseline_rate=baseline.get("booking_complete_user_rate", 0.0),
         )
+        start_rate = _user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count > 0,
+        )
+        detail_rate = _user_rate(
+            profiles,
+            lambda profile: profile.hotel_detail_view_count > 0,
+        )
+        intent_support = 0.35 * start_rate + 0.15 * detail_rate
+        return _clamp01(0.75 * complete_rate + 0.25 * intent_support)
     if promotion.goal_metric == "inflow_rate":
-        return _clamp01(
-            (
-                sum(profile.campaign_landing_count for profile in profiles)
-                + sum(profile.promotion_click_count for profile in profiles)
-                + 0.4 * sum(profile.hotel_search_count for profile in profiles)
-            )
-            / (total * 2.4)
+        landing_rate = _smoothed_user_rate(
+            profiles,
+            lambda profile: profile.campaign_landing_count > 0,
+            baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
         )
+        click_rate = _user_rate(
+            profiles,
+            lambda profile: profile.promotion_click_count > 0,
+        )
+        search_rate = _user_rate(
+            profiles,
+            lambda profile: profile.hotel_search_count > 0,
+        )
+        return _clamp01(0.70 * landing_rate + 0.20 * click_rate + 0.10 * search_rate)
+    search_rate = _user_rate(
+        profiles,
+        lambda profile: profile.hotel_search_count > 0,
+    )
+    detail_rate = _user_rate(
+        profiles,
+        lambda profile: profile.hotel_detail_view_count > 0,
+    )
+    return _clamp01(0.35 * search_rate + 0.65 * detail_rate)
+
+
+def _user_count(
+    profiles: Sequence[RawEventUserSignalRecord],
+    predicate: Callable[[RawEventUserSignalRecord], bool],
+) -> int:
+    return sum(1 for profile in profiles if predicate(profile))
+
+
+def _user_rate(
+    profiles: Sequence[RawEventUserSignalRecord],
+    predicate: Callable[[RawEventUserSignalRecord], bool],
+) -> float:
+    if not profiles:
+        return 0.0
+    return _safe_rate(_user_count(profiles, predicate), len(profiles))
+
+
+def _smoothed_user_rate(
+    profiles: Sequence[RawEventUserSignalRecord],
+    predicate: Callable[[RawEventUserSignalRecord], bool],
+    *,
+    baseline_rate: float,
+) -> float:
+    sample_size = len(profiles)
+    if sample_size <= 0:
+        return _clamp01(baseline_rate)
+    success_count = _user_count(profiles, predicate)
     return _clamp01(
-        (
-            sum(profile.hotel_search_count + profile.hotel_click_count + profile.hotel_detail_view_count for profile in profiles)
-        )
-        / (total * 3.0)
+        (success_count + EXPECTED_RATE_PRIOR_USER_COUNT * _clamp01(baseline_rate))
+        / (sample_size + EXPECTED_RATE_PRIOR_USER_COUNT)
     )
 
 

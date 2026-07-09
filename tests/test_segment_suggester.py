@@ -303,6 +303,53 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     )
 
 
+def test_raw_event_suggester_uses_user_level_expected_conversion_rate() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository([])
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "booking_001",
+                hotel_detail_view_count=100,
+                booking_start_count=20,
+                booking_complete_count=10,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+            raw_signal(
+                "booking_002",
+                hotel_detail_view_count=80,
+                booking_start_count=15,
+                booking_complete_count=8,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    performance_estimate = segments[0].profile_json["performance_estimate"]
+    assert performance_estimate["label"] == "예상 전환율"
+    assert performance_estimate["value"] < 1.0
+    assert performance_estimate["formatted"] != "100.0%"
+    assert segments[0].profile_json["score_components"][
+        "expected_goal_performance"
+    ] < 1.0
+
+
 def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [

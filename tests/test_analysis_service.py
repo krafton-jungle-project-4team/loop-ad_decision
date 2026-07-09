@@ -613,6 +613,66 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     )
 
 
+def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    stale_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_old",
+            source="ai_suggested",
+            sample_size=8000,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["old_user_001", "old_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_old",
+            "source": "raw_event_intent",
+            "recommendation_score": 1.0,
+        },
+    )
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            source="ai_suggested",
+            sample_size=160,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["fresh_user_001", "fresh_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            "source": "raw_event_intent",
+            "recommendation_score": 0.8,
+        },
+    )
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stale_ai_segment, *default_segments()],
+        segment_suggester=FakeSegmentSuggester([fresh_ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    selected_segment_ids = segment_ids(result.target_segments)
+    assert fresh_ai_segment.segment_id in selected_segment_ids
+    assert stale_ai_segment.segment_id not in selected_segment_ids
+    assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
+    assert all(
+        segment["segment_id"] != stale_ai_segment.segment_id
+        for segment in result.analysis.input_snapshot_json[
+            "available_segment_definitions"
+        ]
+    )
+
+
 def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> None:
     promotion = promotion_record(channel="email")
     ai_segment = replace(

@@ -1092,11 +1092,13 @@ def _merge_segment_definitions(
     stored_segments: Sequence[SegmentDefinitionRecord],
     suggested_segments: Sequence[SegmentDefinitionRecord],
 ) -> list[SegmentDefinitionRecord]:
-    merged = {segment.segment_id: segment for segment in stored_segments}
+    merged = {
+        segment.segment_id: segment
+        for segment in stored_segments
+        if segment.source != "ai_suggested"
+    }
     for segment in suggested_segments:
-        existing = merged.get(segment.segment_id)
-        if existing is None or existing.source == "ai_suggested":
-            merged[segment.segment_id] = segment
+        merged[segment.segment_id] = segment
     return list(merged.values())
 
 
