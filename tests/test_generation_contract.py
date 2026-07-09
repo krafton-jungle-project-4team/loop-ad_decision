@@ -90,6 +90,9 @@ CANDIDATE_METADATA_KEYS = {
     "reason_summary",
     "data_evidence",
     "message_strategy",
+    "content_brief_schema_version",
+    "content_brief_readiness",
+    "fallback_guidance_used",
     "operator_instruction",
     "source_segment_definition_id",
     "source_query_preview_id",
@@ -154,7 +157,6 @@ def test_generation_api_response_contract_for_dashboard() -> None:
     assert candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
     assert candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
     assert candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
     assert candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
     assert candidate["source"] == {
         "creative_format": "banner_html",

@@ -15,7 +15,7 @@ from app.generation.service import GenerationService
 from app.main import create_app
 
 
-FORBIDDEN_PUBLIC_KEYS = {"variant_id", "experiment_id"}
+FORBIDDEN_PUBLIC_KEYS = {"variant_id", "experiment_id", "creative_id"}
 DEFAULT_FETCHONE_RESULT = object()
 CONFIRMED_TARGET_SEGMENT_STATUSES = {"approved"}
 
@@ -71,7 +71,6 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert first_candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
     assert first_candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
     assert first_candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert first_candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
     assert first_candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
     assert first_candidate["source"] == {
         "creative_format": "banner_html",
@@ -468,7 +467,6 @@ class FakeGenerationService:
                         "segment_id": "seg_repeat_hotel_no_booking",
                         "content_id": "content_banner_fake_001",
                         "content_option_id": "banner_fake_option_001",
-                        "creative_id": "content_banner_fake_001",
                         "promotion_channel": "onsite_banner",
                         "target_url": "https://demo-stay.example.com/summer",
                     },

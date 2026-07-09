@@ -169,7 +169,6 @@ def attribution_for_candidate(channel: str) -> dict[str, str]:
         "segment_id": "seg_repeat_hotel_no_booking",
         "content_id": "content_repeat_hotel_001",
         "content_option_id": "option_repeat_hotel_001",
-        "creative_id": "content_repeat_hotel_001",
         "promotion_channel": channel,
         "target_url": "https://demo-stay.example.com/summer",
     }

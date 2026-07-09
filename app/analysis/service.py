@@ -28,6 +28,7 @@ from app.analysis.report_generator import (
 )
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
 from app.analysis.vector_service import SegmentVectorBuildRequest, SegmentVectorBuildResult
+from app.content_brief import build_content_brief_v2
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
@@ -749,8 +750,11 @@ class PromotionAnalysisService:
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
         content_brief_json = self._build_content_brief_json(
-            segment=segment,
+            analysis_id=analysis_id,
+            promotion=promotion,
+            candidate=candidate,
             operator_instruction=operator_instruction,
+            segment_vector_id=segment_vector_id,
         )
         profile_json = dict(segment.profile_json)
         if candidate.profile is not None:
@@ -883,9 +887,13 @@ class PromotionAnalysisService:
     def _build_content_brief_json(
         self,
         *,
-        segment: SegmentDefinitionRecord,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        candidate: SegmentCandidate,
         operator_instruction: str | None,
+        segment_vector_id: str | None,
     ) -> dict[str, Any]:
+        segment = candidate.definition
         message_direction, keywords = SEGMENT_CONTENT_HINTS.get(
             segment.segment_id,
             (
@@ -893,13 +901,46 @@ class PromotionAnalysisService:
                 ("hotel booking", "seasonal stay", "booking benefit"),
             ),
         )
-        brief: dict[str, Any] = {
-            "message_direction": message_direction,
-            "keywords": list(keywords),
+        score_components = segment.profile_json.get("score_components")
+        if not isinstance(score_components, Mapping):
+            score_components = _ai_score_details(segment).get("score_components")
+        audience_evidence: dict[str, Any] = {
+            "primary_signals": segment.profile_json.get("primary_signals"),
+            "score_components": score_components,
+            "promotion_vector_basis": segment.profile_json.get(
+                "promotion_vector_basis"
+            ),
+            "promotion_matched_features": segment.profile_json.get(
+                "promotion_matched_features"
+            ),
         }
-        if operator_instruction:
-            brief["operator_instruction"] = operator_instruction
-        return brief
+        return build_content_brief_v2(
+            analysis_id=analysis_id,
+            segment_snapshot={
+                "segment_id": segment.segment_id,
+                "segment_name": segment.segment_name,
+                "segment_source": segment.source,
+                "estimated_size": max(segment.sample_size, 0),
+                "segment_vector_id": segment_vector_id,
+            },
+            promotion_context={
+                "channel": promotion.channel,
+                "goal_metric": promotion.goal_metric,
+                "goal_basis": promotion.goal_basis,
+                "goal_target_value": _json_decimal(promotion.goal_target_value),
+                "message_brief": promotion.message_brief,
+                "landing_url": promotion.landing_url,
+            },
+            fallback_message_direction=message_direction,
+            fallback_keywords=keywords,
+            audience_evidence=audience_evidence,
+            hotel_profile=(
+                dict(candidate.profile.profile_json)
+                if candidate.profile is not None
+                else None
+            ),
+            operator_instruction=operator_instruction,
+        )
 
     def _build_data_evidence_json(
         self,
