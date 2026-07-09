@@ -538,9 +538,9 @@ def test_generation_service_saves_channel_specific_fields() -> None:
     assert email_candidate.source.subject
     assert email_candidate.source.preheader
     assert email_candidate.source.text_body
-    assert email_candidate.source.html_body.startswith("<!doctype html>")
-    assert "{{redirect_url}}" in email_candidate.source.html_body
-    assert "{{open_pixel_url}}" in email_candidate.source.html_body
+    assert not hasattr(email_candidate.source, "html_body")
+    assert "{{redirect_url}}" in email_candidate.source.required_placeholders
+    assert "{{open_pixel_url}}" in email_candidate.source.required_placeholders
     assert email_candidate.artifact.public_url
     assert "호텔" in email_candidate.source.subject
     assert email_candidate.attribution.target_url

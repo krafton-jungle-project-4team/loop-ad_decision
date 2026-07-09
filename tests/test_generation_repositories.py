@@ -188,7 +188,7 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
 
 
-def test_content_candidate_public_values_backfills_legacy_email_html_source() -> None:
+def test_content_candidate_public_values_omits_legacy_email_html_body() -> None:
     candidate = ContentCandidateRecord(
         content_id="content_email_repeat_hotel_001",
         content_option_id="email_repeat_hotel_option_001",
@@ -215,6 +215,12 @@ def test_content_candidate_public_values_backfills_legacy_email_html_source() ->
                     "text_body": (
                         "환불 가능한 객실과 여름 숙박 혜택을 지금 확인해보세요."
                     ),
+                    "html_body": (
+                        "<!doctype html><html><body>"
+                        "<a href=\"{{redirect_url}}\">호텔 특가 보기</a>"
+                        "<img src=\"{{open_pixel_url}}\" />"
+                        "</body></html>"
+                    ),
                     "required_placeholders": [
                         "{{redirect_url}}",
                         "{{open_pixel_url}}",
@@ -228,9 +234,8 @@ def test_content_candidate_public_values_backfills_legacy_email_html_source() ->
 
     source = public_values["source"]
     assert source["creative_format"] == "email_html"
-    assert source["html_body"].startswith("<!doctype html>")
-    assert "{{redirect_url}}" in source["html_body"]
-    assert "{{open_pixel_url}}" in source["html_body"]
+    assert source["text_body"] == "환불 가능한 객실과 여름 숙박 혜택을 지금 확인해보세요."
+    assert "html_body" not in source
 
 
 def test_content_candidate_repository_updates_image_url() -> None:

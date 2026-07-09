@@ -698,22 +698,15 @@ def _source_metadata(
     creative: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     source = creative.get("source")
-    if isinstance(source, Mapping) and _source_matches_current_contract(
-        channel=channel,
-        source=source,
-    ):
-        return source
+    if isinstance(source, Mapping):
+        return _without_html_body(source)
     return source_for_channel(channel=channel, content_values=content_values)
 
 
-def _source_matches_current_contract(
-    *,
-    channel: ContentChannel,
-    source: Mapping[str, Any],
-) -> bool:
-    if channel in {ContentChannel.EMAIL, ContentChannel.ONSITE_BANNER}:
-        return bool(str(source.get("html_body") or "").strip())
-    return True
+def _without_html_body(source: Mapping[str, Any]) -> Mapping[str, Any]:
+    public_source = dict(source)
+    public_source.pop("html_body", None)
+    return public_source
 
 
 def _positive_int(value: object, *, fallback: int = 0) -> int:

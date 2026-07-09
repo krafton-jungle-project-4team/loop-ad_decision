@@ -70,7 +70,7 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert first_candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
     assert first_candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
     assert first_candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert first_candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
+    assert "creative_id" not in first_candidate["attribution"]
     assert first_candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
     source = first_candidate["source"]
     assert source["creative_format"] == "banner_html"
@@ -78,8 +78,7 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert source["height"] == 100
     assert source["click_protocol"] == "post_message"
     assert source["allowed_message_type"] == "loopad:click"
-    assert source["html_body"].startswith("<!doctype html>")
-    assert "loopad:click" in source["html_body"]
+    assert "html_body" not in source
     assert first_candidate["artifact"]["creative_format"] == "banner_html"
     assert first_candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
 
@@ -379,13 +378,11 @@ class FakeGenerationService:
                         "segment_id": "seg_repeat_hotel_no_booking",
                         "content_id": "content_banner_fake_001",
                         "content_option_id": "banner_fake_option_001",
-                        "creative_id": "content_banner_fake_001",
                         "promotion_channel": "onsite_banner",
                         "target_url": "https://demo-stay.example.com/summer",
                     },
                     source={
                         "creative_format": "banner_html",
-                        "html_body": "<!doctype html><html><body>Banner</body></html>",
                         "width": 320,
                         "height": 100,
                         "click_protocol": "post_message",

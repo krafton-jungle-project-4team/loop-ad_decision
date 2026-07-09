@@ -59,12 +59,6 @@ def test_generation_request_rejects_extra_fields() -> None:
                 "subject": "Weekend rooms are still available",
                 "preheader": "See refundable summer hotel offers.",
                 "text_body": "Return to the hotels you viewed and compare today's offer.",
-                "html_body": (
-                    "<!doctype html><html><body>"
-                    "<a href=\"{{redirect_url}}\">Open</a>"
-                    "<img src=\"{{open_pixel_url}}\" />"
-                    "</body></html>"
-                ),
             },
             "artifact": {
                 "creative_format": "email_html",
@@ -93,7 +87,6 @@ def test_generation_request_rejects_extra_fields() -> None:
             "creative_format": "banner_html",
             "source": {
                 "creative_format": "banner_html",
-                "html_body": "<!doctype html><html><body>Banner</body></html>",
                 "width": 320,
                 "height": 100,
                 "click_protocol": "post_message",
@@ -140,7 +133,6 @@ def test_content_candidate_response_rejects_missing_channel_fields() -> None:
             attribution=attribution_for_candidate("onsite_banner"),
             source={
                 "creative_format": "banner_html",
-                "html_body": "<!doctype html><html><body>Banner</body></html>",
                 "height": 100,
                 "click_protocol": "post_message",
                 "allowed_message_type": "loopad:click",
@@ -177,7 +169,6 @@ def attribution_for_candidate(channel: str) -> dict[str, str]:
         "segment_id": "seg_repeat_hotel_no_booking",
         "content_id": "content_repeat_hotel_001",
         "content_option_id": "option_repeat_hotel_001",
-        "creative_id": "content_repeat_hotel_001",
         "promotion_channel": channel,
         "target_url": "https://demo-stay.example.com/summer",
     }

@@ -154,7 +154,7 @@ def test_generation_api_response_contract_for_dashboard() -> None:
     assert candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
     assert candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
     assert candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
+    assert "creative_id" not in candidate["attribution"]
     assert candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
     source = candidate["source"]
     assert source["creative_format"] == "banner_html"
@@ -162,8 +162,7 @@ def test_generation_api_response_contract_for_dashboard() -> None:
     assert source["height"] == 100
     assert source["click_protocol"] == "post_message"
     assert source["allowed_message_type"] == "loopad:click"
-    assert source["html_body"].startswith("<!doctype html>")
-    assert "loopad:click" in source["html_body"]
+    assert "html_body" not in source
     assert candidate["artifact"]["creative_format"] == "banner_html"
     assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
 
@@ -282,17 +281,14 @@ def test_generation_channel_contract_fields_are_stable(
         assert candidate["source"]["subject"]
         assert candidate["source"]["preheader"]
         assert candidate["source"]["text_body"]
-        assert candidate["source"]["html_body"].startswith("<!doctype html>")
-        assert "{{redirect_url}}" in candidate["source"]["html_body"]
-        assert "{{open_pixel_url}}" in candidate["source"]["html_body"]
+        assert "html_body" not in candidate["source"]
         assert candidate["artifact"]["public_url"]
         assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
     elif channel == ContentChannel.SMS:
         assert candidate["source"]["message"]
         assert candidate["artifact"]["artifact_status"] == "not_required"
     else:
-        assert candidate["source"]["html_body"].startswith("<!doctype html>")
-        assert "loopad:click" in candidate["source"]["html_body"]
+        assert "html_body" not in candidate["source"]
         assert candidate["artifact"]["public_url"]
         assert candidate["source"]["width"] == 320
         assert candidate["source"]["height"] == 100
