@@ -11,6 +11,12 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 VECTOR_DIM = 64
 DEFAULT_VECTOR_VERSION = "v1"
+DECISION_ANALYSIS_VECTOR_SOURCE = "decision_analysis"
+FIXTURE_VECTOR_SOURCE = "fixture"
+
+
+class SegmentVectorDataUnavailableError(Exception):
+    pass
 
 
 class SegmentVectorStore(Protocol):
@@ -101,6 +107,10 @@ class SegmentVectorService:
             vector_version=request.vector_version,
         )
         if existing is not None:
+            if existing.source == FIXTURE_VECTOR_SOURCE:
+                raise SegmentVectorDataUnavailableError(
+                    "segment vector data unavailable for existing snapshot"
+                )
             _validate_vector(existing.vector_values, existing.vector_dim)
             response = SegmentVectorBuildResult(
                 segment_id=existing.segment_id,
@@ -119,38 +129,34 @@ class SegmentVectorService:
             segment_id=request.segment_id,
             vector_version=request.vector_version,
         )
-        if reusable is not None:
+        if reusable is not None and reusable.source != FIXTURE_VECTOR_SOURCE:
             _validate_vector(reusable.vector_values, reusable.vector_dim)
             source = reusable.source
             normalized_values = [float(value) for value in reusable.vector_values]
             log.info("segment_vector_source_reused", {"segmentVectorId": reusable.segment_vector_id, "source": source})
         else:
+            if reusable is not None:
+                log.warn("segment_vector_fixture_reuse_rejected", {"segmentVectorId": reusable.segment_vector_id})
             candidate_user_ids = _dedupe(request.candidate_user_ids)
-            user_vectors = (
-                self._user_behavior_vector_repository.list_by_user_ids(
-                    project_id=request.project_id,
-                    user_ids=candidate_user_ids,
-                    vector_version=request.vector_version,
+            if not candidate_user_ids:
+                raise SegmentVectorDataUnavailableError(
+                    "segment vector data unavailable: candidate user ids are required"
                 )
-                if candidate_user_ids
-                else []
+            user_vectors = self._user_behavior_vector_repository.list_by_user_ids(
+                project_id=request.project_id,
+                user_ids=candidate_user_ids,
+                vector_version=request.vector_version,
             )
 
-            source = "decision_analysis"
-            if user_vectors:
-                vector_values = _mean_user_vectors(user_vectors)
-                log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
-            else:
-                source = "fixture"
-                vector_values = _fixture_vector(request.segment_id)
-                log.warn("user_vectors_empty", {"source": source})
+            if not user_vectors:
+                raise SegmentVectorDataUnavailableError(
+                    "segment vector data unavailable: user behavior vectors are required"
+                )
 
-            try:
-                normalized_values = _l2_normalize(vector_values)
-            except ValueError:
-                source = "fixture"
-                normalized_values = _l2_normalize(_fixture_vector(request.segment_id))
-                log.warn("segment_vector_invalid", {"source": source})
+            source = DECISION_ANALYSIS_VECTOR_SOURCE
+            vector_values = _mean_user_vectors(user_vectors)
+            log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
+            normalized_values = _l2_normalize(vector_values)
 
         segment_vector_id = _segment_vector_id(
             analysis_id=request.analysis_id,
@@ -206,15 +212,6 @@ def _l2_normalize(vector_values: Sequence[float]) -> list[float]:
     if norm == 0:
         raise ValueError("segment vector must not be a zero vector")
     return [float(value) / norm for value in vector_values]
-
-
-def _fixture_vector(segment_id: str) -> list[float]:
-    values: list[float] = []
-    for index in range(VECTOR_DIM):
-        digest = hashlib.sha256(f"{segment_id}:{index}".encode("utf-8")).digest()
-        bucket = int.from_bytes(digest[:4], "big") % 2001
-        values.append((bucket - 1000) / 1000.0)
-    return values
 
 
 def _segment_vector_id(

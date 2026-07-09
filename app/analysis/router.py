@@ -27,7 +27,10 @@ from app.analysis.service import (
     PromotionNotFoundError,
     SegmentSelectionError,
 )
-from app.analysis.vector_service import SegmentVectorService
+from app.analysis.vector_service import (
+    SegmentVectorDataUnavailableError,
+    SegmentVectorService,
+)
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.dependencies import get_settings
 
@@ -98,6 +101,11 @@ def analyze_promotion(
         raise HTTPException(
             status_code=422,
             detail=str(exc),
+        ) from exc
+    except SegmentVectorDataUnavailableError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="segment vector data unavailable",
         ) from exc
     except IntegrityError as exc:
         if _is_unique_violation(exc):
