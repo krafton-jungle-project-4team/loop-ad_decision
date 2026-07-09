@@ -36,40 +36,32 @@ CANDIDATE_TYPE_ORDER = (
     "benefit_value_seeker",
 )
 
-CANDIDATE_COPY: Mapping[str, Mapping[str, str]] = {
+CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
     "intent_matched": {
         "rank_role": "프로모션 조건 정합형",
-        "title": "프로모션 조건과 맞는 숙소 관심 고객",
-        "reason": "프로모션의 목적지, 시즌, 숙소 탐색 조건과 실제 행동이 직접 연결됩니다.",
-        "action_hint": "제목과 첫 문장에서 목적지와 시즌 혜택을 명확히 보여주는 메시지가 적합합니다.",
+        "fallback_title": "프로모션 조건과 맞는 숙소 관심 고객",
     },
     "funnel_recovery": {
         "rank_role": "예약 이탈 회수형",
-        "title": "예약 직전 이탈 고객",
-        "reason": "숙소 예약 흐름까지 진입했지만 완료하지 않아 예약 혜택 메시지의 회수 타겟으로 적합합니다.",
-        "action_hint": "예약 혜택, 무료 취소, 마감감을 함께 강조하는 메시지가 적합합니다.",
+        "fallback_title": "예약 직전 이탈 고객",
     },
     "promotion_responsive": {
         "rank_role": "프로모션 반응 확장형",
-        "title": "프로모션 반응이 확인된 고객",
-        "reason": "이전 프로모션 노출이나 클릭 이후 랜딩 행동이 확인되어 캠페인 메시지에 반응할 가능성이 있습니다.",
-        "action_hint": "혜택과 CTA를 짧게 반복해 클릭 이후 랜딩까지 이어지도록 구성하세요.",
+        "fallback_title": "프로모션 반응이 확인된 고객",
     },
     "destination_affinity": {
         "rank_role": "목적지 반복 관심형",
-        "title": "목적지 관심이 반복된 고객",
-        "reason": "같은 목적지나 호텔 시장을 반복해서 탐색해 이번 숙소 프로모션과 관심 방향이 맞습니다.",
-        "action_hint": "목적지명, 인기 숙소, 후기 기반 추천을 앞세운 메시지가 적합합니다.",
+        "fallback_title": "목적지 관심이 반복된 고객",
     },
     "benefit_value_seeker": {
         "rank_role": "혜택 민감형",
-        "title": "할인과 혜택에 반응할 고객",
-        "reason": "특가, 무료 취소, 조식 포함, 가격 확인 같은 혜택 탐색 신호가 확인되었습니다.",
-        "action_hint": "할인율, 무료 취소, 조식 포함 같은 조건을 구체적으로 보여주세요.",
+        "fallback_title": "할인과 혜택에 반응할 고객",
     },
 }
 
-CONDITION_COPY: Mapping[str, tuple[str, str]] = {
+# Stable ontology labels used for deterministic fallbacks and UI chips.
+# These labels do not select users or decide ranking.
+CONDITION_LABELS: Mapping[str, tuple[str, str]] = {
     "hotel_product_interest": ("숙소 관심 행동", "숙소 관심"),
     "recent_destination_search": ("목적지 숙소 검색", "목적지 검색"),
     "summer_checkin_search": ("여름 체크인 숙소 검색", "여름 체크인"),
@@ -304,7 +296,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
     conditions: list[CompiledRawEventCondition] = [
         CompiledRawEventCondition(
             key="hotel_product_interest",
-            label=CONDITION_COPY["hotel_product_interest"][0],
+            label=CONDITION_LABELS["hotel_product_interest"][0],
             support="direct",
             event_names=("hotel_search", "hotel_click", "hotel_detail_view"),
             property_keys=("destination_id", "destination_name", "hotel_city"),
@@ -317,7 +309,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key="recent_destination_search",
-                label=CONDITION_COPY["recent_destination_search"][0],
+                label=CONDITION_LABELS["recent_destination_search"][0],
                 support="direct",
                 event_names=("hotel_search", "hotel_detail_view"),
                 property_keys=("destination_id", "destination_name", "hotel_city", "hotel_country"),
@@ -329,7 +321,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key="summer_checkin_search",
-                label=CONDITION_COPY["summer_checkin_search"][0],
+                label=CONDITION_LABELS["summer_checkin_search"][0],
                 support="direct",
                 event_names=("hotel_search",),
                 property_keys=("checkin_date", "checkout_date"),
@@ -340,7 +332,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key="winter_checkin_search",
-                label=CONDITION_COPY["winter_checkin_search"][0],
+                label=CONDITION_LABELS["winter_checkin_search"][0],
                 support="direct",
                 event_names=("hotel_search",),
                 property_keys=("checkin_date", "checkout_date"),
@@ -382,7 +374,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key=key,
-                label=CONDITION_COPY.get(key, (key, key))[0],
+                label=CONDITION_LABELS.get(key, (key, key))[0],
                 support="direct",
                 event_names=tuple(event_names),
                 property_keys=tuple(property_keys),
@@ -394,7 +386,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key="benefit_interest",
-                label=CONDITION_COPY["benefit_interest"][0],
+                label=CONDITION_LABELS["benefit_interest"][0],
                 support="direct",
                 event_names=("hotel_search", "promotion_click"),
                 property_keys=("deal", "price", "free_cancellation", "breakfast_included"),
@@ -406,7 +398,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
         conditions.append(
             CompiledRawEventCondition(
                 key="profile_hint",
-                label=CONDITION_COPY["profile_hint"][0],
+                label=CONDITION_LABELS["profile_hint"][0],
                 support="direct",
                 event_names=(),
                 property_keys=("age_group", "gender", "user_segment", "preferred_category"),
@@ -706,17 +698,27 @@ def _candidate_from_profiles(
     )
     candidate_user_ids = tuple(profile.user_id for profile in ordered_profiles)
     signal_metrics = _signal_metrics(ordered_profiles, total_profile_count=len(profiles))
-    copy = CANDIDATE_COPY[candidate_type]
+    type_labels = CANDIDATE_TYPE_LABELS[candidate_type]
+    matched_condition_labels = [
+        CONDITION_LABELS.get(condition_key, (condition_key, condition_key))[0]
+        for condition_key in matched_condition_keys
+    ]
     promotion_condition_match = _condition_match_score(
         compilation=compilation,
         matched_condition_keys=matched_condition_keys,
     )
     return _RawEventCandidate(
         candidate_type=candidate_type,
-        rank_role=copy["rank_role"],
-        title=copy["title"],
-        reason=copy["reason"],
-        action_hint=copy["action_hint"],
+        rank_role=type_labels["rank_role"],
+        title=type_labels["fallback_title"],
+        reason=_fallback_candidate_reason(
+            candidate_type=candidate_type,
+            matched_condition_labels=matched_condition_labels,
+        ),
+        action_hint=_fallback_candidate_action_hint(
+            candidate_type=candidate_type,
+            promotion=promotion,
+        ),
         candidate_user_ids=candidate_user_ids,
         matched_condition_keys=tuple(dict.fromkeys(matched_condition_keys)),
         missing_condition_keys=tuple(dict.fromkeys(missing_condition_keys)),
@@ -737,6 +739,32 @@ def _candidate_from_profiles(
             min_sample_size=min_sample_size,
         ),
     )
+
+
+def _fallback_candidate_reason(
+    *,
+    candidate_type: str,
+    matched_condition_labels: Sequence[str],
+) -> str:
+    if matched_condition_labels:
+        return (
+            "실제 SDK 이벤트에서 "
+            + ", ".join(matched_condition_labels[:3])
+            + " 조건이 확인된 고객군입니다."
+        )
+    return f"{candidate_type} 조건에 해당하는 행동 신호가 확인된 고객군입니다."
+
+
+def _fallback_candidate_action_hint(
+    *,
+    candidate_type: str,
+    promotion: PromotionRecord,
+) -> str:
+    if promotion.goal_metric == "booking_conversion_rate":
+        return "예약 시작과 예약 완료 지표를 우선 확인하며 발송 결과를 비교하세요."
+    if promotion.goal_metric == "inflow_rate":
+        return "클릭과 랜딩 유입 지표를 우선 확인하며 발송 결과를 비교하세요."
+    return f"{candidate_type} 후보의 다음 퍼널 이동 지표를 우선 확인하세요."
 
 
 def _rank_candidates(
@@ -830,10 +858,10 @@ def _segment_definition_from_candidate(
     )
     score_components = _score_components(candidate)
     matched_conditions = [
-        CONDITION_COPY.get(key, (key, key))[0] for key in candidate.matched_condition_keys
+        CONDITION_LABELS.get(key, (key, key))[0] for key in candidate.matched_condition_keys
     ]
     missing_conditions = [
-        CONDITION_COPY.get(key, (key, key))[0] for key in candidate.missing_condition_keys
+        CONDITION_LABELS.get(key, (key, key))[0] for key in candidate.missing_condition_keys
     ]
     audience_summary = (
         f"분석 대상 {total_eligible_user_count}명 중 {candidate.sample_size}명 · "
@@ -1348,7 +1376,7 @@ def _signal_chips(
     candidate_type: str,
 ) -> tuple[str, ...]:
     chips = [
-        CONDITION_COPY.get(condition_key, (condition_key, condition_key))[1]
+        CONDITION_LABELS.get(condition_key, (condition_key, condition_key))[1]
         for condition_key in matched_condition_keys
     ]
     if candidate_type == "funnel_recovery":

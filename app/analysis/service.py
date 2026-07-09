@@ -851,7 +851,7 @@ class PromotionAnalysisService:
             "display_copy": display_copy,
         }
         if segment.source == "ai_suggested":
-            metadata_json["ai_report"] = self._segment_report_generator.generate_report(
+            ai_report = self._segment_report_generator.generate_report(
                 SegmentSuggestionReportInput(
                     promotion=promotion,
                     segment=segment,
@@ -862,6 +862,13 @@ class PromotionAnalysisService:
                     reason_json=reason_json,
                 )
             )
+            if _is_raw_event_intent_segment(segment):
+                display_copy = _display_copy_from_report(
+                    display_copy=display_copy,
+                    report=ai_report,
+                )
+                metadata_json["display_copy"] = display_copy
+            metadata_json["ai_report"] = ai_report
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -1244,6 +1251,46 @@ def _display_copy(
     if rank_role:
         display_copy["rank_role"] = rank_role
     return display_copy
+
+
+def _is_raw_event_intent_segment(segment: SegmentDefinitionRecord) -> bool:
+    return (
+        segment.rule_json.get("source") == "raw_event_intent"
+        or segment.profile_json.get("source") == "raw_event_intent"
+    )
+
+
+def _display_copy_from_report(
+    *,
+    display_copy: Mapping[str, Any],
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    enhanced = dict(display_copy)
+    if title := _text_value(report.get("title")):
+        enhanced["title"] = title
+    why_recommended = _text_list(report.get("why_recommended"))
+    if why_recommended:
+        enhanced["reason"] = why_recommended[0]
+    elif summary := _text_value(report.get("summary")):
+        enhanced["reason"] = summary
+    if difference := _text_list(report.get("difference_from_other_ranks")):
+        enhanced["difference_summary"] = difference[0]
+    if action_hint := _text_value(report.get("action_hint")):
+        enhanced["action_hint"] = action_hint
+    return enhanced
+
+
+def _text_value(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _text_list(value: object) -> list[str]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        return []
+    return [text for item in value if (text := _text_value(item))]
 
 
 def _display_title(signal_keys: Sequence[str]) -> str:
