@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 
 from app.generation.generator import GeneratedContent
@@ -635,6 +637,67 @@ def test_generation_service_saves_source_report_references() -> None:
     assert output_json["segment_summaries"][0]["operator_instruction"] == (
         "Make the banner direct and concise."
     )
+
+
+def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(),
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "readiness": {
+                            "level": "partial",
+                            "available_sections": [
+                                "fallback_guidance",
+                                "audience_evidence",
+                            ],
+                            "missing_sections": [],
+                        },
+                        "fallback_guidance": {
+                            "message_direction": "Use a hotel booking message.",
+                            "keywords": ["hotel booking"],
+                            "source": "legacy_segment_content_hints",
+                        },
+                        "audience_evidence": {
+                            "primary_signals": [
+                                "same_hotel_repeat_view",
+                                "near_checkin",
+                            ],
+                            "score_components": {
+                                "promotion_cluster_similarity": 0.92,
+                            },
+                            "behavior_metrics": {
+                                "booking_conversion_rate": 0.018,
+                            },
+                        },
+                    },
+                )
+            ]
+        ),
+    )
+
+    service.generate(generation_request(content_option_count=1))
+
+    metadata = content_candidate_repository.saved[0].metadata_json
+    assert metadata["content_brief_readiness"] == {
+        "level": "partial",
+        "missing_sections": [],
+        "available_sections": ["fallback_guidance", "audience_evidence"],
+    }
+    assert metadata["data_evidence"]["audience_evidence"] == {
+        "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
+        "score_components": {
+            "promotion_cluster_similarity": 0.92,
+        },
+    }
+    assert "behavior_metrics" not in str(metadata)
+    assert "behavior_metrics" not in str(generation_run_repository.saved[0].output_json)
 
 
 class StaticGenerationInputBuilder:

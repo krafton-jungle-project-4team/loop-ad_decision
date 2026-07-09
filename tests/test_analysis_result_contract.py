@@ -533,8 +533,8 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         assert set(content_brief["readiness"]["missing_sections"]) == {
             "primary_signals",
             "score_components",
-            "behavior_metrics",
         }
+        assert content_brief["readiness"]["level"] == "fallback_only"
         assert content_brief["segment_snapshot"] == {
             "segment_id": segment.segment_id,
             "segment_name": segment.segment_name,

@@ -12,7 +12,22 @@ DEFAULT_MESSAGE_DIRECTION = "Use the segment profile to produce clear hotel book
 MISSING_EVIDENCE_SECTIONS = (
     "primary_signals",
     "score_components",
-    "behavior_metrics",
+)
+SUPPORTED_AUDIENCE_EVIDENCE_SECTIONS = (
+    "primary_signals",
+    "score_components",
+    "promotion_vector_basis",
+    "promotion_matched_features",
+)
+SUPPORTED_AVAILABLE_SECTIONS = (
+    "segment_snapshot",
+    "promotion_context",
+    "fallback_guidance",
+    "source_refs",
+    "audience_evidence",
+    "hotel_profile",
+    "operator_instruction",
+    "generation_constraints",
 )
 DEFAULT_DO_NOT_CLAIM = (
     "확인되지 않은 할인율",
@@ -47,8 +62,11 @@ def build_content_brief_v2(
 ) -> dict[str, Any]:
     compact_segment_snapshot = _compact_nulls(segment_snapshot)
     compact_promotion_context = _compact_nulls(promotion_context)
-    compact_audience_evidence = _compact_empty(audience_evidence or {})
+    compact_audience_evidence = _supported_audience_evidence(
+        _compact_empty(audience_evidence or {})
+    )
     compact_hotel_profile = _json_object(hotel_profile)
+    readiness = _readiness_for(compact_audience_evidence)
     available_sections = [
         "segment_snapshot",
         "promotion_context",
@@ -65,13 +83,8 @@ def build_content_brief_v2(
     brief: dict[str, Any] = {
         "schema_version": CONTENT_BRIEF_SCHEMA_VERSION,
         "readiness": {
-            "level": (
-                "partial"
-                if compact_audience_evidence or compact_hotel_profile
-                else "fallback_only"
-            ),
+            **readiness,
             "available_sections": available_sections,
-            "missing_sections": list(MISSING_EVIDENCE_SECTIONS),
         },
         "segment_snapshot": compact_segment_snapshot,
         "promotion_context": compact_promotion_context,
@@ -110,10 +123,15 @@ def _normalize_v2(raw: dict[str, Any]) -> NormalizedContentBrief:
     fallback_guidance = _json_object(raw.get("fallback_guidance"))
     message_direction = _optional_text(fallback_guidance.get("message_direction"))
     keywords = _string_list(fallback_guidance.get("keywords"))
-    readiness = _json_object(raw.get("readiness")) or {
-        "level": "fallback_only",
-        "available_sections": ["fallback_guidance"],
-        "missing_sections": list(MISSING_EVIDENCE_SECTIONS),
+    audience_evidence = _supported_audience_evidence(
+        _json_object(raw.get("audience_evidence"))
+    )
+    readiness = {
+        **_readiness_for(audience_evidence),
+        "available_sections": _available_sections_from(
+            raw_readiness=_json_object(raw.get("readiness")),
+            audience_evidence=audience_evidence,
+        ),
     }
     return NormalizedContentBrief(
         schema_version=CONTENT_BRIEF_SCHEMA_VERSION,
@@ -121,7 +139,7 @@ def _normalize_v2(raw: dict[str, Any]) -> NormalizedContentBrief:
         keywords=keywords,
         readiness=readiness,
         fallback_guidance=fallback_guidance,
-        audience_evidence=_json_object(raw.get("audience_evidence")),
+        audience_evidence=audience_evidence,
         generation_constraints=_json_object(raw.get("generation_constraints")),
         hotel_profile=_json_object(raw.get("hotel_profile")) or None,
         fallback_guidance_used=bool(message_direction or keywords),
@@ -157,6 +175,47 @@ def _normalize_legacy(raw: dict[str, Any]) -> NormalizedContentBrief:
 
 def _compact_nulls(value: Mapping[str, Any]) -> dict[str, Any]:
     return {str(key): item for key, item in value.items() if item is not None}
+
+
+def _readiness_for(audience_evidence: Mapping[str, Any]) -> dict[str, Any]:
+    missing_sections = [
+        section
+        for section in MISSING_EVIDENCE_SECTIONS
+        if section not in audience_evidence
+    ]
+    return {
+        "level": "partial"
+        if len(missing_sections) < len(MISSING_EVIDENCE_SECTIONS)
+        else "fallback_only",
+        "missing_sections": missing_sections,
+    }
+
+
+def _available_sections_from(
+    *,
+    raw_readiness: Mapping[str, Any],
+    audience_evidence: Mapping[str, Any],
+) -> list[str]:
+    raw_sections = raw_readiness.get("available_sections")
+    if isinstance(raw_sections, Sequence) and not isinstance(raw_sections, str):
+        available_sections = [
+            str(section)
+            for section in raw_sections
+            if str(section) in SUPPORTED_AVAILABLE_SECTIONS
+        ]
+    else:
+        available_sections = ["fallback_guidance"]
+    if audience_evidence and "audience_evidence" not in available_sections:
+        available_sections.append("audience_evidence")
+    return available_sections
+
+
+def _supported_audience_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        section: value[section]
+        for section in SUPPORTED_AUDIENCE_EVIDENCE_SECTIONS
+        if section in value
+    }
 
 
 def _compact_empty(value: Mapping[str, Any]) -> dict[str, Any]:

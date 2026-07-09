@@ -901,7 +901,12 @@ class PromotionAnalysisService:
                 ("hotel booking", "seasonal stay", "booking benefit"),
             ),
         )
+        score_components = segment.profile_json.get("score_components")
+        if not isinstance(score_components, Mapping):
+            score_components = _ai_score_details(segment).get("score_components")
         audience_evidence: dict[str, Any] = {
+            "primary_signals": segment.profile_json.get("primary_signals"),
+            "score_components": score_components,
             "promotion_vector_basis": segment.profile_json.get(
                 "promotion_vector_basis"
             ),

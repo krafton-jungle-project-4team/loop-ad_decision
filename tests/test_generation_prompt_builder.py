@@ -197,7 +197,6 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
                 "missing_sections": [
                     "primary_signals",
                     "score_components",
-                    "behavior_metrics",
                 ],
             },
             "segment_snapshot": {
@@ -246,6 +245,62 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
         "refundable stay",
         "same-weekend room",
     ]
+
+
+def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> None:
+    builder = PromptBuilder()
+    target_segment = replace(
+        target_segment_input(),
+        content_brief_json={
+            "schema_version": "content_brief.v2",
+            "readiness": {
+                "level": "partial",
+                "available_sections": ["fallback_guidance", "audience_evidence"],
+                "missing_sections": [],
+            },
+            "fallback_guidance": {
+                "message_direction": "Use a hotel booking message.",
+                "keywords": ["hotel booking"],
+                "source": "legacy_segment_content_hints",
+            },
+            "audience_evidence": {
+                "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
+                "score_components": {
+                    "promotion_cluster_similarity": 0.92,
+                    "sample_size_score": 0.71,
+                },
+                "behavior_metrics": {
+                    "booking_conversion_rate": 0.018,
+                },
+            },
+        },
+    )
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=target_segment,
+    )
+
+    result = builder.build(prompt_input)
+
+    assert "Audience evidence:" in result.generation_prompt
+    assert "same_hotel_repeat_view" in result.generation_prompt
+    assert "promotion_cluster_similarity" in result.generation_prompt
+    assert "behavior_metrics" not in result.generation_prompt
+    assert result.metadata_json["content_brief_readiness"] == {
+        "level": "partial",
+        "missing_sections": [],
+        "available_sections": ["fallback_guidance", "audience_evidence"],
+    }
+    assert result.data_evidence_json["audience_evidence"] == {
+        "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
+        "score_components": {
+            "promotion_cluster_similarity": 0.92,
+            "sample_size_score": 0.71,
+        },
+    }
+    assert "behavior_metrics" not in str(result.metadata_json)
+    assert "behavior_metrics" not in str(result.data_evidence_json)
 
 
 def test_prompt_builder_output_does_not_use_legacy_public_terms() -> None:

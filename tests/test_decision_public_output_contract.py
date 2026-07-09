@@ -187,7 +187,6 @@ class FakeAnalysisService:
                             "missing_sections": [
                                 "primary_signals",
                                 "score_components",
-                                "behavior_metrics",
                             ],
                         },
                         "fallback_guidance": {
