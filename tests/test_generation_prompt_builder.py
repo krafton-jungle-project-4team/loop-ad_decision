@@ -74,6 +74,7 @@ def target_segment_input() -> TargetSegmentPromptInput:
         generated_sql="SELECT user_id FROM hotel_detail_events",
         sample_ratio="0.018000",
         query_preview_id="seg_query_preview_001",
+        status="approved",
     )
 
 
@@ -173,6 +174,7 @@ def test_prompt_builder_includes_channel_contract_and_operator_instruction(
     assert result.message_strategy
     assert result.reason_summary
     assert result.data_evidence_json["segment_id"] == "seg_repeat_hotel_no_booking"
+    assert result.data_evidence_json["target_segment_status"] == "approved"
     assert result.metadata_json["source_query_preview_id"] == "seg_query_preview_001"
 
 
