@@ -20,7 +20,10 @@ from app.analysis.repositories import (
 from app.analysis.report_generator import build_segment_suggestion_report_generator
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 from app.analysis.service import PromotionAnalysisService
-from app.analysis.vector_service import SegmentVectorService
+from app.analysis.vector_service import (
+    SegmentVectorDataUnavailableError,
+    SegmentVectorService,
+)
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.decision.assignment_service import (
     SegmentAssignmentRunNotFoundError,
@@ -435,6 +438,11 @@ async def create_next_loop(
         raise HTTPException(
             status_code=422,
             detail=str(exc),
+        ) from exc
+    except SegmentVectorDataUnavailableError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="segment vector data unavailable",
         ) from exc
     except NextLoopConflictError as exc:
         raise HTTPException(

@@ -312,6 +312,22 @@ def test_assignment_service_rejects_invalid_segment_embedding_without_writes() -
     assert repos.assignments.inserted == []
 
 
+def test_assignment_service_rejects_fixture_segment_vector_without_writes() -> None:
+    service, repos = make_service(
+        segment_vectors=[
+            segment_vector_record("seg_family_trip", vector(0), source="fixture"),
+        ],
+    )
+
+    with pytest.raises(SegmentAssignmentValidationError, match="fixture segment vector"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+        )
+
+    assert repos.assignments.inserted == []
+
+
 def test_assignment_service_marks_insufficient_segments_from_final_counts() -> None:
     service, repos = make_service(
         run=promotion_run_record(min_sample_size=2),
@@ -773,6 +789,8 @@ def ad_experiment_record(segment_id: str) -> AdExperimentRecord:
 def segment_vector_record(
     segment_id: str,
     values: list[float],
+    *,
+    source: str = "decision_analysis",
 ) -> SegmentVectorRecord:
     return SegmentVectorRecord(
         segment_vector_id=f"segvec_{segment_id}_v1",
@@ -784,7 +802,7 @@ def segment_vector_record(
         vector_dim=64,
         vector_values=values,
         vector_version="v1",
-        source="decision_analysis",
+        source=source,
         embedding=values,
     )
 
