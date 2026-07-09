@@ -5,7 +5,12 @@ from typing import Any, Mapping
 
 import pytest
 
-from app.analysis.repositories import PromotionRecord, UserBehaviorVectorRecord
+from app.analysis.raw_event_segments import DeterministicPromotionIntentExtractor
+from app.analysis.repositories import (
+    PromotionRecord,
+    RawEventUserSignalRecord,
+    UserBehaviorVectorRecord,
+)
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
 
@@ -29,6 +34,30 @@ class FakeUserBehaviorVectorRepository:
             }
         )
         return self.vectors
+
+
+class FakeRawEventSignalRepository:
+    def __init__(self, profiles: list[RawEventUserSignalRecord]) -> None:
+        self.profiles = profiles
+        self.calls: list[Mapping[str, Any]] = []
+
+    def list_raw_event_user_signals(
+        self,
+        *,
+        project_id: str,
+        destination_terms: list[str] | tuple[str, ...] = (),
+        season_months: list[int] | tuple[int, ...] = (),
+        limit: int = 1000,
+    ) -> list[RawEventUserSignalRecord]:
+        self.calls.append(
+            {
+                "project_id": project_id,
+                "destination_terms": tuple(destination_terms),
+                "season_months": tuple(season_months),
+                "limit": limit,
+            }
+        )
+        return self.profiles
 
 
 def promotion_record(
@@ -69,6 +98,155 @@ def user_vector(
         vector_values=values,
         vector_version="v1",
         source="batch_profile",
+    )
+
+
+def raw_signal(
+    user_id: str,
+    *,
+    hotel_search_count: int = 0,
+    hotel_detail_view_count: int = 0,
+    promotion_impression_count: int = 0,
+    promotion_click_count: int = 0,
+    campaign_landing_count: int = 0,
+    booking_start_count: int = 0,
+    booking_complete_count: int = 0,
+    deal_event_count: int = 0,
+    free_cancellation_count: int = 0,
+    breakfast_included_count: int = 0,
+    price_event_count: int = 0,
+    destination_match_count: int = 0,
+    season_match_count: int = 0,
+    destination_values: tuple[str, ...] = (),
+    checkin_dates: tuple[str, ...] = (),
+) -> RawEventUserSignalRecord:
+    event_count = max(
+        1,
+        hotel_search_count
+        + hotel_detail_view_count
+        + promotion_impression_count
+        + promotion_click_count
+        + campaign_landing_count
+        + booking_start_count
+        + booking_complete_count
+        + deal_event_count
+        + free_cancellation_count
+        + breakfast_included_count
+        + price_event_count,
+    )
+    return RawEventUserSignalRecord(
+        project_id="hotel-client-a",
+        user_id=user_id,
+        event_count=event_count,
+        hotel_search_count=hotel_search_count,
+        hotel_click_count=0,
+        hotel_detail_view_count=hotel_detail_view_count,
+        promotion_impression_count=promotion_impression_count,
+        promotion_click_count=promotion_click_count,
+        campaign_redirect_click_count=0,
+        campaign_landing_count=campaign_landing_count,
+        booking_start_count=booking_start_count,
+        booking_complete_count=booking_complete_count,
+        booking_cancel_count=0,
+        deal_event_count=deal_event_count,
+        free_cancellation_count=free_cancellation_count,
+        breakfast_included_count=breakfast_included_count,
+        price_event_count=price_event_count,
+        avg_price=0.0,
+        destination_values=destination_values,
+        checkin_dates=checkin_dates,
+        hotel_market_values=(),
+        hotel_cluster_values=(),
+        age_group_values=(),
+        gender_values=(),
+        preferred_category_values=(),
+        destination_match_count=destination_match_count,
+        season_match_count=season_match_count,
+    )
+
+
+def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("fallback_001", vector_values(0)),
+            user_vector("fallback_002", vector_values(0)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "intent_001",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=1,
+                destination_values=("제주 호텔",),
+                checkin_dates=("2026-07-10",),
+            ),
+            raw_signal(
+                "intent_002",
+                hotel_search_count=1,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=1,
+                destination_values=("jeju resort",),
+                checkin_dates=("2026-08-11",),
+            ),
+            raw_signal("funnel_001", hotel_detail_view_count=3, booking_start_count=1),
+            raw_signal("funnel_002", hotel_detail_view_count=2, booking_start_count=1),
+            raw_signal(
+                "promo_001",
+                promotion_impression_count=3,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+            ),
+            raw_signal(
+                "promo_002",
+                promotion_impression_count=4,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+            ),
+            raw_signal("benefit_001", hotel_search_count=1, deal_event_count=1),
+            raw_signal(
+                "benefit_002",
+                hotel_search_count=1,
+                free_cancellation_count=1,
+                price_event_count=1,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 할인 프로모션으로 랜딩 유입을 높인다.",
+        )
+    )
+
+    assert vector_reader.calls == []
+    assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
+    assert raw_reader.calls[0]["season_months"] == (6, 7, 8)
+    assert len(segments) == 3
+    candidate_types = [
+        segment.rule_json["candidate_type"]
+        for segment in segments
+    ]
+    assert len(set(candidate_types)) == 3
+    assert all(segment.rule_json["source"] == "raw_event_intent" for segment in segments)
+    assert all(segment.profile_json["source"] == "raw_event_intent" for segment in segments)
+    assert all("rank_role" in segment.profile_json for segment in segments)
+    assert all("display_copy" in segment.profile_json for segment in segments)
+    assert all(
+        "final_score" in segment.profile_json["score_components"]
+        for segment in segments
     )
 
 
