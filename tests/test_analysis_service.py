@@ -591,12 +591,15 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
     ai_report = result.segment_suggestions[0].metadata_json["ai_report"]
-    assert ai_report["version"] == "dec-c8.segment-report.v1"
+    assert ai_report["version"] == "dec.segment-report.v2"
     assert ai_report["title"] == "예약 가능성이 높은 프로모션 반응 고객"
     assert ai_report["summary"]
+    assert ai_report["promotion_interpretation"]
     assert ai_report["why_recommended"]
     assert ai_report["evidence"]
+    assert ai_report["difference_from_other_ranks"]
     assert ai_report["action_hint"]
+    assert ai_report["confidence_label"] in {"high", "medium", "low"}
     assert all(
         forbidden not in str(ai_report)
         for forbidden in ("벡터", "군집", "클러스터", "centroid", "유사도")

@@ -21,7 +21,7 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log
 
 
-REPORT_GENERATOR_VERSION = "dec-c8.segment-report.v1"
+REPORT_GENERATOR_VERSION = "dec.segment-report.v2"
 
 FORBIDDEN_REPORT_TERMS = ("벡터", "군집", "클러스터", "centroid", "유사도", "cosine")
 
@@ -156,7 +156,7 @@ class OpenAISegmentSuggestionReportGenerator:
                 "durationMs": duration_ms(started_at),
             },
         )
-        return _sanitize_report(report, report_input=report_input, source="llm")
+        return _sanitize_report(report, report_input=report_input, source="openai")
 
 
 def build_segment_suggestion_report_generator(
@@ -211,10 +211,13 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             "JSON 필드 설명:",
             "- title: 카드 제목으로 쓸 짧은 고객군 이름",
             "- summary: 이 고객군이 어떤 사람들인지 한 문장",
+            "- promotion_interpretation: 프로모션 조건을 사용자가 이해할 수 있게 해석한 문장 2개",
             "- why_recommended: 추천 이유 2~3개",
             "- evidence: 판단 근거 2~3개",
+            "- difference_from_other_ranks: 다른 Rank와 비교했을 때의 차이 1~2개",
             "- action_hint: 이 프로모션에서 어떻게 활용하면 좋은지",
             "- caution: 표본 수, 해석 주의점, 다음 액션 중 하나",
+            "- confidence_label: high, medium, low 중 하나",
         ],
     )
 
@@ -226,14 +229,23 @@ def _report_schema() -> dict[str, Any]:
         "required": [
             "title",
             "summary",
+            "promotion_interpretation",
             "why_recommended",
             "evidence",
+            "difference_from_other_ranks",
             "action_hint",
             "caution",
+            "confidence_label",
         ],
         "properties": {
             "title": {"type": "string"},
             "summary": {"type": "string"},
+            "promotion_interpretation": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 2,
+                "maxItems": 3,
+            },
             "why_recommended": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -246,8 +258,15 @@ def _report_schema() -> dict[str, Any]:
                 "minItems": 2,
                 "maxItems": 3,
             },
+            "difference_from_other_ranks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 2,
+            },
             "action_hint": {"type": "string"},
             "caution": {"type": "string"},
+            "confidence_label": {"type": "string", "enum": ["high", "medium", "low"]},
         },
     }
 
@@ -264,12 +283,22 @@ def _sanitize_report(
         "source": source,
         "title": _safe_text(report.get("title")) or fallback["title"],
         "summary": _safe_text(report.get("summary")) or fallback["summary"],
+        "promotion_interpretation": _safe_text_list(
+            report.get("promotion_interpretation")
+        )
+        or fallback["promotion_interpretation"],
         "why_recommended": _safe_text_list(report.get("why_recommended"))
         or fallback["why_recommended"],
         "evidence": _safe_text_list(report.get("evidence")) or fallback["evidence"],
+        "difference_from_other_ranks": _safe_text_list(
+            report.get("difference_from_other_ranks")
+        )
+        or fallback["difference_from_other_ranks"],
         "action_hint": _safe_text(report.get("action_hint"))
         or fallback["action_hint"],
         "caution": _safe_text(report.get("caution")) or fallback["caution"],
+        "confidence_label": _confidence_label(report.get("confidence_label"))
+        or fallback["confidence_label"],
     }
     if _contains_forbidden_terms(sanitized):
         return _fallback_report(report_input=report_input, source="fallback")
@@ -299,21 +328,35 @@ def _fallback_report(
     message_brief = (report_input.promotion.message_brief or "").strip()
     if message_brief:
         evidence_items.append(f"프로모션 설명에 맞춰 '{message_brief[:80]}' 흐름을 반영했습니다.")
+    promotion_interpretation = [
+        _promotion_goal_sentence(report_input.promotion),
+        _promotion_message_sentence(report_input.promotion),
+    ]
+    difference_summary = str(display_copy.get("difference_summary", "")).strip()
 
     return {
         "version": REPORT_GENERATOR_VERSION,
         "source": source,
         "title": title,
         "summary": "이번 프로모션 목표와 맞는 행동을 보인 고객군입니다.",
+        "promotion_interpretation": promotion_interpretation,
         "why_recommended": [
             str(display_copy.get("reason", "")).strip()
             or "예약 전환에 가까운 행동이 확인되었습니다.",
             _signals_sentence(signal_chips),
         ],
         "evidence": evidence_items[:3],
+        "difference_from_other_ranks": [
+            difference_summary
+            or "다른 후보와 다른 행동 조건을 기준으로 분리한 고객군입니다."
+        ],
         "action_hint": str(display_copy.get("action_hint", "")).strip()
         or "이 고객군을 우선 타겟으로 테스트해보는 것이 좋습니다.",
         "caution": _caution_text(
+            sample_size=int(evidence.get("sample_size", 0) or 0),
+            min_sample_size=report_input.promotion.min_sample_size,
+        ),
+        "confidence_label": _fallback_confidence_label(
             sample_size=int(evidence.get("sample_size", 0) or 0),
             min_sample_size=report_input.promotion.min_sample_size,
         ),
@@ -333,10 +376,33 @@ def _signals_sentence(signal_chips: Sequence[str]) -> str:
     return "주요 행동 신호는 " + ", ".join(signal_chips[:3]) + "입니다."
 
 
+def _promotion_goal_sentence(promotion: PromotionRecord) -> str:
+    if promotion.goal_metric == "booking_conversion_rate":
+        return "이번 프로모션은 숙소 예약 전환을 늘리는 것이 목표입니다."
+    if promotion.goal_metric == "inflow_rate":
+        return "이번 프로모션은 랜딩과 숙소 탐색 유입을 늘리는 것이 목표입니다."
+    return "이번 프로모션은 다음 퍼널 단계로 이동하는 고객을 늘리는 것이 목표입니다."
+
+
+def _promotion_message_sentence(promotion: PromotionRecord) -> str:
+    message_brief = (promotion.message_brief or "").strip()
+    if not message_brief:
+        return "채널과 목표 지표를 기준으로 확인 가능한 행동 신호를 연결했습니다."
+    return f"프로모션 설명의 핵심 메시지는 '{message_brief[:80]}'입니다."
+
+
 def _caution_text(*, sample_size: int, min_sample_size: int) -> str:
     if sample_size < min_sample_size:
         return "표본이 적어 첫 실험 결과를 빠르게 확인한 뒤 다음 타겟을 조정하는 것이 좋습니다."
     return "첫 발송 후 랜딩과 예약 시작 지표를 함께 확인하면 다음 액션을 더 잘 정할 수 있습니다."
+
+
+def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str:
+    if sample_size < min_sample_size:
+        return "low"
+    if sample_size < min_sample_size * 3:
+        return "medium"
+    return "high"
 
 
 def _format_goal_value(value: Decimal) -> str:
@@ -354,6 +420,13 @@ def _safe_text_list(value: object) -> list[str]:
     if isinstance(value, str) or not isinstance(value, Sequence):
         return []
     return [text for item in value if (text := _safe_text(item))]
+
+
+def _confidence_label(value: object) -> str | None:
+    text = _safe_text(value)
+    if text in {"high", "medium", "low"}:
+        return text
+    return None
 
 
 def _contains_forbidden_terms(report: Mapping[str, Any]) -> bool:
