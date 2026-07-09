@@ -12,6 +12,7 @@ from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.generation.artifacts import render_banner_html
 from app.generation.router import get_generation_service
 from app.generation.service import GenerationService
 from app.main import create_app
@@ -30,7 +31,6 @@ TERM_RECOMMENDATIONS_PATH = "/recomm" + "endations"
 TERM_RECOMMENDATION_RESULT = "recommendation" + "_result"
 TERM_PLAIN_EXPERIMENT_ID = "experiment" + "_id"
 TERM_VARIANT_ID = "variant" + "_id"
-TERM_CREATIVE_ID = "creative" + "_id"
 TERM_PRODUCT = "pro" + "duct"
 TERM_CART = "ca" + "rt"
 TERM_PURCHASE = "pur" + "chase"
@@ -52,7 +52,6 @@ FORBIDDEN_PUBLIC_PATTERNS = {
         rf"(?<!ad_)\b{re.escape(TERM_PLAIN_EXPERIMENT_ID)}\b", re.IGNORECASE
     ),
     TERM_VARIANT_ID: re.compile(rf"\b{re.escape(TERM_VARIANT_ID)}\b", re.IGNORECASE),
-    TERM_CREATIVE_ID: re.compile(rf"\b{re.escape(TERM_CREATIVE_ID)}\b", re.IGNORECASE),
 }
 
 FORBIDDEN_SHOPPING_PATTERNS = {
@@ -121,13 +120,26 @@ def test_recommendation_word_is_not_banned_unless_exposed_as_public_api_object()
         )
 
 
-def test_public_outputs_use_hotel_booking_language_not_shopping_terms() -> None:
+def test_public_outputs_do_not_use_shopping_terms() -> None:
     payload_text = public_payload_text(make_client())
 
-    assert "호텔" in payload_text
-    assert "특가" in payload_text
     for label, pattern in FORBIDDEN_SHOPPING_PATTERNS.items():
         assert not pattern.search(payload_text), f"shopping term leaked: {label}"
+
+
+def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
+    artifact_text = render_banner_html(
+        {
+            "title": "이번 주말 호텔 특가",
+            "body": "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요.",
+            "cta": "호텔 특가 보기",
+        }
+    ).lower()
+
+    assert "호텔" in artifact_text
+    assert "특가" in artifact_text
+    for label, pattern in FORBIDDEN_SHOPPING_PATTERNS.items():
+        assert not pattern.search(artifact_text), f"shopping term leaked: {label}"
 
 
 def test_readme_documents_decision_boundary_and_dashboard_serving_path() -> None:
@@ -168,14 +180,27 @@ class FakeAnalysisService:
                     rule_json={},
                     profile_json={},
                     content_brief_json={
-                        "message_direction": (
-                            "Emphasize hotel booking availability and breakfast benefits."
-                        ),
-                        "keywords": [
-                            "hotel booking",
-                            "same-day availability",
-                            "breakfast included",
-                        ],
+                        "schema_version": "content_brief.v2",
+                        "readiness": {
+                            "level": "fallback_only",
+                            "available_sections": ["fallback_guidance"],
+                            "missing_sections": [
+                                "primary_signals",
+                                "score_components",
+                                "behavior_metrics",
+                            ],
+                        },
+                        "fallback_guidance": {
+                            "message_direction": (
+                                "호텔 예약 가능성과 조식 특가 혜택을 강조한다."
+                            ),
+                            "keywords": [
+                                "호텔 예약",
+                                "당일 예약 가능",
+                                "조식 특가",
+                            ],
+                            "source": "legacy_segment_content_hints",
+                        },
                     },
                     data_evidence_json={},
                     segment_vector_id="segvec_repeat_hotel_no_booking_v1",

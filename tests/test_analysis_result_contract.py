@@ -526,11 +526,30 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         assert segment.estimated_size >= 0
         assert segment.status == "planned"
         assert segment.priority == ("high" if rank < 2 else "medium")
-        assert set(segment.content_brief_json) == {
-            "message_direction",
-            "keywords",
+        content_brief = segment.content_brief_json
+        assert content_brief["schema_version"] == "content_brief.v2"
+        assert "message_direction" not in content_brief
+        assert "keywords" not in content_brief
+        assert set(content_brief["readiness"]["missing_sections"]) == {
+            "primary_signals",
+            "score_components",
+            "behavior_metrics",
         }
-        assert isinstance(segment.content_brief_json["keywords"], list)
+        assert content_brief["segment_snapshot"] == {
+            "segment_id": segment.segment_id,
+            "segment_name": segment.segment_name,
+            "segment_source": "system_default",
+            "estimated_size": segment.estimated_size,
+            "segment_vector_id": f"segvec_{segment.segment_id}_v1",
+        }
+        assert content_brief["promotion_context"]["goal_metric"] == (
+            "booking_conversion_rate"
+        )
+        assert isinstance(content_brief["fallback_guidance"]["keywords"], list)
+        assert (
+            content_brief["fallback_guidance"]["source"]
+            == "legacy_segment_content_hints"
+        )
         assert segment.data_evidence_json["source"] == "system_default"
         assert segment.data_evidence_json["sample_size"] == segment.estimated_size
         assert "sample_ratio" in segment.data_evidence_json
