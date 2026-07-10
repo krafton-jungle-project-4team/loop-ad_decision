@@ -256,13 +256,21 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
             "schema_version": "content_brief.v2",
             "readiness": {
                 "level": "partial",
-                "available_sections": ["fallback_guidance", "audience_evidence"],
+                "available_sections": [
+                    "fallback_guidance",
+                    "audience_evidence",
+                    "hotel_profile",
+                ],
                 "missing_sections": [],
             },
             "fallback_guidance": {
                 "message_direction": "Use a hotel booking message.",
                 "keywords": ["hotel booking"],
                 "source": "legacy_segment_content_hints",
+            },
+            "hotel_profile": {
+                "hotel_cluster": "jeju_ocean",
+                "booking_count": 120,
             },
             "audience_evidence": {
                 "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
@@ -295,11 +303,17 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "Audience evidence:" in result.generation_prompt
     assert "same_hotel_repeat_view" in result.generation_prompt
     assert "promotion_cluster_similarity" in result.generation_prompt
+    assert "Hotel profile context:" in result.generation_prompt
+    assert "hotel_cluster=jeju_ocean" in result.generation_prompt
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_readiness"] == {
         "level": "evidence_ready",
         "missing_sections": [],
-        "available_sections": ["fallback_guidance", "audience_evidence"],
+        "available_sections": [
+            "fallback_guidance",
+            "audience_evidence",
+            "hotel_profile",
+        ],
     }
     assert result.fallback_guidance_present is True
     assert result.fallback_guidance_used is False
@@ -308,6 +322,7 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "Fallback message direction:" not in result.generation_prompt
     assert "Fallback keywords:" not in result.generation_prompt
     assert "content_brief_keywords" not in result.data_evidence_json
+    assert "hotel_profile" not in result.data_evidence_json
     assert result.data_evidence_json["audience_evidence"] == {
         "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
         "score_components": {

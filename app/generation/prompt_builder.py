@@ -317,6 +317,10 @@ def _content_brief_context_lines(
     lines: list[str] = []
     if content_brief.audience_evidence:
         lines.append(f"Audience evidence: {_compact_jsonish(content_brief.audience_evidence)}")
+    if content_brief.hotel_profile:
+        lines.append(
+            f"Hotel profile context: {_compact_jsonish(content_brief.hotel_profile)}"
+        )
     do_not_claim = content_brief.generation_constraints.get("do_not_claim")
     if isinstance(do_not_claim, Sequence) and not isinstance(do_not_claim, str):
         claims = [str(item).strip() for item in do_not_claim if str(item).strip()]
