@@ -18,6 +18,7 @@ from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
     PromptBuildResult,
+    PromptBuilder,
     TargetSegmentPromptInput,
 )
 from app.generation.schemas import ContentChannel, GenerationRequest
@@ -215,9 +216,11 @@ def test_openai_content_client_parses_responses_output_text() -> None:
         transport=fake_transport,
     )
 
+    rich_prompt_input = prompt_input(ContentChannel.ONSITE_BANNER)
+    rich_prompt_result = PromptBuilder().build(rich_prompt_input)
     content = client.generate_content(
-        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
-        prompt_result=prompt_result(),
+        prompt_input=rich_prompt_input,
+        prompt_result=rich_prompt_result,
         option_index=2,
     )
 
@@ -231,6 +234,12 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     assert "Return concise Korean hotel booking copy" in str(captured["payload"])
     assert "Do not copy English source text verbatim" in str(captured["payload"])
     assert "must not request visible text in the image" in str(captured["payload"])
+    assert "Candidate strategy (apply only to this content option)" in str(
+        captured["payload"]
+    )
+    assert rich_prompt_result.metadata_json["strategy_key"] in str(
+        captured["payload"]
+    )
     schema = captured["payload"]["text"]["format"]["schema"]
     assert "landing_url" not in schema["properties"]
     assert "landing_url" not in schema["required"]

@@ -92,8 +92,13 @@ CANDIDATE_METADATA_KEYS = {
     "message_strategy",
     "content_brief_schema_version",
     "content_brief_readiness",
+    "missing_sections",
     "fallback_guidance_present",
     "fallback_guidance_used",
+    "strategy_key",
+    "strategy_plan",
+    "brief_fingerprint",
+    "evidence_refs",
     "operator_instruction",
     "source_segment_definition_id",
     "source_query_preview_id",
@@ -211,9 +216,9 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
         "status": "completed",
         "content_candidate_count": 1,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v2",
+        "prompt_builder": "dec-c2.v3",
         "content_generator": "dec-c5.image-url-test.v1",
-        "report_builder": "dec-c4.v1",
+        "report_builder": "dec-c4.v2",
     }
 
     candidate = content_candidate_repository.saved[0]
@@ -228,10 +233,22 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
         candidate.metadata_json["data_evidence"]
     )
     assert set(candidate.metadata_json) == CANDIDATE_METADATA_KEYS
-    assert candidate.metadata_json["report_version"] == "dec-c4.v1"
+    assert candidate.metadata_json["report_version"] == "dec-c4.v2"
     assert candidate.metadata_json["reason_summary"]
     assert candidate.metadata_json["data_evidence"]["sample_size"] == 1342
     assert candidate.metadata_json["message_strategy"]
+    assert candidate.metadata_json["strategy_key"]
+    assert candidate.metadata_json["strategy_plan"]["strategy_key"] == (
+        candidate.metadata_json["strategy_key"]
+    )
+    assert candidate.metadata_json["evidence_refs"] == (
+        candidate.metadata_json["strategy_plan"]["evidence_refs"]
+    )
+    assert candidate.metadata_json["brief_fingerprint"].startswith("sha256:")
+    assert candidate.metadata_json["missing_sections"] == [
+        "primary_signals",
+        "score_components",
+    ]
     assert candidate.metadata_json["operator_instruction"] == (
         "Keep the hotel message concise."
     )
