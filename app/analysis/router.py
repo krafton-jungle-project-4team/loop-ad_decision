@@ -139,8 +139,6 @@ def _analysis_response_from_result(
 def _target_segment_response(
     target_segment: PromotionTargetSegmentWrite,
 ) -> TargetSegmentResponse:
-    if target_segment.segment_vector_id is None:
-        raise RuntimeError("analysis target segment must have segment_vector_id")
     raw_keywords = target_segment.content_brief_json.get("keywords", [])
     keywords = raw_keywords if isinstance(raw_keywords, list) else []
     return TargetSegmentResponse(

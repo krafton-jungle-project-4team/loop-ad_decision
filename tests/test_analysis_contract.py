@@ -158,6 +158,18 @@ def test_analysis_returns_v1_6_contract_shape() -> None:
     assert service.calls[0].promotion_id == "promo_banner_001"
 
 
+def test_analysis_allows_missing_segment_vector_for_raw_event_suggestions() -> None:
+    service = FakeAnalysisService(segment_vector_id=None)
+    response = make_client(service).post(
+        "/decision/v1/promotions/promo_banner_001/analysis",
+        json=analysis_payload(),
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["target_segments"][0]["segment_vector_id"] is None
+
+
 def test_analysis_requires_mandatory_fields() -> None:
     response = make_client(FakeAnalysisService()).post(
         "/decision/v1/promotions/promo_banner_001/analysis",
@@ -234,8 +246,14 @@ def test_v1_6_enum_values() -> None:
 
 
 class FakeAnalysisService:
-    def __init__(self, exc: Exception | None = None) -> None:
+    def __init__(
+        self,
+        exc: Exception | None = None,
+        *,
+        segment_vector_id: str | None = "segvec_repeat_hotel_no_booking_v1",
+    ) -> None:
         self.exc = exc
+        self.segment_vector_id = segment_vector_id
         self.calls: list[Any] = []
 
     def analyze(self, request: Any) -> PromotionAnalysisResult:
@@ -281,7 +299,7 @@ class FakeAnalysisService:
                         ],
                     },
                     data_evidence_json={},
-                    segment_vector_id="segvec_repeat_hotel_no_booking_v1",
+                    segment_vector_id=self.segment_vector_id,
                     estimated_size=1342,
                     priority="high",
                     status="planned",
