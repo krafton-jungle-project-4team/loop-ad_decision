@@ -294,7 +294,7 @@ def build_service(
             booking_training_records=booking_training_records,
         ),
         promotion_analysis_repository=analysis_repository,
-        segment_vector_service=segment_vector_service,
+        segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
     )
     return service, analysis_repository, segment_definition_repository
@@ -591,12 +591,15 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
     ai_report = result.segment_suggestions[0].metadata_json["ai_report"]
-    assert ai_report["version"] == "dec-c8.segment-report.v1"
+    assert ai_report["version"] == "dec.segment-report.v2"
     assert ai_report["title"] == "예약 가능성이 높은 프로모션 반응 고객"
     assert ai_report["summary"]
+    assert ai_report["promotion_interpretation"]
     assert ai_report["why_recommended"]
     assert ai_report["evidence"]
+    assert ai_report["difference_from_other_ranks"]
     assert ai_report["action_hint"]
+    assert ai_report["confidence_label"] in {"high", "medium", "low"}
     assert all(
         forbidden not in str(ai_report)
         for forbidden in ("벡터", "군집", "클러스터", "centroid", "유사도")
@@ -607,6 +610,66 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         analysis_id=result.analysis.analysis_id,
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
+    )
+
+
+def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    stale_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_old",
+            source="ai_suggested",
+            sample_size=8000,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["old_user_001", "old_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_old",
+            "source": "raw_event_intent",
+            "recommendation_score": 1.0,
+        },
+    )
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            source="ai_suggested",
+            sample_size=160,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["fresh_user_001", "fresh_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            "source": "raw_event_intent",
+            "recommendation_score": 0.8,
+        },
+    )
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stale_ai_segment, *default_segments()],
+        segment_suggester=FakeSegmentSuggester([fresh_ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    selected_segment_ids = segment_ids(result.target_segments)
+    assert fresh_ai_segment.segment_id in selected_segment_ids
+    assert stale_ai_segment.segment_id not in selected_segment_ids
+    assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
+    assert all(
+        segment["segment_id"] != stale_ai_segment.segment_id
+        for segment in result.analysis.input_snapshot_json[
+            "available_segment_definitions"
+        ]
     )
 
 
