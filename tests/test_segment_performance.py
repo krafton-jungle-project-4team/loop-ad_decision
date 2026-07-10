@@ -80,6 +80,9 @@ def test_logistic_calibration_learns_future_contextual_outcomes() -> None:
 
     assert model.predict(high) > model.predict(low)
     assert model.metadata()["training_period"] == "2013"
+    assert model.metadata()["optimizer"]["selection_basis"] == (
+        "caller_configured"
+    )
 
 
 def test_logistic_calibration_json_round_trip_preserves_prediction() -> None:
@@ -149,4 +152,11 @@ def test_bundled_model_uses_only_2013_training_outcomes() -> None:
     model = build_segment_performance_predictor()
 
     assert model.calibration_status == "calibrated"
+    assert model.version == "dec.contextual-booking-calibration.v2"
     assert model.metadata()["training_end_cutoff"].startswith("2013-")
+    assert model.metadata()["candidate_training_scope"] == (
+        "all_eligible_candidate_types"
+    )
+    assert model.metadata()["optimizer"]["selection_basis"] == (
+        "2014_development_validation"
+    )

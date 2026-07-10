@@ -268,6 +268,18 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     assert temporal_run.calibration_model.training_metadata["target"] == (
         "future_contextual_booking_rate"
     )
+    assert temporal_run.calibration_model.training_metadata[
+        "candidate_training_scope"
+    ] == "all_eligible_candidate_types"
+    assert temporal_run.calibration_model.training_metadata[
+        "training_dataset"
+    ] == "expedia_hotel_recommendations_train"
+    assert temporal_run.calibration_model.training_metadata[
+        "applicability_scope"
+    ] == "destination_specific_hotel_booking_promotions"
+    assert temporal_run.calibration_model.training_metadata[
+        "training_example_count"
+    ] > len(temporal_run.training_run.results)
     assert all(
         result.cutoff.year == 2013
         for result in temporal_run.training_run.results

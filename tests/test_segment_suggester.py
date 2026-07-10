@@ -5,7 +5,12 @@ from typing import Any, Mapping
 
 import pytest
 
-from app.analysis.raw_event_segments import DeterministicPromotionIntentExtractor
+from app.analysis.raw_event_segments import (
+    DeterministicPromotionIntentExtractor,
+    compile_raw_event_intent,
+    generate_raw_event_segment_candidate_pool,
+    generate_raw_event_segment_definitions,
+)
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -288,7 +293,13 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert all(
         segment.profile_json["score_components"]["weights"]
         ["promotion_condition_match"]
-        == 0.35
+        == 0.10
+        for segment in segments
+    )
+    assert all(
+        segment.profile_json["score_components"]["weights"]
+        ["expected_goal_performance"]
+        == 0.85
         for segment in segments
     )
     assert all(
@@ -454,6 +465,46 @@ def test_general_destination_explorer_is_available_without_target_destination() 
         "general_1",
         "general_2",
     }
+
+
+def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 할인 프로모션으로 예약 전환을 높인다.",
+    )
+    extractor = DeterministicPromotionIntentExtractor()
+    intent = extractor.extract(promotion)
+    profiles = [
+        raw_signal(
+            f"overlap_{index}",
+            hotel_detail_view_count=2,
+            booking_start_count=1,
+            destination_match_count=1,
+            season_match_count=1,
+        )
+        for index in range(2)
+    ]
+    compilation = compile_raw_event_intent(intent)
+
+    ranked = generate_raw_event_segment_definitions(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        max_suggested_segments=6,
+        min_sample_size=2,
+    )
+    calibration_pool = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+    )
+
+    assert len(ranked) == 1
+    assert {
+        segment.rule_json["candidate_type"] for segment in calibration_pool
+    } == {"intent_matched", "funnel_recovery"}
 
 
 def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:

@@ -7,11 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
 
 
-CONTEXTUAL_BOOKING_MODEL_VERSION = "dec.contextual-booking-calibration.v1"
+CONTEXTUAL_BOOKING_MODEL_VERSION = "dec.contextual-booking-calibration.v2"
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
-    / "contextual_booking_calibration_v1.json"
+    / "contextual_booking_calibration_v2.json"
 )
 MODEL_CANDIDATE_TYPES = (
     "intent_matched",
@@ -291,7 +291,8 @@ def fit_logistic_segment_performance_model(
     training_metadata: Mapping[str, Any] | None = None,
     iterations: int = 4000,
     learning_rate: float = 0.08,
-    l2_penalty: float = 0.05,
+    l2_penalty: float = 0.02,
+    optimizer_selection_basis: str = "caller_configured",
 ) -> LogisticSegmentPerformanceModel:
     valid = [
         example
@@ -378,6 +379,12 @@ def fit_logistic_segment_performance_model(
             total_success / max(total_sample, 1)
         ),
         **dict(training_metadata or {}),
+        "optimizer": {
+            "iterations": iterations,
+            "learning_rate": learning_rate,
+            "l2_penalty": l2_penalty,
+            "selection_basis": optimizer_selection_basis,
+        },
     }
     return LogisticSegmentPerformanceModel(
         intercept=intercept,
