@@ -21,6 +21,7 @@ from app.analysis.expedia_backtest import (
     validate_table_identifier,
     validate_train_csv_header,
     write_backtest_artifacts,
+    write_temporal_holdout_artifacts,
 )
 from app.analysis.repositories import RawEventUserSignalRecord
 
@@ -281,6 +282,41 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     )
     holdout_summary = summarize_backtest(temporal_run.holdout_run)
     assert holdout_summary["all_candidate_brier_score"] >= 0
+
+
+def test_temporal_artifacts_label_2014_as_development_validation(
+    tmp_path: Path,
+) -> None:
+    repository = FakeExpediaBacktestRepository()
+    config = ExpediaBacktestConfig(
+        max_scenarios_per_cutoff=1,
+        min_scenario_users=2,
+        user_sample_modulo=1,
+    )
+    temporal_run = run_temporal_holdout_backtest(
+        repository,
+        config=config,
+        training_cutoffs=[
+            datetime(2013, 9, 1, tzinfo=UTC),
+            datetime(2013, 11, 1, tzinfo=UTC),
+        ],
+        holdout_cutoffs=[datetime(2014, 1, 1, tzinfo=UTC)],
+    )
+
+    artifacts = write_temporal_holdout_artifacts(
+        temporal_run,
+        output_dir=tmp_path,
+        source_stats=source_stats(),
+        config=config,
+    )
+
+    summary = artifacts["summary"].read_text(encoding="utf-8")
+    report = artifacts["report"].read_text(encoding="utf-8")
+    assert '"development_validation": "2014"' in summary
+    assert '"final_test": "not_run"' in summary
+    assert "개발 검증" in report
+    assert "최종 일반화 성능" in report
+    assert (tmp_path / "development-validation-2014" / "results.csv").exists()
 
 
 def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:

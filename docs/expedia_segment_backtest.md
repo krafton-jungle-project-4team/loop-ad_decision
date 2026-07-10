@@ -91,12 +91,14 @@ python3 scripts/backtest_expedia_segments.py smoke
 - 후보 사용자: 현재 운영 로직과 동일하게 후보별 최대 160명
 - 사용자 샘플: `cityHash64(user_id) % 20 = 0`
 
-## 3. 2013 학습 / 2014 홀드아웃 검증
+## 3. 2013 학습 / 2014 개발 검증
 
-예상 전환율의 보정과 최종 검증은 `holdout` 명령을 사용한다.
+예상 전환율 보정과 추천 로직 개발은 `validation` 명령을 사용한다. `holdout`은 기존
+호환성을 위한 alias지만, 2014년 결과를 보고 추천 규칙과 가중치를 수정했기 때문에 더
+이상 독립적인 최종 테스트가 아니다.
 
 ```bash
-python3 scripts/backtest_expedia_segments.py holdout
+python3 scripts/backtest_expedia_segments.py validation
 ```
 
 이 명령은 다음 순서를 자동으로 수행한다.
@@ -107,11 +109,14 @@ python3 scripts/backtest_expedia_segments.py holdout
 4. 학습에 사용하지 않은 2014-01-01부터 2014-12-01까지의 예상값과 Rank를 계산한다.
 5. 2014년 미래 결과와 비교해 MAE, Brier score, lift, Rank 1 적중률을 기록한다.
 
+5번 결과를 본 뒤 로직을 수정했다면 2014년은 통계적인 학습 데이터는 아니더라도
+human-in-the-loop 개발 검증 데이터다. 이 수치를 최종 일반화 성능으로 발표하지 않는다.
+
 빠른 확인은 기본 5% 결정적 사용자 표본으로 실행한다. 결론이 전체 원천 데이터에서도
 유지되는지 확인할 때는 다음처럼 해시 사전 샘플링을 끈다.
 
 ```bash
-python3 scripts/backtest_expedia_segments.py holdout \
+python3 scripts/backtest_expedia_segments.py validation \
   --user-sample-modulo 1 \
   --profile-pool-limit 1000
 ```
@@ -123,14 +128,14 @@ python3 scripts/backtest_expedia_segments.py holdout \
 결과 디렉터리에는 학습 모델과 시간 분리 결과가 함께 생성된다.
 
 ```text
-artifacts/expedia-segment-backtest/holdout-<timestamp>/
+artifacts/expedia-segment-backtest/validation-<timestamp>/
 ├── contextual_booking_calibration_v1.json
-├── temporal_holdout_report.md
-├── temporal_holdout_summary.json
+├── temporal_validation_report.md
+├── temporal_validation_summary.json
 ├── training-2013/
 │   ├── results.csv
 │   └── summary.json
-└── holdout-2014/
+└── development-validation-2014/
     ├── results.csv
     └── summary.json
 ```
@@ -142,7 +147,83 @@ artifacts/expedia-segment-backtest/holdout-<timestamp>/
 LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH=/path/to/contextual_booking_calibration_v1.json
 ```
 
-## 4. 월별 단순 백테스트
+## 4. 봉인 최종 테스트
+
+### 4.1 코드와 모델 동결
+
+관련 PR을 모두 `dev`에 머지하고 tracked working tree가 clean인 상태에서만 최종 테스트
+manifest를 만들 수 있다. 미추적 로컬 파일은 검사에서 제외하지만 tracked 코드를 수정한
+상태에서는 실행을 거부한다.
+
+```bash
+git switch dev
+git pull origin dev
+git status --short
+```
+
+### 4.2 미래 정답을 열지 않고 manifest 봉인
+
+다음 명령은 2014년 월별 개발 검증 Top 3 목적지의 합집합을 제외한다. 이후 2014년
+7월부터 12월까지 각 기준일에서 아직 사용하지 않은 목적지를 3개씩 선택한다. 목적지
+선정에는 기준일 이전 90일의 행동과 사용자 수만 사용하며 미래 `is_booking`은 조회하지
+않는다.
+
+```bash
+.venv/bin/python scripts/backtest_expedia_segments.py seal-final-test \
+  --user-sample-modulo 1 \
+  --profile-pool-limit 1000
+```
+
+manifest에는 다음 값이 고정된다.
+
+- 정확한 기준일과 목적지 ID 목록
+- 개발 검증에서 제외한 목적지 ID 목록
+- Decision code commit과 tree hash
+- 2013년 학습 모델 SHA-256과 버전
+- Expedia 원천 통계와 전체 행 체크섬
+- 사용자 sampling, profile pool, 후보 수 설정
+- 결과를 보기 전에 등록한 합격 기준
+
+기본 합격 기준은 다음과 같다.
+
+- Rank 1 기준선 승률 `70% 이상`
+- Rank 1 실제 최고 후보 비율 `50% 이상`
+- 전체 후보 MAE `3.5%p 이하`
+- 예측 편향 절댓값 `1.5%p 이하`
+- Brier skill score `0 초과`
+
+명령이 출력하는 `confirmation=RUN_FINAL_TEST_...` 값은 최종 실행 전까지 보관한다.
+
+### 4.3 코드 동결 후 단 한 번 실행
+
+manifest 생성 후 코드, 모델, 원천 데이터 중 하나라도 달라지면 실행을 거부한다. 아래
+명령은 확인 토큰이 일치할 때만 실행 시작 marker를 먼저 생성한 뒤 미래 예약 결과를
+조회한다.
+
+```bash
+.venv/bin/python scripts/backtest_expedia_segments.py run-final-test \
+  --confirm RUN_FINAL_TEST_<seal-command-output>
+```
+
+실행이 시작된 manifest에는 `*.execution-started.json` marker가 남는다. 실행이 실패하거나
+결과가 기준에 미달해도 같은 manifest를 다시 실행할 수 없다. 결과를 확인한 뒤 코드를
+수정하면 새로운 라벨 데이터 없이는 다시 “최종 테스트”라고 부를 수 없다.
+
+생성되는 최종 산출물은 다음과 같다.
+
+```text
+artifacts/expedia-segment-backtest/sealed-final-test-<timestamp>/
+├── sealed_final_test_report.md
+├── sealed_final_test_summary.json
+└── details/
+    ├── results.csv
+    └── skipped_scenarios.csv
+```
+
+이 결과도 완전히 새로운 연도의 외부 테스트는 아니다. 이전에 평가하지 않은 목적지를
+봉인한 내부 destination holdout이며, 실제 광고의 인과적 증분 효과를 증명하지 않는다.
+
+## 5. 월별 단순 백테스트
 
 샘플로 2014년 전체 기준일을 순회한다.
 
@@ -177,7 +258,7 @@ python3 scripts/backtest_expedia_segments.py run \
   --user-sample-modulo 1
 ```
 
-## 5. 결과 파일
+## 6. 결과 파일
 
 결과는 기본적으로 다음 경로에 저장된다.
 
@@ -208,7 +289,7 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 `actual_any_conversion_rate`만 높고 `actual_contextual_conversion_rate`의 향상도가 낮으면
 프로모션 맞춤 추천이 아니라 원래 예약 가능성이 높은 사용자를 추천했을 가능성이 크다.
 
-`temporal_holdout_summary.json`의 주요 검증 지표는 다음과 같다.
+`temporal_validation_summary.json`의 주요 개발 검증 지표는 다음과 같다.
 
 - `all_candidate_mean_absolute_error_percentage_points`: 예상값과 실제값의 평균 절대 오차
 - `all_candidate_brier_score`: 사용자별 확률 예측 오차. 0에 가까울수록 좋다.
