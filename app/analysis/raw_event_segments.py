@@ -930,9 +930,10 @@ def _segment_definition_from_candidate(
     missing_conditions = [
         CONDITION_LABELS.get(key, (key, key))[0] for key in candidate.missing_condition_keys
     ]
-    audience_summary = (
-        f"분석 대상 {total_eligible_user_count}명 중 {candidate.sample_size}명 · "
-        f"{float(sample_ratio) * 100:g}%"
+    audience_summary = _candidate_audience_summary(
+        candidate=candidate,
+        total_eligible_user_count=total_eligible_user_count,
+        sample_ratio=sample_ratio,
     )
     performance_estimate = _performance_estimate(
         promotion=promotion,
@@ -1000,6 +1001,25 @@ def _segment_definition_from_candidate(
         sample_ratio=sample_ratio,
         status="active",
     )
+
+
+def _candidate_audience_summary(
+    *,
+    candidate: _RawEventCandidate,
+    total_eligible_user_count: int,
+    sample_ratio: Decimal,
+) -> str:
+    matching_user_count = int(
+        candidate.signal_metrics.get("matching_profile_count", candidate.sample_size)
+        or candidate.sample_size
+    )
+    summary = (
+        f"분석 대상 {total_eligible_user_count}명 중 "
+        f"조건 일치 {matching_user_count}명"
+    )
+    if matching_user_count > candidate.sample_size:
+        return f"{summary} · 상위 {candidate.sample_size}명 사용"
+    return f"{summary} · {float(sample_ratio) * 100:g}%"
 
 
 def _intent_system_instruction() -> str:
