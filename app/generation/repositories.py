@@ -216,6 +216,8 @@ class GenerationRunRepository:
 
 
 class GenerationInputRepository:
+    CONFIRMED_TARGET_SEGMENT_STATUS_FILTER = "AND pts.status = 'approved'"
+
     SELECT_PROMOTION_SQL = """
         SELECT
             project_id,
@@ -233,7 +235,7 @@ class GenerationInputRepository:
           AND promotion_id = %(promotion_id)s
     """
 
-    SELECT_TARGET_SEGMENTS_SQL = """
+    SELECT_TARGET_SEGMENTS_BASE_SQL = """
         SELECT
             pts.analysis_id,
             pts.promotion_id,
@@ -244,6 +246,7 @@ class GenerationInputRepository:
             pts.segment_vector_id,
             pts.estimated_size,
             pts.priority,
+            pts.status,
             sd.source AS segment_source,
             sd.query_preview_id,
             sd.natural_language_query,
@@ -258,6 +261,7 @@ class GenerationInputRepository:
           AND pts.campaign_id = %(campaign_id)s
           AND pts.promotion_id = %(promotion_id)s
           AND pts.analysis_id = %(analysis_id)s
+          {status_filter}
         ORDER BY
             CASE pts.priority
                 WHEN 'high' THEN 1
@@ -305,9 +309,36 @@ class GenerationInputRepository:
         self,
         request: GenerationRequest,
     ) -> list[TargetSegmentPromptInput]:
+        return self._list_target_segment_inputs(
+            request=request,
+            confirmed_only=True,
+        )
+
+    def list_focus_target_segment_inputs(
+        self,
+        request: GenerationRequest,
+    ) -> list[TargetSegmentPromptInput]:
+        return self._list_target_segment_inputs(
+            request=request,
+            confirmed_only=False,
+        )
+
+    def _list_target_segment_inputs(
+        self,
+        *,
+        request: GenerationRequest,
+        confirmed_only: bool,
+    ) -> list[TargetSegmentPromptInput]:
+        query = self.SELECT_TARGET_SEGMENTS_BASE_SQL.format(
+            status_filter=(
+                self.CONFIRMED_TARGET_SEGMENT_STATUS_FILTER
+                if confirmed_only
+                else ""
+            )
+        )
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
-                self.SELECT_TARGET_SEGMENTS_SQL,
+                query,
                 {
                     "project_id": request.project_id,
                     "campaign_id": request.campaign_id,
@@ -653,6 +684,7 @@ def _target_segment_prompt_input(
         source=_optional_text(row.get("segment_source"))
         or _optional_text(_json_object(row.get("data_evidence_json")).get("source")),
         query_preview_id=_optional_text(row.get("query_preview_id")),
+        status=_optional_text(row.get("status")),
     )
 
 

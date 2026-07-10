@@ -20,6 +20,7 @@ class FakeCursor:
         self.fetchone_result = fetchone_result
         self.fetchall_result = fetchall_result or []
         self.executed: list[tuple[str, dict[str, object] | None]] = []
+        self._last_query = ""
 
     def __enter__(self) -> "FakeCursor":
         return self
@@ -28,12 +29,19 @@ class FakeCursor:
         return None
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> None:
+        self._last_query = query
         self.executed.append((query, params))
 
     def fetchone(self) -> dict[str, object] | None:
         return self.fetchone_result
 
     def fetchall(self) -> list[dict[str, object]]:
+        if "pts.status = 'approved'" in self._last_query:
+            return [
+                row
+                for row in self.fetchall_result
+                if row.get("status") == "approved"
+            ]
         return self.fetchall_result
 
 
@@ -273,6 +281,7 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
                 "segment_vector_id": "segvec_ai_repeat_hotel_v1",
                 "estimated_size": 1342,
                 "priority": "high",
+                "status": "approved",
                 "segment_source": "ai_suggested",
                 "query_preview_id": "seg_query_preview_001",
                 "natural_language_query": "repeat hotel viewers without booking",
@@ -293,12 +302,55 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
                 "segment_vector_id": "segvec_manual_family_trip_v1",
                 "estimated_size": 820,
                 "priority": "medium",
+                "status": "content_ready",
                 "segment_source": "manual_rule",
                 "query_preview_id": None,
                 "natural_language_query": "family hotel trip planners",
                 "generated_sql": None,
                 "segment_sample_size": 820,
                 "segment_sample_ratio": "0.011000",
+            },
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_running_experiment",
+                "segment_name": "Running experiment segment",
+                "content_brief_json": {
+                    "message_direction": "Do not regenerate running segments.",
+                    "keywords": ["running experiment"],
+                },
+                "data_evidence_json": {"source": "ai_suggested"},
+                "segment_vector_id": "segvec_running_experiment_v1",
+                "estimated_size": 910,
+                "priority": "medium",
+                "status": "running",
+                "segment_source": "ai_suggested",
+                "query_preview_id": None,
+                "natural_language_query": "running experiment segment",
+                "generated_sql": None,
+                "segment_sample_size": 910,
+                "segment_sample_ratio": "0.012000",
+            },
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_planned_not_selected",
+                "segment_name": "Planned but not selected segment",
+                "content_brief_json": {
+                    "message_direction": "Do not generate this planned segment.",
+                    "keywords": ["planned only"],
+                },
+                "data_evidence_json": {"source": "ai_suggested"},
+                "segment_vector_id": "segvec_planned_not_selected_v1",
+                "estimated_size": 640,
+                "priority": "low",
+                "status": "planned",
+                "segment_source": "ai_suggested",
+                "query_preview_id": None,
+                "natural_language_query": "planned segment candidate",
+                "generated_sql": None,
+                "segment_sample_size": 640,
+                "segment_sample_ratio": "0.009000",
             },
         ],
     )
@@ -320,10 +372,9 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
     assert promotion.landing_url == "https://demo-stay.example.com/summer"
     assert [segment.segment_id for segment in target_segments] == [
         "seg_ai_repeat_hotel",
-        "seg_manual_family_trip",
     ]
+    assert [segment.status for segment in target_segments] == ["approved"]
     assert target_segments[0].source == "ai_suggested"
-    assert target_segments[1].source == "manual_rule"
     assert target_segments[0].content_brief_json["booking_conversion_rate"] == "0.018"
     assert target_segments[0].natural_language_query == (
         "repeat hotel viewers without booking"
@@ -335,5 +386,55 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
 
     executed_sql = "\n".join(query for query, _params in cursor.executed)
     assert "FROM promotion_target_segments" in executed_sql
+    assert "pts.status" in executed_sql
+    assert "pts.status = 'approved'" in executed_sql
     assert "LEFT JOIN segment_definitions" in executed_sql
     assert "promotion_segment_suggestions" not in executed_sql
+
+
+def test_generation_input_repository_focus_read_bypasses_confirmed_status_filter() -> None:
+    cursor = FakeCursor(
+        fetchall_result=[
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_failed_planned",
+                "segment_name": "Failed planned focus segment",
+                "content_brief_json": {
+                    "message_direction": "Refine the failed hotel message.",
+                    "keywords": ["hotel retry"],
+                },
+                "data_evidence_json": {"source": "next_loop"},
+                "segment_vector_id": "segvec_failed_planned_v1",
+                "estimated_size": 320,
+                "priority": "high",
+                "status": "planned",
+                "segment_source": "ai_suggested",
+                "query_preview_id": None,
+                "natural_language_query": "failed segment from previous loop",
+                "generated_sql": None,
+                "segment_sample_size": 320,
+                "segment_sample_ratio": "0.004000",
+            },
+        ],
+    )
+    repository = GenerationInputRepository(FakeConnection(cursor))
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        content_option_count=1,
+        operator_instruction=None,
+    )
+
+    target_segments = repository.list_focus_target_segment_inputs(request)
+
+    assert [segment.segment_id for segment in target_segments] == [
+        "seg_failed_planned"
+    ]
+    assert target_segments[0].status == "planned"
+
+    executed_sql = "\n".join(query for query, _params in cursor.executed)
+    assert "FROM promotion_target_segments" in executed_sql
+    assert "pts.status = 'approved'" not in executed_sql

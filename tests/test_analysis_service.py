@@ -701,6 +701,14 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
                 "sample_size": 0.5,
                 "final_score": 0.88,
             },
+            "primary_signals": [
+                "campaign_redirect",
+                "hotel_market_affinity",
+                "free_cancellation",
+            ],
+            "behavior_metrics": {
+                "booking_conversion_rate": 0.018,
+            },
             "promotion_matched_features": [
                 "Campaign redirect users",
                 "Hotel market bucket 2 affinity users",
@@ -744,6 +752,22 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
         "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
         "action_hint": "이메일 예약 혜택 메시지의 우선 타겟으로 적합합니다.",
     }
+    content_brief = result.target_segments[0].content_brief_json
+    assert content_brief["readiness"]["level"] == "partial"
+    assert content_brief["readiness"]["missing_sections"] == []
+    assert content_brief["audience_evidence"]["primary_signals"] == [
+        "campaign_redirect",
+        "hotel_market_affinity",
+        "free_cancellation",
+    ]
+    assert content_brief["audience_evidence"]["score_components"] == {
+        "promotion_cluster_similarity": 0.92,
+        "cluster_quality": 0.7,
+        "sample_size": 0.5,
+        "final_score": 0.88,
+    }
+    assert "behavior_metrics" not in content_brief["audience_evidence"]
+    assert "behavior_metrics" not in str(content_brief)
 
 
 def test_service_ranks_ai_clusters_by_booking_propensity_model() -> None:

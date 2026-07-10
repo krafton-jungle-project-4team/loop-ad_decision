@@ -15,8 +15,9 @@ from app.generation.service import GenerationService
 from app.main import create_app
 
 
-FORBIDDEN_PUBLIC_KEYS = {"variant_id", "experiment_id"}
+FORBIDDEN_PUBLIC_KEYS = {"variant_id", "experiment_id", "creative_id"}
 DEFAULT_FETCHONE_RESULT = object()
+CONFIRMED_TARGET_SEGMENT_STATUSES = {"approved"}
 
 
 def valid_env() -> dict[str, str]:
@@ -70,7 +71,6 @@ def test_generation_api_returns_v1_6_final_names() -> None:
     assert first_candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
     assert first_candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
     assert first_candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert first_candidate["attribution"]["creative_id"] == "content_banner_repeat_hotel_001"
     assert first_candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
     assert first_candidate["source"] == {
         "creative_format": "banner_html",
@@ -193,7 +193,15 @@ def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -
     connections: list[RecordingConnection] = []
 
     def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection(target_segment_rows=[])
+        connection = RecordingConnection(
+            target_segment_rows=[
+                target_segment_row(
+                    segment_id="seg_family_trip",
+                    segment_name="Family trip planners",
+                    status="planned",
+                )
+            ]
+        )
         connections.append(connection)
         return connection
 
@@ -296,6 +304,87 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
     ]
 
 
+def test_generation_api_skips_planned_segments_and_image_jobs(monkeypatch) -> None:
+    connections: list[RecordingConnection] = []
+    dispatched_jobs = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(
+            target_segment_rows=[
+                target_segment_row(
+                    segment_id="seg_repeat_hotel_no_booking",
+                    segment_name="Repeat hotel viewers without booking",
+                    status="approved",
+                ),
+                target_segment_row(
+                    segment_id="seg_family_trip",
+                    segment_name="Family trip planners",
+                    status="planned",
+                ),
+            ]
+        )
+        connections.append(connection)
+        return connection
+
+    def fake_build_external_content_generator(settings, *, generate_images=True):
+        del settings, generate_images
+        return FakeExternalContentGenerator()
+
+    def fake_dispatch_image_generation_jobs(*, settings, jobs):
+        dispatched_jobs.append((settings, list(jobs)))
+
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.build_external_content_generator",
+        fake_build_external_content_generator,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.dispatch_image_generation_jobs",
+        fake_dispatch_image_generation_jobs,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.build_s3_creative_artifact_publisher",
+        lambda _settings: StaticCreativeArtifactPublisher(),
+    )
+    env = valid_env()
+    env["LOOPAD_ENV"] = "dev"
+    app = create_app(settings=load_settings(env))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 200
+    segment_ids = [
+        candidate["attribution"]["segment_id"]
+        for candidate in response.json()["content_candidates"]
+    ]
+    assert segment_ids == ["seg_repeat_hotel_no_booking"]
+    assert len(dispatched_jobs) == 1
+    assert [job.content_id for job in dispatched_jobs[0][1]] == [
+        "content_banner_repeat_hotel_no_booking_001"
+    ]
+
+    connection = connections[0]
+    executed_queries = [query for query, _params in connection.executed]
+    assert any(
+        "pts.status = 'approved'" in query
+        for query in executed_queries
+    )
+
+
 def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
 
@@ -378,7 +467,6 @@ class FakeGenerationService:
                         "segment_id": "seg_repeat_hotel_no_booking",
                         "content_id": "content_banner_fake_001",
                         "content_option_id": "banner_fake_option_001",
-                        "creative_id": "content_banner_fake_001",
                         "promotion_channel": "onsite_banner",
                         "target_url": "https://demo-stay.example.com/summer",
                     },
@@ -411,6 +499,42 @@ class FakeExternalContentGenerator:
         )
 
 
+def target_segment_row(
+    *,
+    segment_id: str = "seg_repeat_hotel_no_booking",
+    segment_name: str = "Repeat hotel viewers without booking",
+    status: str = "approved",
+    estimated_size: int = 1342,
+    priority: str = "high",
+) -> dict[str, object]:
+    return {
+        "analysis_id": "analysis_banner_001",
+        "promotion_id": "promo_banner_001",
+        "segment_id": segment_id,
+        "segment_name": segment_name,
+        "content_brief_json": {
+            "message_direction": (
+                "Emphasize refundable rooms and clear booking steps."
+            ),
+            "keywords": ["refundable rooms", "hotel deals"],
+        },
+        "data_evidence_json": {
+            "source": "ai_suggested",
+            "sample_ratio": "0.018000",
+        },
+        "segment_vector_id": f"segvec_{segment_id.removeprefix('seg_')}_v1",
+        "estimated_size": estimated_size,
+        "priority": priority,
+        "status": status,
+        "segment_source": "ai_suggested",
+        "query_preview_id": None,
+        "natural_language_query": "repeat hotel viewers who did not book",
+        "generated_sql": None,
+        "segment_sample_size": estimated_size,
+        "segment_sample_ratio": "0.018000",
+    }
+
+
 class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
@@ -433,7 +557,14 @@ class RecordingCursor:
 
     def fetchall(self) -> list[dict[str, object]]:
         if "FROM promotion_target_segments" in self._last_query:
-            return self._connection.target_segment_rows
+            rows = self._connection.target_segment_rows
+            if "pts.status = 'approved'" in self._last_query:
+                return [
+                    row
+                    for row in rows
+                    if row.get("status") in CONFIRMED_TARGET_SEGMENT_STATUSES
+                ]
+            return rows
         return []
 
 
@@ -463,35 +594,7 @@ class RecordingConnection:
         self.target_segment_rows = (
             target_segment_rows
             if target_segment_rows is not None
-            else [
-                {
-                    "analysis_id": "analysis_banner_001",
-                    "promotion_id": "promo_banner_001",
-                    "segment_id": "seg_repeat_hotel_no_booking",
-                    "segment_name": "Repeat hotel viewers without booking",
-                    "content_brief_json": {
-                        "message_direction": (
-                            "Emphasize refundable rooms and clear booking steps."
-                        ),
-                        "keywords": ["refundable rooms", "hotel deals"],
-                    },
-                    "data_evidence_json": {
-                        "source": "ai_suggested",
-                        "sample_ratio": "0.018000",
-                    },
-                    "segment_vector_id": "segvec_repeat_hotel_v1",
-                    "estimated_size": 1342,
-                    "priority": "high",
-                    "segment_source": "ai_suggested",
-                    "query_preview_id": None,
-                    "natural_language_query": (
-                        "repeat hotel viewers who did not book"
-                    ),
-                    "generated_sql": None,
-                    "segment_sample_size": 1342,
-                    "segment_sample_ratio": "0.018000",
-                }
-            ]
+            else [target_segment_row()]
         )
         self.executed: list[tuple[str, dict[str, object] | None]] = []
         self.row_factories: list[object] = []
