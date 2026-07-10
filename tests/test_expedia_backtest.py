@@ -138,6 +138,37 @@ def test_backtest_separates_observation_and_future_windows() -> None:
     assert future_call["scenario"].cutoff == repository.cutoff
 
 
+def test_backtest_runs_only_explicitly_sealed_scenarios() -> None:
+    repository = FakeExpediaBacktestRepository()
+    second = replace(
+        repository.scenario,
+        scenario_id="20140701_destination_8267",
+        target_destination_id=8267,
+    )
+    service = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            max_scenarios_per_cutoff=3,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    )
+
+    run = service.run_scenarios([repository.scenario, second])
+
+    assert run.results
+    assert not any(name == "list_scenarios" for name, _ in repository.calls)
+    evaluated_scenarios = {
+        payload["scenario"].scenario_id
+        for name, payload in repository.calls
+        if name == "future_booking_users"
+    }
+    assert evaluated_scenarios == {
+        "20140701_destination_8250",
+        "20140701_destination_8267",
+    }
+
+
 def test_backtest_calculates_user_level_future_rates_and_lift() -> None:
     repository = FakeExpediaBacktestRepository()
     run = ExpediaSegmentBacktestService(
@@ -340,6 +371,45 @@ def test_future_booking_query_does_not_shadow_source_user_id() -> None:
     assert future.contextual_booking_user_ids == {"expedia-user-1"}
     assert "AS backtest_user_id" in client.queries[0]
     assert client.parameters[0]["user_ids"] == [1, 2]
+
+
+def test_scenario_query_excludes_development_destinations() -> None:
+    client = FakeClickHouseClient(
+        [
+            {
+                "target_destination_id": 9001,
+                "historical_user_count": 30,
+                "historical_event_count": 80,
+            }
+        ]
+    )
+    repository = ClickHouseExpediaBacktestRepository(client)
+
+    scenarios = repository.list_scenarios(
+        observation_start=datetime(2014, 4, 2, tzinfo=UTC),
+        cutoff=datetime(2014, 7, 1, tzinfo=UTC),
+        limit=3,
+        min_users=20,
+        user_sample_modulo=1,
+        user_sample_remainder=0,
+        season=None,
+        excluded_destination_ids=(8250, 8267),
+    )
+
+    assert [scenario.target_destination_id for scenario in scenarios] == [9001]
+    assert client.parameters[0]["excluded_destination_ids"] == [8250, 8267]
+    assert "NOT has" in client.queries[0]
+
+
+def test_source_checksum_combines_sum_and_xor() -> None:
+    client = FakeClickHouseClient(
+        [{"checksum_sum": "1234", "checksum_xor": "5678"}]
+    )
+    repository = ClickHouseExpediaBacktestRepository(client)
+
+    assert repository.source_checksum() == "1234:5678"
+    assert "sumWithOverflow" in client.queries[0]
+    assert "groupBitXor" in client.queries[0]
 
 
 def profile(

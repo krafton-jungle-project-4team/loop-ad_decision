@@ -144,6 +144,7 @@ class ExpediaBacktestConfig:
     user_sample_modulo: int = 20
     user_sample_remainder: int = 0
     season: str | None = None
+    excluded_destination_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.lookback_days <= 0 or self.outcome_days <= 0:
@@ -162,6 +163,12 @@ class ExpediaBacktestConfig:
             )
         if self.season is not None and self.season not in SEASON_MONTHS:
             raise ValueError(f"unsupported season: {self.season}")
+        if any(value <= 0 for value in self.excluded_destination_ids):
+            raise ValueError("excluded destination IDs must be positive")
+        if len(set(self.excluded_destination_ids)) != len(
+            self.excluded_destination_ids
+        ):
+            raise ValueError("excluded destination IDs must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +240,9 @@ class ExpediaBacktestRepository(Protocol):
     def source_stats(self) -> ExpediaSourceStats:
         ...
 
+    def source_checksum(self) -> str:
+        ...
+
     def list_scenarios(
         self,
         *,
@@ -243,6 +253,7 @@ class ExpediaBacktestRepository(Protocol):
         user_sample_modulo: int,
         user_sample_remainder: int,
         season: str | None,
+        excluded_destination_ids: Sequence[int],
     ) -> list[ExpediaBacktestScenario]:
         ...
 
@@ -327,6 +338,35 @@ class ClickHouseExpediaBacktestRepository:
             last_event_at=_as_utc_datetime(_row_value(row, "last_event_at", 4)),
         )
 
+    def source_checksum(self) -> str:
+        row_hash = "cityHash64(concatWithSeparator('|', " + ", ".join(
+            (
+                "toString(date_time)",
+                "toString(user_id)",
+                "toString(srch_destination_id)",
+                "toString(is_booking)",
+                "toString(cnt)",
+                "toString(hotel_market)",
+                "toString(hotel_cluster)",
+            )
+        ) + "))"
+        result = self._client.query(
+            f"""
+            SELECT
+                toString(sumWithOverflow({row_hash})) AS checksum_sum,
+                toString(groupBitXor({row_hash})) AS checksum_xor
+            FROM {self._source_table}
+            """
+        )
+        rows = _clickhouse_rows(result)
+        if not rows:
+            return "0:0"
+        row = rows[0]
+        return (
+            f"{_row_value(row, 'checksum_sum', 0) or '0'}:"
+            f"{_row_value(row, 'checksum_xor', 1) or '0'}"
+        )
+
     def list_scenarios(
         self,
         *,
@@ -337,6 +377,7 @@ class ClickHouseExpediaBacktestRepository:
         user_sample_modulo: int,
         user_sample_remainder: int,
         season: str | None,
+        excluded_destination_ids: Sequence[int] = (),
     ) -> list[ExpediaBacktestScenario]:
         result = self._client.query(
             f"""
@@ -354,6 +395,10 @@ class ClickHouseExpediaBacktestRepository:
               AND srch_destination_id > 0
               AND modulo(cityHash64(toString(user_id)), {{sample_modulo:UInt64}})
                     = {{sample_remainder:UInt64}}
+              AND NOT has(
+                    {{excluded_destination_ids:Array(UInt64)}},
+                    toUInt64(srch_destination_id)
+                  )
             GROUP BY srch_destination_id
             HAVING historical_user_count >= {{min_users:UInt64}}
             ORDER BY historical_user_count DESC, historical_event_count DESC,
@@ -367,6 +412,7 @@ class ClickHouseExpediaBacktestRepository:
                 "sample_remainder": user_sample_remainder,
                 "min_users": min_users,
                 "limit": limit,
+                "excluded_destination_ids": list(excluded_destination_ids),
             },
         )
         return [
@@ -487,7 +533,13 @@ class ExpediaSegmentBacktestService:
         self._performance_predictor = performance_predictor
 
     @log_context_scope
-    def run(self, cutoffs: Sequence[datetime]) -> ExpediaBacktestRun:
+    def run(
+        self,
+        cutoffs: Sequence[datetime],
+        *,
+        fixed_scenarios: Mapping[datetime, Sequence[ExpediaBacktestScenario]]
+        | None = None,
+    ) -> ExpediaBacktestRun:
         started_at = now_ms()
         log.info(
             "started",
@@ -510,15 +562,21 @@ class ExpediaSegmentBacktestService:
             outcome_end = normalized_cutoff + timedelta(
                 days=self._config.outcome_days
             )
-            scenarios = self._repository.list_scenarios(
-                observation_start=observation_start,
-                cutoff=normalized_cutoff,
-                limit=self._config.max_scenarios_per_cutoff,
-                min_users=self._config.min_scenario_users,
-                user_sample_modulo=self._config.user_sample_modulo,
-                user_sample_remainder=self._config.user_sample_remainder,
-                season=self._config.season,
-            )
+            if fixed_scenarios is None:
+                scenarios = self._repository.list_scenarios(
+                    observation_start=observation_start,
+                    cutoff=normalized_cutoff,
+                    limit=self._config.max_scenarios_per_cutoff,
+                    min_users=self._config.min_scenario_users,
+                    user_sample_modulo=self._config.user_sample_modulo,
+                    user_sample_remainder=self._config.user_sample_remainder,
+                    season=self._config.season,
+                    excluded_destination_ids=(
+                        self._config.excluded_destination_ids
+                    ),
+                )
+            else:
+                scenarios = list(fixed_scenarios.get(normalized_cutoff, ()))
             log.info(
                 "backtest_cutoff_started",
                 {
@@ -601,6 +659,25 @@ class ExpediaSegmentBacktestService:
             },
         )
         return response
+
+    def run_scenarios(
+        self,
+        scenarios: Sequence[ExpediaBacktestScenario],
+    ) -> ExpediaBacktestRun:
+        scenarios_by_cutoff: dict[datetime, list[ExpediaBacktestScenario]] = (
+            defaultdict(list)
+        )
+        for scenario in scenarios:
+            cutoff = _as_utc_datetime(scenario.cutoff)
+            if cutoff is None:
+                raise ValueError("scenario cutoff must not be null")
+            scenarios_by_cutoff[cutoff].append(scenario)
+        if not scenarios_by_cutoff:
+            raise ValueError("sealed scenario list must not be empty")
+        return self.run(
+            sorted(scenarios_by_cutoff),
+            fixed_scenarios=scenarios_by_cutoff,
+        )
 
 
 def run_temporal_holdout_backtest(
