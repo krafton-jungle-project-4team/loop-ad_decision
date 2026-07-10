@@ -44,7 +44,7 @@ class ContentBriefResponse(BaseModel):
 class TargetSegmentResponse(BaseModel):
     segment_id: str
     segment_name: str
-    segment_vector_id: str | None
+    segment_vector_id: str
     estimated_size: int
     content_brief: ContentBriefResponse
 

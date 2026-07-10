@@ -30,7 +30,6 @@ from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalM
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorBuildResult,
-    SegmentVectorDataUnavailableError,
 )
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -1019,27 +1018,15 @@ class PromotionAnalysisService:
         if self._segment_vector_service is None:
             return None
 
-        try:
-            result = self._segment_vector_service.prepare_segment_vector(
-                SegmentVectorBuildRequest(
-                    project_id=promotion.project_id,
-                    promotion_id=promotion.promotion_id,
-                    analysis_id=analysis_id,
-                    segment_id=candidate.segment_id,
-                    candidate_user_ids=_candidate_user_ids(
-                        candidate.definition.rule_json
-                    ),
-                )
+        result = self._segment_vector_service.prepare_segment_vector(
+            SegmentVectorBuildRequest(
+                project_id=promotion.project_id,
+                promotion_id=promotion.promotion_id,
+                analysis_id=analysis_id,
+                segment_id=candidate.segment_id,
+                candidate_user_ids=_candidate_user_ids(candidate.definition.rule_json),
             )
-        except SegmentVectorDataUnavailableError as exc:
-            log.warn(
-                "segment_vector_build_skipped",
-                {
-                    "segmentId": candidate.segment_id,
-                    "err": exc,
-                },
-            )
-            return None
+        )
         return result.segment_vector_id
 
 

@@ -35,6 +35,29 @@ class FakeUserBehaviorVectorRepository:
         )
         return self.vectors
 
+    def list_by_user_ids(
+        self,
+        *,
+        project_id: str,
+        user_ids: list[str] | tuple[str, ...],
+        vector_version: str = "v1",
+    ) -> list[UserBehaviorVectorRecord]:
+        self.calls.append(
+            {
+                "project_id": project_id,
+                "user_ids": tuple(user_ids),
+                "vector_version": vector_version,
+            }
+        )
+        wanted_user_ids = set(user_ids)
+        return [
+            vector
+            for vector in self.vectors
+            if vector.project_id == project_id
+            and vector.vector_version == vector_version
+            and vector.user_id in wanted_user_ids
+        ]
+
 
 class FakeRawEventSignalRepository:
     def __init__(self, profiles: list[RawEventUserSignalRecord]) -> None:
@@ -169,8 +192,14 @@ def raw_signal(
 def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [
-            user_vector("fallback_001", vector_values(0)),
-            user_vector("fallback_002", vector_values(0)),
+            user_vector("intent_001", vector_values(0)),
+            user_vector("intent_002", vector_values(0)),
+            user_vector("funnel_001", vector_values(1)),
+            user_vector("funnel_002", vector_values(1)),
+            user_vector("promo_001", vector_values(5)),
+            user_vector("promo_002", vector_values(5)),
+            user_vector("benefit_001", vector_values(61)),
+            user_vector("benefit_002", vector_values(61)),
         ]
     )
     raw_reader = FakeRawEventSignalRepository(
@@ -232,7 +261,8 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         )
     )
 
-    assert vector_reader.calls == []
+    assert vector_reader.calls[0]["project_id"] == "hotel-client-a"
+    assert "user_ids" in vector_reader.calls[0]
     assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
     assert raw_reader.calls[0]["season_months"] == (6, 7, 8)
     assert len(segments) == 3
@@ -258,7 +288,12 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
 
 
 def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
-    vector_reader = FakeUserBehaviorVectorRepository([])
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("promo_001", vector_values(5)),
+            user_vector("promo_002", vector_values(5)),
+        ]
+    )
     raw_reader = FakeRawEventSignalRepository(
         [
             raw_signal(
@@ -304,7 +339,12 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
 
 
 def test_raw_event_suggester_uses_user_level_expected_conversion_rate() -> None:
-    vector_reader = FakeUserBehaviorVectorRepository([])
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("booking_001", vector_values(8)),
+            user_vector("booking_002", vector_values(8)),
+        ]
+    )
     raw_reader = FakeRawEventSignalRepository(
         [
             raw_signal(
@@ -348,6 +388,62 @@ def test_raw_event_suggester_uses_user_level_expected_conversion_rate() -> None:
     assert segments[0].profile_json["score_components"][
         "expected_goal_performance"
     ] < 1.0
+
+
+def test_raw_event_suggester_uses_only_vector_backed_users() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("user_001", vector_values(0)),
+            user_vector("user_002", vector_values(0)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "user_001",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+            raw_signal(
+                "user_002",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+            raw_signal(
+                "raw_only_001",
+                hotel_search_count=10,
+                hotel_detail_view_count=10,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    assert len(segments) == 1
+    assert segments[0].rule_json["candidate_user_ids"] == [
+        "user_001",
+        "user_002",
+    ]
+    assert "raw_only_001" not in segments[0].rule_json["candidate_user_ids"]
 
 
 def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> None:

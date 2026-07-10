@@ -207,6 +207,15 @@ class UserBehaviorVectorSampler(Protocol):
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
+    def list_by_user_ids(
+        self,
+        *,
+        project_id: str,
+        user_ids: Sequence[str],
+        vector_version: str = DEFAULT_VECTOR_VERSION,
+    ) -> list[UserBehaviorVectorRecord]:
+        ...
+
 
 class RawEventUserSignalSampler(Protocol):
     def list_raw_event_user_signals(
@@ -415,10 +424,16 @@ class VectorClusterSegmentSuggester:
                 season_months=season_months_from_intent(intent),
                 limit=self._vector_pool_limit,
             )
+            vector_backed_profiles = self._filter_vector_backed_profiles(
+                project_id=promotion.project_id,
+                profiles=profiles,
+            )
             log.info(
                 "raw_event_user_signals_loaded",
                 {
                     "userSignalCount": len(profiles),
+                    "vectorBackedUserCount": len(vector_backed_profiles),
+                    "vectorVersion": self._vector_version,
                     "intent": intent.to_json(),
                     "compiledConditionCount": len(compilation.compiled_conditions),
                 },
@@ -427,7 +442,7 @@ class VectorClusterSegmentSuggester:
                 promotion=promotion,
                 intent=intent,
                 compilation=compilation,
-                profiles=profiles[: self._vector_sample_limit],
+                profiles=vector_backed_profiles[: self._vector_sample_limit],
                 max_suggested_segments=self._max_suggested_segments,
                 min_sample_size=self._min_cluster_size,
             )
@@ -440,6 +455,32 @@ class VectorClusterSegmentSuggester:
                 },
             )
             return []
+
+    def _filter_vector_backed_profiles(
+        self,
+        *,
+        project_id: str,
+        profiles: Sequence[RawEventUserSignalRecord],
+    ) -> list[RawEventUserSignalRecord]:
+        if not profiles:
+            return []
+
+        records = self._user_behavior_vector_repository.list_by_user_ids(
+            project_id=project_id,
+            user_ids=[profile.user_id for profile in profiles],
+            vector_version=self._vector_version,
+        )
+        vector_backed_user_ids = {
+            record.user_id
+            for record in records
+            if int(record.vector_dim) == VECTOR_DIM
+            and len(record.vector_values) == VECTOR_DIM
+        }
+        return [
+            profile
+            for profile in profiles
+            if profile.user_id in vector_backed_user_ids
+        ]
 
     def _load_user_vectors(
         self,

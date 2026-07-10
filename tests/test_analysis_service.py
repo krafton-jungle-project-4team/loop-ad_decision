@@ -26,7 +26,6 @@ from app.analysis.service import (
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorBuildResult,
-    SegmentVectorDataUnavailableError,
 )
 
 
@@ -163,8 +162,7 @@ class FakePromotionAnalysisRepository:
 
 
 class FakeSegmentVectorService:
-    def __init__(self, *, fail: bool = False) -> None:
-        self.fail = fail
+    def __init__(self) -> None:
         self.calls: list[SegmentVectorBuildRequest] = []
 
     def prepare_segment_vector(
@@ -172,10 +170,6 @@ class FakeSegmentVectorService:
         request: SegmentVectorBuildRequest,
     ) -> SegmentVectorBuildResult:
         self.calls.append(request)
-        if self.fail:
-            raise SegmentVectorDataUnavailableError(
-                "segment vector data unavailable: user behavior vectors are required"
-            )
         return SegmentVectorBuildResult(
             segment_id=request.segment_id,
             segment_vector_id=f"segvec_{request.segment_id}_v1",
@@ -502,40 +496,6 @@ def test_service_populates_segment_vector_ids_when_vector_service_is_configured(
     )
 
     assert result.target_segments[0].segment_vector_id == "segvec_seg_mobile_user_v1"
-    assert analysis_repository.events == ["analysis", "segment_suggestions"]
-    assert vector_service.calls == [
-        SegmentVectorBuildRequest(
-            project_id="hotel-client-a",
-            promotion_id=promotion.promotion_id,
-            analysis_id=result.analysis.analysis_id,
-            segment_id="seg_mobile_user",
-            candidate_user_ids=["user_001", "user_002"],
-        )
-    ]
-
-
-def test_service_keeps_analysis_when_segment_vector_data_is_unavailable() -> None:
-    promotion = promotion_record(channel="onsite_banner")
-    vector_service = FakeSegmentVectorService(fail=True)
-    service, analysis_repository, _ = build_service(
-        promotion=promotion,
-        segments=[
-            segment_record(
-                "seg_mobile_user",
-                rule_json={
-                    "candidate_user_ids": ["user_001", "user_002"],
-                },
-            ),
-        ],
-        segment_vector_service=vector_service,
-    )
-
-    result = service.analyze(
-        analysis_request(promotion_id=promotion.promotion_id),
-    )
-
-    assert result.target_segments[0].segment_vector_id is None
-    assert result.segment_suggestions[0].metadata_json["segment_vector_id"] is None
     assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert vector_service.calls == [
         SegmentVectorBuildRequest(
