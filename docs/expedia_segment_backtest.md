@@ -91,7 +91,58 @@ python3 scripts/backtest_expedia_segments.py smoke
 - 후보 사용자: 현재 운영 로직과 동일하게 후보별 최대 160명
 - 사용자 샘플: `cityHash64(user_id) % 20 = 0`
 
-## 3. 월별 백테스트
+## 3. 2013 학습 / 2014 홀드아웃 검증
+
+예상 전환율의 보정과 최종 검증은 `holdout` 명령을 사용한다.
+
+```bash
+python3 scripts/backtest_expedia_segments.py holdout
+```
+
+이 명령은 다음 순서를 자동으로 수행한다.
+
+1. 2013-05-01부터 2013-12-01까지 기준일 이전 90일 행동으로 후보 feature를 만든다.
+2. 각 기준일 이후 30일의 동일 목적지 `is_booking=1`을 학습 target으로 연결한다.
+3. 목적지 일치율, 목적지별 기본 수요, 퍼널 행동, 혜택 반응으로 logistic 보정식을 학습한다.
+4. 학습에 사용하지 않은 2014-01-01부터 2014-12-01까지의 예상값과 Rank를 계산한다.
+5. 2014년 미래 결과와 비교해 MAE, Brier score, lift, Rank 1 적중률을 기록한다.
+
+빠른 확인은 기본 5% 결정적 사용자 표본으로 실행한다. 결론이 전체 원천 데이터에서도
+유지되는지 확인할 때는 다음처럼 해시 사전 샘플링을 끈다.
+
+```bash
+python3 scripts/backtest_expedia_segments.py holdout \
+  --user-sample-modulo 1 \
+  --profile-pool-limit 1000
+```
+
+`--user-sample-modulo 1`은 3,770만 원천 행에서 사용자를 해시로 미리 제외하지 않는다는
+의미다. `--profile-pool-limit 1000`은 그 전체 원천 데이터에서 현재 운영 추천과 동일하게
+최근 사용자 최대 1,000명을 후보 분석 풀로 사용한다. 두 옵션은 서로 다른 단계의 제한이다.
+
+결과 디렉터리에는 학습 모델과 시간 분리 결과가 함께 생성된다.
+
+```text
+artifacts/expedia-segment-backtest/holdout-<timestamp>/
+├── contextual_booking_calibration_v1.json
+├── temporal_holdout_report.md
+├── temporal_holdout_summary.json
+├── training-2013/
+│   ├── results.csv
+│   └── summary.json
+└── holdout-2014/
+    ├── results.csv
+    └── summary.json
+```
+
+운영에서 별도 모델 파일을 사용하려면 아래 환경 변수에 검증된 JSON 경로를 지정한다.
+지정하지 않으면 저장소에 포함된 기본 보정 모델을 사용한다.
+
+```dotenv
+LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH=/path/to/contextual_booking_calibration_v1.json
+```
+
+## 4. 월별 단순 백테스트
 
 샘플로 2014년 전체 기준일을 순회한다.
 
@@ -126,7 +177,7 @@ python3 scripts/backtest_expedia_segments.py run \
   --user-sample-modulo 1
 ```
 
-## 4. 결과 파일
+## 5. 결과 파일
 
 결과는 기본적으로 다음 경로에 저장된다.
 
@@ -146,6 +197,8 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 | 컬럼 | 의미 |
 | --- | --- |
 | `predicted_conversion_rate` | 추천 시점에 계산한 예상 전환율 |
+| `prediction_model_version` | 예상값을 계산한 보정 모델 버전 |
+| `performance_features` | 미래 결과 없이 추천 시점에 계산한 모델 입력 feature |
 | `actual_contextual_conversion_rate` | 미래에 해당 목적지를 예약한 추천 사용자 비율 |
 | `baseline_contextual_conversion_rate` | 전체 분석 대상의 미래 해당 목적지 예약률 |
 | `absolute_lift_percentage_points` | 추천 후보와 전체 기준의 전환율 차이 |
@@ -154,6 +207,13 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 
 `actual_any_conversion_rate`만 높고 `actual_contextual_conversion_rate`의 향상도가 낮으면
 프로모션 맞춤 추천이 아니라 원래 예약 가능성이 높은 사용자를 추천했을 가능성이 크다.
+
+`temporal_holdout_summary.json`의 주요 검증 지표는 다음과 같다.
+
+- `all_candidate_mean_absolute_error_percentage_points`: 예상값과 실제값의 평균 절대 오차
+- `all_candidate_brier_score`: 사용자별 확률 예측 오차. 0에 가까울수록 좋다.
+- `rank_one_beats_baseline_rate`: Rank 1이 전체 분석 대상의 목적지 예약률을 이긴 비율
+- `rank_one_is_best_rate`: Rank 1이 노출된 후보 중 실제 최고 예약률이었던 비율
 
 ## 시간 누수 방지
 
