@@ -8,7 +8,7 @@ from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResu
 from app.generation.schemas import GenerationStatus
 
 
-GENERATION_REPORT_VERSION = "dec-c4.v2"
+GENERATION_REPORT_VERSION = "dec-c4.v3"
 MAX_SQL_SUMMARY_LENGTH = 240
 
 

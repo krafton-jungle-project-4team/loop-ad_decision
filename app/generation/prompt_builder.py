@@ -8,17 +8,18 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.content_brief import NormalizedContentBrief, normalize_content_brief
+from app.generation.evidence import EvidenceResolver, verified_hotel_benefits
 from app.generation.schemas import ContentChannel, GenerationRequest
 
 
-PROMPT_BUILDER_VERSION = "dec-c2.v3"
+PROMPT_BUILDER_VERSION = "dec-c2.v4"
 CANDIDATE_STRATEGY_BLOCK_HEADER = (
     "Candidate strategy (apply only to this content option):"
 )
 SAFE_VISUAL_DIRECTIONS = (
-    "bright hotel room",
-    "welcoming hotel lobby",
-    "calm hotel stay planning scene",
+    "generic hotel booking travel scene",
+    "traveler reviewing an accommodation booking on a mobile device",
+    "neutral accommodation planning composition",
 )
 
 
@@ -72,7 +73,6 @@ class GenerationContext:
     operator_instruction: str | None
     fallback_guidance: Mapping[str, Any]
     fallback_guidance_present: bool
-    fallback_guidance_used: bool
     content_brief_schema_version: str
     brief_fingerprint: str
     normalized_content_brief: NormalizedContentBrief = field(
@@ -119,10 +119,6 @@ class GenerationContextBuilder:
         content_brief = normalize_content_brief(
             prompt_input.target_segment.content_brief_json
         )
-        fallback_guidance_used = (
-            content_brief.fallback_guidance_present
-            and _readiness_level(content_brief) != "evidence_ready"
-        )
         missing_sections = tuple(
             _string_list(content_brief.readiness.get("missing_sections"))
         )
@@ -148,7 +144,6 @@ class GenerationContextBuilder:
             "operator_instruction": operator_instruction,
             "fallback_guidance": content_brief.fallback_guidance,
             "fallback_guidance_present": content_brief.fallback_guidance_present,
-            "fallback_guidance_used": fallback_guidance_used,
             "content_brief_schema_version": content_brief.schema_version,
         }
         return GenerationContext(
@@ -165,7 +160,6 @@ class GenerationContextBuilder:
             operator_instruction=operator_instruction,
             fallback_guidance=dict(content_brief.fallback_guidance),
             fallback_guidance_present=content_brief.fallback_guidance_present,
-            fallback_guidance_used=fallback_guidance_used,
             content_brief_schema_version=content_brief.schema_version,
             brief_fingerprint=_brief_fingerprint(fingerprint_payload),
             normalized_content_brief=content_brief,
@@ -183,11 +177,15 @@ class GenerationStrategyPlanner:
             raise ValueError("option_index must be at least 1")
 
         evidence = generation_context.verified_audience_evidence
+        resolver = EvidenceResolver(
+            audience_evidence=evidence,
+            hotel_profile=generation_context.hotel_profile,
+        )
         audience_items = _indexed_evidence_items(
             evidence.get("primary_signals"),
             section="primary_signals",
         )
-        benefit_items = _indexed_evidence_items(
+        matched_feature_items = _indexed_evidence_items(
             evidence.get("promotion_matched_features"),
             section="promotion_matched_features",
         )
@@ -195,27 +193,32 @@ class GenerationStrategyPlanner:
             audience_items,
             option_index=option_index,
         )
+        selected_matched_feature = _select_indexed_evidence(
+            matched_feature_items,
+            option_index=option_index,
+        )
         selected_benefit = _select_indexed_evidence(
-            benefit_items,
+            verified_hotel_benefits(resolver),
             option_index=option_index,
         )
 
-        audience_focus = [selected_audience[0]] if selected_audience else []
+        audience_focus = [
+            selected[0]
+            for selected in (selected_audience, selected_matched_feature)
+            if selected is not None
+        ]
+        audience_focus = list(dict.fromkeys(audience_focus))
         benefit_focus = [selected_benefit[0]] if selected_benefit else []
         evidence_refs = [
             selected[1]
-            for selected in (selected_audience, selected_benefit)
+            for selected in (
+                selected_audience,
+                selected_matched_feature,
+                selected_benefit,
+            )
             if selected is not None
         ]
-
-        if not audience_focus and generation_context.fallback_guidance_used:
-            fallback_keywords = _string_list(
-                generation_context.fallback_guidance.get("keywords")
-            )
-            if fallback_keywords:
-                audience_focus.append(
-                    fallback_keywords[(option_index - 1) % len(fallback_keywords)]
-                )
+        resolver.validate_all(evidence_refs)
 
         message_angle = _message_angle_for(
             str(generation_context.promotion_objective.get("goal_metric", ""))
@@ -289,7 +292,10 @@ class PromptBuilder:
             option_index=1,
         )
         content_brief = generation_context.normalized_content_brief
-        fallback_guidance_used = generation_context.fallback_guidance_used
+        fallback_guidance_used = _should_use_fallback_guidance(
+            content_brief=content_brief,
+            strategy_plan=strategy_plan,
+        )
         message_strategy = _message_strategy(
             content_brief,
             fallback_guidance_used=fallback_guidance_used,
@@ -343,6 +349,11 @@ class PromptBuilder:
             "Keep the content in the hotel booking domain.",
         ]
         if fallback_guidance_used:
+            prompt_lines.extend(
+                _fallback_guardrail_lines(
+                    readiness_level=_readiness_level(content_brief),
+                )
+            )
             prompt_lines.extend(
                 [
                     (
@@ -444,6 +455,46 @@ def _message_strategy(
         "Use the available verified evidence and promotion context; "
         "do not infer missing audience details."
     )
+
+
+def _should_use_fallback_guidance(
+    *,
+    content_brief: NormalizedContentBrief,
+    strategy_plan: GenerationStrategyPlan,
+) -> bool:
+    if not content_brief.fallback_guidance_present:
+        return False
+    readiness_level = _readiness_level(content_brief)
+    if readiness_level == "evidence_ready":
+        return False
+    if readiness_level == "fallback_only":
+        return True
+    if readiness_level != "partial":
+        return False
+    return not any(
+        reference.startswith(("primary_signals[", "promotion_matched_features["))
+        for reference in strategy_plan.evidence_refs
+    )
+
+
+def _fallback_guardrail_lines(*, readiness_level: str) -> list[str]:
+    if readiness_level == "fallback_only":
+        return [
+            (
+                "Fallback basis: fallback_only. Treat fallback guidance as "
+                "non-evidentiary message direction only."
+            ),
+            (
+                "Do not infer audience traits, hotel policies, hotel benefits, "
+                "discounts, room inventory, amenities, or facilities."
+            ),
+        ]
+    return [
+        (
+            "Partial fallback scope: use fallback only for the missing audience "
+            "or message direction; do not treat it as evidence."
+        )
+    ]
 
 
 def _reason_summary(prompt_input: GenerationPromptInput) -> str:
