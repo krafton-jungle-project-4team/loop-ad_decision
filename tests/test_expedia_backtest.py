@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from app.analysis.expedia_backtest import (
     ExpediaSourceStats,
     ExpediaFutureBookingUsers,
     ExpediaSegmentBacktestService,
+    run_temporal_holdout_backtest,
     monthly_cutoffs,
     summarize_backtest,
     validate_table_identifier,
@@ -51,16 +53,26 @@ class FakeExpediaBacktestRepository:
             ),
             profile(
                 "3",
-                hotel_detail_view_count=2,
                 booking_start_count=2,
+                destination_match_count=1,
             ),
             profile(
                 "4",
-                hotel_detail_view_count=2,
                 booking_start_count=1,
+                destination_match_count=1,
             ),
-            profile("5", deal_event_count=2, free_cancellation_count=1),
-            profile("6", deal_event_count=1, breakfast_included_count=1),
+            profile(
+                "5",
+                deal_event_count=2,
+                free_cancellation_count=1,
+                destination_match_count=1,
+            ),
+            profile(
+                "6",
+                deal_event_count=1,
+                breakfast_included_count=1,
+                destination_match_count=1,
+            ),
         ]
         self.calls: list[tuple[str, dict[str, object]]] = []
 
@@ -69,7 +81,14 @@ class FakeExpediaBacktestRepository:
 
     def list_scenarios(self, **kwargs):
         self.calls.append(("list_scenarios", kwargs))
-        return [self.scenario]
+        cutoff = kwargs["cutoff"]
+        return [
+            replace(
+                self.scenario,
+                cutoff=cutoff,
+                scenario_id=f"{cutoff:%Y%m%d}_destination_8250",
+            )
+        ]
 
     def list_user_profiles(self, **kwargs):
         self.calls.append(("list_user_profiles", kwargs))
@@ -192,6 +211,45 @@ def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -
     assert summary["evaluable_scenario_count"] == 0
     assert summary["unevaluable_scenario_count"] == 1
     assert summary["rank_one_is_best_rate"] == 0
+
+
+def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
+    repository = FakeExpediaBacktestRepository()
+    config = ExpediaBacktestConfig(
+        max_scenarios_per_cutoff=1,
+        min_scenario_users=2,
+        user_sample_modulo=1,
+    )
+
+    temporal_run = run_temporal_holdout_backtest(
+        repository,
+        config=config,
+        training_cutoffs=[
+            datetime(2013, 9, 1, tzinfo=UTC),
+            datetime(2013, 11, 1, tzinfo=UTC),
+        ],
+        holdout_cutoffs=[datetime(2014, 1, 1, tzinfo=UTC)],
+    )
+
+    assert temporal_run.training_run.results
+    assert temporal_run.holdout_run.results
+    assert temporal_run.calibration_model.training_metadata["target"] == (
+        "future_contextual_booking_rate"
+    )
+    assert all(
+        result.cutoff.year == 2013
+        for result in temporal_run.training_run.results
+    )
+    assert all(
+        result.cutoff.year == 2014
+        for result in temporal_run.holdout_run.results
+    )
+    assert all(
+        result.prediction_method == "temporal_holdout_logistic_calibration"
+        for result in temporal_run.holdout_run.results
+    )
+    holdout_summary = summarize_backtest(temporal_run.holdout_run)
+    assert holdout_summary["all_candidate_brier_score"] >= 0
 
 
 def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:

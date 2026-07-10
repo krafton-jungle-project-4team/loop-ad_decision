@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from time import perf_counter
 from typing import Any, Mapping, Protocol, Sequence
@@ -12,6 +12,11 @@ from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
     SegmentDefinitionRecord,
+)
+from app.analysis.segment_performance import (
+    ContextualBookingHeuristicPredictor,
+    SegmentPerformanceFeatures,
+    SegmentPerformancePredictor,
 )
 from app.config import Settings
 from app.generation.adapters import (
@@ -24,8 +29,8 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v1"
-RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v1"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v2"
+RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 RAW_EVENT_CANDIDATE_USER_LIMIT = 160
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
@@ -33,11 +38,30 @@ MAX_RANK_USER_OVERLAP = 0.70
 
 CANDIDATE_TYPE_ORDER = (
     "intent_matched",
+    "target_destination_affinity",
     "funnel_recovery",
-    "promotion_responsive",
-    "destination_affinity",
     "benefit_value_seeker",
+    "promotion_responsive",
+    "general_destination_explorer",
 )
+
+DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
+    "promotion_condition_match": 0.30,
+    "expected_goal_performance": 0.25,
+    "behavior_lift_vs_baseline": 0.20,
+    "sample_reliability": 0.15,
+    "rank_distinctiveness": 0.10,
+}
+
+# A named destination is the strongest piece of promotion context. Generic past
+# activity must not outrank a higher predicted contextual booking rate.
+DESTINATION_SCORE_WEIGHTS: Mapping[str, float] = {
+    "promotion_condition_match": 0.35,
+    "expected_goal_performance": 0.55,
+    "behavior_lift_vs_baseline": 0.03,
+    "sample_reliability": 0.05,
+    "rank_distinctiveness": 0.02,
+}
 
 CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
     "intent_matched": {
@@ -52,9 +76,13 @@ CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
         "rank_role": "프로모션 반응 확장형",
         "fallback_title": "프로모션 반응이 확인된 고객",
     },
-    "destination_affinity": {
-        "rank_role": "목적지 반복 관심형",
-        "fallback_title": "목적지 관심이 반복된 고객",
+    "target_destination_affinity": {
+        "rank_role": "이번 목적지 반복 관심형",
+        "fallback_title": "이번 여행지를 반복 탐색한 고객",
+    },
+    "general_destination_explorer": {
+        "rank_role": "다목적지 탐색 확장형",
+        "fallback_title": "여러 여행지를 비교 탐색한 고객",
     },
     "benefit_value_seeker": {
         "rank_role": "혜택 민감형",
@@ -73,7 +101,8 @@ CONDITION_LABELS: Mapping[str, tuple[str, str]] = {
     "promotion_response": ("프로모션 반응", "프로모션 반응"),
     "campaign_landing": ("캠페인 랜딩", "캠페인 랜딩"),
     "booking_start_without_complete": ("예약 시작 후 미완료", "예약 미완료"),
-    "destination_affinity": ("목적지 반복 관심", "목적지 반복"),
+    "target_destination_affinity": ("이번 목적지 반복 관심", "이번 목적지 반복"),
+    "general_destination_exploration": ("여러 목적지 비교 탐색", "다목적지 탐색"),
     "benefit_interest": ("혜택 조건 관심", "혜택 관심"),
     "price_sensitive": ("가격 비교 행동", "가격 비교"),
     "free_cancellation_interest": ("무료 취소 관심", "무료 취소"),
@@ -187,9 +216,13 @@ class _RawEventCandidate:
     signal_chips: tuple[str, ...]
     signal_metrics: Mapping[str, Any]
     promotion_condition_match: float
+    predicted_goal_rate: float
     expected_goal_performance: float
     behavior_lift_vs_baseline: float
     sample_reliability: float
+    destination_context_required: bool
+    performance_features: SegmentPerformanceFeatures
+    performance_model_metadata: Mapping[str, Any]
     rank_distinctiveness: float = 1.0
 
     @property
@@ -339,7 +372,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
                 support="direct",
                 event_names=("hotel_search", "hotel_detail_view"),
                 property_keys=("destination_id", "destination_name", "hotel_city", "hotel_country"),
-                weight=0.2,
+                weight=0.32,
             )
         )
 
@@ -446,11 +479,13 @@ def generate_raw_event_segment_definitions(
     profiles: Sequence[RawEventUserSignalRecord],
     max_suggested_segments: int,
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor | None = None,
 ) -> list[SegmentDefinitionRecord]:
     if len(profiles) < min_sample_size:
         return []
     total_eligible_user_count = len(profiles)
     baseline = _baseline_metrics(profiles)
+    predictor = performance_predictor or ContextualBookingHeuristicPredictor()
     raw_candidates = [
         _intent_matched_candidate(
             promotion=promotion,
@@ -459,37 +494,57 @@ def generate_raw_event_segment_definitions(
             profiles=profiles,
             baseline=baseline,
             min_sample_size=min_sample_size,
+            performance_predictor=predictor,
+        ),
+        _target_destination_affinity_candidate(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=profiles,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
         ),
         _funnel_recovery_candidate(
             promotion=promotion,
+            intent=intent,
             compilation=compilation,
             profiles=profiles,
             baseline=baseline,
             min_sample_size=min_sample_size,
-        ),
-        _promotion_responsive_candidate(
-            promotion=promotion,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-        ),
-        _destination_affinity_candidate(
-            promotion=promotion,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
         ),
         _benefit_value_seeker_candidate(
             promotion=promotion,
+            intent=intent,
             compilation=compilation,
             profiles=profiles,
             baseline=baseline,
             min_sample_size=min_sample_size,
+            performance_predictor=predictor,
+        ),
+        _promotion_responsive_candidate(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=profiles,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
+        ),
+        _general_destination_explorer_candidate(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=profiles,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
         ),
     ]
-    candidates = [candidate for candidate in raw_candidates if candidate is not None]
+    candidates = _normalize_expected_performance(
+        [candidate for candidate in raw_candidates if candidate is not None]
+    )
     ranked = _rank_candidates(candidates, max_suggested_segments=max_suggested_segments)
     return [
         _segment_definition_from_candidate(
@@ -527,6 +582,7 @@ def _intent_matched_candidate(
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     requires_destination = bool(intent.destinations)
     requires_season = bool(intent.season)
@@ -537,7 +593,11 @@ def _intent_matched_candidate(
         and (not requires_destination or profile.destination_match_count > 0)
         and (not requires_season or profile.season_match_count > 0)
     ]
-    if len(matched_profiles) < min_sample_size:
+    if (
+        len(matched_profiles) < min_sample_size
+        and not requires_destination
+        and not requires_season
+    ):
         matched_profiles = [
             profile
             for profile in profiles
@@ -554,6 +614,7 @@ def _intent_matched_candidate(
     return _candidate_from_profiles(
         candidate_type="intent_matched",
         promotion=promotion,
+        intent=intent,
         compilation=compilation,
         profiles=matched_profiles,
         baseline=baseline,
@@ -563,44 +624,104 @@ def _intent_matched_candidate(
             compilation,
             matched_condition_keys,
         ),
+        performance_predictor=performance_predictor,
+    )
+
+
+def _target_destination_affinity_candidate(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+) -> _RawEventCandidate | None:
+    if not intent.destinations:
+        return None
+    matched_profiles = [
+        profile
+        for profile in profiles
+        if profile.destination_match_count >= 2
+        and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
+    ]
+    matched_condition_keys = [
+        "target_destination_affinity",
+        "hotel_product_interest",
+        "recent_destination_search",
+    ]
+    if any(profile.hotel_detail_view_count > 0 for profile in matched_profiles):
+        matched_condition_keys.append("hotel_detail_view")
+    return _candidate_from_profiles(
+        candidate_type="target_destination_affinity",
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=matched_profiles,
+        baseline=baseline,
+        min_sample_size=min_sample_size,
+        matched_condition_keys=tuple(matched_condition_keys),
+        missing_condition_keys=_missing_condition_keys(
+            compilation,
+            matched_condition_keys,
+        ),
+        performance_predictor=performance_predictor,
     )
 
 
 def _funnel_recovery_candidate(
     *,
     promotion: PromotionRecord,
+    intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     matched_profiles = [
         profile
         for profile in profiles
         if profile.booking_start_count > profile.booking_complete_count
+        and (not intent.destinations or profile.destination_match_count > 0)
     ]
+    matched_condition_keys = ["booking_start_without_complete"]
+    if any(
+        profile.hotel_search_count + profile.hotel_detail_view_count > 0
+        for profile in matched_profiles
+    ):
+        matched_condition_keys.append("hotel_product_interest")
+    if any(profile.hotel_detail_view_count > 0 for profile in matched_profiles):
+        matched_condition_keys.append("hotel_detail_view")
+    if intent.destinations:
+        matched_condition_keys.append("recent_destination_search")
     return _candidate_from_profiles(
         candidate_type="funnel_recovery",
         promotion=promotion,
+        intent=intent,
         compilation=compilation,
         profiles=matched_profiles,
         baseline=baseline,
         min_sample_size=min_sample_size,
-        matched_condition_keys=("booking_start_without_complete", "hotel_detail_view"),
+        matched_condition_keys=tuple(matched_condition_keys),
         missing_condition_keys=_missing_condition_keys(
             compilation,
-            ("booking_start_without_complete", "hotel_detail_view"),
+            matched_condition_keys,
         ),
+        performance_predictor=performance_predictor,
     )
 
 
 def _promotion_responsive_candidate(
     *,
     promotion: PromotionRecord,
+    intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     matched_profiles = [
         profile
@@ -615,6 +736,7 @@ def _promotion_responsive_candidate(
     return _candidate_from_profiles(
         candidate_type="promotion_responsive",
         promotion=promotion,
+        intent=intent,
         compilation=compilation,
         profiles=matched_profiles,
         baseline=baseline,
@@ -624,50 +746,61 @@ def _promotion_responsive_candidate(
             compilation,
             ("promotion_response", "campaign_landing"),
         ),
+        performance_predictor=performance_predictor,
     )
 
 
-def _destination_affinity_candidate(
+def _general_destination_explorer_candidate(
     *,
     promotion: PromotionRecord,
+    intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     matched_profiles = [
         profile
         for profile in profiles
         if (
-            profile.destination_match_count > 0
-            or len(profile.destination_values) >= 2
+            len(profile.destination_values) >= 2
             or len(profile.hotel_market_values) >= 2
             or len(profile.hotel_cluster_values) >= 2
         )
         and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
+        and (not intent.destinations or profile.destination_match_count == 0)
     ]
+    matched_condition_keys = (
+        "general_destination_exploration",
+        "hotel_product_interest",
+    )
     return _candidate_from_profiles(
-        candidate_type="destination_affinity",
+        candidate_type="general_destination_explorer",
         promotion=promotion,
+        intent=intent,
         compilation=compilation,
         profiles=matched_profiles,
         baseline=baseline,
         min_sample_size=min_sample_size,
-        matched_condition_keys=("destination_affinity", "recent_destination_search"),
+        matched_condition_keys=matched_condition_keys,
         missing_condition_keys=_missing_condition_keys(
             compilation,
-            ("destination_affinity", "recent_destination_search"),
+            matched_condition_keys,
         ),
+        performance_predictor=performance_predictor,
     )
 
 
 def _benefit_value_seeker_candidate(
     *,
     promotion: PromotionRecord,
+    intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     matched_profiles = [
         profile
@@ -679,24 +812,35 @@ def _benefit_value_seeker_candidate(
             + profile.price_event_count
         )
         > 0
+        and (not intent.destinations or profile.destination_match_count > 0)
     ]
+    matched_condition_keys = [
+        "benefit_interest",
+        "price_sensitive",
+        "free_cancellation_interest",
+        "breakfast_interest",
+    ]
+    if intent.destinations:
+        matched_condition_keys.append("recent_destination_search")
+    if any(
+        profile.hotel_search_count + profile.hotel_detail_view_count > 0
+        for profile in matched_profiles
+    ):
+        matched_condition_keys.append("hotel_product_interest")
     return _candidate_from_profiles(
         candidate_type="benefit_value_seeker",
         promotion=promotion,
+        intent=intent,
         compilation=compilation,
         profiles=matched_profiles,
         baseline=baseline,
         min_sample_size=min_sample_size,
-        matched_condition_keys=(
-            "benefit_interest",
-            "price_sensitive",
-            "free_cancellation_interest",
-            "breakfast_interest",
-        ),
+        matched_condition_keys=tuple(matched_condition_keys),
         missing_condition_keys=_missing_condition_keys(
             compilation,
-            ("benefit_interest", "price_sensitive"),
+            matched_condition_keys,
         ),
+        performance_predictor=performance_predictor,
     )
 
 
@@ -704,12 +848,14 @@ def _candidate_from_profiles(
     *,
     candidate_type: str,
     promotion: PromotionRecord,
+    intent: PromotionIntent | None,
     compilation: RawEventIntentCompilation,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
     min_sample_size: int,
     matched_condition_keys: Sequence[str],
     missing_condition_keys: Sequence[str],
+    performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
     if len(profiles) < min_sample_size:
         return None
@@ -736,6 +882,26 @@ def _candidate_from_profiles(
         compilation=compilation,
         matched_condition_keys=matched_condition_keys,
     )
+    sample_reliability = _sample_reliability(
+        sample_size=len(selected_profiles),
+        min_sample_size=min_sample_size,
+    )
+    performance_features = _performance_features(
+        candidate_type=candidate_type,
+        profiles=selected_profiles,
+        signal_metrics=signal_metrics,
+        baseline=baseline,
+        promotion_condition_match=promotion_condition_match,
+        destination_context_required=bool(intent and intent.destinations),
+        sample_reliability=sample_reliability,
+    )
+    predicted_goal_rate = _expected_goal_performance(
+        promotion=promotion,
+        profiles=selected_profiles,
+        baseline=baseline,
+        performance_features=performance_features,
+        performance_predictor=performance_predictor,
+    )
     return _RawEventCandidate(
         candidate_type=candidate_type,
         rank_role=type_labels["rank_role"],
@@ -754,20 +920,17 @@ def _candidate_from_profiles(
         signal_chips=_signal_chips(matched_condition_keys, candidate_type=candidate_type),
         signal_metrics=signal_metrics,
         promotion_condition_match=promotion_condition_match,
-        expected_goal_performance=_expected_goal_performance(
-            promotion=promotion,
-            profiles=selected_profiles,
-            baseline=baseline,
-        ),
+        predicted_goal_rate=predicted_goal_rate,
+        expected_goal_performance=predicted_goal_rate,
         behavior_lift_vs_baseline=_behavior_lift(
             profiles=selected_profiles,
             baseline=baseline,
             candidate_type=candidate_type,
         ),
-        sample_reliability=_sample_reliability(
-            sample_size=len(selected_profiles),
-            min_sample_size=min_sample_size,
-        ),
+        sample_reliability=sample_reliability,
+        destination_context_required=bool(intent and intent.destinations),
+        performance_features=performance_features,
+        performance_model_metadata=dict(performance_predictor.metadata()),
     )
 
 
@@ -795,6 +958,29 @@ def _fallback_candidate_action_hint(
     if promotion.goal_metric == "inflow_rate":
         return "클릭과 랜딩 유입 지표를 우선 확인하며 발송 결과를 비교하세요."
     return f"{candidate_type} 후보의 다음 퍼널 이동 지표를 우선 확인하세요."
+
+
+def _normalize_expected_performance(
+    candidates: Sequence[_RawEventCandidate],
+) -> list[_RawEventCandidate]:
+    highest_predicted_rate = max(
+        (candidate.predicted_goal_rate for candidate in candidates),
+        default=0.0,
+    )
+    if highest_predicted_rate <= 0:
+        return [
+            replace(candidate, expected_goal_performance=0.0)
+            for candidate in candidates
+        ]
+    return [
+        replace(
+            candidate,
+            expected_goal_performance=_clamp01(
+                candidate.predicted_goal_rate / highest_predicted_rate
+            ),
+        )
+        for candidate in candidates
+    ]
 
 
 def _rank_candidates(
@@ -869,9 +1055,13 @@ def _with_distinctiveness(
         signal_chips=candidate.signal_chips,
         signal_metrics=candidate.signal_metrics,
         promotion_condition_match=candidate.promotion_condition_match,
+        predicted_goal_rate=candidate.predicted_goal_rate,
         expected_goal_performance=candidate.expected_goal_performance,
         behavior_lift_vs_baseline=candidate.behavior_lift_vs_baseline,
         sample_reliability=candidate.sample_reliability,
+        destination_context_required=candidate.destination_context_required,
+        performance_features=candidate.performance_features,
+        performance_model_metadata=candidate.performance_model_metadata,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
     )
 
@@ -883,7 +1073,7 @@ def _maximum_user_overlap(
 ) -> float:
     return max(
         (
-            _set_overlap_coefficient(
+            _set_jaccard_similarity(
                 candidate.candidate_user_ids,
                 selected.candidate_user_ids,
             )
@@ -891,15 +1081,6 @@ def _maximum_user_overlap(
         ),
         default=0.0,
     )
-
-
-def _set_overlap_coefficient(left: Sequence[str], right: Sequence[str]) -> float:
-    left_values = set(left)
-    right_values = set(right)
-    if not left_values or not right_values:
-        return 0.0
-    return len(left_values & right_values) / min(len(left_values), len(right_values))
-
 
 def _set_jaccard_similarity(left: Sequence[str], right: Sequence[str]) -> float:
     left_values = set(left)
@@ -965,6 +1146,7 @@ def _segment_definition_from_candidate(
         "missing_conditions": missing_conditions,
         "signal_chips": list(candidate.signal_chips),
         "performance_estimate": performance_estimate,
+        "performance_features": candidate.performance_features.to_json(),
         "signal_metrics": {
             **dict(candidate.signal_metrics),
             "sample_size": candidate.sample_size,
@@ -1264,6 +1446,10 @@ def _baseline_metrics(
         "campaign_landing": sum(profile.campaign_landing_count for profile in profiles) / total,
         "booking_start": sum(profile.booking_start_count for profile in profiles) / total,
         "booking_complete": sum(profile.booking_complete_count for profile in profiles) / total,
+        "destination_match": sum(
+            profile.destination_match_count for profile in profiles
+        )
+        / total,
         "hotel_search_user_rate": _user_rate(
             profiles,
             lambda profile: profile.hotel_search_count > 0,
@@ -1288,6 +1474,10 @@ def _baseline_metrics(
             profiles,
             lambda profile: profile.booking_complete_count > 0,
         ),
+        "destination_match_user_rate": _user_rate(
+            profiles,
+            lambda profile: profile.destination_match_count > 0,
+        ),
         "benefit": sum(
             profile.deal_event_count
             + profile.free_cancellation_count
@@ -1309,7 +1499,8 @@ def _profile_strength(profile: RawEventUserSignalRecord, *, candidate_type: str)
         )
     if candidate_type == "funnel_recovery":
         return (
-            2.0 * max(profile.booking_start_count - profile.booking_complete_count, 0)
+            2.0 * profile.destination_match_count
+            + 2.0 * max(profile.booking_start_count - profile.booking_complete_count, 0)
             + profile.hotel_detail_view_count
         )
     if candidate_type == "promotion_responsive":
@@ -1318,16 +1509,22 @@ def _profile_strength(profile: RawEventUserSignalRecord, *, candidate_type: str)
             + profile.campaign_landing_count
             + 0.25 * profile.promotion_impression_count
         )
-    if candidate_type == "destination_affinity":
+    if candidate_type == "target_destination_affinity":
         return (
-            profile.destination_match_count
-            + len(profile.destination_values)
+            2.0 * profile.destination_match_count
+            + profile.hotel_detail_view_count
+            + 0.5 * profile.hotel_search_count
+        )
+    if candidate_type == "general_destination_explorer":
+        return (
+            len(profile.destination_values)
             + len(profile.hotel_market_values)
             + profile.hotel_search_count
         )
     if candidate_type == "benefit_value_seeker":
         return (
-            profile.deal_event_count
+            2.0 * profile.destination_match_count
+            + profile.deal_event_count
             + profile.free_cancellation_count
             + profile.breakfast_included_count
             + 0.5 * profile.price_event_count
@@ -1360,6 +1557,10 @@ def _signal_metrics(
     booking_complete_user_count = _user_count(
         profiles,
         lambda profile: profile.booking_complete_count > 0,
+    )
+    destination_match_user_count = _user_count(
+        profiles,
+        lambda profile: profile.destination_match_count > 0,
     )
     return {
         "profile_count": sample_size,
@@ -1401,6 +1602,11 @@ def _signal_metrics(
         "destination_match_count": sum(
             profile.destination_match_count for profile in profiles
         ),
+        "destination_match_user_count": destination_match_user_count,
+        "destination_match_user_rate": _safe_rate(
+            destination_match_user_count,
+            sample_size,
+        ),
         "season_match_count": sum(profile.season_match_count for profile in profiles),
         "benefit_event_count": sum(
             profile.deal_event_count
@@ -1433,18 +1639,89 @@ def _condition_match_score(
     return _clamp01(matched_weight / total_weight)
 
 
+def _performance_features(
+    *,
+    candidate_type: str,
+    profiles: Sequence[RawEventUserSignalRecord],
+    signal_metrics: Mapping[str, Any],
+    baseline: Mapping[str, float],
+    promotion_condition_match: float,
+    destination_context_required: bool,
+    sample_reliability: float,
+) -> SegmentPerformanceFeatures:
+    destination_match_count = sum(
+        profile.destination_match_count for profile in profiles
+    )
+    destination_event_denominator = max(
+        sum(
+            profile.hotel_search_count
+            + profile.hotel_detail_view_count
+            + profile.booking_start_count
+            + profile.booking_complete_count
+            for profile in profiles
+        ),
+        destination_match_count,
+        1,
+    )
+    return SegmentPerformanceFeatures(
+        candidate_type=candidate_type,
+        promotion_condition_match=promotion_condition_match,
+        destination_context_required=destination_context_required,
+        destination_match_user_rate=float(
+            signal_metrics.get("destination_match_user_rate", 0.0) or 0.0
+        ),
+        destination_match_event_rate=_clamp01(
+            destination_match_count / destination_event_denominator
+        ),
+        eligible_destination_match_user_rate=float(
+            baseline.get("destination_match_user_rate", 0.0) or 0.0
+        ),
+        hotel_detail_view_user_rate=_user_rate(
+            profiles,
+            lambda profile: profile.hotel_detail_view_count > 0,
+        ),
+        booking_start_user_rate=_user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count > 0,
+        ),
+        booking_complete_user_rate=_user_rate(
+            profiles,
+            lambda profile: profile.booking_complete_count > 0,
+        ),
+        funnel_recovery_user_rate=_user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count
+            > profile.booking_complete_count,
+        ),
+        benefit_user_rate=_user_rate(
+            profiles,
+            lambda profile: (
+                profile.deal_event_count
+                + profile.free_cancellation_count
+                + profile.breakfast_included_count
+                + profile.price_event_count
+            )
+            > 0,
+        ),
+        promotion_response_user_rate=_user_rate(
+            profiles,
+            lambda profile: profile.promotion_click_count > 0
+            or profile.campaign_landing_count > 0,
+        ),
+        sample_reliability=sample_reliability,
+    )
+
+
 def _expected_goal_performance(
     *,
     promotion: PromotionRecord,
     profiles: Sequence[RawEventUserSignalRecord],
     baseline: Mapping[str, float],
+    performance_features: SegmentPerformanceFeatures,
+    performance_predictor: SegmentPerformancePredictor,
 ) -> float:
     if promotion.goal_metric == "booking_conversion_rate":
-        return _smoothed_user_rate(
-            profiles,
-            lambda profile: profile.booking_complete_count > 0,
-            baseline_rate=baseline.get("booking_complete_user_rate", 0.0),
-        )
+        return _clamp01(performance_predictor.predict(performance_features))
     if promotion.goal_metric == "inflow_rate":
         return _smoothed_user_rate(
             profiles,
@@ -1505,7 +1782,8 @@ def _behavior_lift(
         "intent_matched": "hotel_detail_view",
         "funnel_recovery": "booking_start",
         "promotion_responsive": "promotion_click",
-        "destination_affinity": "hotel_search",
+        "target_destination_affinity": "destination_match",
+        "general_destination_explorer": "hotel_search",
         "benefit_value_seeker": "benefit",
     }.get(candidate_type, "hotel_search")
     candidate_metric = {
@@ -1513,6 +1791,9 @@ def _behavior_lift(
         "booking_start": sum(profile.booking_start_count for profile in profiles),
         "promotion_click": sum(profile.promotion_click_count for profile in profiles),
         "hotel_search": sum(profile.hotel_search_count for profile in profiles),
+        "destination_match": sum(
+            profile.destination_match_count for profile in profiles
+        ),
         "benefit": sum(
             profile.deal_event_count
             + profile.free_cancellation_count
@@ -1533,22 +1814,19 @@ def _sample_reliability(*, sample_size: int, min_sample_size: int) -> float:
     return _clamp01(sample_size / max(min_sample_size * 3, 1))
 
 
-def _score_components(candidate: _RawEventCandidate) -> dict[str, float]:
+def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
     final_score = _final_score(candidate)
+    weights = _score_weights(candidate)
     return {
         "promotion_condition_match": round(candidate.promotion_condition_match, 6),
+        "predicted_goal_rate": round(candidate.predicted_goal_rate, 6),
         "expected_goal_performance": round(candidate.expected_goal_performance, 6),
         "behavior_lift_vs_baseline": round(candidate.behavior_lift_vs_baseline, 6),
         "sample_reliability": round(candidate.sample_reliability, 6),
         "rank_distinctiveness": round(candidate.rank_distinctiveness, 6),
         "final_score": round(final_score, 6),
-        "weights": {
-            "promotion_condition_match": 0.30,
-            "expected_goal_performance": 0.25,
-            "behavior_lift_vs_baseline": 0.20,
-            "sample_reliability": 0.15,
-            "rank_distinctiveness": 0.10,
-        },
+        "weights": dict(weights),
+        "destination_context_required": candidate.destination_context_required,
     }
 
 
@@ -1557,21 +1835,28 @@ def _performance_estimate(
     promotion: PromotionRecord,
     candidate: _RawEventCandidate,
 ) -> dict[str, Any]:
-    value = _clamp01(candidate.expected_goal_performance)
+    value = _clamp01(candidate.predicted_goal_rate)
     observed_value = _observed_goal_rate(
         goal_metric=promotion.goal_metric,
         signal_metrics=candidate.signal_metrics,
     )
+    model_metadata = dict(candidate.performance_model_metadata)
+    if promotion.goal_metric != "booking_conversion_rate":
+        model_metadata = {
+            "model_version": "dec.empirical-bayes-user-rate.v1",
+            "method": "empirical_bayes_user_rate",
+            "calibration_status": "historical_signal_estimate",
+        }
     return {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
         "value": round(value, 6),
         "formatted": _format_percent(value),
         "observed_value": round(observed_value, 6),
-        "basis_label": "최근 행동 벡터 관찰 구간 기반 추정",
-        "method": "empirical_bayes_user_rate",
-        "prior_user_count": int(EXPECTED_RATE_PRIOR_USER_COUNT),
-        "calibration_status": "not_backtested",
+        "basis_label": "과거 행동 기반 프로모션 조건 일치 성과 추정",
+        "method": model_metadata.get("method"),
+        "model_version": model_metadata.get("model_version"),
+        "calibration_status": model_metadata.get("calibration_status"),
     }
 
 
@@ -1603,13 +1888,22 @@ def _format_percent(value: float) -> str:
 
 
 def _final_score(candidate: _RawEventCandidate) -> float:
+    weights = _score_weights(candidate)
     return (
-        0.30 * candidate.promotion_condition_match
-        + 0.25 * candidate.expected_goal_performance
-        + 0.20 * candidate.behavior_lift_vs_baseline
-        + 0.15 * candidate.sample_reliability
-        + 0.10 * candidate.rank_distinctiveness
+        weights["promotion_condition_match"] * candidate.promotion_condition_match
+        + weights["expected_goal_performance"]
+        * candidate.expected_goal_performance
+        + weights["behavior_lift_vs_baseline"]
+        * candidate.behavior_lift_vs_baseline
+        + weights["sample_reliability"] * candidate.sample_reliability
+        + weights["rank_distinctiveness"] * candidate.rank_distinctiveness
     )
+
+
+def _score_weights(candidate: _RawEventCandidate) -> Mapping[str, float]:
+    if candidate.destination_context_required:
+        return DESTINATION_SCORE_WEIGHTS
+    return DEFAULT_SCORE_WEIGHTS
 
 
 def _signal_chips(
@@ -1625,6 +1919,10 @@ def _signal_chips(
         chips = ["예약 시작", "예약 미완료", "호텔 상세 조회"]
     if candidate_type == "promotion_responsive":
         chips = ["프로모션 반응", "캠페인 랜딩", "클릭 행동"]
+    if candidate_type == "target_destination_affinity":
+        chips = ["이번 목적지 반복", "목적지 검색", "호텔 상세 조회"]
+    if candidate_type == "general_destination_explorer":
+        chips = ["다목적지 탐색", "숙소 비교", "여행지 확장"]
     if candidate_type == "benefit_value_seeker":
         chips = ["할인 관심", "가격 비교", "혜택 탐색"]
     return tuple(dict.fromkeys(chips))[:3]
@@ -1649,8 +1947,10 @@ def _difference_summary(candidate: _RawEventCandidate, *, rank: int) -> str:
         return "상위 후보보다 목적지 조건은 약할 수 있지만 예약 의도 깊이가 더 강합니다."
     if candidate.candidate_type == "promotion_responsive":
         return "상위 후보보다 구매 단계는 넓지만 캠페인 메시지 반응 가능성이 더 높습니다."
-    if candidate.candidate_type == "destination_affinity":
-        return "상위 후보보다 퍼널 깊이는 낮아도 특정 목적지 관심이 반복적으로 확인됩니다."
+    if candidate.candidate_type == "target_destination_affinity":
+        return "상위 후보보다 퍼널 깊이는 낮아도 이번 프로모션 목적지를 반복 탐색했습니다."
+    if candidate.candidate_type == "general_destination_explorer":
+        return "이번 목적지 직접 관심은 약하지만 여러 여행지를 비교하는 확장 타겟입니다."
     if candidate.candidate_type == "benefit_value_seeker":
         return "상위 후보보다 넓은 타겟이지만 할인과 혜택 메시지에 반응할 가능성이 큽니다."
     return "다른 Rank와 다른 행동 조건을 기준으로 분리한 후보입니다."

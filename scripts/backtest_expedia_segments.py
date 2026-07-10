@@ -9,6 +9,8 @@ Examples:
         --start-cutoff 2014-01-01 \
         --end-cutoff 2014-12-01 \
         --user-sample-modulo 1
+    python3 scripts/backtest_expedia_segments.py holdout \
+        --user-sample-modulo 1
 """
 
 from __future__ import annotations
@@ -33,8 +35,10 @@ from app.analysis.expedia_backtest import (  # noqa: E402
     ExpediaBacktestError,
     ExpediaSegmentBacktestService,
     monthly_cutoffs,
+    run_temporal_holdout_backtest,
     validate_source_window,
     write_backtest_artifacts,
+    write_temporal_holdout_artifacts,
 )
 from app.config import DECISION_SERVICE_ID, Settings  # noqa: E402
 from app.logging import (  # noqa: E402
@@ -113,6 +117,57 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
 
     repository.ensure_source_table()
     config = backtest_config(args)
+    if args.command == "holdout":
+        training_cutoffs = monthly_cutoffs(
+            args.train_start_cutoff,
+            args.train_end_cutoff,
+        )
+        holdout_cutoffs = monthly_cutoffs(
+            args.start_cutoff,
+            args.end_cutoff,
+        )
+        stats = repository.source_stats()
+        validate_source_window(
+            stats,
+            cutoffs=[*training_cutoffs, *holdout_cutoffs],
+            lookback_days=config.lookback_days,
+            outcome_days=config.outcome_days,
+        )
+        temporal_run = run_temporal_holdout_backtest(
+            repository,
+            config=config,
+            training_cutoffs=training_cutoffs,
+            holdout_cutoffs=holdout_cutoffs,
+        )
+        output_dir = args.output_dir or default_output_dir(args.command)
+        artifacts = write_temporal_holdout_artifacts(
+            temporal_run,
+            output_dir=output_dir,
+            source_stats=stats,
+            config=config,
+        )
+        log.info(
+            "temporal_holdout_artifacts_created",
+            {
+                "trainingResultCount": len(temporal_run.training_run.results),
+                "holdoutResultCount": len(temporal_run.holdout_run.results),
+                "outputDir": output_dir,
+                "reportPath": artifacts["report"],
+                "summaryPath": artifacts["summary"],
+                "modelPath": artifacts["model"],
+            },
+        )
+        log.info(
+            "completed",
+            {
+                "mode": args.command,
+                "trainingResultCount": len(temporal_run.training_run.results),
+                "holdoutResultCount": len(temporal_run.holdout_run.results),
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return 0
+
     cutoffs = resolve_cutoffs(args)
     stats = repository.source_stats()
     validate_source_window(
@@ -196,6 +251,36 @@ def parse_args() -> argparse.Namespace:
     )
     run.add_argument(
         "--end-cutoff", type=parse_date, default=date(2014, 12, 1)
+    )
+
+    holdout = subparsers.add_parser(
+        "holdout",
+        help=(
+            "Fit contextual booking calibration on 2013 windows and evaluate "
+            "predictions and ranking on untouched 2014 windows."
+        ),
+    )
+    add_connection_arguments(holdout)
+    add_backtest_arguments(holdout, smoke=False)
+    holdout.add_argument(
+        "--train-start-cutoff",
+        type=parse_date,
+        default=date(2013, 5, 1),
+    )
+    holdout.add_argument(
+        "--train-end-cutoff",
+        type=parse_date,
+        default=date(2013, 12, 1),
+    )
+    holdout.add_argument(
+        "--start-cutoff",
+        type=parse_date,
+        default=date(2014, 1, 1),
+    )
+    holdout.add_argument(
+        "--end-cutoff",
+        type=parse_date,
+        default=date(2014, 12, 1),
     )
     return parser.parse_args()
 
