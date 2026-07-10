@@ -5,7 +5,7 @@ import json
 import re
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -17,6 +17,15 @@ from app.analysis.raw_event_segments import (
     generate_raw_event_segment_definitions,
 )
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
+from app.analysis.segment_performance import (
+    MODEL_CANDIDATE_TYPES,
+    CalibrationTrainingExample,
+    LogisticSegmentPerformanceModel,
+    SegmentPerformanceFeatures,
+    SegmentPerformancePredictor,
+    fit_logistic_segment_performance_model,
+    write_segment_performance_model,
+)
 from app.logging import duration_ms, log, log_context_scope, now_ms
 
 
@@ -170,6 +179,9 @@ class ExpediaBacktestResult:
     sample_size: int
     total_eligible_user_count: int
     matching_profile_count: int
+    performance_features: Mapping[str, Any]
+    prediction_method: str
+    prediction_model_version: str
     predicted_conversion_rate: float
     actual_contextual_conversion_rate: float
     actual_any_conversion_rate: float
@@ -208,6 +220,13 @@ class ExpediaBacktestSkippedScenario:
 class ExpediaBacktestRun:
     results: tuple[ExpediaBacktestResult, ...]
     skipped_scenarios: tuple[ExpediaBacktestSkippedScenario, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ExpediaTemporalHoldoutRun:
+    training_run: ExpediaBacktestRun
+    holdout_run: ExpediaBacktestRun
+    calibration_model: LogisticSegmentPerformanceModel
 
 
 class ExpediaBacktestRepository(Protocol):
@@ -461,9 +480,11 @@ class ExpediaSegmentBacktestService:
         repository: ExpediaBacktestRepository,
         *,
         config: ExpediaBacktestConfig,
+        performance_predictor: SegmentPerformancePredictor | None = None,
     ) -> None:
         self._repository = repository
         self._config = config
+        self._performance_predictor = performance_predictor
 
     @log_context_scope
     def run(self, cutoffs: Sequence[datetime]) -> ExpediaBacktestRun:
@@ -535,6 +556,7 @@ class ExpediaSegmentBacktestService:
                     profiles=profiles,
                     max_suggested_segments=self._config.max_suggested_segments,
                     min_sample_size=self._config.min_sample_size,
+                    performance_predictor=self._performance_predictor,
                 )
                 if not segments:
                     skipped.append(
@@ -579,6 +601,96 @@ class ExpediaSegmentBacktestService:
             },
         )
         return response
+
+
+def run_temporal_holdout_backtest(
+    repository: ExpediaBacktestRepository,
+    *,
+    config: ExpediaBacktestConfig,
+    training_cutoffs: Sequence[datetime],
+    holdout_cutoffs: Sequence[datetime],
+) -> ExpediaTemporalHoldoutRun:
+    if not training_cutoffs or not holdout_cutoffs:
+        raise ValueError("training and holdout cutoffs must not be empty")
+    normalized_training = tuple(
+        value
+        for cutoff in training_cutoffs
+        if (value := _as_utc_datetime(cutoff)) is not None
+    )
+    normalized_holdout = tuple(
+        value
+        for cutoff in holdout_cutoffs
+        if (value := _as_utc_datetime(cutoff)) is not None
+    )
+    training_outcome_end = max(normalized_training) + timedelta(
+        days=config.outcome_days
+    )
+    if training_outcome_end > min(normalized_holdout):
+        raise ValueError(
+            "training outcomes must end before the first holdout cutoff"
+        )
+
+    training_config = replace(
+        config,
+        max_suggested_segments=max(
+            config.max_suggested_segments,
+            len(MODEL_CANDIDATE_TYPES),
+        ),
+    )
+    training_feature_run = ExpediaSegmentBacktestService(
+        repository,
+        config=training_config,
+    ).run(normalized_training)
+    examples = calibration_examples_from_run(training_feature_run)
+    model = fit_logistic_segment_performance_model(
+        examples,
+        training_metadata={
+            "target": "future_contextual_booking_rate",
+            "training_start_cutoff": min(normalized_training).isoformat(),
+            "training_end_cutoff": max(normalized_training).isoformat(),
+            "outcome_days": config.outcome_days,
+            "user_sample_modulo": config.user_sample_modulo,
+            "profile_pool_limit": config.profile_pool_limit,
+        },
+    )
+    training_run = ExpediaSegmentBacktestService(
+        repository,
+        config=training_config,
+        performance_predictor=model,
+    ).run(normalized_training)
+    holdout_run = ExpediaSegmentBacktestService(
+        repository,
+        config=config,
+        performance_predictor=model,
+    ).run(normalized_holdout)
+    return ExpediaTemporalHoldoutRun(
+        training_run=training_run,
+        holdout_run=holdout_run,
+        calibration_model=model,
+    )
+
+
+def calibration_examples_from_run(
+    run: ExpediaBacktestRun,
+) -> list[CalibrationTrainingExample]:
+    examples: list[CalibrationTrainingExample] = []
+    for result in run.results:
+        if result.sample_size <= 0:
+            continue
+        examples.append(
+            CalibrationTrainingExample(
+                features=SegmentPerformanceFeatures.from_json(
+                    result.performance_features
+                ),
+                success_count=result.contextual_booking_user_count,
+                sample_size=result.sample_size,
+            )
+        )
+    if len(examples) < 2:
+        raise ExpediaBacktestError(
+            "training backtest produced too few calibration examples"
+        )
+    return examples
 
 
 def validate_train_csv_header(path: Path) -> None:
@@ -660,7 +772,11 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
         for scenario_results in evaluable_grouped.values()
         for result in scenario_results
     ]
+    calibration_results = results
     rank_one = [result for result in evaluable_results if result.rank == 1]
+    calibration_rank_one = [
+        result for result in calibration_results if result.rank == 1
+    ]
     rank_one_is_best = 0
     for scenario_results in evaluable_grouped.values():
         rank_one_result = next(
@@ -700,6 +816,7 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             "mean_calibration_error_percentage_points": _mean(
                 result.calibration_error_percentage_points for result in candidates
             ),
+            "brier_score": _brier_score(candidates),
         }
     return {
         "scenario_count": len(grouped),
@@ -735,7 +852,22 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             result.absolute_lift_percentage_points for result in rank_one
         ),
         "rank_one_mean_calibration_error_percentage_points": _mean(
-            result.calibration_error_percentage_points for result in rank_one
+            result.calibration_error_percentage_points
+            for result in calibration_rank_one
+        ),
+        "rank_one_brier_score": _brier_score(calibration_rank_one),
+        "all_candidate_mean_absolute_error_percentage_points": _mean(
+            result.calibration_error_percentage_points
+            for result in calibration_results
+        ),
+        "all_candidate_brier_score": _brier_score(calibration_results),
+        "all_candidate_prediction_bias_percentage_points": _mean(
+            (
+                result.predicted_conversion_rate
+                - result.actual_contextual_conversion_rate
+            )
+            * 100.0
+            for result in calibration_results
         ),
         "rank_one_beats_baseline_rate": _safe_rate(
             sum(
@@ -797,6 +929,64 @@ def write_backtest_artifacts(
     }
 
 
+def write_temporal_holdout_artifacts(
+    run: ExpediaTemporalHoldoutRun,
+    *,
+    output_dir: Path,
+    source_stats: ExpediaSourceStats,
+    config: ExpediaBacktestConfig,
+) -> dict[str, Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    training_paths = write_backtest_artifacts(
+        run.training_run,
+        output_dir=output_dir / "training-2013",
+        source_stats=source_stats,
+        config=replace(
+            config,
+            max_suggested_segments=max(
+                config.max_suggested_segments,
+                len(MODEL_CANDIDATE_TYPES),
+            ),
+        ),
+    )
+    holdout_paths = write_backtest_artifacts(
+        run.holdout_run,
+        output_dir=output_dir / "holdout-2014",
+        source_stats=source_stats,
+        config=config,
+    )
+    model_path = output_dir / "contextual_booking_calibration_v1.json"
+    write_segment_performance_model(run.calibration_model, model_path)
+    summary_path = output_dir / "temporal_holdout_summary.json"
+    summary = {
+        "split": {
+            "training": "2013",
+            "holdout": "2014",
+            "target": "future_contextual_booking_rate",
+        },
+        "config": asdict(config),
+        "model": run.calibration_model.to_json(),
+        "training_metrics": summarize_backtest(run.training_run),
+        "holdout_metrics": summarize_backtest(run.holdout_run),
+    }
+    summary_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
+        encoding="utf-8",
+    )
+    report_path = output_dir / "temporal_holdout_report.md"
+    report_path.write_text(
+        _temporal_holdout_markdown_report(summary),
+        encoding="utf-8",
+    )
+    return {
+        "model": model_path,
+        "summary": summary_path,
+        "report": report_path,
+        "training_results": training_paths["results"],
+        "holdout_results": holdout_paths["results"],
+    }
+
+
 def validate_table_identifier(value: str) -> str:
     if not _TABLE_IDENTIFIER.fullmatch(value):
         raise ValueError(f"invalid ClickHouse table identifier: {value!r}")
@@ -831,6 +1021,7 @@ def _evaluate_segments(
         actual_any_rate = _safe_rate(any_count, sample_size)
         performance_estimate = segment.profile_json.get("performance_estimate", {})
         predicted_rate = float(performance_estimate.get("value", 0.0) or 0.0)
+        performance_features = segment.profile_json.get("performance_features", {})
         signal_metrics = segment.profile_json.get("signal_metrics", {})
         absolute_lift = (actual_contextual_rate - baseline_contextual_rate) * 100.0
         relative_lift = (
@@ -856,6 +1047,13 @@ def _evaluate_segments(
                 total_eligible_user_count=len(eligible),
                 matching_profile_count=int(
                     signal_metrics.get("matching_profile_count", sample_size) or 0
+                ),
+                performance_features=dict(performance_features),
+                prediction_method=str(
+                    performance_estimate.get("method", "unknown")
+                ),
+                prediction_model_version=str(
+                    performance_estimate.get("model_version", "unknown")
                 ),
                 predicted_conversion_rate=predicted_rate,
                 actual_contextual_conversion_rate=actual_contextual_rate,
@@ -1167,6 +1365,52 @@ def _markdown_report(
     return "\n".join(lines)
 
 
+def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
+    training = summary["training_metrics"]
+    holdout = summary["holdout_metrics"]
+    model = summary["model"]
+    return "\n".join(
+        [
+            "# Expedia 2013 학습 / 2014 홀드아웃 검증",
+            "",
+            "## 시간 분리",
+            "",
+            "- 2013년 기준일 이전 행동과 이후 30일 목적지 예약으로 보정식을 학습했습니다.",
+            "- 2014년 결과는 학습에 사용하지 않고 최종 예상값과 Rank 검증에만 사용했습니다.",
+            f"- 학습 예시: {model['training_metadata']['training_example_count']}개",
+            "",
+            "## 2014년 홀드아웃 결과",
+            "",
+            f"- 평가 시나리오: {holdout['scenario_count']}개",
+            "- Rank 1이 실제 최고 후보였던 비율: "
+            f"{_format_percent(holdout['rank_one_is_best_rate'])}",
+            "- Rank 1이 기준선을 이긴 비율: "
+            f"{_format_percent(holdout['rank_one_beats_baseline_rate'])}",
+            "- Rank 1 평균 절대 오차: "
+            f"{holdout['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
+            f"- Rank 1 Brier score: {holdout['rank_one_brier_score']:.6f}",
+            "- 전체 후보 평균 절대 오차: "
+            f"{holdout['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
+            f"- 전체 후보 Brier score: {holdout['all_candidate_brier_score']:.6f}",
+            "- 전체 후보 예측 편향: "
+            f"{holdout['all_candidate_prediction_bias_percentage_points']:.2f}%p",
+            "",
+            "## 학습 구간 참고 지표",
+            "",
+            f"- 학습 시나리오: {training['scenario_count']}개",
+            "- 학습 Rank 1 실제 최고 후보 비율: "
+            f"{_format_percent(training['rank_one_is_best_rate'])}",
+            "",
+            "## 해석 주의사항",
+            "",
+            "- Expedia에는 실제 광고 노출 대조군이 없으므로 미래 목적지 예약 가능성을 검증한 결과입니다.",
+            "- 홀드아웃의 MAE와 Brier score가 낮아져야 예상 전환율의 절대값을 신뢰할 수 있습니다.",
+            "- `user_sample_modulo=1`은 해시 표본 없이 전체 원천 데이터에서 운영과 같은 후보 풀을 조회합니다.",
+            "",
+        ]
+    )
+
+
 def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
@@ -1247,6 +1491,20 @@ def _mean(values: Any) -> float:
     if not items:
         return 0.0
     return sum(items) / len(items)
+
+
+def _brier_score(results: Sequence[ExpediaBacktestResult]) -> float:
+    total_users = sum(result.sample_size for result in results)
+    if total_users <= 0:
+        return 0.0
+    total_error = 0.0
+    for result in results:
+        prediction = max(0.0, min(1.0, result.predicted_conversion_rate))
+        successes = result.contextual_booking_user_count
+        failures = max(result.sample_size - successes, 0)
+        total_error += successes * (1.0 - prediction) ** 2
+        total_error += failures * prediction**2
+    return total_error / total_users
 
 
 def _format_percent(value: float) -> str:
