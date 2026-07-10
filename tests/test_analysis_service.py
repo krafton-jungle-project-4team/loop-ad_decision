@@ -798,6 +798,52 @@ def test_service_preserves_existing_generation_primary_signals() -> None:
     }
 
 
+def test_service_excludes_empty_and_unstructured_generation_evidence() -> None:
+    promotion = promotion_record(channel="email")
+    invalid_profile = {
+        "primary_segment": "seg_ai_cluster_promo_email_001_1_invalid",
+        "source": "user_vector_clustering",
+        "primary_signals": "not-a-sequence",
+        "score_components": ["not-a-mapping"],
+        "promotion_vector_basis": {},
+        "promotion_matched_features": [],
+        "top_common_features": ["Campaign redirect users"],
+        "recommendation_score": 0.91,
+    }
+    ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_email_001_1_invalid",
+            source="ai_suggested",
+            sample_size=120,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json=invalid_profile,
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester([ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    target_segment = result.target_segments[0]
+    assert target_segment.profile_json == invalid_profile
+    assert "audience_evidence" not in target_segment.content_brief_json
+    assert target_segment.content_brief_json["readiness"]["level"] == "fallback_only"
+    assert target_segment.content_brief_json["readiness"]["missing_sections"] == [
+        "primary_signals",
+        "score_components",
+    ]
+
+
 def test_service_ranks_ai_clusters_by_booking_propensity_model() -> None:
     promotion = promotion_record(channel="onsite_banner")
     high_cluster_low_booking = replace(
