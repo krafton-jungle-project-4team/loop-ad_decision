@@ -20,12 +20,13 @@ from app.generation.artifacts import (
     public_asset_url,
 )
 from app.generation.generator import GeneratedContent
+from app.generation.image_prompt_builder import RichImagePromptBuilder
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel, CreativeFormat
 from app.logging import log, duration_ms
 
 
-EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v2"
+EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v3"
 DEFAULT_OPENAI_CONTENT_MODEL = "gpt-4o-mini"
 DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
@@ -40,7 +41,6 @@ TEXT_FIELD_NAMES = (
     "message",
     "image_prompt",
 )
-FALLBACK_IMAGE_PROMPT_MAX_LENGTH = 240
 
 
 class ContentTextClient(Protocol):
@@ -422,11 +422,7 @@ class ExternalContentGenerator:
             channel=channel,
             values=values,
             landing_url=prompt_input.promotion.landing_url,
-            visual_direction=(
-                prompt_result.strategy_plan.visual_direction
-                if prompt_result.strategy_plan is not None
-                else ()
-            ),
+            prompt_result=prompt_result,
         )
 
         if channel != ContentChannel.ONSITE_BANNER or not self._generate_images:
@@ -561,14 +557,14 @@ def _generated_content_from_values(
     channel: ContentChannel,
     values: Mapping[str, str | None],
     landing_url: str | None,
-    visual_direction: tuple[str, ...] = (),
+    prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
     if not landing_url:
         raise ValueError("promotion.landing_url is required to generate content")
     values = _values_with_banner_image_prompt(
         channel=channel,
         values=values,
-        visual_direction=visual_direction,
+        prompt_result=prompt_result,
     )
     values = _values_with_sms_redirect_placeholder(channel=channel, values=values)
     content = GeneratedContent(
@@ -603,41 +599,16 @@ def _values_with_banner_image_prompt(
     *,
     channel: ContentChannel,
     values: Mapping[str, str | None],
-    visual_direction: tuple[str, ...] = (),
+    prompt_result: PromptBuildResult,
 ) -> Mapping[str, str | None]:
-    if channel != ContentChannel.ONSITE_BANNER or _optional_text(
-        values.get("image_prompt")
-    ):
+    if channel != ContentChannel.ONSITE_BANNER:
         return values
 
-    image_prompt = _fallback_banner_image_prompt(
-        values,
-        visual_direction=visual_direction,
+    image_prompt = RichImagePromptBuilder().build(
+        prompt_result,
+        provider_visual_concept=_optional_text(values.get("image_prompt")),
     )
-    if not image_prompt:
-        return values
     return {**values, "image_prompt": image_prompt}
-
-
-def _fallback_banner_image_prompt(
-    values: Mapping[str, str | None],
-    *,
-    visual_direction: tuple[str, ...] = (),
-) -> str | None:
-    title = _optional_text(values.get("title"))
-    body = _optional_text(values.get("body"))
-    cta = _optional_text(values.get("cta"))
-    prompt_parts = [part for part in (title, body, cta) if part]
-    if not prompt_parts:
-        return None
-
-    visual_prefix = (
-        f"{', '.join(visual_direction)}, "
-        if visual_direction
-        else "Bright modern hotel booking onsite banner image, "
-    )
-    prompt = visual_prefix + "clean travel layout, " + " ".join(prompt_parts)
-    return _compact_text(prompt, max_length=FALLBACK_IMAGE_PROMPT_MAX_LENGTH)
 
 
 def _system_instruction(channel: ContentChannel) -> str:
@@ -707,13 +678,6 @@ def _optional_text(value: object) -> str | None:
         return None
     text = str(value).strip()
     return text or None
-
-
-def _compact_text(value: str, *, max_length: int) -> str:
-    compacted = " ".join(value.split())
-    if len(compacted) <= max_length:
-        return compacted
-    return compacted[: max_length - 1].rstrip() + "."
 
 
 def _asset_key(

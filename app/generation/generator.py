@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.generation.image_prompt_builder import RichImagePromptBuilder
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import ContentChannel, missing_channel_fields
 
 
-CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v3"
+CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v4"
 
 
 @dataclass(frozen=True)
@@ -213,7 +214,7 @@ def _banner_content(
             max_length=180,
         ),
         cta="호텔 정보 보기",
-        image_prompt=_strategy_image_prompt(prompt_result),
+        image_prompt=RichImagePromptBuilder().build(prompt_result),
         landing_url=landing_url,
     )
 
@@ -250,20 +251,6 @@ def _audience_label(values: tuple[str, ...]) -> str | None:
         if any(term in normalized for term in terms):
             return label
     return "선택된 호텔 고객군"
-
-
-def _strategy_image_prompt(prompt_result: PromptBuildResult) -> str:
-    strategy_plan = prompt_result.strategy_plan
-    if strategy_plan is not None and strategy_plan.visual_direction:
-        visual_direction = ", ".join(strategy_plan.visual_direction)
-        return (
-            f"{visual_direction}, hotel booking onsite banner, clean travel "
-            "layout, no visible text"
-        )
-    return (
-        "modern hotel room summer promotion banner, clean bright travel "
-        "layout, no visible text"
-    )
 
 
 def _variant(option_index: int, values: tuple[str, ...]) -> str:
