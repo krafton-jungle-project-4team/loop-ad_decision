@@ -62,10 +62,14 @@ def test_external_content_generator_stores_banner_image_url() -> None:
     )
 
     assert content.title == "이번 주말 호텔 특가"
-    assert content.image_prompt == "bright hotel suite banner, no visible text"
+    assert content.image_prompt is not None
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
+    assert "no visible text" in content.image_prompt
     assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url == IMAGE_URL
-    assert image_client.prompts == ["bright hotel suite banner, no visible text"]
+    assert image_client.prompts == [content.image_prompt]
     assert asset_storage.saved == [
         (
             "content_banner_repeat_hotel_001",
@@ -98,7 +102,10 @@ def test_external_content_generator_can_defer_banner_image_generation() -> None:
     )
 
     assert content.title == "이번 주말 호텔 특가"
-    assert content.image_prompt == "bright hotel suite banner, no visible text"
+    assert content.image_prompt is not None
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
     assert content.image_url is None
     assert image_client.prompts == []
     assert asset_storage.saved == []
@@ -127,7 +134,9 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
     )
 
     assert content.image_prompt is not None
-    assert content.image_prompt.startswith("Bright modern hotel booking onsite banner")
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
     assert content.image_url == IMAGE_URL
     assert image_client.prompts == [content.image_prompt]
     assert len(asset_storage.saved) == 1

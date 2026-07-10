@@ -112,7 +112,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "channel": "onsite_banner",
     }
     assert generation_run.output_json is not None
-    assert generation_run.output_json["report_version"] == "dec-c4.v2"
+    assert generation_run.output_json["report_version"] == "dec-c4.v3"
     assert generation_run.output_json["content_candidate_ids"] == [
         "content_banner_repeat_hotel_001",
         "content_banner_repeat_hotel_002",
@@ -135,9 +135,9 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "status": "completed",
         "content_candidate_count": 2,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v3",
-        "content_generator": "dec-c3.deterministic.v3",
-        "report_builder": "dec-c4.v2",
+        "prompt_builder": "dec-c2.v4",
+        "content_generator": "dec-c3.deterministic.v4",
+        "report_builder": "dec-c4.v3",
     }
 
     assert len(content_candidate_repository.saved) == 2
@@ -157,11 +157,11 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
-    assert first_candidate.metadata_json["report_version"] == "dec-c4.v2"
-    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v3"
+    assert first_candidate.metadata_json["report_version"] == "dec-c4.v3"
+    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v4"
     assert (
         first_candidate.metadata_json["content_generator_version"]
-        == "dec-c3.deterministic.v3"
+        == "dec-c3.deterministic.v4"
     )
     assert first_candidate.metadata_json["reason_summary"] == (
         first_candidate.reason_summary
@@ -472,7 +472,7 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     generation_run = generation_run_repository.saved[0]
     assert generation_run.status == "failed"
     assert generation_run.output_json == {
-        "report_version": "dec-c4.v2",
+        "report_version": "dec-c4.v3",
         "content_candidate_ids": [],
         "generation_summary": {
             "status": "failed",
@@ -487,9 +487,9 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
         "status": "failed",
         "content_candidate_count": 0,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v3",
-        "content_generator": "dec-c3.deterministic.v3",
-        "report_builder": "dec-c4.v2",
+        "prompt_builder": "dec-c2.v4",
+        "content_generator": "dec-c3.deterministic.v4",
+        "report_builder": "dec-c4.v3",
         "error_code": "content_generation_failed",
     }
     assert content_candidate_repository.saved == []
@@ -860,12 +860,8 @@ def test_generation_service_applies_candidate_strategy_to_content_and_metadata()
         "brief_fingerprint"
     ]
     assert first_metadata["brief_fingerprint"].startswith("sha256:")
-    assert first_metadata["strategy_key"] == (
-        "booking_confidence__free_cancellation"
-    )
-    assert second_metadata["strategy_key"] == (
-        "booking_confidence__breakfast_included"
-    )
+    assert first_metadata["strategy_key"] == "booking_confidence__near_checkin"
+    assert second_metadata["strategy_key"] == "booking_confidence__mobile"
     assert first_metadata["evidence_refs"] == [
         "primary_signals[0]",
         "promotion_matched_features[0]",
@@ -877,6 +873,8 @@ def test_generation_service_applies_candidate_strategy_to_content_and_metadata()
     assert first_metadata["evidence_refs"] == first_metadata["strategy_plan"][
         "evidence_refs"
     ]
+    assert first_metadata["strategy_plan"]["benefit_focus"] == []
+    assert second_metadata["strategy_plan"]["benefit_focus"] == []
     assert first_metadata["missing_sections"] == []
     assert first_candidate.message_strategy == second_candidate.message_strategy
 
@@ -897,8 +895,57 @@ def test_generation_service_applies_candidate_strategy_to_content_and_metadata()
     assert "모바일로 호텔을 찾는 고객" in second_candidate.body
     assert first_candidate.image_prompt is not None
     assert second_candidate.image_prompt is not None
-    assert "bright hotel room" in first_candidate.image_prompt
-    assert "welcoming hotel lobby" in second_candidate.image_prompt
+    assert "generic hotel booking travel scene" in first_candidate.image_prompt
+    assert "traveler reviewing an accommodation booking" in (
+        second_candidate.image_prompt
+    )
+    assert "goal_metric=booking_conversion_rate" in first_candidate.image_prompt
+    assert "Audience focus: near_checkin, free_cancellation" in (
+        first_candidate.image_prompt
+    )
+    assert "Verified hotel visual context: none" in first_candidate.image_prompt
+    assert "no visible text" in first_candidate.image_prompt
+
+
+def test_generation_service_allows_repeated_strategy_and_content_when_evidence_is_sparse() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(),
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "audience_evidence": {
+                            "primary_signals": ["near_checkin"],
+                            "score_components": {"final_score": 0.91},
+                        },
+                    },
+                )
+            ]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=4))
+
+    candidates = content_candidate_repository.saved
+    assert len(response.content_candidates) == 4
+    assert len(candidates) == 4
+    assert {candidate.metadata_json["strategy_key"] for candidate in candidates} == {
+        "booking_confidence__near_checkin"
+    }
+    assert {
+        tuple(candidate.metadata_json["evidence_refs"])
+        for candidate in candidates
+    } == {("primary_signals[0]",)}
+    assert all(
+        candidate.metadata_json["strategy_plan"]["benefit_focus"] == []
+        for candidate in candidates
+    )
+    assert candidates[0].title == candidates[3].title
+    assert candidates[0].body == candidates[3].body
+    assert candidates[0].image_prompt == candidates[3].image_prompt
 
 
 class StaticGenerationInputBuilder:
