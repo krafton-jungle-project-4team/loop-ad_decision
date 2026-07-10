@@ -291,6 +291,14 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         == 0.35
         for segment in segments
     )
+    assert all(
+        "조건 일치" in segment.profile_json["display_copy"]["audience_summary"]
+        for segment in segments
+    )
+    assert all(
+        "상위" not in segment.profile_json["display_copy"]["audience_summary"]
+        for segment in segments
+    )
 
 
 def test_destination_candidates_are_split_and_contextual_candidates_exclude_other_destinations() -> None:
@@ -404,6 +412,43 @@ def test_destination_candidates_are_split_and_contextual_candidates_exclude_othe
     assert set(
         by_type["benefit_value_seeker"].rule_json["candidate_user_ids"]
     ) == {"benefit_target_1", "benefit_target_2"}
+
+
+def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository([])
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                f"hotel_user_{index:03d}",
+                hotel_detail_view_count=1,
+            )
+            for index in range(170)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=200,
+        vector_sample_limit=200,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="호텔 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.sample_size == 160
+    assert segment.total_eligible_user_count == 170
+    assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
+    assert segment.profile_json["display_copy"]["audience_summary"] == (
+        "분석 대상 170명 중 조건 일치 170명 · 상위 160명 사용"
+    )
 
 
 def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
