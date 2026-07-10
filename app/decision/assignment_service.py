@@ -730,6 +730,10 @@ def _segment_vector_from_record(
     *,
     require_embedding: bool,
 ) -> SegmentVector:
+    if record.source == "fixture":
+        raise SegmentAssignmentValidationError(
+            f"fixture segment vector is not allowed: {record.segment_id}"
+        )
     if record.embedding is None:
         if require_embedding:
             raise SegmentAssignmentValidationError(

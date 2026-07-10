@@ -216,6 +216,43 @@ def test_next_loop_api_rolls_back_and_closes_on_failure(
     assert connection.close_count == 1
 
 
+def test_next_loop_api_maps_segment_vector_data_unavailable_to_validation_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(user_vector_rows=[]),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "segment vector data unavailable"
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+
+
 def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -679,7 +716,10 @@ def segment_definition_row() -> dict[str, object]:
         "query_preview_id": None,
         "natural_language_query": "luxury hotel users",
         "generated_sql": None,
-        "rule_json": {"segment_id": "seg_luxury"},
+        "rule_json": {
+            "segment_id": "seg_luxury",
+            "candidate_user_ids": ["user_luxury_001", "user_luxury_002"],
+        },
         "profile_json": {"primary_segment": "seg_luxury"},
         "sample_size": 1200,
         "total_eligible_user_count": 50000,
@@ -714,7 +754,10 @@ def decision_target_segment_row() -> dict[str, object]:
         **target_segment_row(),
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
-        "rule_json": {"segment_id": "seg_luxury"},
+        "rule_json": {
+            "segment_id": "seg_luxury",
+            "candidate_user_ids": ["user_luxury_001", "user_luxury_002"],
+        },
         "profile_json": {"primary_segment": "seg_luxury"},
         "status": "active",
     }
@@ -819,23 +862,49 @@ def content_candidate_insert_row(params: Any) -> dict[str, object]:
 
 
 class FakeClickHouseResult:
-    result_rows: list[dict[str, object]] = []
+    def __init__(self, rows: list[dict[str, object]] | None = None) -> None:
+        self.result_rows = rows or []
 
     def named_results(self) -> list[dict[str, object]]:
-        return []
+        return self.result_rows
 
 
 class FakeClickHouseClient:
-    close_count = 0
+    def __init__(
+        self,
+        *,
+        user_vector_rows: list[dict[str, object]] | None = None,
+    ) -> None:
+        self.close_count = 0
+        self.user_vector_rows = (
+            user_behavior_vector_rows()
+            if user_vector_rows is None
+            else user_vector_rows
+        )
 
     def query(
         self,
         query: str,
         parameters: dict[str, object] | None = None,
     ) -> FakeClickHouseResult:
-        _ = query
+        sql = compact_sql(query)
         _ = parameters
+        if "from user_behavior_vectors" in sql and "user_id in" in sql:
+            return FakeClickHouseResult(self.user_vector_rows)
         return FakeClickHouseResult()
 
     def close(self) -> None:
         self.close_count += 1
+
+
+def user_behavior_vector_rows() -> list[dict[str, object]]:
+    return [
+        {
+            "project_id": "hotel-client-a",
+            "user_id": "user_luxury_001",
+            "vector_dim": 64,
+            "vector_values": [1.0, *([0.0] * 63)],
+            "vector_version": "v1",
+            "source": "batch_profile",
+        }
+    ]

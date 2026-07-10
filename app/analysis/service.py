@@ -27,7 +27,11 @@ from app.analysis.report_generator import (
     SegmentSuggestionReportInput,
 )
 from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
-from app.analysis.vector_service import SegmentVectorBuildRequest, SegmentVectorBuildResult
+from app.analysis.vector_service import (
+    SegmentVectorBuildRequest,
+    SegmentVectorBuildResult,
+)
+from app.content_brief import build_content_brief_v2
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
@@ -390,7 +394,7 @@ class PromotionAnalysisService:
         segment_definition_repository: SegmentDefinitionReader,
         hotel_profile_repository: HotelProfileReader,
         promotion_analysis_repository: PromotionAnalysisWriter,
-        segment_vector_service: SegmentVectorPreparer | None = None,
+        segment_vector_service: SegmentVectorPreparer,
         segment_suggester: SegmentDefinitionSuggester | None = None,
         segment_report_generator: SegmentSuggestionReportGenerator | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
@@ -745,14 +749,18 @@ class PromotionAnalysisService:
         candidate: SegmentCandidate,
         rank: int,
         operator_instruction: str | None,
-        segment_vector_id: str | None,
+        segment_vector_id: str,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
+        profile_json = _profile_json_with_generation_evidence(segment)
         content_brief_json = self._build_content_brief_json(
-            segment=segment,
+            analysis_id=analysis_id,
+            promotion=promotion,
+            candidate=candidate,
+            profile_json=profile_json,
             operator_instruction=operator_instruction,
+            segment_vector_id=segment_vector_id,
         )
-        profile_json = dict(segment.profile_json)
         if candidate.profile is not None:
             profile_json["hotel_profile"] = dict(candidate.profile.profile_json)
 
@@ -851,7 +859,7 @@ class PromotionAnalysisService:
             "display_copy": display_copy,
         }
         if segment.source == "ai_suggested":
-            metadata_json["ai_report"] = self._segment_report_generator.generate_report(
+            ai_report = self._segment_report_generator.generate_report(
                 SegmentSuggestionReportInput(
                     promotion=promotion,
                     segment=segment,
@@ -862,6 +870,13 @@ class PromotionAnalysisService:
                     reason_json=reason_json,
                 )
             )
+            if _is_raw_event_intent_segment(segment):
+                display_copy = _display_copy_from_report(
+                    display_copy=display_copy,
+                    report=ai_report,
+                )
+                metadata_json["display_copy"] = display_copy
+            metadata_json["ai_report"] = ai_report
         return PromotionSegmentSuggestionWrite(
             suggestion_id=_suggestion_id(
                 analysis_id=analysis_id,
@@ -883,9 +898,14 @@ class PromotionAnalysisService:
     def _build_content_brief_json(
         self,
         *,
-        segment: SegmentDefinitionRecord,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        candidate: SegmentCandidate,
+        profile_json: Mapping[str, Any],
         operator_instruction: str | None,
+        segment_vector_id: str,
     ) -> dict[str, Any]:
+        segment = candidate.definition
         message_direction, keywords = SEGMENT_CONTENT_HINTS.get(
             segment.segment_id,
             (
@@ -893,13 +913,46 @@ class PromotionAnalysisService:
                 ("hotel booking", "seasonal stay", "booking benefit"),
             ),
         )
-        brief: dict[str, Any] = {
-            "message_direction": message_direction,
-            "keywords": list(keywords),
+        score_components = profile_json.get("score_components")
+        if not isinstance(score_components, Mapping):
+            score_components = None
+        audience_evidence: dict[str, Any] = {
+            "primary_signals": profile_json.get("primary_signals"),
+            "score_components": score_components,
+            "promotion_vector_basis": profile_json.get(
+                "promotion_vector_basis"
+            ),
+            "promotion_matched_features": profile_json.get(
+                "promotion_matched_features"
+            ),
         }
-        if operator_instruction:
-            brief["operator_instruction"] = operator_instruction
-        return brief
+        return build_content_brief_v2(
+            analysis_id=analysis_id,
+            segment_snapshot={
+                "segment_id": segment.segment_id,
+                "segment_name": segment.segment_name,
+                "segment_source": segment.source,
+                "estimated_size": max(segment.sample_size, 0),
+                "segment_vector_id": segment_vector_id,
+            },
+            promotion_context={
+                "channel": promotion.channel,
+                "goal_metric": promotion.goal_metric,
+                "goal_basis": promotion.goal_basis,
+                "goal_target_value": _json_decimal(promotion.goal_target_value),
+                "message_brief": promotion.message_brief,
+                "landing_url": promotion.landing_url,
+            },
+            fallback_message_direction=message_direction,
+            fallback_keywords=keywords,
+            audience_evidence=audience_evidence,
+            hotel_profile=(
+                dict(candidate.profile.profile_json)
+                if candidate.profile is not None
+                else None
+            ),
+            operator_instruction=operator_instruction,
+        )
 
     def _build_data_evidence_json(
         self,
@@ -917,6 +970,13 @@ class PromotionAnalysisService:
             "recommendation_score",
             "cluster_quality_score",
             "sample_size_score",
+            "candidate_type",
+            "rank_role",
+            "performance_estimate",
+            "matched_conditions",
+            "missing_conditions",
+            "signal_metrics",
+            "score_components",
         ):
             value = segment.profile_json.get(key)
             if value is not None:
@@ -997,10 +1057,7 @@ class PromotionAnalysisService:
         analysis_id: str,
         promotion: PromotionRecord,
         candidate: SegmentCandidate,
-    ) -> str | None:
-        if self._segment_vector_service is None:
-            return None
-
+    ) -> str:
         result = self._segment_vector_service.prepare_segment_vector(
             SegmentVectorBuildRequest(
                 project_id=promotion.project_id,
@@ -1078,11 +1135,13 @@ def _merge_segment_definitions(
     stored_segments: Sequence[SegmentDefinitionRecord],
     suggested_segments: Sequence[SegmentDefinitionRecord],
 ) -> list[SegmentDefinitionRecord]:
-    merged = {segment.segment_id: segment for segment in stored_segments}
+    merged = {
+        segment.segment_id: segment
+        for segment in stored_segments
+        if segment.source != "ai_suggested"
+    }
     for segment in suggested_segments:
-        existing = merged.get(segment.segment_id)
-        if existing is None or existing.source == "ai_suggested":
-            merged[segment.segment_id] = segment
+        merged[segment.segment_id] = segment
     return list(merged.values())
 
 
@@ -1120,9 +1179,83 @@ def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
     return cleaned
 
 
+def _profile_json_with_generation_evidence(
+    segment: SegmentDefinitionRecord,
+) -> dict[str, Any]:
+    profile_json = dict(segment.profile_json)
+    if "primary_signals" not in profile_json:
+        primary_signal_keys = _primary_signal_keys_from_analysis(segment)
+        if primary_signal_keys:
+            profile_json["primary_signals"] = primary_signal_keys
+
+    score_components = profile_json.get("score_components")
+    if isinstance(score_components, Mapping):
+        profile_json["score_components"] = dict(score_components)
+    return profile_json
+
+
+def _primary_signal_keys_from_analysis(
+    segment: SegmentDefinitionRecord,
+) -> list[str]:
+    raw_event_signal_keys = _raw_event_primary_signal_keys(segment.rule_json)
+    if raw_event_signal_keys:
+        return raw_event_signal_keys
+    return _primary_signal_keys_from_features(segment.profile_json)
+
+
+def _raw_event_primary_signal_keys(rule_json: Mapping[str, Any]) -> list[str]:
+    if rule_json.get("source") != "raw_event_intent":
+        return []
+    conditions = rule_json.get("compiled_conditions")
+    if not isinstance(conditions, Sequence) or isinstance(conditions, str):
+        return []
+
+    signal_keys: list[str] = []
+    seen: set[str] = set()
+    for condition in conditions:
+        signal_key = str(condition).strip()
+        if not signal_key or signal_key in seen:
+            continue
+        signal_keys.append(signal_key)
+        seen.add(signal_key)
+        if len(signal_keys) == 3:
+            break
+    return signal_keys
+
+
+def _primary_signal_keys_from_features(profile_json: Mapping[str, Any]) -> list[str]:
+    signals: list[str] = []
+    seen: set[str] = set()
+    for feature_key in ("promotion_matched_features", "top_common_features"):
+        features = profile_json.get(feature_key)
+        if not isinstance(features, Sequence) or isinstance(features, str):
+            continue
+        for feature in features:
+            signal = _signal_from_feature(str(feature))
+            if signal is None or signal["key"] in seen:
+                continue
+            signals.append(signal["key"])
+            seen.add(signal["key"])
+            if len(signals) == 3:
+                return signals
+    return signals
+
+
 def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
     signals: list[dict[str, str]] = []
     seen: set[str] = set()
+    signal_chips = segment.profile_json.get("signal_chips")
+    if isinstance(signal_chips, Sequence) and not isinstance(signal_chips, str):
+        for chip in signal_chips:
+            chip_text = str(chip).strip()
+            if not chip_text:
+                continue
+            signal_key = _signal_key_from_chip(chip_text)
+            if signal_key in seen:
+                continue
+            signals.append({"key": signal_key, "chip": chip_text})
+            seen.add(signal_key)
+
     matched_features = segment.profile_json.get("promotion_matched_features")
     if isinstance(matched_features, Sequence) and not isinstance(matched_features, str):
         for feature in matched_features:
@@ -1151,6 +1284,10 @@ def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
     return signals[:3]
 
 
+def _signal_key_from_chip(chip: str) -> str:
+    return re.sub(r"[^0-9a-zA-Z가-힣]+", "_", chip).strip("_") or "signal"
+
+
 def _signal_from_feature(feature: str) -> dict[str, str] | None:
     signal_copy = SIGNAL_COPY_BY_FEATURE.get(feature)
     if signal_copy is not None:
@@ -1176,7 +1313,34 @@ def _display_copy(
     sample_size = int(evidence.get("sample_size", target_segment.estimated_size) or 0)
     total_users = int(evidence.get("total_eligible_user_count", 0) or 0)
     sample_ratio = _format_percent(evidence.get("sample_ratio", 0))
-    return {
+    raw_display_copy = target_segment.profile_json.get("display_copy")
+    if isinstance(raw_display_copy, Mapping):
+        display_copy = dict(raw_display_copy)
+        display_copy.setdefault("title", target_segment.segment_name)
+        rank_role = target_segment.profile_json.get("rank_role")
+        if rank_role:
+            display_copy.setdefault("rank_role", rank_role)
+        display_copy.setdefault(
+            "audience_summary",
+            f"분석 대상 {total_users}명 중 {sample_size}명 · {sample_ratio}",
+        )
+        display_copy.setdefault("signal_chips", signal_chips)
+        display_copy.setdefault(
+            "reason",
+            GOAL_REASON_COPY.get(
+                promotion.goal_metric,
+                "호텔 예약 관심 행동이 확인된 고객군입니다.",
+            ),
+        )
+        display_copy.setdefault(
+            "action_hint",
+            CHANNEL_ACTION_COPY.get(
+                promotion.channel,
+                "프로모션 메시지의 우선 타겟으로 적합합니다.",
+            ),
+        )
+        return display_copy
+    display_copy = {
         "title": _display_title(signal_keys),
         "audience_summary": (
             f"분석 대상 {total_users}명 중 {sample_size}명 · {sample_ratio}"
@@ -1191,6 +1355,50 @@ def _display_copy(
             "프로모션 메시지의 우선 타겟으로 적합합니다.",
         ),
     }
+    rank_role = target_segment.profile_json.get("rank_role")
+    if rank_role:
+        display_copy["rank_role"] = rank_role
+    return display_copy
+
+
+def _is_raw_event_intent_segment(segment: SegmentDefinitionRecord) -> bool:
+    return (
+        segment.rule_json.get("source") == "raw_event_intent"
+        or segment.profile_json.get("source") == "raw_event_intent"
+    )
+
+
+def _display_copy_from_report(
+    *,
+    display_copy: Mapping[str, Any],
+    report: Mapping[str, Any],
+) -> dict[str, Any]:
+    enhanced = dict(display_copy)
+    if title := _text_value(report.get("title")):
+        enhanced["title"] = title
+    why_recommended = _text_list(report.get("why_recommended"))
+    if why_recommended:
+        enhanced["reason"] = why_recommended[0]
+    elif summary := _text_value(report.get("summary")):
+        enhanced["reason"] = summary
+    if difference := _text_list(report.get("difference_from_other_ranks")):
+        enhanced["difference_summary"] = difference[0]
+    if action_hint := _text_value(report.get("action_hint")):
+        enhanced["action_hint"] = action_hint
+    return enhanced
+
+
+def _text_value(value: object) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _text_list(value: object) -> list[str]:
+    if isinstance(value, str) or not isinstance(value, Sequence):
+        return []
+    return [text for item in value if (text := _text_value(item))]
 
 
 def _display_title(signal_keys: Sequence[str]) -> str:
@@ -1231,10 +1439,13 @@ def _analysis_reason(focus_segment_ids: Sequence[str] | None) -> str:
 
 
 def _ai_segment_score(segment: SegmentDefinitionRecord) -> float:
-    raw_score = segment.profile_json.get(
-        "recommendation_score",
-        segment.profile_json.get("cluster_score", 0.0),
-    )
+    raw_score = segment.profile_json.get("recommendation_score")
+    if raw_score is None:
+        score_components = segment.profile_json.get("score_components")
+        if isinstance(score_components, Mapping):
+            raw_score = score_components.get("final_score")
+    if raw_score is None:
+        raw_score = segment.profile_json.get("cluster_score", 0.0)
     try:
         return float(raw_score)
     except (TypeError, ValueError):
@@ -1248,6 +1459,9 @@ def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
         "recommendation_score",
         "cluster_quality_score",
         "sample_size_score",
+        "candidate_type",
+        "rank_role",
+        "performance_estimate",
     ):
         value = segment.profile_json.get(key)
         if value is not None:

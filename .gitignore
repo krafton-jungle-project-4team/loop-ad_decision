@@ -20,3 +20,5 @@ dummy.sql
 schema.sql
 
 /agent/
+
+.codegraph

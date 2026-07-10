@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.content_brief import NormalizedContentBrief, normalize_content_brief
 from app.generation.schemas import ContentChannel, GenerationRequest
 
 
@@ -39,6 +40,7 @@ class TargetSegmentPromptInput:
     sample_ratio: str | None = None
     source: str | None = None
     query_preview_id: str | None = None
+    status: str | None = None
 
 
 @dataclass(frozen=True)
@@ -90,56 +92,61 @@ class PromptBuilder:
         promotion = prompt_input.promotion
         target_segment = prompt_input.target_segment
         channel_contract = _channel_contract(promotion.channel)
-        message_strategy = _message_strategy(prompt_input)
+        content_brief = normalize_content_brief(target_segment.content_brief_json)
+        message_strategy = _message_strategy(content_brief)
         reason_summary = _reason_summary(prompt_input)
-        evidence = _data_evidence(prompt_input)
+        evidence = _data_evidence(prompt_input, content_brief)
 
-        generation_prompt = "\n".join(
-            [
-                "Generate one Loop-Ad hotel marketing content candidate.",
-                "Output language: Korean (ko-KR).",
-                (
-                    "Write customer-facing copy fields in natural Korean; "
-                    "keep JSON field names in English."
-                ),
-                (
-                    "Use source segment details as context, but do not copy "
-                    "English source text verbatim into customer-facing copy."
-                ),
-                f"Channel: {promotion.channel.value}",
-                f"Required output fields: {', '.join(channel_contract)}.",
-                f"Project: {promotion.project_id}",
-                f"Campaign: {promotion.campaign_id}",
-                f"Promotion: {promotion.promotion_id}",
-                f"Analysis: {prompt_input.request.analysis_id}",
-                f"Target segment: {target_segment.segment_name} ({target_segment.segment_id})",
-                f"Estimated segment size: {target_segment.estimated_size}",
-                f"Goal: {promotion.goal_metric} {promotion.goal_basis} {promotion.goal_target_value}",
-                f"Fixed landing URL: {promotion.landing_url or 'not provided'}",
-                f"Promotion brief: {promotion.message_brief or 'not provided'}",
-                f"Segment message direction: {_message_direction(target_segment)}",
-                f"Segment keywords: {', '.join(_keywords(target_segment)) or 'not provided'}",
-                f"Message strategy: {message_strategy}",
-                _optional_line(
-                    "Natural language segment query",
-                    target_segment.natural_language_query,
-                ),
-                _optional_line("Generated SQL summary", target_segment.generated_sql),
-                _optional_line(
-                    "Operator instruction",
-                    prompt_input.request.operator_instruction,
-                ),
-                "Return only fields that belong to the requested channel contract.",
-                "Do not generate or override landing_url; Loop-Ad assigns the fixed landing URL.",
-                "Keep the content in the hotel booking domain.",
-            ]
-        )
+        prompt_lines = [
+            "Generate one Loop-Ad hotel marketing content candidate.",
+            "Output language: Korean (ko-KR).",
+            (
+                "Write customer-facing copy fields in natural Korean; "
+                "keep JSON field names in English."
+            ),
+            (
+                "Use source segment details as context, but do not copy "
+                "English source text verbatim into customer-facing copy."
+            ),
+            f"Channel: {promotion.channel.value}",
+            f"Required output fields: {', '.join(channel_contract)}.",
+            f"Project: {promotion.project_id}",
+            f"Campaign: {promotion.campaign_id}",
+            f"Promotion: {promotion.promotion_id}",
+            f"Analysis: {prompt_input.request.analysis_id}",
+            f"Target segment: {target_segment.segment_name} ({target_segment.segment_id})",
+            f"Estimated segment size: {target_segment.estimated_size}",
+            f"Goal: {promotion.goal_metric} {promotion.goal_basis} {promotion.goal_target_value}",
+            f"Fixed landing URL: {promotion.landing_url or 'not provided'}",
+            f"Promotion brief: {promotion.message_brief or 'not provided'}",
+            f"Content brief readiness: {_readiness_level(content_brief)}",
+            f"Fallback message direction: {content_brief.message_direction}",
+            f"Fallback keywords: {', '.join(content_brief.keywords) or 'not provided'}",
+            f"Message strategy: {message_strategy}",
+            _optional_line(
+                "Natural language segment query",
+                target_segment.natural_language_query,
+            ),
+            _optional_line("Generated SQL summary", target_segment.generated_sql),
+            _optional_line(
+                "Operator instruction",
+                prompt_input.request.operator_instruction,
+            ),
+            "Return only fields that belong to the requested channel contract.",
+            "Do not generate or override landing_url; Loop-Ad assigns the fixed landing URL.",
+            "Keep the content in the hotel booking domain.",
+        ]
+        prompt_lines.extend(_content_brief_context_lines(content_brief))
+        generation_prompt = "\n".join(prompt_lines)
 
         metadata = {
             "prompt_builder_version": PROMPT_BUILDER_VERSION,
             "reason_summary": reason_summary,
             "data_evidence": evidence,
             "message_strategy": message_strategy,
+            "content_brief_schema_version": content_brief.schema_version,
+            "content_brief_readiness": content_brief.readiness,
+            "fallback_guidance_used": content_brief.fallback_guidance_used,
             "operator_instruction": prompt_input.request.operator_instruction,
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
@@ -187,13 +194,14 @@ def _channel_contract(channel: ContentChannel) -> tuple[str, ...]:
     return ("title", "body", "cta", "image_prompt")
 
 
-def _message_strategy(prompt_input: GenerationPromptInput) -> str:
-    target_segment = prompt_input.target_segment
-    direction = _message_direction(target_segment)
-    keywords = _keywords(target_segment)
-    if keywords:
-        return f"{direction} Use these hotel audience cues: {', '.join(keywords)}."
-    return direction
+def _message_strategy(content_brief: NormalizedContentBrief) -> str:
+    if content_brief.keywords:
+        return (
+            f"{content_brief.message_direction} "
+            f"Use these fallback hotel audience cues: "
+            f"{', '.join(content_brief.keywords)}."
+        )
+    return content_brief.message_direction
 
 
 def _reason_summary(prompt_input: GenerationPromptInput) -> str:
@@ -205,10 +213,13 @@ def _reason_summary(prompt_input: GenerationPromptInput) -> str:
     )
 
 
-def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
+def _data_evidence(
+    prompt_input: GenerationPromptInput,
+    content_brief: NormalizedContentBrief,
+) -> dict[str, Any]:
     promotion = prompt_input.promotion
     target_segment = prompt_input.target_segment
-    return {
+    evidence: dict[str, Any] = {
         "analysis_id": prompt_input.request.analysis_id,
         "promotion_id": promotion.promotion_id,
         "segment_id": target_segment.segment_id,
@@ -216,26 +227,57 @@ def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
         "segment_vector_id": target_segment.segment_vector_id,
         "estimated_size": target_segment.estimated_size,
         "priority": target_segment.priority,
+        "target_segment_status": target_segment.status,
         "sample_ratio": target_segment.sample_ratio,
         "goal_metric": promotion.goal_metric,
         "goal_basis": promotion.goal_basis,
         "goal_target_value": promotion.goal_target_value,
-        "content_brief_keywords": _keywords(target_segment),
+        "content_brief_schema_version": content_brief.schema_version,
+        "content_brief_readiness": content_brief.readiness,
+        "fallback_guidance_used": content_brief.fallback_guidance_used,
+        "content_brief_keywords": content_brief.keywords,
     }
+    if content_brief.audience_evidence:
+        evidence["audience_evidence"] = content_brief.audience_evidence
+    return evidence
 
 
-def _message_direction(target_segment: TargetSegmentPromptInput) -> str:
-    value = target_segment.content_brief_json.get("message_direction")
+def _readiness_level(content_brief: NormalizedContentBrief) -> str:
+    value = content_brief.readiness.get("level")
     if isinstance(value, str) and value.strip():
         return value.strip()
-    return "Use the segment profile to produce clear hotel booking content."
+    return "fallback_only"
 
 
-def _keywords(target_segment: TargetSegmentPromptInput) -> list[str]:
-    value = target_segment.content_brief_json.get("keywords")
-    if not isinstance(value, Sequence) or isinstance(value, str):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]
+def _content_brief_context_lines(
+    content_brief: NormalizedContentBrief,
+) -> list[str]:
+    lines: list[str] = []
+    if content_brief.audience_evidence:
+        lines.append(f"Audience evidence: {_compact_jsonish(content_brief.audience_evidence)}")
+    do_not_claim = content_brief.generation_constraints.get("do_not_claim")
+    if isinstance(do_not_claim, Sequence) and not isinstance(do_not_claim, str):
+        claims = [str(item).strip() for item in do_not_claim if str(item).strip()]
+        if claims:
+            lines.append(f"Do not claim: {', '.join(claims)}")
+    return lines
+
+
+def _compact_jsonish(value: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key, item in value.items():
+        if isinstance(item, Mapping):
+            if item:
+                parts.append(f"{key}={dict(item)}")
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, str):
+            items = [str(nested_item) for nested_item in item if str(nested_item)]
+            if items:
+                parts.append(f"{key}={items}")
+            continue
+        if item is not None:
+            parts.append(f"{key}={item}")
+    return "; ".join(parts)
 
 
 def _optional_line(label: str, value: str | None) -> str:

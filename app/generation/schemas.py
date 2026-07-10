@@ -88,7 +88,6 @@ class LoopAdAttribution(BaseModel):
     segment_id: str = Field(min_length=1)
     content_id: str = Field(min_length=1)
     content_option_id: str = Field(min_length=1)
-    creative_id: str = Field(min_length=1)
     promotion_channel: ContentChannel
     target_url: str = Field(min_length=1)
     placement_id: str | None = None

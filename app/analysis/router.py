@@ -14,6 +14,7 @@ from app.analysis.repositories import (
     UserBehaviorVectorRepository,
 )
 from app.analysis.report_generator import build_segment_suggestion_report_generator
+from app.analysis.raw_event_segments import build_promotion_intent_extractor
 from app.analysis.schemas import (
     AnalysisRequest,
     AnalysisResponse,
@@ -28,7 +29,11 @@ from app.analysis.service import (
     PromotionNotFoundError,
     SegmentSelectionError,
 )
-from app.analysis.vector_service import SegmentVectorService
+from app.analysis.vector_service import (
+    SegmentVectorDataUnavailableError,
+    SegmentVectorService,
+)
+from app.content_brief import normalize_content_brief
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.dependencies import get_settings
 
@@ -66,6 +71,8 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             ),
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=user_behavior_vector_repository,
+                raw_event_signal_repository=user_behavior_vector_repository,
+                promotion_intent_extractor=build_promotion_intent_extractor(settings),
             ),
             segment_report_generator=segment_report_generator,
         )
@@ -102,6 +109,11 @@ def analyze_promotion(
             status_code=422,
             detail=str(exc),
         ) from exc
+    except SegmentVectorDataUnavailableError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="segment vector data unavailable",
+        ) from exc
     except IntegrityError as exc:
         if _is_unique_violation(exc):
             raise HTTPException(
@@ -130,18 +142,15 @@ def _target_segment_response(
 ) -> TargetSegmentResponse:
     if target_segment.segment_vector_id is None:
         raise RuntimeError("analysis target segment must have segment_vector_id")
-    raw_keywords = target_segment.content_brief_json.get("keywords", [])
-    keywords = raw_keywords if isinstance(raw_keywords, list) else []
+    content_brief = normalize_content_brief(target_segment.content_brief_json)
     return TargetSegmentResponse(
         segment_id=target_segment.segment_id,
         segment_name=target_segment.segment_name,
         segment_vector_id=target_segment.segment_vector_id,
         estimated_size=target_segment.estimated_size,
         content_brief=ContentBriefResponse(
-            message_direction=str(
-                target_segment.content_brief_json.get("message_direction", ""),
-            ),
-            keywords=[str(keyword) for keyword in keywords],
+            message_direction=content_brief.message_direction,
+            keywords=content_brief.keywords,
         ),
     )
 

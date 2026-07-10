@@ -171,7 +171,6 @@ def attribution_for_candidate(
         "segment_id": segment_id,
         "content_id": content_id,
         "content_option_id": content_option_id,
-        "creative_id": content_id,
         "promotion_channel": channel.value,
         "target_url": target_url,
     }

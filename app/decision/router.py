@@ -18,9 +18,13 @@ from app.analysis.repositories import (
     UserBehaviorVectorRepository as AnalysisUserBehaviorVectorRepository,
 )
 from app.analysis.report_generator import build_segment_suggestion_report_generator
+from app.analysis.raw_event_segments import build_promotion_intent_extractor
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 from app.analysis.service import PromotionAnalysisService
-from app.analysis.vector_service import SegmentVectorService
+from app.analysis.vector_service import (
+    SegmentVectorDataUnavailableError,
+    SegmentVectorService,
+)
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.decision.assignment_service import (
     SegmentAssignmentRunNotFoundError,
@@ -263,6 +267,8 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             ),
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=analysis_user_behavior_vector_repository,
+                raw_event_signal_repository=analysis_user_behavior_vector_repository,
+                promotion_intent_extractor=build_promotion_intent_extractor(settings),
             ),
             segment_report_generator=build_segment_suggestion_report_generator(settings),
         )
@@ -435,6 +441,11 @@ async def create_next_loop(
         raise HTTPException(
             status_code=422,
             detail=str(exc),
+        ) from exc
+    except SegmentVectorDataUnavailableError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="segment vector data unavailable",
         ) from exc
     except NextLoopConflictError as exc:
         raise HTTPException(

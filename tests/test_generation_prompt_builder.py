@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -74,6 +75,7 @@ def target_segment_input() -> TargetSegmentPromptInput:
         generated_sql="SELECT user_id FROM hotel_detail_events",
         sample_ratio="0.018000",
         query_preview_id="seg_query_preview_001",
+        status="approved",
     )
 
 
@@ -173,7 +175,132 @@ def test_prompt_builder_includes_channel_contract_and_operator_instruction(
     assert result.message_strategy
     assert result.reason_summary
     assert result.data_evidence_json["segment_id"] == "seg_repeat_hotel_no_booking"
+    assert result.data_evidence_json["target_segment_status"] == "approved"
     assert result.metadata_json["source_query_preview_id"] == "seg_query_preview_001"
+    assert result.metadata_json["content_brief_schema_version"] == "content_brief.v1"
+    assert result.metadata_json["fallback_guidance_used"] is True
+
+
+def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence() -> None:
+    builder = PromptBuilder()
+    target_segment = replace(
+        target_segment_input(),
+        content_brief_json={
+            "schema_version": "content_brief.v2",
+            "readiness": {
+                "level": "fallback_only",
+                "available_sections": [
+                    "segment_snapshot",
+                    "promotion_context",
+                    "fallback_guidance",
+                ],
+                "missing_sections": [
+                    "primary_signals",
+                    "score_components",
+                ],
+            },
+            "segment_snapshot": {
+                "segment_id": "seg_repeat_hotel_no_booking",
+                "segment_name": "Repeat hotel viewers without booking",
+                "segment_source": "system_default",
+                "estimated_size": 1342,
+                "segment_vector_id": "segvec_repeat_hotel_v1",
+            },
+            "promotion_context": {
+                "channel": "onsite_banner",
+                "goal_metric": "booking_conversion_rate",
+                "goal_basis": "all_segments",
+                "goal_target_value": "0.030000",
+                "message_brief": "Drive hotel booking conversion for summer stays.",
+                "landing_url": "https://demo-stay.example.com/summer",
+            },
+            "fallback_guidance": {
+                "message_direction": "Use a refundable hotel booking reminder.",
+                "keywords": ["refundable stay", "same-weekend room"],
+                "source": "legacy_segment_content_hints",
+            },
+        },
+    )
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=target_segment,
+    )
+
+    result = builder.build(prompt_input)
+
+    assert "Content brief readiness: fallback_only" in result.generation_prompt
+    assert "Fallback message direction: Use a refundable hotel booking reminder." in (
+        result.generation_prompt
+    )
+    assert "refundable stay, same-weekend room" in result.generation_prompt
+    assert "Audience evidence:" not in result.generation_prompt
+    assert "primary_signals" not in result.generation_prompt
+    assert "score_components" not in result.generation_prompt
+    assert "behavior_metrics" not in result.generation_prompt
+    assert result.metadata_json["content_brief_schema_version"] == "content_brief.v2"
+    assert result.metadata_json["content_brief_readiness"]["level"] == "fallback_only"
+    assert result.metadata_json["fallback_guidance_used"] is True
+    assert result.data_evidence_json["content_brief_keywords"] == [
+        "refundable stay",
+        "same-weekend room",
+    ]
+
+
+def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> None:
+    builder = PromptBuilder()
+    target_segment = replace(
+        target_segment_input(),
+        content_brief_json={
+            "schema_version": "content_brief.v2",
+            "readiness": {
+                "level": "partial",
+                "available_sections": ["fallback_guidance", "audience_evidence"],
+                "missing_sections": [],
+            },
+            "fallback_guidance": {
+                "message_direction": "Use a hotel booking message.",
+                "keywords": ["hotel booking"],
+                "source": "legacy_segment_content_hints",
+            },
+            "audience_evidence": {
+                "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
+                "score_components": {
+                    "promotion_cluster_similarity": 0.92,
+                    "sample_size_score": 0.71,
+                },
+                "behavior_metrics": {
+                    "booking_conversion_rate": 0.018,
+                },
+            },
+        },
+    )
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=target_segment,
+    )
+
+    result = builder.build(prompt_input)
+
+    assert "Audience evidence:" in result.generation_prompt
+    assert "same_hotel_repeat_view" in result.generation_prompt
+    assert "promotion_cluster_similarity" in result.generation_prompt
+    assert "behavior_metrics" not in result.generation_prompt
+    assert result.metadata_json["content_brief_readiness"] == {
+        "level": "partial",
+        "missing_sections": [],
+        "available_sections": ["fallback_guidance", "audience_evidence"],
+    }
+    assert result.data_evidence_json["audience_evidence"] == {
+        "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
+        "score_components": {
+            "promotion_cluster_similarity": 0.92,
+            "sample_size_score": 0.71,
+        },
+    }
+    assert "behavior_metrics" not in str(result.metadata_json)
+    assert "behavior_metrics" not in str(result.data_evidence_json)
 
 
 def test_prompt_builder_output_does_not_use_legacy_public_terms() -> None:

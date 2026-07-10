@@ -174,7 +174,7 @@ class FakeSegmentVectorService:
             segment_id=request.segment_id,
             segment_vector_id=f"segvec_{request.segment_id}_v1",
             vector_values=[1.0, *([0.0] * 63)],
-            source="fixture",
+            source="decision_analysis",
         )
 
 
@@ -294,7 +294,7 @@ def build_service(
             booking_training_records=booking_training_records,
         ),
         promotion_analysis_repository=analysis_repository,
-        segment_vector_service=segment_vector_service,
+        segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
     )
     return service, analysis_repository, segment_definition_repository
@@ -353,6 +353,7 @@ def test_service_analyzes_email_promotion_and_persists_four_suggestions() -> Non
     )
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
     assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+    assert "primary_signals" not in result.target_segments[0].profile_json
 
 
 def test_service_creates_new_analysis_id_for_repeated_ai_recommendations() -> None:
@@ -575,6 +576,24 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     }
     assert result.target_segments[0].data_evidence_json["source"] == "ai_suggested"
     assert result.target_segments[0].profile_json["cluster_score"] == 0.99
+    assert result.target_segments[0].profile_json["primary_signals"] == [
+        "booking_conversion_ready",
+        "promotion_engaged",
+        "hotel_browsing",
+    ]
+    assert "hotel_booking_interest" not in result.target_segments[0].profile_json[
+        "primary_signals"
+    ]
+    assert result.target_segments[0].content_brief_json["audience_evidence"][
+        "primary_signals"
+    ] == [
+        "booking_conversion_ready",
+        "promotion_engaged",
+        "hotel_browsing",
+    ]
+    assert result.target_segments[0].content_brief_json["readiness"][
+        "missing_sections"
+    ] == ["score_components"]
     assert result.segment_suggestions[0].suggestion_source == "ai_generated"
     assert result.segment_suggestions[0].status == "suggested"
     assert result.segment_suggestions[0].suggested_rank == 1
@@ -591,12 +610,15 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
     ai_report = result.segment_suggestions[0].metadata_json["ai_report"]
-    assert ai_report["version"] == "dec-c8.segment-report.v1"
+    assert ai_report["version"] == "dec.segment-report.v2"
     assert ai_report["title"] == "예약 가능성이 높은 프로모션 반응 고객"
     assert ai_report["summary"]
+    assert ai_report["promotion_interpretation"]
     assert ai_report["why_recommended"]
     assert ai_report["evidence"]
+    assert ai_report["difference_from_other_ranks"]
     assert ai_report["action_hint"]
+    assert ai_report["confidence_label"] in {"high", "medium", "low"}
     assert all(
         forbidden not in str(ai_report)
         for forbidden in ("벡터", "군집", "클러스터", "centroid", "유사도")
@@ -607,6 +629,66 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         analysis_id=result.analysis.analysis_id,
         segment_id=ai_segment.segment_id,
         candidate_user_ids=["user_101", "user_102"],
+    )
+
+
+def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    stale_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_old",
+            source="ai_suggested",
+            sample_size=8000,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["old_user_001", "old_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_old",
+            "source": "raw_event_intent",
+            "recommendation_score": 1.0,
+        },
+    )
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            source="ai_suggested",
+            sample_size=160,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["fresh_user_001", "fresh_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_onsite_banner_001_fresh",
+            "source": "raw_event_intent",
+            "recommendation_score": 0.8,
+        },
+    )
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stale_ai_segment, *default_segments()],
+        segment_suggester=FakeSegmentSuggester([fresh_ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    selected_segment_ids = segment_ids(result.target_segments)
+    assert fresh_ai_segment.segment_id in selected_segment_ids
+    assert stale_ai_segment.segment_id not in selected_segment_ids
+    assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
+    assert all(
+        segment["segment_id"] != stale_ai_segment.segment_id
+        for segment in result.analysis.input_snapshot_json[
+            "available_segment_definitions"
+        ]
     )
 
 
@@ -637,6 +719,9 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
                 "cluster_quality": 0.7,
                 "sample_size": 0.5,
                 "final_score": 0.88,
+            },
+            "behavior_metrics": {
+                "booking_conversion_rate": 0.018,
             },
             "promotion_matched_features": [
                 "Campaign redirect users",
@@ -681,6 +766,152 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
         "reason": "예약 전환 목표에 가까운 행동 패턴을 보인 고객군입니다.",
         "action_hint": "이메일 예약 혜택 메시지의 우선 타겟으로 적합합니다.",
     }
+    target_profile = result.target_segments[0].profile_json
+    assert target_profile["primary_signals"] == [
+        "campaign_redirect",
+        "hotel_market_affinity",
+        "free_cancellation",
+    ]
+    assert target_profile["score_components"] == {
+        "promotion_cluster_similarity": 0.92,
+        "cluster_quality": 0.7,
+        "sample_size": 0.5,
+        "final_score": 0.88,
+    }
+    content_brief = result.target_segments[0].content_brief_json
+    assert content_brief["readiness"]["level"] == "partial"
+    assert content_brief["readiness"]["missing_sections"] == []
+    assert content_brief["audience_evidence"]["primary_signals"] == [
+        "campaign_redirect",
+        "hotel_market_affinity",
+        "free_cancellation",
+    ]
+    assert content_brief["audience_evidence"]["score_components"] == {
+        "promotion_cluster_similarity": 0.92,
+        "cluster_quality": 0.7,
+        "sample_size": 0.5,
+        "final_score": 0.88,
+    }
+    assert "behavior_metrics" not in content_brief["audience_evidence"]
+    assert "behavior_metrics" not in str(content_brief)
+
+
+def test_service_uses_raw_event_conditions_for_generation_primary_signals() -> None:
+    promotion = promotion_record(channel="email")
+    ai_segment = replace(
+        segment_record(
+            "seg_ai_raw_promo_email_001_1_funnel_recovery",
+            source="ai_suggested",
+            sample_size=42,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_type": "funnel_recovery",
+                "compiled_conditions": [
+                    "booking_start_without_complete",
+                    "hotel_detail_view",
+                    "recent_destination_search",
+                    "price_sensitive",
+                ],
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_raw_promo_email_001_1_funnel_recovery",
+            "source": "raw_event_intent",
+            "rank_role": "예약 이탈 회수형",
+            "candidate_type": "funnel_recovery",
+            "recommendation_score": 0.84,
+            "score_components": {
+                "promotion_condition_match": 0.8,
+                "expected_goal_performance": 0.7,
+                "final_score": 0.84,
+            },
+            "matched_conditions": [
+                "예약 시작 후 미완료",
+                "호텔 상세 조회",
+                "목적지 숙소 검색",
+            ],
+            "signal_chips": ["예약 시작", "예약 미완료", "호텔 상세 조회"],
+            "signal_metrics": {
+                "booking_start_user_count": 42,
+                "booking_complete_user_count": 0,
+            },
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester([ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    target_segment = result.target_segments[0]
+    expected_primary_signals = [
+        "booking_start_without_complete",
+        "hotel_detail_view",
+        "recent_destination_search",
+    ]
+    assert target_segment.profile_json["primary_signals"] == expected_primary_signals
+    assert target_segment.content_brief_json["audience_evidence"][
+        "primary_signals"
+    ] == expected_primary_signals
+    assert target_segment.content_brief_json["audience_evidence"][
+        "score_components"
+    ] == {
+        "promotion_condition_match": 0.8,
+        "expected_goal_performance": 0.7,
+        "final_score": 0.84,
+    }
+    assert target_segment.content_brief_json["readiness"]["missing_sections"] == []
+    assert "signal_chips" not in target_segment.content_brief_json["audience_evidence"]
+    assert "matched_conditions" not in target_segment.content_brief_json[
+        "audience_evidence"
+    ]
+
+
+def test_service_preserves_existing_generation_primary_signals() -> None:
+    promotion = promotion_record(channel="email")
+    ai_segment = replace(
+        segment_record(
+            "seg_ai_cluster_promo_email_001_1_explicit",
+            source="ai_suggested",
+            sample_size=120,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_cluster_promo_email_001_1_explicit",
+            "source": "user_vector_clustering",
+            "cluster_score": 0.7,
+            "primary_signals": ["explicit_analysis_signal"],
+            "top_common_features": ["Booking conversion ready users"],
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=FakeSegmentSuggester([ai_segment]),
+    )
+
+    result = service.analyze(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert result.target_segments[0].profile_json["primary_signals"] == [
+        "explicit_analysis_signal"
+    ]
+    assert result.target_segments[0].content_brief_json["audience_evidence"][
+        "primary_signals"
+    ] == ["explicit_analysis_signal"]
 
 
 def test_service_ranks_ai_clusters_by_booking_propensity_model() -> None:

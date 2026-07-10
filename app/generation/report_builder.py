@@ -4,6 +4,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+from app.content_brief import NormalizedContentBrief, normalize_content_brief
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import GenerationStatus
 
@@ -33,10 +34,11 @@ class GenerationReportBuilder:
         status: str,
     ) -> CandidateGenerationReport:
         target_segment = prompt_input.target_segment
+        content_brief = normalize_content_brief(target_segment.content_brief_json)
         reason_summary = prompt_result.reason_summary
         message_strategy = prompt_result.message_strategy
         generated_sql_summary = _generated_sql_summary(target_segment.generated_sql)
-        data_evidence = _data_evidence(prompt_input)
+        data_evidence = _data_evidence(prompt_input, content_brief)
 
         metadata = {
             "report_version": GENERATION_REPORT_VERSION,
@@ -47,6 +49,9 @@ class GenerationReportBuilder:
             "reason_summary": reason_summary,
             "data_evidence": data_evidence,
             "message_strategy": message_strategy,
+            "content_brief_schema_version": content_brief.schema_version,
+            "content_brief_readiness": content_brief.readiness,
+            "fallback_guidance_used": content_brief.fallback_guidance_used,
             "operator_instruction": prompt_input.request.operator_instruction,
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
@@ -99,15 +104,18 @@ class GenerationReportBuilder:
         return output_json
 
 
-def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
+def _data_evidence(
+    prompt_input: GenerationPromptInput,
+    content_brief: NormalizedContentBrief,
+) -> dict[str, Any]:
     promotion = prompt_input.promotion
     target_segment = prompt_input.target_segment
-    content_brief = target_segment.content_brief_json
-    keywords = _string_list(content_brief.get("keywords"))
-    top_common_features = _string_list(content_brief.get("top_common_features"))
+    raw_brief = content_brief.raw
+    keywords = content_brief.keywords
+    top_common_features = _string_list(raw_brief.get("top_common_features"))
     goal_target_value = _optional_float(promotion.goal_target_value)
 
-    return {
+    evidence: dict[str, Any] = {
         "analysis_id": prompt_input.request.analysis_id,
         "promotion_id": promotion.promotion_id,
         "segment_id": target_segment.segment_id,
@@ -116,20 +124,27 @@ def _data_evidence(prompt_input: GenerationPromptInput) -> dict[str, Any]:
         "sample_size": target_segment.estimated_size,
         "sample_ratio": _optional_float(target_segment.sample_ratio),
         "booking_conversion_rate": _optional_float(
-            content_brief.get("booking_conversion_rate")
+            raw_brief.get("booking_conversion_rate")
         ),
         "comparison_group_conversion_rate": _optional_float(
-            content_brief.get("comparison_group_conversion_rate")
+            raw_brief.get("comparison_group_conversion_rate")
         ),
         "top_common_features": top_common_features or keywords,
         "priority": target_segment.priority,
+        "target_segment_status": target_segment.status,
         "goal_metric": promotion.goal_metric,
         "goal_basis": promotion.goal_basis,
         "goal_target_value": goal_target_value
         if goal_target_value is not None
         else promotion.goal_target_value,
+        "content_brief_schema_version": content_brief.schema_version,
+        "content_brief_readiness": content_brief.readiness,
+        "fallback_guidance_used": content_brief.fallback_guidance_used,
         "content_brief_keywords": keywords,
     }
+    if content_brief.audience_evidence:
+        evidence["audience_evidence"] = content_brief.audience_evidence
+    return evidence
 
 
 def _segment_summaries(
