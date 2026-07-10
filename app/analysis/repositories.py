@@ -650,6 +650,7 @@ class SegmentVectorRepository:
 
 class UserBehaviorVectorRepository:
     VECTOR_DIM = 64
+    RAW_EVENTS_SOURCE = "raw_events"
 
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
@@ -774,12 +775,30 @@ class UserBehaviorVectorRepository:
         self,
         *,
         project_id: str,
+        vector_version: str = "v1",
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
         limit: int = 1000,
     ) -> list[RawEventUserSignalRecord]:
         result = self._client.query(
             """
+            WITH
+                (
+                    SELECT argMax(window_start, updated_at)
+                    FROM user_behavior_vectors
+                    WHERE project_id = {project_id:String}
+                      AND vector_dim = {vector_dim:UInt16}
+                      AND vector_version = {vector_version:String}
+                      AND source = {vector_source:String}
+                ) AS vector_window_start,
+                (
+                    SELECT argMax(window_end, updated_at)
+                    FROM user_behavior_vectors
+                    WHERE project_id = {project_id:String}
+                      AND vector_dim = {vector_dim:UInt16}
+                      AND vector_version = {vector_version:String}
+                      AND source = {vector_source:String}
+                ) AS vector_window_end
             SELECT
                 project_id,
                 user_id,
@@ -823,12 +842,28 @@ class UserBehaviorVectorRepository:
             WHERE project_id = {project_id:String}
               AND validation_status = 'valid'
               AND notEmpty(user_id)
+              AND event_time >= vector_window_start
+              AND event_time < vector_window_end
+              AND user_id IN (
+                  SELECT user_id
+                  FROM user_behavior_vectors
+                  WHERE project_id = {project_id:String}
+                    AND vector_dim = {vector_dim:UInt16}
+                    AND vector_version = {vector_version:String}
+                    AND source = {vector_source:String}
+                    AND window_start = vector_window_start
+                    AND window_end = vector_window_end
+                  GROUP BY user_id
+              )
             GROUP BY project_id, user_id
             ORDER BY max(event_time) DESC, user_id ASC
             LIMIT {limit:UInt32}
             """,
             parameters={
                 "project_id": project_id,
+                "vector_dim": self.VECTOR_DIM,
+                "vector_version": vector_version,
+                "vector_source": self.RAW_EVENTS_SOURCE,
                 "limit": limit,
             },
         )

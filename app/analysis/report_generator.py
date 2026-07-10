@@ -18,7 +18,7 @@ from app.generation.adapters import (
     _parse_output_json,
     _post_json,
 )
-from app.logging import duration_ms, log
+from app.logging import duration_ms, log, log_context_scope
 
 
 REPORT_GENERATOR_VERSION = "dec.segment-report.v2"
@@ -46,6 +46,7 @@ class SegmentSuggestionReportInput:
 
 
 class DeterministicSegmentSuggestionReportGenerator:
+    @log_context_scope
     def generate_report(
         self,
         report_input: SegmentSuggestionReportInput,
@@ -114,14 +115,19 @@ class OpenAISegmentSuggestionReportGenerator:
             "Content-Type": "application/json",
         }
         started_at = perf_counter()
-        log.info(
-            "segment_report_provider_request_prepared",
+        log.assign_context(
             {
-                "provider": "openai",
-                "endpoint": self._endpoint,
-                "model": self._model,
                 "promotionId": report_input.promotion.promotion_id,
                 "segmentId": report_input.segment.segment_id,
+                "provider": "openai",
+                "model": self._model,
+            }
+        )
+        log.info(
+            "provider_request_prepared",
+            {
+                "providerOperation": "segment_suggestion_report",
+                "endpoint": self._endpoint,
             },
         )
         try:
@@ -134,25 +140,22 @@ class OpenAISegmentSuggestionReportGenerator:
             report = dict(_parse_output_json(response_payload))
         except Exception as exc:
             log.warn(
-                "segment_report_provider_request_failed",
+                "provider_request_failed",
                 {
-                    "provider": "openai",
+                    "providerOperation": "segment_suggestion_report",
                     "endpoint": self._endpoint,
-                    "model": self._model,
-                    "promotionId": report_input.promotion.promotion_id,
-                    "segmentId": report_input.segment.segment_id,
                     "err": exc,
                     "durationMs": duration_ms(started_at),
+                    "fallback": "deterministic",
                 },
             )
             return self._fallback_generator.generate_report(report_input)
 
         log.info(
-            "segment_report_provider_request_completed",
+            "provider_request_completed",
             {
-                "provider": "openai",
+                "providerOperation": "segment_suggestion_report",
                 "endpoint": self._endpoint,
-                "model": self._model,
                 "durationMs": duration_ms(started_at),
             },
         )

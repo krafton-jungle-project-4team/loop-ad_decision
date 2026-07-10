@@ -35,30 +35,6 @@ class FakeUserBehaviorVectorRepository:
         )
         return self.vectors
 
-    def list_by_user_ids(
-        self,
-        *,
-        project_id: str,
-        user_ids: list[str] | tuple[str, ...],
-        vector_version: str = "v1",
-    ) -> list[UserBehaviorVectorRecord]:
-        self.calls.append(
-            {
-                "project_id": project_id,
-                "user_ids": tuple(user_ids),
-                "vector_version": vector_version,
-            }
-        )
-        wanted_user_ids = set(user_ids)
-        return [
-            vector
-            for vector in self.vectors
-            if vector.project_id == project_id
-            and vector.vector_version == vector_version
-            and vector.user_id in wanted_user_ids
-        ]
-
-
 class FakeRawEventSignalRepository:
     def __init__(self, profiles: list[RawEventUserSignalRecord]) -> None:
         self.profiles = profiles
@@ -68,6 +44,7 @@ class FakeRawEventSignalRepository:
         self,
         *,
         project_id: str,
+        vector_version: str = "v1",
         destination_terms: list[str] | tuple[str, ...] = (),
         season_months: list[int] | tuple[int, ...] = (),
         limit: int = 1000,
@@ -75,6 +52,7 @@ class FakeRawEventSignalRepository:
         self.calls.append(
             {
                 "project_id": project_id,
+                "vector_version": vector_version,
                 "destination_terms": tuple(destination_terms),
                 "season_months": tuple(season_months),
                 "limit": limit,
@@ -261,8 +239,8 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         )
     )
 
-    assert vector_reader.calls[0]["project_id"] == "hotel-client-a"
-    assert "user_ids" in vector_reader.calls[0]
+    assert vector_reader.calls == []
+    assert raw_reader.calls[0]["vector_version"] == "v1"
     assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
     assert raw_reader.calls[0]["season_months"] == (6, 7, 8)
     assert len(segments) == 3
@@ -285,6 +263,53 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         "final_score" in segment.profile_json["score_components"]
         for segment in segments
     )
+
+
+def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("user_001", vector_values(0)),
+            user_vector("user_002", vector_values(1)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                user_id,
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                promotion_impression_count=2,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+                booking_start_count=1,
+                deal_event_count=1,
+                destination_match_count=1,
+                season_match_count=1,
+                destination_values=("제주 호텔", "오키나와 호텔"),
+                checkin_dates=("2026-07-10",),
+            )
+            for user_id in ("user_001", "user_002")
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 할인 프로모션으로 예약 전환을 높인다.",
+        )
+    )
+
+    assert len(segments) == 1
+    assert segments[0].rule_json["candidate_user_ids"] == ["user_001", "user_002"]
+    assert vector_reader.calls == []
 
 
 def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
@@ -333,6 +358,8 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     performance_estimate = segments[0].profile_json["performance_estimate"]
     assert performance_estimate["label"] == "예상 유입률"
     assert performance_estimate["metric"] == "inflow_rate"
+    assert performance_estimate["basis_label"] == "최근 행동 벡터 관찰 구간 기반 추정"
+    assert performance_estimate["calibration_status"] == "not_backtested"
     assert segments[0].profile_json["display_copy"]["performance_estimate"] == (
         performance_estimate
     )
@@ -385,12 +412,14 @@ def test_raw_event_suggester_uses_user_level_expected_conversion_rate() -> None:
     assert performance_estimate["label"] == "예상 전환율"
     assert performance_estimate["value"] < 1.0
     assert performance_estimate["formatted"] != "100.0%"
+    assert performance_estimate["observed_value"] == 1.0
+    assert performance_estimate["method"] == "empirical_bayes_user_rate"
     assert segments[0].profile_json["score_components"][
         "expected_goal_performance"
     ] < 1.0
 
 
-def test_raw_event_suggester_uses_only_vector_backed_users() -> None:
+def test_raw_event_suggester_requests_vector_window_signals() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("user_001", vector_values(0)),
@@ -410,13 +439,6 @@ def test_raw_event_suggester_uses_only_vector_backed_users() -> None:
                 "user_002",
                 hotel_search_count=2,
                 hotel_detail_view_count=2,
-                destination_match_count=1,
-                season_match_count=1,
-            ),
-            raw_signal(
-                "raw_only_001",
-                hotel_search_count=10,
-                hotel_detail_view_count=10,
                 destination_match_count=1,
                 season_match_count=1,
             ),
@@ -443,7 +465,15 @@ def test_raw_event_suggester_uses_only_vector_backed_users() -> None:
         "user_001",
         "user_002",
     ]
-    assert "raw_only_001" not in segments[0].rule_json["candidate_user_ids"]
+    assert raw_reader.calls == [
+        {
+            "project_id": "hotel-client-a",
+            "vector_version": "v1",
+            "destination_terms": ("jeju", "제주"),
+            "season_months": (6, 7, 8),
+            "limit": 20,
+        }
+    ]
 
 
 def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> None:

@@ -207,21 +207,12 @@ class UserBehaviorVectorSampler(Protocol):
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
-    def list_by_user_ids(
-        self,
-        *,
-        project_id: str,
-        user_ids: Sequence[str],
-        vector_version: str = DEFAULT_VECTOR_VERSION,
-    ) -> list[UserBehaviorVectorRecord]:
-        ...
-
-
 class RawEventUserSignalSampler(Protocol):
     def list_raw_event_user_signals(
         self,
         *,
         project_id: str,
+        vector_version: str = DEFAULT_VECTOR_VERSION,
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
         limit: int = DEFAULT_VECTOR_POOL_LIMIT,
@@ -307,19 +298,20 @@ class VectorClusterSegmentSuggester:
         log.info("started", {"promotion": promotion})
         sample_seed = _promotion_sample_seed(promotion)
         raw_event_segments = self._suggest_raw_event_segments(promotion=promotion)
-        if len(raw_event_segments) >= self._max_suggested_segments:
+        if raw_event_segments:
+            response = raw_event_segments[: self._max_suggested_segments]
             log.info(
                 "raw_event_intent_segments_created",
                 {
-                    "suggestedSegmentCount": len(raw_event_segments),
+                    "suggestedSegmentCount": len(response),
                     "durationMs": duration_ms(started_at),
                 },
             )
             log.info(
                 "completed",
-                {"response": raw_event_segments, "durationMs": duration_ms(started_at)},
+                {"response": response, "durationMs": duration_ms(started_at)},
             )
-            return raw_event_segments[: self._max_suggested_segments]
+            return response
 
         user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
@@ -384,25 +376,6 @@ class VectorClusterSegmentSuggester:
             },
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
-        if raw_event_segments:
-            raw_segment_ids = {segment.segment_id for segment in raw_event_segments}
-            combined_segments = [
-                *raw_event_segments,
-                *[
-                    segment
-                    for segment in response
-                    if segment.segment_id not in raw_segment_ids
-                ],
-            ][: self._max_suggested_segments]
-            log.info(
-                "raw_event_segments_combined_with_vector_fallback",
-                {
-                    "rawEventSegmentCount": len(raw_event_segments),
-                    "vectorFallbackSegmentCount": len(combined_segments)
-                    - len(raw_event_segments),
-                },
-            )
-            return combined_segments
         return response
 
     def _suggest_raw_event_segments(
@@ -420,19 +393,15 @@ class VectorClusterSegmentSuggester:
             compilation = compile_raw_event_intent(intent)
             profiles = self._raw_event_signal_repository.list_raw_event_user_signals(
                 project_id=promotion.project_id,
+                vector_version=self._vector_version,
                 destination_terms=destination_terms_from_intent(intent),
                 season_months=season_months_from_intent(intent),
                 limit=self._vector_pool_limit,
             )
-            vector_backed_profiles = self._filter_vector_backed_profiles(
-                project_id=promotion.project_id,
-                profiles=profiles,
-            )
             log.info(
-                "raw_event_user_signals_loaded",
+                "raw_event_vector_window_signals_loaded",
                 {
                     "userSignalCount": len(profiles),
-                    "vectorBackedUserCount": len(vector_backed_profiles),
                     "vectorVersion": self._vector_version,
                     "intent": intent.to_json(),
                     "compiledConditionCount": len(compilation.compiled_conditions),
@@ -442,7 +411,7 @@ class VectorClusterSegmentSuggester:
                 promotion=promotion,
                 intent=intent,
                 compilation=compilation,
-                profiles=vector_backed_profiles[: self._vector_sample_limit],
+                profiles=profiles[: self._vector_sample_limit],
                 max_suggested_segments=self._max_suggested_segments,
                 min_sample_size=self._min_cluster_size,
             )
@@ -450,37 +419,10 @@ class VectorClusterSegmentSuggester:
             log.warn(
                 "raw_event_intent_segments_failed",
                 {
-                    "promotionId": promotion.promotion_id,
                     "err": exc,
                 },
             )
             return []
-
-    def _filter_vector_backed_profiles(
-        self,
-        *,
-        project_id: str,
-        profiles: Sequence[RawEventUserSignalRecord],
-    ) -> list[RawEventUserSignalRecord]:
-        if not profiles:
-            return []
-
-        records = self._user_behavior_vector_repository.list_by_user_ids(
-            project_id=project_id,
-            user_ids=[profile.user_id for profile in profiles],
-            vector_version=self._vector_version,
-        )
-        vector_backed_user_ids = {
-            record.user_id
-            for record in records
-            if int(record.vector_dim) == VECTOR_DIM
-            and len(record.vector_values) == VECTOR_DIM
-        }
-        return [
-            profile
-            for profile in profiles
-            if profile.user_id in vector_backed_user_ids
-        ]
 
     def _load_user_vectors(
         self,

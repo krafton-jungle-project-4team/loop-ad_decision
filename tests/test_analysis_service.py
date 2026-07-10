@@ -294,7 +294,7 @@ def build_service(
             booking_training_records=booking_training_records,
         ),
         promotion_analysis_repository=analysis_repository,
-        segment_vector_service=segment_vector_service,
+        segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
     )
     return service, analysis_repository, segment_definition_repository

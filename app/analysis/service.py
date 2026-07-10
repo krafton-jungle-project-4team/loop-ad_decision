@@ -394,7 +394,7 @@ class PromotionAnalysisService:
         segment_definition_repository: SegmentDefinitionReader,
         hotel_profile_repository: HotelProfileReader,
         promotion_analysis_repository: PromotionAnalysisWriter,
-        segment_vector_service: SegmentVectorPreparer | None = None,
+        segment_vector_service: SegmentVectorPreparer,
         segment_suggester: SegmentDefinitionSuggester | None = None,
         segment_report_generator: SegmentSuggestionReportGenerator | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
@@ -749,7 +749,7 @@ class PromotionAnalysisService:
         candidate: SegmentCandidate,
         rank: int,
         operator_instruction: str | None,
-        segment_vector_id: str | None,
+        segment_vector_id: str,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
         content_brief_json = self._build_content_brief_json(
@@ -901,7 +901,7 @@ class PromotionAnalysisService:
         promotion: PromotionRecord,
         candidate: SegmentCandidate,
         operator_instruction: str | None,
-        segment_vector_id: str | None,
+        segment_vector_id: str,
     ) -> dict[str, Any]:
         segment = candidate.definition
         message_direction, keywords = SEGMENT_CONTENT_HINTS.get(
@@ -1055,10 +1055,7 @@ class PromotionAnalysisService:
         analysis_id: str,
         promotion: PromotionRecord,
         candidate: SegmentCandidate,
-    ) -> str | None:
-        if self._segment_vector_service is None:
-            return None
-
+    ) -> str:
         result = self._segment_vector_service.prepare_segment_vector(
             SegmentVectorBuildRequest(
                 project_id=promotion.project_id,

@@ -21,7 +21,7 @@ from app.generation.adapters import (
     _parse_output_json,
     _post_json,
 )
-from app.logging import duration_ms, log
+from app.logging import duration_ms, log, log_context_scope
 
 
 RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v1"
@@ -29,6 +29,7 @@ RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v1"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 RAW_EVENT_CANDIDATE_USER_LIMIT = 160
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
+MAX_RANK_USER_OVERLAP = 0.70
 
 CANDIDATE_TYPE_ORDER = (
     "intent_matched",
@@ -219,6 +220,7 @@ class OpenAIPromotionIntentExtractor:
         self._fallback_extractor = fallback_extractor or DeterministicPromotionIntentExtractor()
         self._transport = transport or _post_json
 
+    @log_context_scope
     def extract(self, promotion: PromotionRecord) -> PromotionIntent:
         payload = {
             "model": self._model,
@@ -258,6 +260,20 @@ class OpenAIPromotionIntentExtractor:
             "Content-Type": "application/json",
         }
         started_at = perf_counter()
+        log.assign_context(
+            {
+                "promotionId": promotion.promotion_id,
+                "provider": "openai",
+                "model": self._model,
+            }
+        )
+        log.info(
+            "provider_request_prepared",
+            {
+                "providerOperation": "promotion_intent_extraction",
+                "endpoint": self._endpoint,
+            },
+        )
         try:
             response_payload = self._transport(
                 self._endpoint,
@@ -265,24 +281,32 @@ class OpenAIPromotionIntentExtractor:
                 payload,
                 self._timeout_seconds,
             )
-            return _intent_from_payload(
+            intent = _intent_from_payload(
                 _parse_output_json(response_payload),
                 promotion=promotion,
                 source="openai",
             )
         except Exception as exc:
             log.warn(
-                "promotion_intent_provider_request_failed",
+                "provider_request_failed",
                 {
-                    "provider": "openai",
+                    "providerOperation": "promotion_intent_extraction",
                     "endpoint": self._endpoint,
-                    "model": self._model,
-                    "promotionId": promotion.promotion_id,
                     "err": exc,
                     "durationMs": duration_ms(started_at),
+                    "fallback": "deterministic",
                 },
             )
             return self._fallback_extractor.extract(promotion)
+        log.info(
+            "provider_request_completed",
+            {
+                "providerOperation": "promotion_intent_extraction",
+                "endpoint": self._endpoint,
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return intent
 
 
 def build_promotion_intent_extractor(settings: Settings) -> PromotionIntentExtractor:
@@ -554,7 +578,6 @@ def _funnel_recovery_candidate(
         profile
         for profile in profiles
         if profile.booking_start_count > profile.booking_complete_count
-        or (profile.hotel_detail_view_count >= 2 and profile.booking_complete_count == 0)
     ]
     return _candidate_from_profiles(
         candidate_type="funnel_recovery",
@@ -656,7 +679,6 @@ def _benefit_value_seeker_candidate(
             + profile.price_event_count
         )
         > 0
-        or profile.promotion_click_count > 0
     ]
     return _candidate_from_profiles(
         candidate_type="benefit_value_seeker",
@@ -790,8 +812,17 @@ def _rank_candidates(
             )
             for candidate in remaining
         ]
+        distinct_candidates = [
+            candidate
+            for candidate in scored
+            if not selected
+            or _maximum_user_overlap(candidate, selected_candidates=selected)
+            < MAX_RANK_USER_OVERLAP
+        ]
+        if not distinct_candidates:
+            break
         next_candidate = max(
-            scored,
+            distinct_candidates,
             key=lambda candidate: (
                 _final_score(candidate),
                 -CANDIDATE_TYPE_ORDER.index(candidate.candidate_type),
@@ -814,24 +845,18 @@ def _with_distinctiveness(
 ) -> _RawEventCandidate:
     if not selected_candidates:
         return candidate
-    distinctiveness = 1.0
-    candidate_users = set(candidate.candidate_user_ids)
-    candidate_chips = set(candidate.signal_chips)
-    for selected in selected_candidates:
-        if selected.candidate_type == candidate.candidate_type:
-            distinctiveness -= 0.35
-        selected_users = set(selected.candidate_user_ids)
-        if candidate_users and selected_users:
-            overlap = len(candidate_users & selected_users) / max(
-                len(candidate_users),
-                1,
-            )
-            if overlap >= 0.7:
-                distinctiveness -= 0.45
-            elif overlap >= 0.4:
-                distinctiveness -= 0.2
-        if candidate_chips == set(selected.signal_chips):
-            distinctiveness -= 0.25
+    user_distinctiveness = 1.0 - _maximum_user_overlap(
+        candidate,
+        selected_candidates=selected_candidates,
+    )
+    chip_distinctiveness = 1.0 - max(
+        (
+            _set_jaccard_similarity(candidate.signal_chips, selected.signal_chips)
+            for selected in selected_candidates
+        ),
+        default=0.0,
+    )
+    distinctiveness = 0.8 * user_distinctiveness + 0.2 * chip_distinctiveness
     return _RawEventCandidate(
         candidate_type=candidate.candidate_type,
         rank_role=candidate.rank_role,
@@ -849,6 +874,40 @@ def _with_distinctiveness(
         sample_reliability=candidate.sample_reliability,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
     )
+
+
+def _maximum_user_overlap(
+    candidate: _RawEventCandidate,
+    *,
+    selected_candidates: Sequence[_RawEventCandidate],
+) -> float:
+    return max(
+        (
+            _set_overlap_coefficient(
+                candidate.candidate_user_ids,
+                selected.candidate_user_ids,
+            )
+            for selected in selected_candidates
+        ),
+        default=0.0,
+    )
+
+
+def _set_overlap_coefficient(left: Sequence[str], right: Sequence[str]) -> float:
+    left_values = set(left)
+    right_values = set(right)
+    if not left_values or not right_values:
+        return 0.0
+    return len(left_values & right_values) / min(len(left_values), len(right_values))
+
+
+def _set_jaccard_similarity(left: Sequence[str], right: Sequence[str]) -> float:
+    left_values = set(left)
+    right_values = set(right)
+    union = left_values | right_values
+    if not union:
+        return 0.0
+    return len(left_values & right_values) / len(union)
 
 
 def _segment_definition_from_candidate(
@@ -1294,8 +1353,16 @@ def _signal_metrics(
             profile.campaign_landing_count for profile in profiles
         ),
         "campaign_landing_user_count": campaign_landing_user_count,
+        "campaign_landing_user_rate": _safe_rate(
+            campaign_landing_user_count,
+            sample_size,
+        ),
         "booking_start_count": sum(profile.booking_start_count for profile in profiles),
         "booking_start_user_count": booking_start_user_count,
+        "booking_start_user_rate": _safe_rate(
+            booking_start_user_count,
+            sample_size,
+        ),
         "booking_complete_count": sum(
             profile.booking_complete_count for profile in profiles
         ),
@@ -1346,45 +1413,22 @@ def _expected_goal_performance(
     baseline: Mapping[str, float],
 ) -> float:
     if promotion.goal_metric == "booking_conversion_rate":
-        complete_rate = _smoothed_user_rate(
+        return _smoothed_user_rate(
             profiles,
             lambda profile: profile.booking_complete_count > 0,
             baseline_rate=baseline.get("booking_complete_user_rate", 0.0),
         )
-        start_rate = _user_rate(
-            profiles,
-            lambda profile: profile.booking_start_count > 0,
-        )
-        detail_rate = _user_rate(
-            profiles,
-            lambda profile: profile.hotel_detail_view_count > 0,
-        )
-        intent_support = 0.35 * start_rate + 0.15 * detail_rate
-        return _clamp01(0.75 * complete_rate + 0.25 * intent_support)
     if promotion.goal_metric == "inflow_rate":
-        landing_rate = _smoothed_user_rate(
+        return _smoothed_user_rate(
             profiles,
             lambda profile: profile.campaign_landing_count > 0,
             baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
         )
-        click_rate = _user_rate(
-            profiles,
-            lambda profile: profile.promotion_click_count > 0,
-        )
-        search_rate = _user_rate(
-            profiles,
-            lambda profile: profile.hotel_search_count > 0,
-        )
-        return _clamp01(0.70 * landing_rate + 0.20 * click_rate + 0.10 * search_rate)
-    search_rate = _user_rate(
+    return _smoothed_user_rate(
         profiles,
-        lambda profile: profile.hotel_search_count > 0,
+        lambda profile: profile.booking_start_count > 0,
+        baseline_rate=baseline.get("booking_start_user_rate", 0.0),
     )
-    detail_rate = _user_rate(
-        profiles,
-        lambda profile: profile.hotel_detail_view_count > 0,
-    )
-    return _clamp01(0.35 * search_rate + 0.65 * detail_rate)
 
 
 def _user_count(
@@ -1413,9 +1457,13 @@ def _smoothed_user_rate(
     if sample_size <= 0:
         return _clamp01(baseline_rate)
     success_count = _user_count(profiles, predicate)
+    prior_success = 0.5 + EXPECTED_RATE_PRIOR_USER_COUNT * _clamp01(baseline_rate)
+    prior_failure = 0.5 + EXPECTED_RATE_PRIOR_USER_COUNT * (
+        1.0 - _clamp01(baseline_rate)
+    )
     return _clamp01(
-        (success_count + EXPECTED_RATE_PRIOR_USER_COUNT * _clamp01(baseline_rate))
-        / (sample_size + EXPECTED_RATE_PRIOR_USER_COUNT)
+        (success_count + prior_success)
+        / (sample_size + prior_success + prior_failure)
     )
 
 
@@ -1483,12 +1531,34 @@ def _performance_estimate(
     candidate: _RawEventCandidate,
 ) -> dict[str, Any]:
     value = _clamp01(candidate.expected_goal_performance)
+    observed_value = _observed_goal_rate(
+        goal_metric=promotion.goal_metric,
+        signal_metrics=candidate.signal_metrics,
+    )
     return {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
         "value": round(value, 6),
         "formatted": _format_percent(value),
+        "observed_value": round(observed_value, 6),
+        "basis_label": "최근 행동 벡터 관찰 구간 기반 추정",
+        "method": "empirical_bayes_user_rate",
+        "prior_user_count": int(EXPECTED_RATE_PRIOR_USER_COUNT),
+        "calibration_status": "not_backtested",
     }
+
+
+def _observed_goal_rate(
+    *,
+    goal_metric: str,
+    signal_metrics: Mapping[str, Any],
+) -> float:
+    metric_key = {
+        "booking_conversion_rate": "booking_complete_user_rate",
+        "inflow_rate": "campaign_landing_user_rate",
+        "funnel_step_rate": "booking_start_user_rate",
+    }.get(goal_metric, "booking_start_user_rate")
+    return _clamp01(float(signal_metrics.get(metric_key, 0.0) or 0.0))
 
 
 def _performance_estimate_label(goal_metric: str) -> str:
@@ -1496,7 +1566,7 @@ def _performance_estimate_label(goal_metric: str) -> str:
         return "예상 전환율"
     if goal_metric == "inflow_rate":
         return "예상 유입률"
-    if goal_metric == "funnel_progression_rate":
+    if goal_metric == "funnel_step_rate":
         return "예상 퍼널 이동률"
     return "예상 성과"
 
