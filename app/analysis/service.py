@@ -1184,7 +1184,7 @@ def _profile_json_with_generation_evidence(
 ) -> dict[str, Any]:
     profile_json = dict(segment.profile_json)
     if "primary_signals" not in profile_json:
-        primary_signal_keys = _primary_signal_keys_from_features(profile_json)
+        primary_signal_keys = _primary_signal_keys_from_analysis(segment)
         if primary_signal_keys:
             profile_json["primary_signals"] = primary_signal_keys
 
@@ -1192,6 +1192,35 @@ def _profile_json_with_generation_evidence(
     if isinstance(score_components, Mapping):
         profile_json["score_components"] = dict(score_components)
     return profile_json
+
+
+def _primary_signal_keys_from_analysis(
+    segment: SegmentDefinitionRecord,
+) -> list[str]:
+    raw_event_signal_keys = _raw_event_primary_signal_keys(segment.rule_json)
+    if raw_event_signal_keys:
+        return raw_event_signal_keys
+    return _primary_signal_keys_from_features(segment.profile_json)
+
+
+def _raw_event_primary_signal_keys(rule_json: Mapping[str, Any]) -> list[str]:
+    if rule_json.get("source") != "raw_event_intent":
+        return []
+    conditions = rule_json.get("compiled_conditions")
+    if not isinstance(conditions, Sequence) or isinstance(conditions, str):
+        return []
+
+    signal_keys: list[str] = []
+    seen: set[str] = set()
+    for condition in conditions:
+        signal_key = str(condition).strip()
+        if not signal_key or signal_key in seen:
+            continue
+        signal_keys.append(signal_key)
+        seen.add(signal_key)
+        if len(signal_keys) == 3:
+            break
+    return signal_keys
 
 
 def _primary_signal_keys_from_features(profile_json: Mapping[str, Any]) -> list[str]:
