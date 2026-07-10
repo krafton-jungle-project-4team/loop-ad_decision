@@ -728,6 +728,84 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
     assert "behavior_metrics" not in str(generation_run_repository.saved[0].output_json)
 
 
+def test_generation_service_persists_candidate_specific_prompt_and_strategy_metadata() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(index=1, content_slug="jeju_ocean"),
+                    segment_name="Jeju ocean hotel viewers",
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "fallback_guidance": {
+                            "message_direction": "Use a booking reminder.",
+                            "keywords": ["should-not-be-used"],
+                        },
+                        "hotel_profile": {
+                            "hotel_cluster": "jeju_ocean",
+                            "booking_count": 120,
+                        },
+                        "audience_evidence": {
+                            "primary_signals": ["jeju_destination_search"],
+                            "score_components": {"final_score": 0.91},
+                        },
+                    },
+                ),
+                replace(
+                    target_segment_input(index=2, content_slug="seoul_business"),
+                    segment_name="Seoul business hotel viewers",
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "fallback_guidance": {
+                            "message_direction": "Use a booking reminder.",
+                            "keywords": ["should-not-be-used"],
+                        },
+                        "hotel_profile": {
+                            "hotel_cluster": "seoul_business",
+                            "booking_count": 240,
+                        },
+                        "audience_evidence": {
+                            "primary_signals": ["weekday_business_search"],
+                            "score_components": {"final_score": 0.87},
+                        },
+                    },
+                ),
+            ]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=1))
+
+    assert len(response.content_candidates) == 2
+    assert len(content_candidate_repository.saved) == 2
+    candidates_by_segment = {
+        candidate.segment_id: candidate
+        for candidate in content_candidate_repository.saved
+    }
+    jeju_candidate = candidates_by_segment["seg_jeju_ocean_001"]
+    seoul_candidate = candidates_by_segment["seg_seoul_business_002"]
+
+    assert jeju_candidate.generation_prompt != seoul_candidate.generation_prompt
+    assert "jeju_destination_search" in jeju_candidate.generation_prompt
+    assert "hotel_cluster=jeju_ocean" in jeju_candidate.generation_prompt
+    assert "weekday_business_search" in seoul_candidate.generation_prompt
+    assert "hotel_cluster=seoul_business" in seoul_candidate.generation_prompt
+
+    for candidate in (jeju_candidate, seoul_candidate):
+        metadata = candidate.metadata_json
+        assert metadata["content_brief_readiness"]["level"] == "evidence_ready"
+        assert metadata["fallback_guidance_present"] is True
+        assert metadata["fallback_guidance_used"] is False
+        assert candidate.data_evidence_json == metadata["data_evidence"]
+        assert "content_brief_keywords" not in candidate.data_evidence_json
+
+    assert jeju_candidate.data_evidence_json["audience_evidence"] != (
+        seoul_candidate.data_evidence_json["audience_evidence"]
+    )
+
+
 class StaticGenerationInputBuilder:
     def __init__(
         self,
