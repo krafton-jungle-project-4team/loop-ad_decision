@@ -19,6 +19,14 @@ SUPPORTED_AUDIENCE_EVIDENCE_SECTIONS = (
     "promotion_vector_basis",
     "promotion_matched_features",
 )
+SEQUENCE_AUDIENCE_EVIDENCE_SECTIONS = (
+    "primary_signals",
+    "promotion_matched_features",
+)
+MAPPING_AUDIENCE_EVIDENCE_SECTIONS = (
+    "score_components",
+    "promotion_vector_basis",
+)
 SUPPORTED_AVAILABLE_SECTIONS = (
     "segment_snapshot",
     "promotion_context",
@@ -63,7 +71,7 @@ def build_content_brief_v2(
     compact_segment_snapshot = _compact_nulls(segment_snapshot)
     compact_promotion_context = _compact_nulls(promotion_context)
     compact_audience_evidence = _supported_audience_evidence(
-        _compact_empty(audience_evidence or {})
+        audience_evidence or {}
     )
     compact_hotel_profile = _json_object(hotel_profile)
     readiness = _readiness_for(compact_audience_evidence)
@@ -202,6 +210,10 @@ def _available_sections_from(
             str(section)
             for section in raw_sections
             if str(section) in SUPPORTED_AVAILABLE_SECTIONS
+            and (
+                str(section) != "audience_evidence"
+                or bool(audience_evidence)
+            )
         ]
     else:
         available_sections = ["fallback_guidance"]
@@ -211,11 +223,44 @@ def _available_sections_from(
 
 
 def _supported_audience_evidence(value: Mapping[str, Any]) -> dict[str, Any]:
-    return {
-        section: value[section]
-        for section in SUPPORTED_AUDIENCE_EVIDENCE_SECTIONS
-        if section in value
-    }
+    supported: dict[str, Any] = {}
+    for section in SUPPORTED_AUDIENCE_EVIDENCE_SECTIONS:
+        item = value.get(section)
+        if section in SEQUENCE_AUDIENCE_EVIDENCE_SECTIONS:
+            if not isinstance(item, Sequence) or isinstance(item, str):
+                continue
+            compact_items = _compact_sequence(item)
+            if compact_items:
+                supported[section] = compact_items
+            continue
+        if section in MAPPING_AUDIENCE_EVIDENCE_SECTIONS:
+            if not isinstance(item, Mapping):
+                continue
+            compact_mapping = _compact_empty(item)
+            if compact_mapping:
+                supported[section] = compact_mapping
+    return supported
+
+
+def _compact_sequence(value: Sequence[Any]) -> list[Any]:
+    compact: list[Any] = []
+    for item in value:
+        if item is None:
+            continue
+        if isinstance(item, Mapping):
+            nested_mapping = _compact_empty(item)
+            if nested_mapping:
+                compact.append(nested_mapping)
+            continue
+        if isinstance(item, Sequence) and not isinstance(item, str):
+            nested_sequence = _compact_sequence(item)
+            if nested_sequence:
+                compact.append(nested_sequence)
+            continue
+        if isinstance(item, str) and not item.strip():
+            continue
+        compact.append(item)
+    return compact
 
 
 def _compact_empty(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -229,9 +274,11 @@ def _compact_empty(value: Mapping[str, Any]) -> dict[str, Any]:
                 compact[str(key)] = nested
             continue
         if isinstance(item, Sequence) and not isinstance(item, str):
-            items = [nested_item for nested_item in item if nested_item is not None]
+            items = _compact_sequence(item)
             if items:
                 compact[str(key)] = items
+            continue
+        if isinstance(item, str) and not item.strip():
             continue
         compact[str(key)] = item
     return compact
