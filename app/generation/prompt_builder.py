@@ -57,6 +57,8 @@ class PromptBuildResult:
     reason_summary: str
     data_evidence_json: dict[str, Any] = field(default_factory=dict)
     metadata_json: dict[str, Any] = field(default_factory=dict)
+    fallback_guidance_present: bool = False
+    fallback_guidance_used: bool = False
 
 
 class GenerationInputBuilder:
@@ -93,9 +95,20 @@ class PromptBuilder:
         target_segment = prompt_input.target_segment
         channel_contract = _channel_contract(promotion.channel)
         content_brief = normalize_content_brief(target_segment.content_brief_json)
-        message_strategy = _message_strategy(content_brief)
+        fallback_guidance_used = (
+            content_brief.fallback_guidance_present
+            and _readiness_level(content_brief) != "evidence_ready"
+        )
+        message_strategy = _message_strategy(
+            content_brief,
+            fallback_guidance_used=fallback_guidance_used,
+        )
         reason_summary = _reason_summary(prompt_input)
-        evidence = _data_evidence(prompt_input, content_brief)
+        evidence = _data_evidence(
+            prompt_input,
+            content_brief,
+            fallback_guidance_used=fallback_guidance_used,
+        )
 
         prompt_lines = [
             "Generate one Loop-Ad hotel marketing content candidate.",
@@ -120,8 +133,6 @@ class PromptBuilder:
             f"Fixed landing URL: {promotion.landing_url or 'not provided'}",
             f"Promotion brief: {promotion.message_brief or 'not provided'}",
             f"Content brief readiness: {_readiness_level(content_brief)}",
-            f"Fallback message direction: {content_brief.message_direction}",
-            f"Fallback keywords: {', '.join(content_brief.keywords) or 'not provided'}",
             f"Message strategy: {message_strategy}",
             _optional_line(
                 "Natural language segment query",
@@ -136,6 +147,19 @@ class PromptBuilder:
             "Do not generate or override landing_url; Loop-Ad assigns the fixed landing URL.",
             "Keep the content in the hotel booking domain.",
         ]
+        if fallback_guidance_used:
+            prompt_lines.extend(
+                [
+                    (
+                        "Fallback message direction: "
+                        f"{content_brief.message_direction}"
+                    ),
+                    (
+                        "Fallback keywords: "
+                        f"{', '.join(content_brief.keywords) or 'not provided'}"
+                    ),
+                ]
+            )
         prompt_lines.extend(_content_brief_context_lines(content_brief))
         generation_prompt = "\n".join(prompt_lines)
 
@@ -146,7 +170,8 @@ class PromptBuilder:
             "message_strategy": message_strategy,
             "content_brief_schema_version": content_brief.schema_version,
             "content_brief_readiness": content_brief.readiness,
-            "fallback_guidance_used": content_brief.fallback_guidance_used,
+            "fallback_guidance_present": content_brief.fallback_guidance_present,
+            "fallback_guidance_used": fallback_guidance_used,
             "operator_instruction": prompt_input.request.operator_instruction,
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
@@ -159,6 +184,8 @@ class PromptBuilder:
             reason_summary=reason_summary,
             data_evidence_json=evidence,
             metadata_json=metadata,
+            fallback_guidance_present=content_brief.fallback_guidance_present,
+            fallback_guidance_used=fallback_guidance_used,
         )
 
 
@@ -194,14 +221,25 @@ def _channel_contract(channel: ContentChannel) -> tuple[str, ...]:
     return ("title", "body", "cta", "image_prompt")
 
 
-def _message_strategy(content_brief: NormalizedContentBrief) -> str:
-    if content_brief.keywords:
+def _message_strategy(
+    content_brief: NormalizedContentBrief,
+    *,
+    fallback_guidance_used: bool,
+) -> str:
+    if fallback_guidance_used and content_brief.keywords:
         return (
             f"{content_brief.message_direction} "
             f"Use these fallback hotel audience cues: "
             f"{', '.join(content_brief.keywords)}."
         )
-    return content_brief.message_direction
+    if fallback_guidance_used:
+        return content_brief.message_direction
+    if _readiness_level(content_brief) == "evidence_ready":
+        return "Use verified audience evidence and promotion context."
+    return (
+        "Use the available verified evidence and promotion context; "
+        "do not infer missing audience details."
+    )
 
 
 def _reason_summary(prompt_input: GenerationPromptInput) -> str:
@@ -216,27 +254,51 @@ def _reason_summary(prompt_input: GenerationPromptInput) -> str:
 def _data_evidence(
     prompt_input: GenerationPromptInput,
     content_brief: NormalizedContentBrief,
+    *,
+    fallback_guidance_used: bool,
 ) -> dict[str, Any]:
     promotion = prompt_input.promotion
     target_segment = prompt_input.target_segment
+    goal_target_value = _optional_float(promotion.goal_target_value)
     evidence: dict[str, Any] = {
         "analysis_id": prompt_input.request.analysis_id,
         "promotion_id": promotion.promotion_id,
         "segment_id": target_segment.segment_id,
         "segment_name": target_segment.segment_name,
         "segment_vector_id": target_segment.segment_vector_id,
-        "estimated_size": target_segment.estimated_size,
+        "sample_size": target_segment.estimated_size,
         "priority": target_segment.priority,
         "target_segment_status": target_segment.status,
-        "sample_ratio": target_segment.sample_ratio,
+        "sample_ratio": _optional_float(target_segment.sample_ratio),
         "goal_metric": promotion.goal_metric,
         "goal_basis": promotion.goal_basis,
-        "goal_target_value": promotion.goal_target_value,
+        "goal_target_value": (
+            goal_target_value
+            if goal_target_value is not None
+            else promotion.goal_target_value
+        ),
         "content_brief_schema_version": content_brief.schema_version,
         "content_brief_readiness": content_brief.readiness,
-        "fallback_guidance_used": content_brief.fallback_guidance_used,
-        "content_brief_keywords": content_brief.keywords,
+        "fallback_guidance_present": content_brief.fallback_guidance_present,
+        "fallback_guidance_used": fallback_guidance_used,
     }
+    if fallback_guidance_used:
+        evidence["content_brief_keywords"] = content_brief.keywords
+    if content_brief.schema_version != "content_brief.v2":
+        raw_brief = content_brief.raw
+        top_common_features = _string_list(raw_brief.get("top_common_features"))
+        evidence.update(
+            {
+                "booking_conversion_rate": _optional_float(
+                    raw_brief.get("booking_conversion_rate")
+                ),
+                "comparison_group_conversion_rate": _optional_float(
+                    raw_brief.get("comparison_group_conversion_rate")
+                ),
+                "top_common_features": top_common_features
+                or content_brief.keywords,
+            }
+        )
     if content_brief.audience_evidence:
         evidence["audience_evidence"] = content_brief.audience_evidence
     return evidence
@@ -284,3 +346,18 @@ def _optional_line(label: str, value: str | None) -> str:
     if not value:
         return f"{label}: not provided"
     return f"{label}: {value}"
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except ValueError:
+        return None
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]

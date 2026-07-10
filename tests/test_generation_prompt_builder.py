@@ -240,6 +240,7 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_schema_version"] == "content_brief.v2"
     assert result.metadata_json["content_brief_readiness"]["level"] == "fallback_only"
+    assert result.metadata_json["fallback_guidance_present"] is True
     assert result.metadata_json["fallback_guidance_used"] is True
     assert result.data_evidence_json["content_brief_keywords"] == [
         "refundable stay",
@@ -269,6 +270,14 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
                     "promotion_cluster_similarity": 0.92,
                     "sample_size_score": 0.71,
                 },
+                "promotion_vector_basis": {
+                    "channel": "onsite_banner",
+                    "goal_metric": "booking_conversion_rate",
+                },
+                "promotion_matched_features": [
+                    "same_hotel_repeat_view",
+                    "near_checkin",
+                ],
                 "behavior_metrics": {
                     "booking_conversion_rate": 0.018,
                 },
@@ -288,19 +297,144 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "promotion_cluster_similarity" in result.generation_prompt
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_readiness"] == {
-        "level": "partial",
+        "level": "evidence_ready",
         "missing_sections": [],
         "available_sections": ["fallback_guidance", "audience_evidence"],
     }
+    assert result.fallback_guidance_present is True
+    assert result.fallback_guidance_used is False
+    assert result.metadata_json["fallback_guidance_present"] is True
+    assert result.metadata_json["fallback_guidance_used"] is False
+    assert "Fallback message direction:" not in result.generation_prompt
+    assert "Fallback keywords:" not in result.generation_prompt
+    assert "content_brief_keywords" not in result.data_evidence_json
     assert result.data_evidence_json["audience_evidence"] == {
         "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
         "score_components": {
             "promotion_cluster_similarity": 0.92,
             "sample_size_score": 0.71,
         },
+        "promotion_vector_basis": {
+            "channel": "onsite_banner",
+            "goal_metric": "booking_conversion_rate",
+        },
+        "promotion_matched_features": [
+            "same_hotel_repeat_view",
+            "near_checkin",
+        ],
     }
     assert "behavior_metrics" not in str(result.metadata_json)
     assert "behavior_metrics" not in str(result.data_evidence_json)
+
+
+def test_prompt_builder_preserves_zero_goal_target_as_number() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=replace(promotion_input(), goal_target_value="0"),
+            target_segment=target_segment_input(),
+        )
+    )
+
+    assert result.data_evidence_json["goal_target_value"] == 0.0
+    assert isinstance(result.data_evidence_json["goal_target_value"], float)
+
+
+def test_prompt_builder_uses_stored_fallback_for_partial_evidence() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=replace(
+                target_segment_input(),
+                content_brief_json={
+                    "schema_version": "content_brief.v2",
+                    "fallback_guidance": {
+                        "message_direction": "Prioritize flexible cancellation.",
+                        "keywords": ["flexible cancellation"],
+                    },
+                    "audience_evidence": {
+                        "primary_signals": ["booking_start_without_complete"],
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
+    assert result.fallback_guidance_present is True
+    assert result.fallback_guidance_used is True
+    assert "Fallback message direction: Prioritize flexible cancellation." in (
+        result.generation_prompt
+    )
+
+
+def test_prompt_builder_does_not_invent_missing_fallback_guidance() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=replace(
+                target_segment_input(),
+                content_brief_json={
+                    "schema_version": "content_brief.v2",
+                    "audience_evidence": {
+                        "score_components": {"final_score": 0.8},
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
+    assert result.fallback_guidance_present is False
+    assert result.fallback_guidance_used is False
+    assert "Fallback message direction:" not in result.generation_prompt
+    assert "Fallback keywords:" not in result.generation_prompt
+
+
+def test_prompt_builder_excludes_unstructured_v2_audience_evidence() -> None:
+    builder = PromptBuilder()
+    target_segment = replace(
+        target_segment_input(),
+        content_brief_json={
+            "schema_version": "content_brief.v2",
+            "readiness": {
+                "level": "partial",
+                "available_sections": ["fallback_guidance", "audience_evidence"],
+                "missing_sections": [],
+            },
+            "fallback_guidance": {
+                "message_direction": "Use a hotel booking message.",
+                "keywords": ["hotel booking"],
+                "source": "legacy_segment_content_hints",
+            },
+            "audience_evidence": {
+                "primary_signals": "not-a-sequence",
+                "score_components": ["not-a-mapping"],
+                "promotion_vector_basis": {},
+                "promotion_matched_features": [],
+                "top_common_features": ["must-not-pass"],
+            },
+        },
+    )
+
+    result = builder.build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=target_segment,
+        )
+    )
+
+    assert "Audience evidence:" not in result.generation_prompt
+    assert "must-not-pass" not in result.generation_prompt
+    assert result.metadata_json["content_brief_readiness"] == {
+        "level": "fallback_only",
+        "missing_sections": ["primary_signals", "score_components"],
+        "available_sections": ["fallback_guidance"],
+    }
+    assert "audience_evidence" not in result.data_evidence_json
 
 
 def test_prompt_builder_output_does_not_use_legacy_public_terms() -> None:

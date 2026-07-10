@@ -954,6 +954,32 @@ def _segment_definition_from_candidate(
         rank=rank,
         candidate_user_ids=candidate.candidate_user_ids,
     )
+    profile_json: dict[str, Any] = {
+        "primary_segment": segment_id,
+        "source": "raw_event_intent",
+        "rank_role": candidate.rank_role,
+        "candidate_type": candidate.candidate_type,
+        "score_components": score_components,
+        "matched_conditions": matched_conditions,
+        "missing_conditions": missing_conditions,
+        "signal_chips": list(candidate.signal_chips),
+        "performance_estimate": performance_estimate,
+        "signal_metrics": {
+            **dict(candidate.signal_metrics),
+            "sample_size": candidate.sample_size,
+            "total_eligible_user_count": total_eligible_user_count,
+        },
+        "promotion_intent": intent.to_json(),
+        "compiled_intent": compilation.to_json(),
+        "display_copy": display_copy,
+        "recommendation_score": score_components["final_score"],
+    }
+    primary_signals = [
+        key for key in candidate.matched_condition_keys if key.strip()
+    ][:3]
+    if primary_signals:
+        profile_json["primary_signals"] = primary_signals
+
     return SegmentDefinitionRecord(
         segment_id=segment_id,
         project_id=promotion.project_id,
@@ -975,26 +1001,7 @@ def _segment_definition_from_candidate(
             "fallback_used": False,
             "version": RAW_EVENT_SEGMENT_VERSION,
         },
-        profile_json={
-            "primary_segment": segment_id,
-            "source": "raw_event_intent",
-            "rank_role": candidate.rank_role,
-            "candidate_type": candidate.candidate_type,
-            "score_components": score_components,
-            "matched_conditions": matched_conditions,
-            "missing_conditions": missing_conditions,
-            "signal_chips": list(candidate.signal_chips),
-            "performance_estimate": performance_estimate,
-            "signal_metrics": {
-                **dict(candidate.signal_metrics),
-                "sample_size": candidate.sample_size,
-                "total_eligible_user_count": total_eligible_user_count,
-            },
-            "promotion_intent": intent.to_json(),
-            "compiled_intent": compilation.to_json(),
-            "display_copy": display_copy,
-            "recommendation_score": score_components["final_score"],
-        },
+        profile_json=profile_json,
         sample_size=candidate.sample_size,
         total_eligible_user_count=total_eligible_user_count,
         sample_ratio=sample_ratio,
