@@ -12,6 +12,7 @@ venv/
 .env
 .env.local
 .env.*.local
+artifacts/
 
 # Local planning/reference files that are not part of remote dev yet.
 agent.md

@@ -31,3 +31,8 @@ Before adding or changing application logs, read
 [docs/reference_logging.md](docs/reference_logging.md). Decision logs must stay
 JSON structured, use context propagation, keep stable snake_case `event` names,
 and follow the shared Loop-Ad logging standard from the Dashboard API reference.
+
+## Local Validation Tools
+
+- [Expedia 세그먼트 추천 백테스트](docs/expedia_segment_backtest.md): 과거 행동과
+  미래 예약 라벨을 시간 분리해 AI 추천 후보, Rank, 예상 전환율을 검증한다.
