@@ -1226,25 +1226,9 @@ def _profile_query(source_table: str) -> str:
         toUInt64(0) AS booking_cancel_count,
         countIf(
             is_package = 1
-            OR (
-                NOT isNull(srch_ci)
-                AND dateDiff('day', toDate(date_time), assumeNotNull(srch_ci)) >= 30
-            )
-            OR cnt >= 4
         ) AS deal_event_count,
-        countIf(
-            is_package = 1
-            OR (
-                NOT isNull(srch_ci)
-                AND dateDiff('day', toDate(date_time), assumeNotNull(srch_ci)) >= 14
-            )
-        ) AS free_cancellation_count,
-        countIf(
-            is_package = 1
-            AND NOT isNull(srch_ci)
-            AND NOT isNull(srch_co)
-            AND dateDiff('day', assumeNotNull(srch_ci), assumeNotNull(srch_co)) >= 2
-        ) AS breakfast_included_count,
+        toUInt64(0) AS free_cancellation_count,
+        toUInt64(0) AS breakfast_included_count,
         toUInt64(0) AS price_event_count,
         toFloat64(0) AS avg_price,
         groupUniqArray(20)(toString(srch_destination_id)) AS destination_values,

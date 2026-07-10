@@ -409,6 +409,32 @@ def test_future_booking_query_does_not_shadow_source_user_id() -> None:
     assert client.parameters[0]["user_ids"] == [1, 2]
 
 
+def test_profile_query_does_not_invent_unsupported_benefit_properties() -> None:
+    client = FakeClickHouseClient([])
+    repository = ClickHouseExpediaBacktestRepository(client)
+    scenario = ExpediaBacktestScenario(
+        scenario_id="20140701_destination_8250",
+        cutoff=datetime(2014, 7, 1, tzinfo=UTC),
+        target_destination_id=8250,
+        historical_user_count=20,
+        historical_event_count=40,
+    )
+
+    repository.list_user_profiles(
+        scenario=scenario,
+        observation_start=datetime(2014, 4, 2, tzinfo=UTC),
+        cutoff=scenario.cutoff,
+        limit=1000,
+        user_sample_modulo=1,
+        user_sample_remainder=0,
+    )
+
+    query = client.queries[0]
+    assert "countIf(\n            is_package = 1\n        ) AS deal_event_count" in query
+    assert "toUInt64(0) AS free_cancellation_count" in query
+    assert "toUInt64(0) AS breakfast_included_count" in query
+
+
 def test_scenario_query_excludes_development_destinations() -> None:
     client = FakeClickHouseClient(
         [

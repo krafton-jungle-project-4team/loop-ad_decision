@@ -29,7 +29,7 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v2"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v3"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 RAW_EVENT_CANDIDATE_USER_LIMIT = 160
@@ -760,6 +760,8 @@ def _general_destination_explorer_candidate(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
+    if intent.destinations:
+        return None
     matched_profiles = [
         profile
         for profile in profiles
@@ -769,7 +771,6 @@ def _general_destination_explorer_candidate(
             or len(profile.hotel_cluster_values) >= 2
         )
         and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
-        and (not intent.destinations or profile.destination_match_count == 0)
     ]
     matched_condition_keys = (
         "general_destination_exploration",
