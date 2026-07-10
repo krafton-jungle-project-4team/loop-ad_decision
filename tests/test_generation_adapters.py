@@ -230,6 +230,7 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     assert "natural Korean" in str(captured["payload"])
     assert "Return concise Korean hotel booking copy" in str(captured["payload"])
     assert "Do not copy English source text verbatim" in str(captured["payload"])
+    assert "must not request visible text in the image" in str(captured["payload"])
     schema = captured["payload"]["text"]["format"]["schema"]
     assert "landing_url" not in schema["properties"]
     assert "landing_url" not in schema["required"]
