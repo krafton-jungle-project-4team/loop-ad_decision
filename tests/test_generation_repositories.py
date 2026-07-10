@@ -6,6 +6,7 @@ from app.generation.repositories import (
     GenerationInputRepository,
     GenerationRunRecord,
     GenerationRunRepository,
+    _content_brief_json,
 )
 from app.generation.schemas import ContentChannel, GenerationRequest
 
@@ -102,6 +103,33 @@ def test_content_candidate_repository_columns_match_data_source_contract() -> No
         "created_at",
         "updated_at",
     )
+
+
+def test_v2_content_brief_does_not_merge_legacy_data_evidence() -> None:
+    content_brief = {
+        "schema_version": "content_brief.v2",
+        "fallback_guidance": {
+            "message_direction": "Use a hotel booking reminder.",
+            "keywords": ["refundable stay"],
+        },
+        "audience_evidence": {
+            "primary_signals": ["same_hotel_repeat_view"],
+        },
+    }
+
+    result = _content_brief_json(
+        {
+            "content_brief_json": content_brief,
+            "data_evidence_json": {
+                "booking_conversion_rate": "0.018",
+                "comparison_group_conversion_rate": "0.034",
+                "top_common_features": ["must_not_merge"],
+                "keywords": ["must_not_merge"],
+            },
+        }
+    )
+
+    assert result == content_brief
 
 
 def test_generation_run_repository_create_executes_insert() -> None:
