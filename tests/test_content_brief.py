@@ -82,3 +82,14 @@ def test_normalize_content_brief_does_not_count_default_fallback_as_present() ->
 
     assert normalized.message_direction
     assert normalized.fallback_guidance_present is False
+
+
+def test_normalize_content_brief_preserves_operator_instruction() -> None:
+    normalized = normalize_content_brief(
+        {
+            "schema_version": "content_brief.v2",
+            "operator_instruction": "  Emphasize booking confidence.  ",
+        }
+    )
+
+    assert normalized.operator_instruction == "Emphasize booking confidence."
