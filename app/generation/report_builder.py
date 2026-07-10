@@ -8,7 +8,7 @@ from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResu
 from app.generation.schemas import GenerationStatus
 
 
-GENERATION_REPORT_VERSION = "dec-c4.v1"
+GENERATION_REPORT_VERSION = "dec-c4.v2"
 MAX_SQL_SUMMARY_LENGTH = 240
 
 
@@ -50,12 +50,24 @@ class GenerationReportBuilder:
             "content_brief_schema_version": data_evidence.get(
                 "content_brief_schema_version"
             ),
-            "content_brief_readiness": data_evidence.get(
+            "content_brief_readiness": prompt_result.metadata_json.get(
                 "content_brief_readiness"
+            ),
+            "missing_sections": prompt_result.metadata_json.get(
+                "missing_sections",
+                [],
             ),
             "fallback_guidance_present": prompt_result.fallback_guidance_present,
             "fallback_guidance_used": prompt_result.fallback_guidance_used,
-            "operator_instruction": prompt_input.request.operator_instruction,
+            "operator_instruction": prompt_result.metadata_json.get(
+                "operator_instruction"
+            ),
+            "strategy_key": prompt_result.metadata_json.get("strategy_key"),
+            "strategy_plan": prompt_result.metadata_json.get("strategy_plan", {}),
+            "brief_fingerprint": prompt_result.metadata_json.get(
+                "brief_fingerprint"
+            ),
+            "evidence_refs": prompt_result.metadata_json.get("evidence_refs", []),
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
             "generated_sql_summary": generated_sql_summary,
