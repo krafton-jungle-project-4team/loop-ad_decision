@@ -53,6 +53,7 @@ class NormalizedContentBrief:
     audience_evidence: dict[str, Any]
     generation_constraints: dict[str, Any]
     hotel_profile: dict[str, Any] | None
+    operator_instruction: str | None
     fallback_guidance_present: bool
     raw: dict[str, Any]
 
@@ -150,6 +151,7 @@ def _normalize_v2(raw: dict[str, Any]) -> NormalizedContentBrief:
         audience_evidence=audience_evidence,
         generation_constraints=_json_object(raw.get("generation_constraints")),
         hotel_profile=_json_object(raw.get("hotel_profile")) or None,
+        operator_instruction=_optional_text(raw.get("operator_instruction")),
         fallback_guidance_present=bool(message_direction or keywords),
         raw=dict(raw),
     )
@@ -177,6 +179,7 @@ def _normalize_legacy(raw: dict[str, Any]) -> NormalizedContentBrief:
         audience_evidence={},
         generation_constraints={},
         hotel_profile=None,
+        operator_instruction=_optional_text(raw.get("operator_instruction")),
         fallback_guidance_present=fallback_guidance_present,
         raw=dict(raw),
     )
