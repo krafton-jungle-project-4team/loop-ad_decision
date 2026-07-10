@@ -5,6 +5,7 @@ import pytest
 from app.generation.generator import GeneratedContent
 from app.generation.image_tasks import ImageGenerationJob
 from app.generation.prompt_builder import (
+    CANDIDATE_STRATEGY_BLOCK_HEADER,
     GenerationPromptInput,
     PromotionPromptInput,
     PromptBuildResult,
@@ -111,7 +112,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "channel": "onsite_banner",
     }
     assert generation_run.output_json is not None
-    assert generation_run.output_json["report_version"] == "dec-c4.v1"
+    assert generation_run.output_json["report_version"] == "dec-c4.v3"
     assert generation_run.output_json["content_candidate_ids"] == [
         "content_banner_repeat_hotel_001",
         "content_banner_repeat_hotel_002",
@@ -134,9 +135,9 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "status": "completed",
         "content_candidate_count": 2,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v2",
-        "content_generator": "dec-c3.deterministic.v2",
-        "report_builder": "dec-c4.v1",
+        "prompt_builder": "dec-c2.v4",
+        "content_generator": "dec-c3.deterministic.v4",
+        "report_builder": "dec-c4.v3",
     }
 
     assert len(content_candidate_repository.saved) == 2
@@ -156,11 +157,11 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
-    assert first_candidate.metadata_json["report_version"] == "dec-c4.v1"
-    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v2"
+    assert first_candidate.metadata_json["report_version"] == "dec-c4.v3"
+    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v4"
     assert (
         first_candidate.metadata_json["content_generator_version"]
-        == "dec-c3.deterministic.v2"
+        == "dec-c3.deterministic.v4"
     )
     assert first_candidate.metadata_json["reason_summary"] == (
         first_candidate.reason_summary
@@ -176,11 +177,22 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     assert first_candidate.metadata_json["data_evidence"]["sample_size"] == 1342
     assert first_candidate.metadata_json["data_evidence"]["sample_ratio"] == 0.018
-    assert first_candidate.title == "이번 주말 호텔 특가"
+    assert first_candidate.title == "이번 주말 호텔 확인"
     assert first_candidate.body == (
-        "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요."
+        "관심 호텔의 객실 정보와 예약 조건을 지금 비교해보세요."
     )
-    assert first_candidate.cta == "호텔 특가 보기"
+    assert first_candidate.cta == "호텔 정보 보기"
+    fallback_copy = " ".join(
+        value
+        for value in (
+            first_candidate.title,
+            first_candidate.body,
+            first_candidate.cta,
+        )
+        if value
+    )
+    for unsupported_claim in ("환불 가능", "객실 마감", "특가"):
+        assert unsupported_claim not in fallback_copy
     assert first_candidate.image_url is None
     assert first_candidate.metadata_json["image_url"] is None
     assert first_candidate.metadata_json["source_query_preview_id"] is None
@@ -460,7 +472,7 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     generation_run = generation_run_repository.saved[0]
     assert generation_run.status == "failed"
     assert generation_run.output_json == {
-        "report_version": "dec-c4.v1",
+        "report_version": "dec-c4.v3",
         "content_candidate_ids": [],
         "generation_summary": {
             "status": "failed",
@@ -475,9 +487,9 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
         "status": "failed",
         "content_candidate_count": 0,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v2",
-        "content_generator": "dec-c3.deterministic.v2",
-        "report_builder": "dec-c4.v1",
+        "prompt_builder": "dec-c2.v4",
+        "content_generator": "dec-c3.deterministic.v4",
+        "report_builder": "dec-c4.v3",
         "error_code": "content_generation_failed",
     }
     assert content_candidate_repository.saved == []
@@ -726,6 +738,214 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
     assert "must_not_pass" not in str(metadata)
     assert "behavior_metrics" not in str(metadata)
     assert "behavior_metrics" not in str(generation_run_repository.saved[0].output_json)
+
+
+def test_generation_service_persists_candidate_specific_prompt_and_strategy_metadata() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(index=1, content_slug="jeju_ocean"),
+                    segment_name="Jeju ocean hotel viewers",
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "fallback_guidance": {
+                            "message_direction": "Use a booking reminder.",
+                            "keywords": ["should-not-be-used"],
+                        },
+                        "hotel_profile": {
+                            "hotel_cluster": "jeju_ocean",
+                            "booking_count": 120,
+                        },
+                        "audience_evidence": {
+                            "primary_signals": ["jeju_destination_search"],
+                            "score_components": {"final_score": 0.91},
+                        },
+                    },
+                ),
+                replace(
+                    target_segment_input(index=2, content_slug="seoul_business"),
+                    segment_name="Seoul business hotel viewers",
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "fallback_guidance": {
+                            "message_direction": "Use a booking reminder.",
+                            "keywords": ["should-not-be-used"],
+                        },
+                        "hotel_profile": {
+                            "hotel_cluster": "seoul_business",
+                            "booking_count": 240,
+                        },
+                        "audience_evidence": {
+                            "primary_signals": ["weekday_business_search"],
+                            "score_components": {"final_score": 0.87},
+                        },
+                    },
+                ),
+            ]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=1))
+
+    assert len(response.content_candidates) == 2
+    assert len(content_candidate_repository.saved) == 2
+    candidates_by_segment = {
+        candidate.segment_id: candidate
+        for candidate in content_candidate_repository.saved
+    }
+    jeju_candidate = candidates_by_segment["seg_jeju_ocean_001"]
+    seoul_candidate = candidates_by_segment["seg_seoul_business_002"]
+
+    assert jeju_candidate.generation_prompt != seoul_candidate.generation_prompt
+    assert "jeju_destination_search" in jeju_candidate.generation_prompt
+    assert "hotel_cluster=jeju_ocean" in jeju_candidate.generation_prompt
+    assert "weekday_business_search" in seoul_candidate.generation_prompt
+    assert "hotel_cluster=seoul_business" in seoul_candidate.generation_prompt
+
+    for candidate in (jeju_candidate, seoul_candidate):
+        metadata = candidate.metadata_json
+        assert metadata["content_brief_readiness"]["level"] == "evidence_ready"
+        assert metadata["fallback_guidance_present"] is True
+        assert metadata["fallback_guidance_used"] is False
+        assert candidate.data_evidence_json == metadata["data_evidence"]
+        assert "content_brief_keywords" not in candidate.data_evidence_json
+
+    assert jeju_candidate.data_evidence_json["audience_evidence"] != (
+        seoul_candidate.data_evidence_json["audience_evidence"]
+    )
+
+
+def test_generation_service_applies_candidate_strategy_to_content_and_metadata() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(),
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "fallback_guidance": {
+                            "message_direction": "Use a hotel booking message.",
+                            "keywords": ["hotel booking"],
+                        },
+                        "hotel_profile": {
+                            "event_count": 5000,
+                            "booking_count": 120,
+                        },
+                        "audience_evidence": {
+                            "primary_signals": ["near_checkin", "mobile"],
+                            "score_components": {"final_score": 0.91},
+                            "promotion_matched_features": [
+                                "free_cancellation",
+                                "breakfast_included",
+                            ],
+                        },
+                    },
+                )
+            ]
+        ),
+    )
+
+    service.generate(generation_request(content_option_count=2))
+
+    first_candidate, second_candidate = content_candidate_repository.saved
+    first_metadata = first_candidate.metadata_json
+    second_metadata = second_candidate.metadata_json
+
+    assert first_metadata["brief_fingerprint"] == second_metadata[
+        "brief_fingerprint"
+    ]
+    assert first_metadata["brief_fingerprint"].startswith("sha256:")
+    assert first_metadata["strategy_key"] == "booking_confidence__near_checkin"
+    assert second_metadata["strategy_key"] == "booking_confidence__mobile"
+    assert first_metadata["evidence_refs"] == [
+        "primary_signals[0]",
+        "promotion_matched_features[0]",
+    ]
+    assert second_metadata["evidence_refs"] == [
+        "primary_signals[1]",
+        "promotion_matched_features[1]",
+    ]
+    assert first_metadata["evidence_refs"] == first_metadata["strategy_plan"][
+        "evidence_refs"
+    ]
+    assert first_metadata["strategy_plan"]["benefit_focus"] == []
+    assert second_metadata["strategy_plan"]["benefit_focus"] == []
+    assert first_metadata["missing_sections"] == []
+    assert first_candidate.message_strategy == second_candidate.message_strategy
+
+    first_base, first_strategy = first_candidate.generation_prompt.split(
+        CANDIDATE_STRATEGY_BLOCK_HEADER,
+        maxsplit=1,
+    )
+    second_base, second_strategy = second_candidate.generation_prompt.split(
+        CANDIDATE_STRATEGY_BLOCK_HEADER,
+        maxsplit=1,
+    )
+    assert first_base == second_base
+    assert first_strategy != second_strategy
+
+    assert first_candidate.body is not None
+    assert second_candidate.body is not None
+    assert "체크인 일정이 가까운 고객" in first_candidate.body
+    assert "모바일로 호텔을 찾는 고객" in second_candidate.body
+    assert first_candidate.image_prompt is not None
+    assert second_candidate.image_prompt is not None
+    assert "generic hotel booking travel scene" in first_candidate.image_prompt
+    assert "traveler reviewing an accommodation booking" in (
+        second_candidate.image_prompt
+    )
+    assert "goal_metric=booking_conversion_rate" in first_candidate.image_prompt
+    assert "Audience focus: near_checkin, free_cancellation" in (
+        first_candidate.image_prompt
+    )
+    assert "Verified hotel visual context: none" in first_candidate.image_prompt
+    assert "no visible text" in first_candidate.image_prompt
+
+
+def test_generation_service_allows_repeated_strategy_and_content_when_evidence_is_sparse() -> None:
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_builder=StaticGenerationInputBuilder(
+            [
+                replace(
+                    target_segment_input(),
+                    content_brief_json={
+                        "schema_version": "content_brief.v2",
+                        "audience_evidence": {
+                            "primary_signals": ["near_checkin"],
+                            "score_components": {"final_score": 0.91},
+                        },
+                    },
+                )
+            ]
+        ),
+    )
+
+    response = service.generate(generation_request(content_option_count=4))
+
+    candidates = content_candidate_repository.saved
+    assert len(response.content_candidates) == 4
+    assert len(candidates) == 4
+    assert {candidate.metadata_json["strategy_key"] for candidate in candidates} == {
+        "booking_confidence__near_checkin"
+    }
+    assert {
+        tuple(candidate.metadata_json["evidence_refs"])
+        for candidate in candidates
+    } == {("primary_signals[0]",)}
+    assert all(
+        candidate.metadata_json["strategy_plan"]["benefit_focus"] == []
+        for candidate in candidates
+    )
+    assert candidates[0].title == candidates[3].title
+    assert candidates[0].body == candidates[3].body
+    assert candidates[0].image_prompt == candidates[3].image_prompt
 
 
 class StaticGenerationInputBuilder:

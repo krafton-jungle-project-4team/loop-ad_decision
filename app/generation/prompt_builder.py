@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import hashlib
+import json
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
 
 from app.content_brief import NormalizedContentBrief, normalize_content_brief
+from app.generation.evidence import EvidenceResolver, verified_hotel_benefits
 from app.generation.schemas import ContentChannel, GenerationRequest
 
 
-PROMPT_BUILDER_VERSION = "dec-c2.v2"
+PROMPT_BUILDER_VERSION = "dec-c2.v4"
+CANDIDATE_STRATEGY_BLOCK_HEADER = (
+    "Candidate strategy (apply only to this content option):"
+)
+SAFE_VISUAL_DIRECTIONS = (
+    "generic hotel booking travel scene",
+    "traveler reviewing an accommodation booking on a mobile device",
+    "neutral accommodation planning composition",
+)
 
 
 @dataclass(frozen=True)
@@ -51,6 +63,45 @@ class GenerationPromptInput:
 
 
 @dataclass(frozen=True)
+class GenerationContext:
+    promotion_objective: Mapping[str, Any]
+    verified_audience_evidence: Mapping[str, Any]
+    hotel_profile: Mapping[str, Any] | None
+    readiness: Mapping[str, Any]
+    missing_sections: tuple[str, ...]
+    generation_constraints: Mapping[str, Any]
+    operator_instruction: str | None
+    fallback_guidance: Mapping[str, Any]
+    fallback_guidance_present: bool
+    content_brief_schema_version: str
+    brief_fingerprint: str
+    normalized_content_brief: NormalizedContentBrief = field(
+        repr=False,
+        compare=False,
+    )
+
+
+@dataclass(frozen=True)
+class GenerationStrategyPlan:
+    strategy_key: str
+    audience_focus: tuple[str, ...]
+    message_angle: str
+    benefit_focus: tuple[str, ...]
+    visual_direction: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+
+    def to_metadata(self) -> dict[str, Any]:
+        return {
+            "strategy_key": self.strategy_key,
+            "audience_focus": list(self.audience_focus),
+            "message_angle": self.message_angle,
+            "benefit_focus": list(self.benefit_focus),
+            "visual_direction": list(self.visual_direction),
+            "evidence_refs": list(self.evidence_refs),
+        }
+
+
+@dataclass(frozen=True)
 class PromptBuildResult:
     generation_prompt: str
     message_strategy: str
@@ -59,6 +110,139 @@ class PromptBuildResult:
     metadata_json: dict[str, Any] = field(default_factory=dict)
     fallback_guidance_present: bool = False
     fallback_guidance_used: bool = False
+    generation_context: GenerationContext | None = None
+    strategy_plan: GenerationStrategyPlan | None = None
+
+
+class GenerationContextBuilder:
+    def build(self, prompt_input: GenerationPromptInput) -> GenerationContext:
+        content_brief = normalize_content_brief(
+            prompt_input.target_segment.content_brief_json
+        )
+        missing_sections = tuple(
+            _string_list(content_brief.readiness.get("missing_sections"))
+        )
+        operator_instruction = _resolved_operator_instruction(
+            request_value=prompt_input.request.operator_instruction,
+            brief_value=content_brief.operator_instruction,
+        )
+        promotion = prompt_input.promotion
+        promotion_objective = {
+            "channel": promotion.channel.value,
+            "goal_metric": promotion.goal_metric,
+            "goal_basis": promotion.goal_basis,
+            "goal_target_value": promotion.goal_target_value,
+            "message_brief": promotion.message_brief,
+        }
+        fingerprint_payload = {
+            "promotion_objective": promotion_objective,
+            "verified_audience_evidence": content_brief.audience_evidence,
+            "hotel_profile": content_brief.hotel_profile,
+            "readiness": content_brief.readiness,
+            "missing_sections": list(missing_sections),
+            "generation_constraints": content_brief.generation_constraints,
+            "operator_instruction": operator_instruction,
+            "fallback_guidance": content_brief.fallback_guidance,
+            "fallback_guidance_present": content_brief.fallback_guidance_present,
+            "content_brief_schema_version": content_brief.schema_version,
+        }
+        return GenerationContext(
+            promotion_objective=promotion_objective,
+            verified_audience_evidence=dict(content_brief.audience_evidence),
+            hotel_profile=(
+                dict(content_brief.hotel_profile)
+                if content_brief.hotel_profile is not None
+                else None
+            ),
+            readiness=dict(content_brief.readiness),
+            missing_sections=missing_sections,
+            generation_constraints=dict(content_brief.generation_constraints),
+            operator_instruction=operator_instruction,
+            fallback_guidance=dict(content_brief.fallback_guidance),
+            fallback_guidance_present=content_brief.fallback_guidance_present,
+            content_brief_schema_version=content_brief.schema_version,
+            brief_fingerprint=_brief_fingerprint(fingerprint_payload),
+            normalized_content_brief=content_brief,
+        )
+
+
+class GenerationStrategyPlanner:
+    def build(
+        self,
+        generation_context: GenerationContext,
+        *,
+        option_index: int,
+    ) -> GenerationStrategyPlan:
+        if option_index < 1:
+            raise ValueError("option_index must be at least 1")
+
+        evidence = generation_context.verified_audience_evidence
+        resolver = EvidenceResolver(
+            audience_evidence=evidence,
+            hotel_profile=generation_context.hotel_profile,
+        )
+        audience_items = _indexed_evidence_items(
+            evidence.get("primary_signals"),
+            section="primary_signals",
+        )
+        matched_feature_items = _indexed_evidence_items(
+            evidence.get("promotion_matched_features"),
+            section="promotion_matched_features",
+        )
+        selected_audience = _select_indexed_evidence(
+            audience_items,
+            option_index=option_index,
+        )
+        selected_matched_feature = _select_indexed_evidence(
+            matched_feature_items,
+            option_index=option_index,
+        )
+        selected_benefit = _select_indexed_evidence(
+            verified_hotel_benefits(resolver),
+            option_index=option_index,
+        )
+
+        audience_focus = [
+            selected[0]
+            for selected in (selected_audience, selected_matched_feature)
+            if selected is not None
+        ]
+        audience_focus = list(dict.fromkeys(audience_focus))
+        benefit_focus = [selected_benefit[0]] if selected_benefit else []
+        evidence_refs = [
+            selected[1]
+            for selected in (
+                selected_audience,
+                selected_matched_feature,
+                selected_benefit,
+            )
+            if selected is not None
+        ]
+        resolver.validate_all(evidence_refs)
+
+        message_angle = _message_angle_for(
+            str(generation_context.promotion_objective.get("goal_metric", ""))
+        )
+        strategy_focus = (
+            benefit_focus[0]
+            if benefit_focus
+            else audience_focus[0]
+            if audience_focus
+            else "promotion"
+        )
+        visual_direction = SAFE_VISUAL_DIRECTIONS[
+            (option_index - 1) % len(SAFE_VISUAL_DIRECTIONS)
+        ]
+        return GenerationStrategyPlan(
+            strategy_key=(
+                f"{message_angle}__{_strategy_slug(strategy_focus)}"
+            ),
+            audience_focus=tuple(audience_focus),
+            message_angle=message_angle,
+            benefit_focus=tuple(benefit_focus),
+            visual_direction=(visual_direction,),
+            evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+        )
 
 
 class GenerationInputBuilder:
@@ -90,14 +274,27 @@ class GenerationInputBuilder:
 
 
 class PromptBuilder:
-    def build(self, prompt_input: GenerationPromptInput) -> PromptBuildResult:
+    def build(
+        self,
+        prompt_input: GenerationPromptInput,
+        *,
+        generation_context: GenerationContext | None = None,
+        strategy_plan: GenerationStrategyPlan | None = None,
+    ) -> PromptBuildResult:
         promotion = prompt_input.promotion
         target_segment = prompt_input.target_segment
         channel_contract = _channel_contract(promotion.channel)
-        content_brief = normalize_content_brief(target_segment.content_brief_json)
-        fallback_guidance_used = (
-            content_brief.fallback_guidance_present
-            and _readiness_level(content_brief) != "evidence_ready"
+        generation_context = generation_context or GenerationContextBuilder().build(
+            prompt_input
+        )
+        strategy_plan = strategy_plan or GenerationStrategyPlanner().build(
+            generation_context,
+            option_index=1,
+        )
+        content_brief = generation_context.normalized_content_brief
+        fallback_guidance_used = _should_use_fallback_guidance(
+            content_brief=content_brief,
+            strategy_plan=strategy_plan,
         )
         message_strategy = _message_strategy(
             content_brief,
@@ -133,6 +330,10 @@ class PromptBuilder:
             f"Fixed landing URL: {promotion.landing_url or 'not provided'}",
             f"Promotion brief: {promotion.message_brief or 'not provided'}",
             f"Content brief readiness: {_readiness_level(content_brief)}",
+            (
+                "Missing evidence sections: "
+                f"{', '.join(generation_context.missing_sections) or 'none'}"
+            ),
             f"Message strategy: {message_strategy}",
             _optional_line(
                 "Natural language segment query",
@@ -141,13 +342,18 @@ class PromptBuilder:
             _optional_line("Generated SQL summary", target_segment.generated_sql),
             _optional_line(
                 "Operator instruction",
-                prompt_input.request.operator_instruction,
+                generation_context.operator_instruction,
             ),
             "Return only fields that belong to the requested channel contract.",
             "Do not generate or override landing_url; Loop-Ad assigns the fixed landing URL.",
             "Keep the content in the hotel booking domain.",
         ]
         if fallback_guidance_used:
+            prompt_lines.extend(
+                _fallback_guardrail_lines(
+                    readiness_level=_readiness_level(content_brief),
+                )
+            )
             prompt_lines.extend(
                 [
                     (
@@ -161,7 +367,9 @@ class PromptBuilder:
                 ]
             )
         prompt_lines.extend(_content_brief_context_lines(content_brief))
+        prompt_lines.extend(_strategy_block_lines(strategy_plan))
         generation_prompt = "\n".join(prompt_lines)
+        strategy_metadata = strategy_plan.to_metadata()
 
         metadata = {
             "prompt_builder_version": PROMPT_BUILDER_VERSION,
@@ -170,9 +378,14 @@ class PromptBuilder:
             "message_strategy": message_strategy,
             "content_brief_schema_version": content_brief.schema_version,
             "content_brief_readiness": content_brief.readiness,
+            "missing_sections": list(generation_context.missing_sections),
             "fallback_guidance_present": content_brief.fallback_guidance_present,
             "fallback_guidance_used": fallback_guidance_used,
-            "operator_instruction": prompt_input.request.operator_instruction,
+            "operator_instruction": generation_context.operator_instruction,
+            "strategy_key": strategy_plan.strategy_key,
+            "strategy_plan": strategy_metadata,
+            "brief_fingerprint": generation_context.brief_fingerprint,
+            "evidence_refs": list(strategy_plan.evidence_refs),
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
             "generated_sql_summary": target_segment.generated_sql,
@@ -186,6 +399,8 @@ class PromptBuilder:
             metadata_json=metadata,
             fallback_guidance_present=content_brief.fallback_guidance_present,
             fallback_guidance_used=fallback_guidance_used,
+            generation_context=generation_context,
+            strategy_plan=strategy_plan,
         )
 
 
@@ -240,6 +455,46 @@ def _message_strategy(
         "Use the available verified evidence and promotion context; "
         "do not infer missing audience details."
     )
+
+
+def _should_use_fallback_guidance(
+    *,
+    content_brief: NormalizedContentBrief,
+    strategy_plan: GenerationStrategyPlan,
+) -> bool:
+    if not content_brief.fallback_guidance_present:
+        return False
+    readiness_level = _readiness_level(content_brief)
+    if readiness_level == "evidence_ready":
+        return False
+    if readiness_level == "fallback_only":
+        return True
+    if readiness_level != "partial":
+        return False
+    return not any(
+        reference.startswith(("primary_signals[", "promotion_matched_features["))
+        for reference in strategy_plan.evidence_refs
+    )
+
+
+def _fallback_guardrail_lines(*, readiness_level: str) -> list[str]:
+    if readiness_level == "fallback_only":
+        return [
+            (
+                "Fallback basis: fallback_only. Treat fallback guidance as "
+                "non-evidentiary message direction only."
+            ),
+            (
+                "Do not infer audience traits, hotel policies, hotel benefits, "
+                "discounts, room inventory, amenities, or facilities."
+            ),
+        ]
+    return [
+        (
+            "Partial fallback scope: use fallback only for the missing audience "
+            "or message direction; do not treat it as evidence."
+        )
+    ]
 
 
 def _reason_summary(prompt_input: GenerationPromptInput) -> str:
@@ -317,12 +572,117 @@ def _content_brief_context_lines(
     lines: list[str] = []
     if content_brief.audience_evidence:
         lines.append(f"Audience evidence: {_compact_jsonish(content_brief.audience_evidence)}")
+    if content_brief.hotel_profile:
+        lines.append(
+            f"Hotel profile context: {_compact_jsonish(content_brief.hotel_profile)}"
+        )
     do_not_claim = content_brief.generation_constraints.get("do_not_claim")
     if isinstance(do_not_claim, Sequence) and not isinstance(do_not_claim, str):
         claims = [str(item).strip() for item in do_not_claim if str(item).strip()]
         if claims:
             lines.append(f"Do not claim: {', '.join(claims)}")
     return lines
+
+
+def _strategy_block_lines(
+    strategy_plan: GenerationStrategyPlan,
+) -> list[str]:
+    return [
+        CANDIDATE_STRATEGY_BLOCK_HEADER,
+        (
+            "Strategy plan JSON: "
+            + json.dumps(
+                strategy_plan.to_metadata(),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        ),
+        (
+            "Use this strategy to shape this option's copy and image_prompt. "
+            "Evidence references are provenance only; do not expose them in "
+            "customer-facing copy."
+        ),
+    ]
+
+
+def _brief_fingerprint(value: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+    return f"sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
+def _resolved_operator_instruction(
+    *,
+    request_value: str | None,
+    brief_value: str | None,
+) -> str | None:
+    for value in (request_value, brief_value):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _message_angle_for(goal_metric: str) -> str:
+    normalized = goal_metric.strip().lower()
+    if normalized == "booking_conversion_rate":
+        return "booking_confidence"
+    if normalized == "inflow_rate":
+        return "landing_motivation"
+    return "promotion_relevance"
+
+
+def _indexed_evidence_items(
+    value: object,
+    *,
+    section: str,
+) -> list[tuple[str, str]]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        return []
+    items: list[tuple[str, str]] = []
+    for index, item in enumerate(value):
+        text = _evidence_text(item)
+        if text:
+            items.append((text, f"{section}[{index}]"))
+    return items
+
+
+def _select_indexed_evidence(
+    items: Sequence[tuple[str, str]],
+    *,
+    option_index: int,
+) -> tuple[str, str] | None:
+    if not items:
+        return None
+    return items[(option_index - 1) % len(items)]
+
+
+def _evidence_text(value: object) -> str | None:
+    if isinstance(value, Mapping):
+        for key in ("key", "feature", "name", "label", "chip"):
+            nested = value.get(key)
+            if isinstance(nested, str) and nested.strip():
+                return nested.strip()
+        return None
+    if isinstance(value, Sequence) and not isinstance(value, str):
+        return None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _strategy_slug(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    if slug:
+        return slug
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:10]
+    return f"evidence_{digest}"
 
 
 def _compact_jsonish(value: Mapping[str, Any]) -> str:

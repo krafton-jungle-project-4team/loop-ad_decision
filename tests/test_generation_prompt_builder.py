@@ -6,8 +6,11 @@ from typing import Any
 import pytest
 
 from app.generation.prompt_builder import (
+    CANDIDATE_STRATEGY_BLOCK_HEADER,
+    GenerationContextBuilder,
     GenerationInputBuilder,
     GenerationPromptInput,
+    GenerationStrategyPlanner,
     PromotionPromptInput,
     PromptBuilder,
     TargetSegmentPromptInput,
@@ -235,9 +238,15 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
     )
     assert "refundable stay, same-weekend room" in result.generation_prompt
     assert "Audience evidence:" not in result.generation_prompt
-    assert "primary_signals" not in result.generation_prompt
-    assert "score_components" not in result.generation_prompt
+    assert (
+        "Missing evidence sections: primary_signals, score_components"
+        in result.generation_prompt
+    )
     assert "behavior_metrics" not in result.generation_prompt
+    assert "Fallback basis: fallback_only" in result.generation_prompt
+    assert "Do not infer audience traits, hotel policies, hotel benefits" in (
+        result.generation_prompt
+    )
     assert result.metadata_json["content_brief_schema_version"] == "content_brief.v2"
     assert result.metadata_json["content_brief_readiness"]["level"] == "fallback_only"
     assert result.metadata_json["fallback_guidance_present"] is True
@@ -248,6 +257,157 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
     ]
 
 
+def test_prompt_builder_uses_brief_operator_instruction_and_exposes_missing_sections() -> None:
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=replace(
+            target_segment_input(),
+            content_brief_json={
+                "schema_version": "content_brief.v2",
+                "operator_instruction": "Emphasize a calm booking decision.",
+                "fallback_guidance": {
+                    "message_direction": "Use a clear hotel booking message.",
+                    "keywords": ["hotel booking"],
+                },
+                "audience_evidence": {
+                    "primary_signals": ["near_checkin"],
+                },
+            },
+        ),
+    )
+
+    result = PromptBuilder().build(prompt_input)
+
+    assert "Operator instruction: Emphasize a calm booking decision." in (
+        result.generation_prompt
+    )
+    assert "Missing evidence sections: score_components" in result.generation_prompt
+    assert result.metadata_json["operator_instruction"] == (
+        "Emphasize a calm booking decision."
+    )
+    assert result.metadata_json["missing_sections"] == ["score_components"]
+
+
+def test_generation_context_fingerprint_and_candidate_strategy_are_deterministic() -> None:
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=replace(
+            target_segment_input(),
+            content_brief_json={
+                "schema_version": "content_brief.v2",
+                "fallback_guidance": {
+                    "message_direction": "Use a hotel booking message.",
+                    "keywords": ["hotel booking"],
+                },
+                "hotel_profile": {"event_count": 5000, "booking_count": 120},
+                "audience_evidence": {
+                    "primary_signals": ["near_checkin", "mobile"],
+                    "score_components": {"final_score": 0.91},
+                    "promotion_matched_features": [
+                        "free_cancellation",
+                        "breakfast_included",
+                    ],
+                },
+            },
+        ),
+    )
+    context_builder = GenerationContextBuilder()
+    planner = GenerationStrategyPlanner()
+
+    context = context_builder.build(prompt_input)
+    same_context = context_builder.build(prompt_input)
+    first_plan = planner.build(context, option_index=1)
+    same_first_plan = planner.build(context, option_index=1)
+    second_plan = planner.build(context, option_index=2)
+
+    assert context.brief_fingerprint == same_context.brief_fingerprint
+    assert context.brief_fingerprint.startswith("sha256:")
+    assert len(context.brief_fingerprint) == len("sha256:") + 64
+    assert first_plan == same_first_plan
+    assert first_plan.strategy_key == "booking_confidence__near_checkin"
+    assert first_plan.benefit_focus == ()
+    assert first_plan.audience_focus == ("near_checkin", "free_cancellation")
+    assert first_plan.evidence_refs == (
+        "primary_signals[0]",
+        "promotion_matched_features[0]",
+    )
+    assert second_plan.evidence_refs == (
+        "primary_signals[1]",
+        "promotion_matched_features[1]",
+    )
+
+    first_result = PromptBuilder().build(
+        prompt_input,
+        generation_context=context,
+        strategy_plan=first_plan,
+    )
+    second_result = PromptBuilder().build(
+        prompt_input,
+        generation_context=context,
+        strategy_plan=second_plan,
+    )
+    first_base, first_strategy = first_result.generation_prompt.split(
+        CANDIDATE_STRATEGY_BLOCK_HEADER,
+        maxsplit=1,
+    )
+    second_base, second_strategy = second_result.generation_prompt.split(
+        CANDIDATE_STRATEGY_BLOCK_HEADER,
+        maxsplit=1,
+    )
+
+    assert first_base == second_base
+    assert first_strategy != second_strategy
+    assert first_result.message_strategy == second_result.message_strategy
+    assert first_result.metadata_json["brief_fingerprint"] == (
+        second_result.metadata_json["brief_fingerprint"]
+    )
+    assert first_result.metadata_json["evidence_refs"] == list(
+        first_plan.evidence_refs
+    )
+
+    changed_request = prompt_input.request.model_copy(
+        update={"operator_instruction": "Prioritize a concise mobile message."}
+    )
+    changed_context = context_builder.build(
+        replace(prompt_input, request=changed_request)
+    )
+    assert changed_context.brief_fingerprint != context.brief_fingerprint
+
+
+def test_strategy_planner_requires_hotel_reference_for_benefit_focus() -> None:
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(),
+        target_segment=replace(
+            target_segment_input(),
+            content_brief_json={
+                "schema_version": "content_brief.v2",
+                "hotel_profile": {
+                    "booking_policy": {"free_cancellation": True},
+                },
+                "audience_evidence": {
+                    "primary_signals": ["near_checkin"],
+                    "score_components": {"final_score": 0.91},
+                    "promotion_matched_features": ["free_cancellation"],
+                },
+            },
+        ),
+    )
+
+    context = GenerationContextBuilder().build(prompt_input)
+    strategy_plan = GenerationStrategyPlanner().build(context, option_index=1)
+
+    assert strategy_plan.strategy_key == "booking_confidence__free_cancellation"
+    assert strategy_plan.benefit_focus == ("free_cancellation",)
+    assert strategy_plan.evidence_refs == (
+        "primary_signals[0]",
+        "promotion_matched_features[0]",
+        "hotel_profile.booking_policy.free_cancellation",
+    )
+
+
 def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> None:
     builder = PromptBuilder()
     target_segment = replace(
@@ -256,13 +416,21 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
             "schema_version": "content_brief.v2",
             "readiness": {
                 "level": "partial",
-                "available_sections": ["fallback_guidance", "audience_evidence"],
+                "available_sections": [
+                    "fallback_guidance",
+                    "audience_evidence",
+                    "hotel_profile",
+                ],
                 "missing_sections": [],
             },
             "fallback_guidance": {
                 "message_direction": "Use a hotel booking message.",
                 "keywords": ["hotel booking"],
                 "source": "legacy_segment_content_hints",
+            },
+            "hotel_profile": {
+                "hotel_cluster": "jeju_ocean",
+                "booking_count": 120,
             },
             "audience_evidence": {
                 "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
@@ -295,11 +463,17 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "Audience evidence:" in result.generation_prompt
     assert "same_hotel_repeat_view" in result.generation_prompt
     assert "promotion_cluster_similarity" in result.generation_prompt
+    assert "Hotel profile context:" in result.generation_prompt
+    assert "hotel_cluster=jeju_ocean" in result.generation_prompt
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_readiness"] == {
         "level": "evidence_ready",
         "missing_sections": [],
-        "available_sections": ["fallback_guidance", "audience_evidence"],
+        "available_sections": [
+            "fallback_guidance",
+            "audience_evidence",
+            "hotel_profile",
+        ],
     }
     assert result.fallback_guidance_present is True
     assert result.fallback_guidance_used is False
@@ -308,6 +482,7 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "Fallback message direction:" not in result.generation_prompt
     assert "Fallback keywords:" not in result.generation_prompt
     assert "content_brief_keywords" not in result.data_evidence_json
+    assert "hotel_profile" not in result.data_evidence_json
     assert result.data_evidence_json["audience_evidence"] == {
         "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
         "score_components": {
@@ -363,10 +538,41 @@ def test_prompt_builder_uses_stored_fallback_for_partial_evidence() -> None:
 
     assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
     assert result.fallback_guidance_present is True
+    assert result.fallback_guidance_used is False
+    assert "Fallback message direction:" not in result.generation_prompt
+
+
+def test_prompt_builder_uses_partial_fallback_only_without_verified_audience_cue() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=replace(
+                target_segment_input(),
+                content_brief_json={
+                    "schema_version": "content_brief.v2",
+                    "fallback_guidance": {
+                        "message_direction": "Use a neutral booking reminder.",
+                        "keywords": ["hotel booking"],
+                    },
+                    "audience_evidence": {
+                        "score_components": {"final_score": 0.8},
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
     assert result.fallback_guidance_used is True
-    assert "Fallback message direction: Prioritize flexible cancellation." in (
+    assert "Partial fallback scope:" in result.generation_prompt
+    assert "Fallback message direction: Use a neutral booking reminder." in (
         result.generation_prompt
     )
+    assert result.strategy_plan is not None
+    assert result.strategy_plan.audience_focus == ()
+    assert result.strategy_plan.benefit_focus == ()
+    assert result.strategy_plan.evidence_refs == ()
 
 
 def test_prompt_builder_does_not_invent_missing_fallback_guidance() -> None:

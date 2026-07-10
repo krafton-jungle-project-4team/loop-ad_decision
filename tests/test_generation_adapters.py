@@ -18,6 +18,7 @@ from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
     PromptBuildResult,
+    PromptBuilder,
     TargetSegmentPromptInput,
 )
 from app.generation.schemas import ContentChannel, GenerationRequest
@@ -61,10 +62,14 @@ def test_external_content_generator_stores_banner_image_url() -> None:
     )
 
     assert content.title == "이번 주말 호텔 특가"
-    assert content.image_prompt == "bright hotel suite banner, no visible text"
+    assert content.image_prompt is not None
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
+    assert "no visible text" in content.image_prompt
     assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url == IMAGE_URL
-    assert image_client.prompts == ["bright hotel suite banner, no visible text"]
+    assert image_client.prompts == [content.image_prompt]
     assert asset_storage.saved == [
         (
             "content_banner_repeat_hotel_001",
@@ -97,7 +102,10 @@ def test_external_content_generator_can_defer_banner_image_generation() -> None:
     )
 
     assert content.title == "이번 주말 호텔 특가"
-    assert content.image_prompt == "bright hotel suite banner, no visible text"
+    assert content.image_prompt is not None
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
     assert content.image_url is None
     assert image_client.prompts == []
     assert asset_storage.saved == []
@@ -126,7 +134,9 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
     )
 
     assert content.image_prompt is not None
-    assert content.image_prompt.startswith("Bright modern hotel booking onsite banner")
+    assert content.image_prompt.startswith(
+        "Property-agnostic hotel booking advertisement image."
+    )
     assert content.image_url == IMAGE_URL
     assert image_client.prompts == [content.image_prompt]
     assert len(asset_storage.saved) == 1
@@ -215,9 +225,11 @@ def test_openai_content_client_parses_responses_output_text() -> None:
         transport=fake_transport,
     )
 
+    rich_prompt_input = prompt_input(ContentChannel.ONSITE_BANNER)
+    rich_prompt_result = PromptBuilder().build(rich_prompt_input)
     content = client.generate_content(
-        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
-        prompt_result=prompt_result(),
+        prompt_input=rich_prompt_input,
+        prompt_result=rich_prompt_result,
         option_index=2,
     )
 
@@ -230,6 +242,13 @@ def test_openai_content_client_parses_responses_output_text() -> None:
     assert "natural Korean" in str(captured["payload"])
     assert "Return concise Korean hotel booking copy" in str(captured["payload"])
     assert "Do not copy English source text verbatim" in str(captured["payload"])
+    assert "must not request visible text in the image" in str(captured["payload"])
+    assert "Candidate strategy (apply only to this content option)" in str(
+        captured["payload"]
+    )
+    assert rich_prompt_result.metadata_json["strategy_key"] in str(
+        captured["payload"]
+    )
     schema = captured["payload"]["text"]["format"]["schema"]
     assert "landing_url" not in schema["properties"]
     assert "landing_url" not in schema["required"]

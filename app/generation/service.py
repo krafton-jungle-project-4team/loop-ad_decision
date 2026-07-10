@@ -20,8 +20,12 @@ from app.generation.repositories import (
     GenerationRunRecord,
 )
 from app.generation.prompt_builder import (
+    GenerationContext,
+    GenerationContextBuilder,
     GenerationInputBuilder,
     GenerationPromptInput,
+    GenerationStrategyPlan,
+    GenerationStrategyPlanner,
     PROMPT_BUILDER_VERSION,
     PromptBuilder,
     PromotionPromptInput,
@@ -125,6 +129,8 @@ class GenerationService:
         content_candidate_repository: ContentCandidateWriter | None = None,
         generation_input_reader: GenerationInputReader | None = None,
         generation_input_builder: GenerationInputBuilder | None = None,
+        generation_context_builder: GenerationContextBuilder | None = None,
+        generation_strategy_planner: GenerationStrategyPlanner | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
         artifact_publisher: CreativeArtifactPublisher | None = None,
@@ -136,6 +142,12 @@ class GenerationService:
         self._generation_input_reader = generation_input_reader
         self._generation_input_builder = (
             generation_input_builder or GenerationInputBuilder()
+        )
+        self._generation_context_builder = (
+            generation_context_builder or GenerationContextBuilder()
+        )
+        self._generation_strategy_planner = (
+            generation_strategy_planner or GenerationStrategyPlanner()
         )
         self._prompt_builder = prompt_builder or PromptBuilder()
         self._content_generator = content_generator or DeterministicContentGenerator()
@@ -465,27 +477,42 @@ class GenerationService:
         prompt_inputs: Sequence[GenerationPromptInput],
         candidate_status: ContentCandidateStatus = ContentCandidateStatus.DRAFT,
     ) -> list[ContentCandidateRecord]:
-        return [
-            self._build_content_candidate_record(
-                generation_id=generation_id,
-                prompt_input=prompt_input,
-                index=index,
-                status=candidate_status,
-            )
-            for prompt_input in prompt_inputs
-            for index in range(1, request.content_option_count + 1)
-        ]
+        records: list[ContentCandidateRecord] = []
+        for raw_prompt_input in prompt_inputs:
+            prompt_input = _prompt_input_with_resolved_landing_url(raw_prompt_input)
+            generation_context = self._generation_context_builder.build(prompt_input)
+            for index in range(1, request.content_option_count + 1):
+                strategy_plan = self._generation_strategy_planner.build(
+                    generation_context,
+                    option_index=index,
+                )
+                records.append(
+                    self._build_content_candidate_record(
+                        generation_id=generation_id,
+                        prompt_input=prompt_input,
+                        generation_context=generation_context,
+                        strategy_plan=strategy_plan,
+                        index=index,
+                        status=candidate_status,
+                    )
+                )
+        return records
 
     def _build_content_candidate_record(
         self,
         *,
         generation_id: str,
         prompt_input: GenerationPromptInput,
+        generation_context: GenerationContext,
+        strategy_plan: GenerationStrategyPlan,
         index: int,
         status: ContentCandidateStatus,
     ) -> ContentCandidateRecord:
-        prompt_input = _prompt_input_with_resolved_landing_url(prompt_input)
-        prompt_result = self._prompt_builder.build(prompt_input)
+        prompt_result = self._prompt_builder.build(
+            prompt_input,
+            generation_context=generation_context,
+            strategy_plan=strategy_plan,
+        )
         channel = prompt_input.promotion.channel
         channel_slug = _channel_slug(channel)
         segment_slug = _segment_slug(prompt_input.target_segment)
