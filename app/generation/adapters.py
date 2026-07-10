@@ -422,6 +422,11 @@ class ExternalContentGenerator:
             channel=channel,
             values=values,
             landing_url=prompt_input.promotion.landing_url,
+            visual_direction=(
+                prompt_result.strategy_plan.visual_direction
+                if prompt_result.strategy_plan is not None
+                else ()
+            ),
         )
 
         if channel != ContentChannel.ONSITE_BANNER or not self._generate_images:
@@ -556,10 +561,15 @@ def _generated_content_from_values(
     channel: ContentChannel,
     values: Mapping[str, str | None],
     landing_url: str | None,
+    visual_direction: tuple[str, ...] = (),
 ) -> GeneratedContent:
     if not landing_url:
         raise ValueError("promotion.landing_url is required to generate content")
-    values = _values_with_banner_image_prompt(channel=channel, values=values)
+    values = _values_with_banner_image_prompt(
+        channel=channel,
+        values=values,
+        visual_direction=visual_direction,
+    )
     values = _values_with_sms_redirect_placeholder(channel=channel, values=values)
     content = GeneratedContent(
         subject=values.get("subject"),
@@ -593,19 +603,27 @@ def _values_with_banner_image_prompt(
     *,
     channel: ContentChannel,
     values: Mapping[str, str | None],
+    visual_direction: tuple[str, ...] = (),
 ) -> Mapping[str, str | None]:
     if channel != ContentChannel.ONSITE_BANNER or _optional_text(
         values.get("image_prompt")
     ):
         return values
 
-    image_prompt = _fallback_banner_image_prompt(values)
+    image_prompt = _fallback_banner_image_prompt(
+        values,
+        visual_direction=visual_direction,
+    )
     if not image_prompt:
         return values
     return {**values, "image_prompt": image_prompt}
 
 
-def _fallback_banner_image_prompt(values: Mapping[str, str | None]) -> str | None:
+def _fallback_banner_image_prompt(
+    values: Mapping[str, str | None],
+    *,
+    visual_direction: tuple[str, ...] = (),
+) -> str | None:
     title = _optional_text(values.get("title"))
     body = _optional_text(values.get("body"))
     cta = _optional_text(values.get("cta"))
@@ -613,10 +631,12 @@ def _fallback_banner_image_prompt(values: Mapping[str, str | None]) -> str | Non
     if not prompt_parts:
         return None
 
-    prompt = (
-        "Bright modern hotel booking onsite banner image, clean travel layout, "
-        + " ".join(prompt_parts)
+    visual_prefix = (
+        f"{', '.join(visual_direction)}, "
+        if visual_direction
+        else "Bright modern hotel booking onsite banner image, "
     )
+    prompt = visual_prefix + "clean travel layout, " + " ".join(prompt_parts)
     return _compact_text(prompt, max_length=FALLBACK_IMAGE_PROMPT_MAX_LENGTH)
 
 
