@@ -1038,6 +1038,7 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
     assert "from ( select project_id, user_id, vector_dim" in sql
     assert "limit {limit:uint32}" in sql
     assert "user_id in" not in sql
+    assert "after_user_id" not in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
@@ -1067,6 +1068,33 @@ def test_user_behavior_vector_repository_filters_project_scope_by_source() -> No
         "vector_dim": 64,
         "limit": 500,
         "source": "booking_profile",
+    }
+
+
+def test_user_behavior_vector_repository_applies_keyset_cursor() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    repo.list_for_project(
+        project_id="hotel-client-a",
+        vector_version="v2",
+        limit=10_000,
+        source="booking_profile",
+        after_user_id="user_009999",
+    )
+
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "user_id > {after_user_id:string}" in sql
+    assert "order by user_id asc" in sql
+    assert "limit {limit:uint32}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v2",
+        "vector_dim": 64,
+        "limit": 10_000,
+        "source": "booking_profile",
+        "after_user_id": "user_009999",
     }
 
 
