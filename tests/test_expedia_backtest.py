@@ -1,0 +1,372 @@
+from __future__ import annotations
+
+from datetime import UTC, date, datetime
+from pathlib import Path
+
+import pytest
+
+from app.analysis.expedia_backtest import (
+    ClickHouseExpediaBacktestRepository,
+    EXPEDIA_TRAIN_COLUMNS,
+    ExpediaBacktestConfig,
+    ExpediaBacktestError,
+    ExpediaBacktestScenario,
+    ExpediaSourceStats,
+    ExpediaFutureBookingUsers,
+    ExpediaSegmentBacktestService,
+    monthly_cutoffs,
+    summarize_backtest,
+    validate_table_identifier,
+    validate_train_csv_header,
+    write_backtest_artifacts,
+)
+from app.analysis.repositories import RawEventUserSignalRecord
+
+
+class FakeExpediaBacktestRepository:
+    def __init__(self) -> None:
+        self.cutoff = datetime(2014, 7, 1, tzinfo=UTC)
+        self.scenario = ExpediaBacktestScenario(
+            scenario_id="20140701_destination_8250",
+            cutoff=self.cutoff,
+            target_destination_id=8250,
+            historical_user_count=6,
+            historical_event_count=20,
+        )
+        self.profiles = [
+            profile(
+                "1",
+                hotel_search_count=3,
+                hotel_detail_view_count=2,
+                destination_values=("8250",),
+                destination_match_count=3,
+                booking_complete_count=1,
+            ),
+            profile(
+                "2",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_values=("8250",),
+                destination_match_count=2,
+            ),
+            profile(
+                "3",
+                hotel_detail_view_count=2,
+                booking_start_count=2,
+            ),
+            profile(
+                "4",
+                hotel_detail_view_count=2,
+                booking_start_count=1,
+            ),
+            profile("5", deal_event_count=2, free_cancellation_count=1),
+            profile("6", deal_event_count=1, breakfast_included_count=1),
+        ]
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def source_stats(self):  # pragma: no cover - not used by the service
+        raise NotImplementedError
+
+    def list_scenarios(self, **kwargs):
+        self.calls.append(("list_scenarios", kwargs))
+        return [self.scenario]
+
+    def list_user_profiles(self, **kwargs):
+        self.calls.append(("list_user_profiles", kwargs))
+        return self.profiles
+
+    def future_booking_users(self, **kwargs):
+        self.calls.append(("future_booking_users", kwargs))
+        return ExpediaFutureBookingUsers(
+            any_booking_user_ids=frozenset(
+                {"expedia-user-1", "expedia-user-3", "expedia-user-5"}
+            ),
+            contextual_booking_user_ids=frozenset(
+                {"expedia-user-1", "expedia-user-3"}
+            ),
+        )
+
+
+def test_backtest_separates_observation_and_future_windows() -> None:
+    repository = FakeExpediaBacktestRepository()
+    service = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            lookback_days=90,
+            outcome_days=30,
+            max_scenarios_per_cutoff=1,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    )
+
+    run = service.run([repository.cutoff])
+
+    assert run.results
+    scenario_call = next(payload for name, payload in repository.calls if name == "list_scenarios")
+    profile_call = next(
+        payload for name, payload in repository.calls if name == "list_user_profiles"
+    )
+    future_call = next(
+        payload for name, payload in repository.calls if name == "future_booking_users"
+    )
+    expected_start = datetime(2014, 4, 2, tzinfo=UTC)
+    assert scenario_call["observation_start"] == expected_start
+    assert scenario_call["cutoff"] == repository.cutoff
+    assert profile_call["observation_start"] == expected_start
+    assert profile_call["cutoff"] == repository.cutoff
+    assert future_call["outcome_end"] == datetime(2014, 7, 31, tzinfo=UTC)
+    assert future_call["scenario"].cutoff == repository.cutoff
+
+
+def test_backtest_calculates_user_level_future_rates_and_lift() -> None:
+    repository = FakeExpediaBacktestRepository()
+    run = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            max_scenarios_per_cutoff=1,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    ).run([repository.cutoff])
+
+    assert len(run.results) >= 2
+    assert all(result.total_eligible_user_count == 6 for result in run.results)
+    assert all(
+        result.baseline_contextual_conversion_rate == pytest.approx(2 / 6)
+        for result in run.results
+    )
+    intent_result = next(
+        result for result in run.results if result.candidate_type == "intent_matched"
+    )
+    assert intent_result.sample_size == 2
+    assert intent_result.contextual_booking_user_count == 1
+    assert intent_result.actual_contextual_conversion_rate == pytest.approx(0.5)
+    assert intent_result.absolute_lift_percentage_points == pytest.approx(
+        (0.5 - 2 / 6) * 100
+    )
+    assert intent_result.calibration_error_percentage_points >= 0
+
+
+def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
+    repository = FakeExpediaBacktestRepository()
+    run = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            max_scenarios_per_cutoff=1,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    ).run([repository.cutoff])
+
+    summary = summarize_backtest(run)
+
+    assert summary["scenario_count"] == 1
+    assert summary["candidate_result_count"] == len(run.results)
+    assert 0 <= summary["rank_one_beats_baseline_rate"] <= 1
+    assert 0 <= summary["rank_one_is_best_rate"] <= 1
+
+
+def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -> None:
+    repository = FakeExpediaBacktestRepository()
+
+    def no_future_bookings(**kwargs):
+        return ExpediaFutureBookingUsers(
+            any_booking_user_ids=frozenset(),
+            contextual_booking_user_ids=frozenset(),
+        )
+
+    repository.future_booking_users = no_future_bookings  # type: ignore[method-assign]
+    run = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            max_scenarios_per_cutoff=1,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    ).run([repository.cutoff])
+
+    summary = summarize_backtest(run)
+
+    assert summary["scenario_count"] == 1
+    assert summary["evaluable_scenario_count"] == 0
+    assert summary["unevaluable_scenario_count"] == 1
+    assert summary["rank_one_is_best_rate"] == 0
+
+
+def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:
+    repository = FakeExpediaBacktestRepository()
+    config = ExpediaBacktestConfig(
+        max_scenarios_per_cutoff=1,
+        min_scenario_users=2,
+        user_sample_modulo=1,
+    )
+    run = ExpediaSegmentBacktestService(repository, config=config).run(
+        [repository.cutoff]
+    )
+
+    artifacts = write_backtest_artifacts(
+        run,
+        output_dir=tmp_path,
+        source_stats=source_stats(),
+        config=config,
+    )
+
+    assert artifacts["results"].read_text(encoding="utf-8").startswith("cutoff,")
+    assert '"scenario_count": 1' in artifacts["summary"].read_text(
+        encoding="utf-8"
+    )
+    report = artifacts["report"].read_text(encoding="utf-8")
+    assert "Rank 1 실제 전환율" in report
+    assert "광고의 인과적 증분 효과" in report
+
+
+def test_train_csv_validation_rejects_unlabeled_test_file(tmp_path: Path) -> None:
+    train_path = tmp_path / "train.csv"
+    train_path.write_text(",".join(EXPEDIA_TRAIN_COLUMNS) + "\n", encoding="utf-8")
+    validate_train_csv_header(train_path)
+
+    test_path = tmp_path / "test.csv"
+    test_path.write_text(
+        "id,date_time,user_id,srch_destination_id\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ExpediaBacktestError, match="requires train.csv"):
+        validate_train_csv_header(test_path)
+
+
+def test_monthly_cutoffs_are_inclusive() -> None:
+    assert monthly_cutoffs(date(2014, 10, 1), date(2014, 12, 1)) == [
+        datetime(2014, 10, 1, tzinfo=UTC),
+        datetime(2014, 11, 1, tzinfo=UTC),
+        datetime(2014, 12, 1, tzinfo=UTC),
+    ]
+
+
+def test_clickhouse_table_identifier_rejects_sql_fragments() -> None:
+    assert validate_table_identifier("expedia_hotel_events") == "expedia_hotel_events"
+    with pytest.raises(ValueError, match="invalid ClickHouse table"):
+        validate_table_identifier("expedia_hotel_events; DROP TABLE raw_events")
+
+
+def test_future_booking_query_does_not_shadow_source_user_id() -> None:
+    client = FakeClickHouseClient(
+        [
+            {
+                "backtest_user_id": "expedia-user-1",
+                "contextual_booking": 1,
+            },
+            {
+                "backtest_user_id": "expedia-user-2",
+                "contextual_booking": 0,
+            },
+        ]
+    )
+    repository = ClickHouseExpediaBacktestRepository(client)
+    scenario = ExpediaBacktestScenario(
+        scenario_id="20140701_destination_8250",
+        cutoff=datetime(2014, 7, 1, tzinfo=UTC),
+        target_destination_id=8250,
+        historical_user_count=2,
+        historical_event_count=4,
+    )
+
+    future = repository.future_booking_users(
+        scenario=scenario,
+        outcome_end=datetime(2014, 7, 31, tzinfo=UTC),
+        eligible_user_ids=("expedia-user-1", "expedia-user-2"),
+    )
+
+    assert future.any_booking_user_ids == {"expedia-user-1", "expedia-user-2"}
+    assert future.contextual_booking_user_ids == {"expedia-user-1"}
+    assert "AS backtest_user_id" in client.queries[0]
+    assert client.parameters[0]["user_ids"] == [1, 2]
+
+
+def profile(
+    suffix: str,
+    *,
+    hotel_search_count: int = 0,
+    hotel_detail_view_count: int = 0,
+    booking_start_count: int = 0,
+    booking_complete_count: int = 0,
+    deal_event_count: int = 0,
+    free_cancellation_count: int = 0,
+    breakfast_included_count: int = 0,
+    destination_values: tuple[str, ...] = (),
+    destination_match_count: int = 0,
+) -> RawEventUserSignalRecord:
+    event_count = max(
+        1,
+        hotel_search_count
+        + hotel_detail_view_count
+        + booking_start_count
+        + booking_complete_count
+        + deal_event_count,
+    )
+    return RawEventUserSignalRecord(
+        project_id="expedia_backtest",
+        user_id=f"expedia-user-{suffix}",
+        event_count=event_count,
+        hotel_search_count=hotel_search_count,
+        hotel_click_count=0,
+        hotel_detail_view_count=hotel_detail_view_count,
+        promotion_impression_count=0,
+        promotion_click_count=0,
+        campaign_redirect_click_count=0,
+        campaign_landing_count=0,
+        booking_start_count=booking_start_count,
+        booking_complete_count=booking_complete_count,
+        booking_cancel_count=0,
+        deal_event_count=deal_event_count,
+        free_cancellation_count=free_cancellation_count,
+        breakfast_included_count=breakfast_included_count,
+        price_event_count=0,
+        avg_price=0.0,
+        destination_values=destination_values,
+        checkin_dates=(),
+        hotel_market_values=(),
+        hotel_cluster_values=(),
+        age_group_values=(),
+        gender_values=(),
+        preferred_category_values=(),
+        destination_match_count=destination_match_count,
+        season_match_count=0,
+    )
+
+
+def source_stats() -> ExpediaSourceStats:
+    return ExpediaSourceStats(
+        row_count=100,
+        user_count=6,
+        booking_row_count=10,
+        first_event_at=datetime(2013, 1, 1, tzinfo=UTC),
+        last_event_at=datetime(2014, 12, 31, 23, 59, 59, tzinfo=UTC),
+    )
+
+
+class FakeQueryResult:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self._rows = rows
+
+    def named_results(self):
+        return iter(self._rows)
+
+
+class FakeClickHouseClient:
+    def __init__(self, rows: list[dict[str, object]]) -> None:
+        self.rows = rows
+        self.queries: list[str] = []
+        self.parameters: list[dict[str, object]] = []
+
+    def query(self, query: str, parameters=None):
+        self.queries.append(query)
+        self.parameters.append(dict(parameters or {}))
+        return FakeQueryResult(self.rows)
+
+    def command(self, command: str, parameters=None):  # pragma: no cover
+        raise NotImplementedError
+
+    def raw_insert(self, *args, **kwargs):  # pragma: no cover
+        raise NotImplementedError
