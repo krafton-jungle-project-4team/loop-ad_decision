@@ -53,7 +53,7 @@ class NormalizedContentBrief:
     audience_evidence: dict[str, Any]
     generation_constraints: dict[str, Any]
     hotel_profile: dict[str, Any] | None
-    fallback_guidance_used: bool
+    fallback_guidance_present: bool
     raw: dict[str, Any]
 
 
@@ -150,7 +150,7 @@ def _normalize_v2(raw: dict[str, Any]) -> NormalizedContentBrief:
         audience_evidence=audience_evidence,
         generation_constraints=_json_object(raw.get("generation_constraints")),
         hotel_profile=_json_object(raw.get("hotel_profile")) or None,
-        fallback_guidance_used=bool(message_direction or keywords),
+        fallback_guidance_present=bool(message_direction or keywords),
         raw=dict(raw),
     )
 
@@ -158,6 +158,7 @@ def _normalize_v2(raw: dict[str, Any]) -> NormalizedContentBrief:
 def _normalize_legacy(raw: dict[str, Any]) -> NormalizedContentBrief:
     message_direction = _optional_text(raw.get("message_direction"))
     keywords = _string_list(raw.get("keywords"))
+    fallback_guidance_present = bool(message_direction or keywords)
     fallback_guidance = {
         "message_direction": message_direction or DEFAULT_MESSAGE_DIRECTION,
         "keywords": keywords,
@@ -176,7 +177,7 @@ def _normalize_legacy(raw: dict[str, Any]) -> NormalizedContentBrief:
         audience_evidence={},
         generation_constraints={},
         hotel_profile=None,
-        fallback_guidance_used=True,
+        fallback_guidance_present=fallback_guidance_present,
         raw=dict(raw),
     )
 
@@ -191,12 +192,13 @@ def _readiness_for(audience_evidence: Mapping[str, Any]) -> dict[str, Any]:
         for section in MISSING_EVIDENCE_SECTIONS
         if section not in audience_evidence
     ]
-    return {
-        "level": "partial"
-        if len(missing_sections) < len(MISSING_EVIDENCE_SECTIONS)
-        else "fallback_only",
-        "missing_sections": missing_sections,
-    }
+    if not missing_sections:
+        level = "evidence_ready"
+    elif len(missing_sections) == len(MISSING_EVIDENCE_SECTIONS):
+        level = "fallback_only"
+    else:
+        level = "partial"
+    return {"level": level, "missing_sections": missing_sections}
 
 
 def _available_sections_from(

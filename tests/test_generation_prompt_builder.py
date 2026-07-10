@@ -240,6 +240,7 @@ def test_prompt_builder_reads_v2_fallback_guidance_without_fabricating_evidence(
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_schema_version"] == "content_brief.v2"
     assert result.metadata_json["content_brief_readiness"]["level"] == "fallback_only"
+    assert result.metadata_json["fallback_guidance_present"] is True
     assert result.metadata_json["fallback_guidance_used"] is True
     assert result.data_evidence_json["content_brief_keywords"] == [
         "refundable stay",
@@ -296,10 +297,17 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "promotion_cluster_similarity" in result.generation_prompt
     assert "behavior_metrics" not in result.generation_prompt
     assert result.metadata_json["content_brief_readiness"] == {
-        "level": "partial",
+        "level": "evidence_ready",
         "missing_sections": [],
         "available_sections": ["fallback_guidance", "audience_evidence"],
     }
+    assert result.fallback_guidance_present is True
+    assert result.fallback_guidance_used is False
+    assert result.metadata_json["fallback_guidance_present"] is True
+    assert result.metadata_json["fallback_guidance_used"] is False
+    assert "Fallback message direction:" not in result.generation_prompt
+    assert "Fallback keywords:" not in result.generation_prompt
+    assert "content_brief_keywords" not in result.data_evidence_json
     assert result.data_evidence_json["audience_evidence"] == {
         "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
         "score_components": {

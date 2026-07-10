@@ -4,11 +4,6 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from app.content_brief import (
-    CONTENT_BRIEF_SCHEMA_VERSION,
-    NormalizedContentBrief,
-    normalize_content_brief,
-)
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import GenerationStatus
 
@@ -38,11 +33,10 @@ class GenerationReportBuilder:
         status: str,
     ) -> CandidateGenerationReport:
         target_segment = prompt_input.target_segment
-        content_brief = normalize_content_brief(target_segment.content_brief_json)
         reason_summary = prompt_result.reason_summary
         message_strategy = prompt_result.message_strategy
         generated_sql_summary = _generated_sql_summary(target_segment.generated_sql)
-        data_evidence = _data_evidence(prompt_input, content_brief)
+        data_evidence = dict(prompt_result.data_evidence_json)
 
         metadata = {
             "report_version": GENERATION_REPORT_VERSION,
@@ -53,9 +47,14 @@ class GenerationReportBuilder:
             "reason_summary": reason_summary,
             "data_evidence": data_evidence,
             "message_strategy": message_strategy,
-            "content_brief_schema_version": content_brief.schema_version,
-            "content_brief_readiness": content_brief.readiness,
-            "fallback_guidance_used": content_brief.fallback_guidance_used,
+            "content_brief_schema_version": data_evidence.get(
+                "content_brief_schema_version"
+            ),
+            "content_brief_readiness": data_evidence.get(
+                "content_brief_readiness"
+            ),
+            "fallback_guidance_present": prompt_result.fallback_guidance_present,
+            "fallback_guidance_used": prompt_result.fallback_guidance_used,
             "operator_instruction": prompt_input.request.operator_instruction,
             "source_segment_definition_id": target_segment.segment_id,
             "source_query_preview_id": target_segment.query_preview_id,
@@ -106,54 +105,6 @@ class GenerationReportBuilder:
         if error_code:
             output_json["error_code"] = error_code
         return output_json
-
-
-def _data_evidence(
-    prompt_input: GenerationPromptInput,
-    content_brief: NormalizedContentBrief,
-) -> dict[str, Any]:
-    promotion = prompt_input.promotion
-    target_segment = prompt_input.target_segment
-    raw_brief = content_brief.raw
-    keywords = content_brief.keywords
-    goal_target_value = _optional_float(promotion.goal_target_value)
-
-    evidence: dict[str, Any] = {
-        "analysis_id": prompt_input.request.analysis_id,
-        "promotion_id": promotion.promotion_id,
-        "segment_id": target_segment.segment_id,
-        "segment_name": target_segment.segment_name,
-        "segment_vector_id": target_segment.segment_vector_id,
-        "sample_size": target_segment.estimated_size,
-        "sample_ratio": _optional_float(target_segment.sample_ratio),
-        "priority": target_segment.priority,
-        "target_segment_status": target_segment.status,
-        "goal_metric": promotion.goal_metric,
-        "goal_basis": promotion.goal_basis,
-        "goal_target_value": goal_target_value
-        if goal_target_value is not None
-        else promotion.goal_target_value,
-        "content_brief_schema_version": content_brief.schema_version,
-        "content_brief_readiness": content_brief.readiness,
-        "fallback_guidance_used": content_brief.fallback_guidance_used,
-        "content_brief_keywords": keywords,
-    }
-    if content_brief.schema_version != CONTENT_BRIEF_SCHEMA_VERSION:
-        top_common_features = _string_list(raw_brief.get("top_common_features"))
-        evidence.update(
-            {
-                "booking_conversion_rate": _optional_float(
-                    raw_brief.get("booking_conversion_rate")
-                ),
-                "comparison_group_conversion_rate": _optional_float(
-                    raw_brief.get("comparison_group_conversion_rate")
-                ),
-                "top_common_features": top_common_features or keywords,
-            }
-        )
-    if content_brief.audience_evidence:
-        evidence["audience_evidence"] = content_brief.audience_evidence
-    return evidence
 
 
 def _segment_summaries(
@@ -211,18 +162,3 @@ def _generated_sql_summary(value: str | None) -> str | None:
     if len(compacted) <= MAX_SQL_SUMMARY_LENGTH:
         return compacted
     return compacted[: MAX_SQL_SUMMARY_LENGTH - 1].rstrip() + "."
-
-
-def _optional_float(value: object) -> float | None:
-    if value is None:
-        return None
-    try:
-        return float(str(value).strip())
-    except ValueError:
-        return None
-
-
-def _string_list(value: object) -> list[str]:
-    if not isinstance(value, Sequence) or isinstance(value, str):
-        return []
-    return [str(item).strip() for item in value if str(item).strip()]

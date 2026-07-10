@@ -588,7 +588,8 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
 
     family_segment = saved_segments[0]
     repeat_hotel_segment = saved_segments[2]
-    assert family_segment.profile_json["hotel_profile"] == {
+    assert "hotel_profile" not in family_segment.profile_json
+    assert family_segment.content_brief_json["hotel_profile"] == {
         "event_count": 3000,
         "booking_count": 120,
         "mobile_ratio": 0.65,

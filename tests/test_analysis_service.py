@@ -352,7 +352,7 @@ def test_service_analyzes_email_promotion_and_persists_four_suggestions() -> Non
         result.target_segments
     )
     assert result.analysis.profile_summary_json["selected_segment_count"] == 4
-    assert result.target_segments[0].profile_json["hotel_profile"]["event_count"] == 5000
+    assert result.target_segments[0].content_brief_json["hotel_profile"]["event_count"] == 5000
     assert "primary_signals" not in result.target_segments[0].profile_json
 
 
@@ -576,24 +576,18 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     }
     assert result.target_segments[0].data_evidence_json["source"] == "ai_suggested"
     assert result.target_segments[0].profile_json["cluster_score"] == 0.99
-    assert result.target_segments[0].profile_json["primary_signals"] == [
-        "booking_conversion_ready",
-        "promotion_engaged",
-        "hotel_browsing",
-    ]
-    assert "hotel_booking_interest" not in result.target_segments[0].profile_json[
-        "primary_signals"
-    ]
-    assert result.target_segments[0].content_brief_json["audience_evidence"][
-        "primary_signals"
-    ] == [
-        "booking_conversion_ready",
-        "promotion_engaged",
-        "hotel_browsing",
-    ]
-    assert result.target_segments[0].content_brief_json["readiness"][
-        "missing_sections"
-    ] == ["score_components"]
+    assert "primary_signals" not in result.target_segments[0].profile_json
+    assert "audience_evidence" not in result.target_segments[0].content_brief_json
+    assert result.target_segments[0].content_brief_json["readiness"] == {
+        "level": "fallback_only",
+        "missing_sections": ["primary_signals", "score_components"],
+        "available_sections": [
+            "segment_snapshot",
+            "promotion_context",
+            "fallback_guidance",
+            "source_refs",
+        ],
+    }
     assert result.segment_suggestions[0].suggestion_source == "ai_generated"
     assert result.segment_suggestions[0].status == "suggested"
     assert result.segment_suggestions[0].suggested_rank == 1
@@ -767,11 +761,7 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
         "action_hint": "이메일 예약 혜택 메시지의 우선 타겟으로 적합합니다.",
     }
     target_profile = result.target_segments[0].profile_json
-    assert target_profile["primary_signals"] == [
-        "campaign_redirect",
-        "hotel_market_affinity",
-        "free_cancellation",
-    ]
+    assert "primary_signals" not in target_profile
     assert target_profile["score_components"] == {
         "promotion_cluster_similarity": 0.92,
         "cluster_quality": 0.7,
@@ -780,13 +770,8 @@ def test_service_uses_promotion_matched_features_for_ai_suggestion_copy() -> Non
     }
     content_brief = result.target_segments[0].content_brief_json
     assert content_brief["readiness"]["level"] == "partial"
-    assert content_brief["readiness"]["missing_sections"] == []
+    assert content_brief["readiness"]["missing_sections"] == ["primary_signals"]
     assert content_brief["audience_evidence"] == {
-        "primary_signals": [
-            "campaign_redirect",
-            "hotel_market_affinity",
-            "free_cancellation",
-        ],
         "score_components": {
             "promotion_cluster_similarity": 0.92,
             "cluster_quality": 0.7,
@@ -865,7 +850,7 @@ def test_service_preserves_existing_generation_primary_signals() -> None:
         "promotion_matched_features": ["Explicit matched feature"],
     }
     assert result.target_segments[0].content_brief_json["readiness"] == {
-        "level": "partial",
+        "level": "evidence_ready",
         "missing_sections": [],
         "available_sections": [
             "segment_snapshot",
@@ -923,7 +908,7 @@ def test_service_excludes_empty_and_unstructured_generation_evidence() -> None:
     ]
 
 
-def test_service_uses_raw_event_conditions_for_generation_primary_signals() -> None:
+def test_service_does_not_derive_raw_event_conditions_for_generation_evidence() -> None:
     promotion = promotion_record(channel="email")
     ai_segment = replace(
         segment_record(
@@ -978,15 +963,7 @@ def test_service_uses_raw_event_conditions_for_generation_primary_signals() -> N
     )
 
     target_segment = result.target_segments[0]
-    expected_primary_signals = [
-        "booking_start_without_complete",
-        "hotel_detail_view",
-        "recent_destination_search",
-    ]
-    assert target_segment.profile_json["primary_signals"] == expected_primary_signals
-    assert target_segment.content_brief_json["audience_evidence"][
-        "primary_signals"
-    ] == expected_primary_signals
+    assert "primary_signals" not in target_segment.profile_json
     assert target_segment.content_brief_json["audience_evidence"][
         "score_components"
     ] == {
@@ -994,7 +971,10 @@ def test_service_uses_raw_event_conditions_for_generation_primary_signals() -> N
         "expected_goal_performance": 0.7,
         "final_score": 0.84,
     }
-    assert target_segment.content_brief_json["readiness"]["missing_sections"] == []
+    assert target_segment.content_brief_json["readiness"]["level"] == "partial"
+    assert target_segment.content_brief_json["readiness"]["missing_sections"] == [
+        "primary_signals"
+    ]
     assert "signal_chips" not in target_segment.content_brief_json["audience_evidence"]
     assert "matched_conditions" not in target_segment.content_brief_json[
         "audience_evidence"

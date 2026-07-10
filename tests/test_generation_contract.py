@@ -92,6 +92,7 @@ CANDIDATE_METADATA_KEYS = {
     "message_strategy",
     "content_brief_schema_version",
     "content_brief_readiness",
+    "fallback_guidance_present",
     "fallback_guidance_used",
     "operator_instruction",
     "source_segment_definition_id",

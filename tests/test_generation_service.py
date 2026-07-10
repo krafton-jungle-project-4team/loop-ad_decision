@@ -697,10 +697,15 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
 
     metadata = content_candidate_repository.saved[0].metadata_json
     assert metadata["content_brief_readiness"] == {
-        "level": "partial",
+        "level": "evidence_ready",
         "missing_sections": [],
         "available_sections": ["fallback_guidance", "audience_evidence"],
     }
+    assert metadata["fallback_guidance_present"] is True
+    assert metadata["fallback_guidance_used"] is False
+    assert metadata["data_evidence"]["fallback_guidance_present"] is True
+    assert metadata["data_evidence"]["fallback_guidance_used"] is False
+    assert "content_brief_keywords" not in metadata["data_evidence"]
     assert metadata["data_evidence"]["audience_evidence"] == {
         "primary_signals": ["same_hotel_repeat_view", "near_checkin"],
         "score_components": {

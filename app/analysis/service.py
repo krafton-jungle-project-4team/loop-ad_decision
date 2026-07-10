@@ -752,7 +752,7 @@ class PromotionAnalysisService:
         segment_vector_id: str,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
-        profile_json = _profile_json_with_generation_evidence(segment)
+        profile_json = dict(segment.profile_json)
         content_brief_json = self._build_content_brief_json(
             analysis_id=analysis_id,
             promotion=promotion,
@@ -761,9 +761,6 @@ class PromotionAnalysisService:
             operator_instruction=operator_instruction,
             segment_vector_id=segment_vector_id,
         )
-        if candidate.profile is not None:
-            profile_json["hotel_profile"] = dict(candidate.profile.profile_json)
-
         return PromotionTargetSegmentWrite(
             analysis_id=analysis_id,
             project_id=promotion.project_id,
@@ -797,7 +794,7 @@ class PromotionAnalysisService:
         rank: int,
     ) -> PromotionSegmentSuggestionWrite:
         segment = candidate.definition
-        primary_signals = _primary_signals(segment)
+        primary_signals = _display_primary_signals(segment)
         display_copy = _display_copy(
             promotion=promotion,
             target_segment=target_segment,
@@ -1179,69 +1176,7 @@ def _focus_segment_ids(values: Sequence[str] | None) -> list[str] | None:
     return cleaned
 
 
-def _profile_json_with_generation_evidence(
-    segment: SegmentDefinitionRecord,
-) -> dict[str, Any]:
-    profile_json = dict(segment.profile_json)
-    if "primary_signals" not in profile_json:
-        primary_signal_keys = _primary_signal_keys_from_analysis(segment)
-        if primary_signal_keys:
-            profile_json["primary_signals"] = primary_signal_keys
-
-    score_components = profile_json.get("score_components")
-    if isinstance(score_components, Mapping):
-        profile_json["score_components"] = dict(score_components)
-    return profile_json
-
-
-def _primary_signal_keys_from_analysis(
-    segment: SegmentDefinitionRecord,
-) -> list[str]:
-    raw_event_signal_keys = _raw_event_primary_signal_keys(segment.rule_json)
-    if raw_event_signal_keys:
-        return raw_event_signal_keys
-    return _primary_signal_keys_from_features(segment.profile_json)
-
-
-def _raw_event_primary_signal_keys(rule_json: Mapping[str, Any]) -> list[str]:
-    if rule_json.get("source") != "raw_event_intent":
-        return []
-    conditions = rule_json.get("compiled_conditions")
-    if not isinstance(conditions, Sequence) or isinstance(conditions, str):
-        return []
-
-    signal_keys: list[str] = []
-    seen: set[str] = set()
-    for condition in conditions:
-        signal_key = str(condition).strip()
-        if not signal_key or signal_key in seen:
-            continue
-        signal_keys.append(signal_key)
-        seen.add(signal_key)
-        if len(signal_keys) == 3:
-            break
-    return signal_keys
-
-
-def _primary_signal_keys_from_features(profile_json: Mapping[str, Any]) -> list[str]:
-    signals: list[str] = []
-    seen: set[str] = set()
-    for feature_key in ("promotion_matched_features", "top_common_features"):
-        features = profile_json.get(feature_key)
-        if not isinstance(features, Sequence) or isinstance(features, str):
-            continue
-        for feature in features:
-            signal = _signal_from_feature(str(feature))
-            if signal is None or signal["key"] in seen:
-                continue
-            signals.append(signal["key"])
-            seen.add(signal["key"])
-            if len(signals) == 3:
-                return signals
-    return signals
-
-
-def _primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
+def _display_primary_signals(segment: SegmentDefinitionRecord) -> list[dict[str, str]]:
     signals: list[dict[str, str]] = []
     seen: set[str] = set()
     signal_chips = segment.profile_json.get("signal_chips")
