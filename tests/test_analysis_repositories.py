@@ -597,6 +597,36 @@ def test_user_behavior_vector_repository_queries_recent_project_vectors() -> Non
     }
 
 
+def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        vector_version="v2",
+        limit=250,
+    )
+
+    assert records == []
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "argmax(window_start, updated_at)" in sql
+    assert "argmax(window_end, updated_at)" in sql
+    assert "source = {vector_source:string}" in sql
+    assert "event_time >= vector_window_start" in sql
+    assert "event_time < vector_window_end" in sql
+    assert "user_id in ( select user_id from user_behavior_vectors" in sql
+    assert "window_start = vector_window_start" in sql
+    assert "window_end = vector_window_end" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_dim": 64,
+        "vector_version": "v2",
+        "vector_source": "raw_events",
+        "limit": 250,
+    }
+
+
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:
     client = FakeClickHouseClient(
         rows=[

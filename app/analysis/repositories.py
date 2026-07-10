@@ -195,6 +195,37 @@ class UserBehaviorVectorRecord:
 
 
 @dataclass(frozen=True)
+class RawEventUserSignalRecord:
+    project_id: str
+    user_id: str
+    event_count: int
+    hotel_search_count: int
+    hotel_click_count: int
+    hotel_detail_view_count: int
+    promotion_impression_count: int
+    promotion_click_count: int
+    campaign_redirect_click_count: int
+    campaign_landing_count: int
+    booking_start_count: int
+    booking_complete_count: int
+    booking_cancel_count: int
+    deal_event_count: int
+    free_cancellation_count: int
+    breakfast_included_count: int
+    price_event_count: int
+    avg_price: float
+    destination_values: tuple[str, ...]
+    checkin_dates: tuple[str, ...]
+    hotel_market_values: tuple[str, ...]
+    hotel_cluster_values: tuple[str, ...]
+    age_group_values: tuple[str, ...]
+    gender_values: tuple[str, ...]
+    preferred_category_values: tuple[str, ...]
+    destination_match_count: int
+    season_match_count: int
+
+
+@dataclass(frozen=True)
 class HotelMarketingProfileRecord:
     project_id: str
     profile_name: str
@@ -619,6 +650,7 @@ class SegmentVectorRepository:
 
 class UserBehaviorVectorRepository:
     VECTOR_DIM = 64
+    RAW_EVENTS_SOURCE = "raw_events"
 
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
@@ -738,6 +770,197 @@ class UserBehaviorVectorRepository:
             )
             for row in _clickhouse_rows(result)
         ]
+
+    def list_raw_event_user_signals(
+        self,
+        *,
+        project_id: str,
+        vector_version: str = "v1",
+        destination_terms: Sequence[str] = (),
+        season_months: Sequence[int] = (),
+        limit: int = 1000,
+    ) -> list[RawEventUserSignalRecord]:
+        result = self._client.query(
+            """
+            WITH
+                (
+                    SELECT argMax(window_start, updated_at)
+                    FROM user_behavior_vectors
+                    WHERE project_id = {project_id:String}
+                      AND vector_dim = {vector_dim:UInt16}
+                      AND vector_version = {vector_version:String}
+                      AND source = {vector_source:String}
+                ) AS vector_window_start,
+                (
+                    SELECT argMax(window_end, updated_at)
+                    FROM user_behavior_vectors
+                    WHERE project_id = {project_id:String}
+                      AND vector_dim = {vector_dim:UInt16}
+                      AND vector_version = {vector_version:String}
+                      AND source = {vector_source:String}
+                ) AS vector_window_end
+            SELECT
+                project_id,
+                user_id,
+                count() AS event_count,
+                countIf(event_name = 'hotel_search') AS hotel_search_count,
+                countIf(event_name = 'hotel_click') AS hotel_click_count,
+                countIf(event_name = 'hotel_detail_view') AS hotel_detail_view_count,
+                countIf(event_name = 'promotion_impression') AS promotion_impression_count,
+                countIf(event_name = 'promotion_click') AS promotion_click_count,
+                countIf(event_name = 'campaign_redirect_click') AS campaign_redirect_click_count,
+                countIf(event_name = 'campaign_landing') AS campaign_landing_count,
+                countIf(event_name = 'booking_start') AS booking_start_count,
+                countIf(event_name = 'booking_complete') AS booking_complete_count,
+                countIf(event_name = 'booking_cancel') AS booking_cancel_count,
+                countIf(nullIf(JSONExtractString(properties_json, 'deal'), '') != '') AS deal_event_count,
+                countIf(toUInt8OrZero(JSONExtractString(properties_json, 'free_cancellation')) = 1) AS free_cancellation_count,
+                countIf(toUInt8OrZero(JSONExtractString(properties_json, 'breakfast_included')) = 1) AS breakfast_included_count,
+                countIf(nullIf(JSONExtractString(properties_json, 'price'), '') != '') AS price_event_count,
+                avgIf(
+                    toFloat64OrZero(JSONExtractString(properties_json, 'price')),
+                    nullIf(JSONExtractString(properties_json, 'price'), '') != ''
+                ) AS avg_price,
+                groupUniqArray(20)(
+                    concat(
+                        ifNull(JSONExtractString(properties_json, 'destination_id'), ''),
+                        ' ',
+                        ifNull(JSONExtractString(properties_json, 'destination_name'), ''),
+                        ' ',
+                        ifNull(JSONExtractString(properties_json, 'hotel_city'), ''),
+                        ' ',
+                        ifNull(JSONExtractString(properties_json, 'hotel_country'), '')
+                    )
+                ) AS destination_values,
+                groupUniqArray(20)(ifNull(JSONExtractString(properties_json, 'checkin_date'), '')) AS checkin_dates,
+                groupUniqArray(20)(ifNull(JSONExtractString(properties_json, 'hotel_market'), '')) AS hotel_market_values,
+                groupUniqArray(20)(ifNull(JSONExtractString(properties_json, 'hotel_cluster'), '')) AS hotel_cluster_values,
+                groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'age_group'), '')) AS age_group_values,
+                groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'gender'), '')) AS gender_values,
+                groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'preferred_category'), '')) AS preferred_category_values
+            FROM raw_events
+            WHERE project_id = {project_id:String}
+              AND validation_status = 'valid'
+              AND notEmpty(user_id)
+              AND event_time >= vector_window_start
+              AND event_time < vector_window_end
+              AND user_id IN (
+                  SELECT user_id
+                  FROM user_behavior_vectors
+                  WHERE project_id = {project_id:String}
+                    AND vector_dim = {vector_dim:UInt16}
+                    AND vector_version = {vector_version:String}
+                    AND source = {vector_source:String}
+                    AND window_start = vector_window_start
+                    AND window_end = vector_window_end
+                  GROUP BY user_id
+              )
+            GROUP BY project_id, user_id
+            ORDER BY max(event_time) DESC, user_id ASC
+            LIMIT {limit:UInt32}
+            """,
+            parameters={
+                "project_id": project_id,
+                "vector_dim": self.VECTOR_DIM,
+                "vector_version": vector_version,
+                "vector_source": self.RAW_EVENTS_SOURCE,
+                "limit": limit,
+            },
+        )
+        cleaned_destination_terms = tuple(
+            term.strip().lower()
+            for term in destination_terms
+            if str(term).strip()
+        )
+        cleaned_season_months = {
+            int(month)
+            for month in season_months
+            if 1 <= int(month) <= 12
+        }
+        records: list[RawEventUserSignalRecord] = []
+        for row in _clickhouse_rows(result):
+            destination_values = _clean_string_tuple(
+                _clickhouse_value(row, "destination_values", 18)
+            )
+            checkin_dates = _clean_string_tuple(
+                _clickhouse_value(row, "checkin_dates", 19)
+            )
+            records.append(
+                RawEventUserSignalRecord(
+                    project_id=_clickhouse_value(row, "project_id", 0),
+                    user_id=_clickhouse_value(row, "user_id", 1),
+                    event_count=int(_clickhouse_value(row, "event_count", 2) or 0),
+                    hotel_search_count=int(
+                        _clickhouse_value(row, "hotel_search_count", 3) or 0
+                    ),
+                    hotel_click_count=int(
+                        _clickhouse_value(row, "hotel_click_count", 4) or 0
+                    ),
+                    hotel_detail_view_count=int(
+                        _clickhouse_value(row, "hotel_detail_view_count", 5) or 0
+                    ),
+                    promotion_impression_count=int(
+                        _clickhouse_value(row, "promotion_impression_count", 6) or 0
+                    ),
+                    promotion_click_count=int(
+                        _clickhouse_value(row, "promotion_click_count", 7) or 0
+                    ),
+                    campaign_redirect_click_count=int(
+                        _clickhouse_value(row, "campaign_redirect_click_count", 8) or 0
+                    ),
+                    campaign_landing_count=int(
+                        _clickhouse_value(row, "campaign_landing_count", 9) or 0
+                    ),
+                    booking_start_count=int(
+                        _clickhouse_value(row, "booking_start_count", 10) or 0
+                    ),
+                    booking_complete_count=int(
+                        _clickhouse_value(row, "booking_complete_count", 11) or 0
+                    ),
+                    booking_cancel_count=int(
+                        _clickhouse_value(row, "booking_cancel_count", 12) or 0
+                    ),
+                    deal_event_count=int(
+                        _clickhouse_value(row, "deal_event_count", 13) or 0
+                    ),
+                    free_cancellation_count=int(
+                        _clickhouse_value(row, "free_cancellation_count", 14) or 0
+                    ),
+                    breakfast_included_count=int(
+                        _clickhouse_value(row, "breakfast_included_count", 15) or 0
+                    ),
+                    price_event_count=int(
+                        _clickhouse_value(row, "price_event_count", 16) or 0
+                    ),
+                    avg_price=float(_clickhouse_value(row, "avg_price", 17) or 0.0),
+                    destination_values=destination_values,
+                    checkin_dates=checkin_dates,
+                    hotel_market_values=_clean_string_tuple(
+                        _clickhouse_value(row, "hotel_market_values", 20)
+                    ),
+                    hotel_cluster_values=_clean_string_tuple(
+                        _clickhouse_value(row, "hotel_cluster_values", 21)
+                    ),
+                    age_group_values=_clean_string_tuple(
+                        _clickhouse_value(row, "age_group_values", 22)
+                    ),
+                    gender_values=_clean_string_tuple(
+                        _clickhouse_value(row, "gender_values", 23)
+                    ),
+                    preferred_category_values=_clean_string_tuple(
+                        _clickhouse_value(row, "preferred_category_values", 24)
+                    ),
+                    destination_match_count=_destination_match_count(
+                        values=destination_values,
+                        terms=cleaned_destination_terms,
+                    ),
+                    season_match_count=_season_match_count(
+                        values=checkin_dates,
+                        season_months=cleaned_season_months,
+                    ),
+                )
+            )
+        return records
 
 
 class HotelProfileRepository:
@@ -918,6 +1141,48 @@ def _clickhouse_value(row: Any, key: str, index: int) -> Any:
     if isinstance(row, Mapping):
         return row[key]
     return row[index]
+
+
+def _clean_string_tuple(value: Any) -> tuple[str, ...]:
+    if isinstance(value, str):
+        raw_values: Sequence[Any] = (value,)
+    elif isinstance(value, Sequence):
+        raw_values = value
+    else:
+        raw_values = ()
+    cleaned: list[str] = []
+    for item in raw_values:
+        text = str(item or "").strip()
+        if text and text not in cleaned:
+            cleaned.append(text)
+    return tuple(cleaned)
+
+
+def _destination_match_count(*, values: Sequence[str], terms: Sequence[str]) -> int:
+    if not terms:
+        return 0
+    return sum(
+        1
+        for value in values
+        if any(term in value.lower() for term in terms)
+    )
+
+
+def _season_match_count(*, values: Sequence[str], season_months: set[int]) -> int:
+    if not season_months:
+        return 0
+    matched = 0
+    for value in values:
+        parts = value.replace("/", "-").split("-")
+        if len(parts) < 2:
+            continue
+        try:
+            month = int(parts[1])
+        except ValueError:
+            continue
+        if month in season_months:
+            matched += 1
+    return matched
 
 
 def _vector_literal(values: Sequence[float], vector_dim: int) -> str:
