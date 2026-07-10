@@ -483,6 +483,7 @@ class UserBehaviorVectorReader(Protocol):
         vector_version: str,
         limit: int,
         source: str | None = None,
+        after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
@@ -1433,10 +1434,16 @@ class UserBehaviorVectorRepository:
         vector_version: str,
         limit: int,
         source: str | None = None,
+        after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         source_filter = (
             "                  AND source = {source:String}\n"
             if source is not None
+            else ""
+        )
+        cursor_filter = (
+            "                  AND user_id > {after_user_id:String}\n"
+            if after_user_id is not None
             else ""
         )
         parameters: dict[str, Any] = {
@@ -1447,6 +1454,8 @@ class UserBehaviorVectorRepository:
         }
         if source is not None:
             parameters["source"] = source
+        if after_user_id is not None:
+            parameters["after_user_id"] = after_user_id
 
         query = (
             """
@@ -1472,6 +1481,7 @@ class UserBehaviorVectorRepository:
                   AND vector_dim = {vector_dim:UInt16}
             """
             + source_filter
+            + cursor_filter
             + """
             )
             GROUP BY project_id, user_id, vector_version
