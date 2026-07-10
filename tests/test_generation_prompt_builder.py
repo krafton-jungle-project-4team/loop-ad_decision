@@ -327,6 +327,72 @@ def test_prompt_builder_passes_selection_evidence_without_behavior_metrics() -> 
     assert "behavior_metrics" not in str(result.data_evidence_json)
 
 
+def test_prompt_builder_preserves_zero_goal_target_as_number() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=replace(promotion_input(), goal_target_value="0"),
+            target_segment=target_segment_input(),
+        )
+    )
+
+    assert result.data_evidence_json["goal_target_value"] == 0.0
+    assert isinstance(result.data_evidence_json["goal_target_value"], float)
+
+
+def test_prompt_builder_uses_stored_fallback_for_partial_evidence() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=replace(
+                target_segment_input(),
+                content_brief_json={
+                    "schema_version": "content_brief.v2",
+                    "fallback_guidance": {
+                        "message_direction": "Prioritize flexible cancellation.",
+                        "keywords": ["flexible cancellation"],
+                    },
+                    "audience_evidence": {
+                        "primary_signals": ["booking_start_without_complete"],
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
+    assert result.fallback_guidance_present is True
+    assert result.fallback_guidance_used is True
+    assert "Fallback message direction: Prioritize flexible cancellation." in (
+        result.generation_prompt
+    )
+
+
+def test_prompt_builder_does_not_invent_missing_fallback_guidance() -> None:
+    result = PromptBuilder().build(
+        GenerationPromptInput(
+            request=generation_request(operator_instruction=None),
+            promotion=promotion_input(),
+            target_segment=replace(
+                target_segment_input(),
+                content_brief_json={
+                    "schema_version": "content_brief.v2",
+                    "audience_evidence": {
+                        "score_components": {"final_score": 0.8},
+                    },
+                },
+            ),
+        )
+    )
+
+    assert result.metadata_json["content_brief_readiness"]["level"] == "partial"
+    assert result.fallback_guidance_present is False
+    assert result.fallback_guidance_used is False
+    assert "Fallback message direction:" not in result.generation_prompt
+    assert "Fallback keywords:" not in result.generation_prompt
+
+
 def test_prompt_builder_excludes_unstructured_v2_audience_evidence() -> None:
     builder = PromptBuilder()
     target_segment = replace(
