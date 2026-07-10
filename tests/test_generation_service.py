@@ -661,9 +661,12 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
                         },
                         "fallback_guidance": {
                             "message_direction": "Use a hotel booking message.",
-                            "keywords": ["hotel booking"],
+                            "keywords": ["must_not_be_common_feature"],
                             "source": "legacy_segment_content_hints",
                         },
+                        "top_common_features": ["must_not_pass"],
+                        "booking_conversion_rate": 0.99,
+                        "comparison_group_conversion_rate": 0.98,
                         "audience_evidence": {
                             "primary_signals": [
                                 "same_hotel_repeat_view",
@@ -672,6 +675,14 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
                             "score_components": {
                                 "promotion_cluster_similarity": 0.92,
                             },
+                            "promotion_vector_basis": {
+                                "channel": "onsite_banner",
+                                "goal_metric": "booking_conversion_rate",
+                            },
+                            "promotion_matched_features": [
+                                "same_hotel_repeat_view",
+                                "near_checkin",
+                            ],
                             "behavior_metrics": {
                                 "booking_conversion_rate": 0.018,
                             },
@@ -695,7 +706,19 @@ def test_generation_service_report_filters_behavior_metrics_from_v2_brief() -> N
         "score_components": {
             "promotion_cluster_similarity": 0.92,
         },
+        "promotion_vector_basis": {
+            "channel": "onsite_banner",
+            "goal_metric": "booking_conversion_rate",
+        },
+        "promotion_matched_features": [
+            "same_hotel_repeat_view",
+            "near_checkin",
+        ],
     }
+    assert "top_common_features" not in metadata["data_evidence"]
+    assert "booking_conversion_rate" not in metadata["data_evidence"]
+    assert "comparison_group_conversion_rate" not in metadata["data_evidence"]
+    assert "must_not_pass" not in str(metadata)
     assert "behavior_metrics" not in str(metadata)
     assert "behavior_metrics" not in str(generation_run_repository.saved[0].output_json)
 
