@@ -255,6 +255,11 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert all("display_copy" in segment.profile_json for segment in segments)
     assert all("performance_estimate" in segment.profile_json for segment in segments)
     assert all(
+        segment.profile_json["primary_signals"]
+        == segment.rule_json["compiled_conditions"][:3]
+        for segment in segments
+    )
+    assert all(
         segment.profile_json["display_copy"]["performance_estimate"]["label"]
         == "예상 전환율"
         for segment in segments
