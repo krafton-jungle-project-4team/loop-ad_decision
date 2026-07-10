@@ -417,25 +417,12 @@ def write_sealed_final_test_artifacts(
     }
 
 
-def source_fingerprint(
-    *,
-    source_table: str,
-    stats: ExpediaSourceStats,
-    checksum: str,
-) -> str:
-    return _json_sha256(
-        _source_payload(
-            source_table=source_table,
-            stats=stats,
-            checksum=checksum,
-        )
-    )
-
-
 def sealed_final_test_cutoffs(
     manifest: ExpediaSealedFinalTestManifest,
 ) -> tuple[datetime, ...]:
-    return tuple(sorted({scenario.cutoff for scenario in _manifest_scenarios(manifest)}))
+    return tuple(
+        sorted({scenario.cutoff for scenario in _manifest_scenarios(manifest)})
+    )
 
 
 def _source_payload(
@@ -633,9 +620,12 @@ def _sealed_final_test_report(summary: Mapping[str, Any]) -> str:
             "",
             "## 한계",
             "",
-            "- 이 결과는 새로운 연도가 아니라 아직 평가하지 않은 Expedia 목적지를 봉인한 내부 테스트입니다.",
-            "- 실제 광고 노출 대조군이 없으므로 광고의 인과적 증분 효과를 검증하지 않습니다.",
-            "- 결과를 확인한 뒤 추천 로직을 수정하면 이 manifest는 다시 최종 테스트로 사용할 수 없습니다.",
+            "- 이 결과는 새로운 연도가 아니라 아직 평가하지 않은 Expedia "
+            "목적지를 봉인한 내부 테스트입니다.",
+            "- 실제 광고 노출 대조군이 없으므로 광고의 인과적 증분 효과를 "
+            "검증하지 않습니다.",
+            "- 결과를 확인한 뒤 추천 로직을 수정하면 이 manifest는 다시 "
+            "최종 테스트로 사용할 수 없습니다.",
             "",
         ]
     )

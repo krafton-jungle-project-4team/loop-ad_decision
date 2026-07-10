@@ -165,8 +165,8 @@ git status --short
 
 다음 명령은 2014년 월별 개발 검증 Top 3 목적지의 합집합을 제외한다. 이후 2014년
 7월부터 12월까지 각 기준일에서 아직 사용하지 않은 목적지를 3개씩 선택한다. 목적지
-선정에는 기준일 이전 90일의 행동과 사용자 수만 사용하며 미래 `is_booking`은 조회하지
-않는다.
+선정에는 기준일 이전 90일의 행동과 사용자 수만 사용한다. 미래 `is_booking`은 원천
+무결성 체크섬에만 포함하며 목적지 선정이나 성능 계산에는 전달하지 않는다.
 
 ```bash
 .venv/bin/python scripts/backtest_expedia_segments.py seal-final-test \
