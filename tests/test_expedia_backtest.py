@@ -21,6 +21,7 @@ from app.analysis.expedia_backtest import (
     validate_table_identifier,
     validate_train_csv_header,
     write_backtest_artifacts,
+    write_temporal_holdout_artifacts,
 )
 from app.analysis.repositories import RawEventUserSignalRecord
 
@@ -138,6 +139,37 @@ def test_backtest_separates_observation_and_future_windows() -> None:
     assert future_call["scenario"].cutoff == repository.cutoff
 
 
+def test_backtest_runs_only_explicitly_sealed_scenarios() -> None:
+    repository = FakeExpediaBacktestRepository()
+    second = replace(
+        repository.scenario,
+        scenario_id="20140701_destination_8267",
+        target_destination_id=8267,
+    )
+    service = ExpediaSegmentBacktestService(
+        repository,
+        config=ExpediaBacktestConfig(
+            max_scenarios_per_cutoff=3,
+            min_scenario_users=2,
+            user_sample_modulo=1,
+        ),
+    )
+
+    run = service.run_scenarios([repository.scenario, second])
+
+    assert run.results
+    assert not any(name == "list_scenarios" for name, _ in repository.calls)
+    evaluated_scenarios = {
+        payload["scenario"].scenario_id
+        for name, payload in repository.calls
+        if name == "future_booking_users"
+    }
+    assert evaluated_scenarios == {
+        "20140701_destination_8250",
+        "20140701_destination_8267",
+    }
+
+
 def test_backtest_calculates_user_level_future_rates_and_lift() -> None:
     repository = FakeExpediaBacktestRepository()
     run = ExpediaSegmentBacktestService(
@@ -252,6 +284,41 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     assert holdout_summary["all_candidate_brier_score"] >= 0
 
 
+def test_temporal_artifacts_label_2014_as_development_validation(
+    tmp_path: Path,
+) -> None:
+    repository = FakeExpediaBacktestRepository()
+    config = ExpediaBacktestConfig(
+        max_scenarios_per_cutoff=1,
+        min_scenario_users=2,
+        user_sample_modulo=1,
+    )
+    temporal_run = run_temporal_holdout_backtest(
+        repository,
+        config=config,
+        training_cutoffs=[
+            datetime(2013, 9, 1, tzinfo=UTC),
+            datetime(2013, 11, 1, tzinfo=UTC),
+        ],
+        holdout_cutoffs=[datetime(2014, 1, 1, tzinfo=UTC)],
+    )
+
+    artifacts = write_temporal_holdout_artifacts(
+        temporal_run,
+        output_dir=tmp_path,
+        source_stats=source_stats(),
+        config=config,
+    )
+
+    summary = artifacts["summary"].read_text(encoding="utf-8")
+    report = artifacts["report"].read_text(encoding="utf-8")
+    assert '"development_validation": "2014"' in summary
+    assert '"final_test": "not_run"' in summary
+    assert "개발 검증" in report
+    assert "최종 일반화 성능" in report
+    assert (tmp_path / "development-validation-2014" / "results.csv").exists()
+
+
 def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:
     repository = FakeExpediaBacktestRepository()
     config = ExpediaBacktestConfig(
@@ -340,6 +407,45 @@ def test_future_booking_query_does_not_shadow_source_user_id() -> None:
     assert future.contextual_booking_user_ids == {"expedia-user-1"}
     assert "AS backtest_user_id" in client.queries[0]
     assert client.parameters[0]["user_ids"] == [1, 2]
+
+
+def test_scenario_query_excludes_development_destinations() -> None:
+    client = FakeClickHouseClient(
+        [
+            {
+                "target_destination_id": 9001,
+                "historical_user_count": 30,
+                "historical_event_count": 80,
+            }
+        ]
+    )
+    repository = ClickHouseExpediaBacktestRepository(client)
+
+    scenarios = repository.list_scenarios(
+        observation_start=datetime(2014, 4, 2, tzinfo=UTC),
+        cutoff=datetime(2014, 7, 1, tzinfo=UTC),
+        limit=3,
+        min_users=20,
+        user_sample_modulo=1,
+        user_sample_remainder=0,
+        season=None,
+        excluded_destination_ids=(8250, 8267),
+    )
+
+    assert [scenario.target_destination_id for scenario in scenarios] == [9001]
+    assert client.parameters[0]["excluded_destination_ids"] == [8250, 8267]
+    assert "NOT has" in client.queries[0]
+
+
+def test_source_checksum_combines_sum_and_xor() -> None:
+    client = FakeClickHouseClient(
+        [{"checksum_sum": "1234", "checksum_xor": "5678"}]
+    )
+    repository = ClickHouseExpediaBacktestRepository(client)
+
+    assert repository.source_checksum() == "1234:5678"
+    assert "sumWithOverflow" in client.queries[0]
+    assert "groupBitXor" in client.queries[0]
 
 
 def profile(

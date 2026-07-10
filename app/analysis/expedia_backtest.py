@@ -144,6 +144,7 @@ class ExpediaBacktestConfig:
     user_sample_modulo: int = 20
     user_sample_remainder: int = 0
     season: str | None = None
+    excluded_destination_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.lookback_days <= 0 or self.outcome_days <= 0:
@@ -162,6 +163,12 @@ class ExpediaBacktestConfig:
             )
         if self.season is not None and self.season not in SEASON_MONTHS:
             raise ValueError(f"unsupported season: {self.season}")
+        if any(value <= 0 for value in self.excluded_destination_ids):
+            raise ValueError("excluded destination IDs must be positive")
+        if len(set(self.excluded_destination_ids)) != len(
+            self.excluded_destination_ids
+        ):
+            raise ValueError("excluded destination IDs must be unique")
 
 
 @dataclass(frozen=True, slots=True)
@@ -233,6 +240,9 @@ class ExpediaBacktestRepository(Protocol):
     def source_stats(self) -> ExpediaSourceStats:
         ...
 
+    def source_checksum(self) -> str:
+        ...
+
     def list_scenarios(
         self,
         *,
@@ -243,6 +253,7 @@ class ExpediaBacktestRepository(Protocol):
         user_sample_modulo: int,
         user_sample_remainder: int,
         season: str | None,
+        excluded_destination_ids: Sequence[int],
     ) -> list[ExpediaBacktestScenario]:
         ...
 
@@ -327,6 +338,35 @@ class ClickHouseExpediaBacktestRepository:
             last_event_at=_as_utc_datetime(_row_value(row, "last_event_at", 4)),
         )
 
+    def source_checksum(self) -> str:
+        row_hash = "cityHash64(concatWithSeparator('|', " + ", ".join(
+            (
+                "toString(date_time)",
+                "toString(user_id)",
+                "toString(srch_destination_id)",
+                "toString(is_booking)",
+                "toString(cnt)",
+                "toString(hotel_market)",
+                "toString(hotel_cluster)",
+            )
+        ) + "))"
+        result = self._client.query(
+            f"""
+            SELECT
+                toString(sumWithOverflow({row_hash})) AS checksum_sum,
+                toString(groupBitXor({row_hash})) AS checksum_xor
+            FROM {self._source_table}
+            """
+        )
+        rows = _clickhouse_rows(result)
+        if not rows:
+            return "0:0"
+        row = rows[0]
+        return (
+            f"{_row_value(row, 'checksum_sum', 0) or '0'}:"
+            f"{_row_value(row, 'checksum_xor', 1) or '0'}"
+        )
+
     def list_scenarios(
         self,
         *,
@@ -337,6 +377,7 @@ class ClickHouseExpediaBacktestRepository:
         user_sample_modulo: int,
         user_sample_remainder: int,
         season: str | None,
+        excluded_destination_ids: Sequence[int] = (),
     ) -> list[ExpediaBacktestScenario]:
         result = self._client.query(
             f"""
@@ -354,6 +395,10 @@ class ClickHouseExpediaBacktestRepository:
               AND srch_destination_id > 0
               AND modulo(cityHash64(toString(user_id)), {{sample_modulo:UInt64}})
                     = {{sample_remainder:UInt64}}
+              AND NOT has(
+                    {{excluded_destination_ids:Array(UInt64)}},
+                    toUInt64(srch_destination_id)
+                  )
             GROUP BY srch_destination_id
             HAVING historical_user_count >= {{min_users:UInt64}}
             ORDER BY historical_user_count DESC, historical_event_count DESC,
@@ -367,6 +412,7 @@ class ClickHouseExpediaBacktestRepository:
                 "sample_remainder": user_sample_remainder,
                 "min_users": min_users,
                 "limit": limit,
+                "excluded_destination_ids": list(excluded_destination_ids),
             },
         )
         return [
@@ -487,7 +533,13 @@ class ExpediaSegmentBacktestService:
         self._performance_predictor = performance_predictor
 
     @log_context_scope
-    def run(self, cutoffs: Sequence[datetime]) -> ExpediaBacktestRun:
+    def run(
+        self,
+        cutoffs: Sequence[datetime],
+        *,
+        fixed_scenarios: Mapping[datetime, Sequence[ExpediaBacktestScenario]]
+        | None = None,
+    ) -> ExpediaBacktestRun:
         started_at = now_ms()
         log.info(
             "started",
@@ -510,15 +562,21 @@ class ExpediaSegmentBacktestService:
             outcome_end = normalized_cutoff + timedelta(
                 days=self._config.outcome_days
             )
-            scenarios = self._repository.list_scenarios(
-                observation_start=observation_start,
-                cutoff=normalized_cutoff,
-                limit=self._config.max_scenarios_per_cutoff,
-                min_users=self._config.min_scenario_users,
-                user_sample_modulo=self._config.user_sample_modulo,
-                user_sample_remainder=self._config.user_sample_remainder,
-                season=self._config.season,
-            )
+            if fixed_scenarios is None:
+                scenarios = self._repository.list_scenarios(
+                    observation_start=observation_start,
+                    cutoff=normalized_cutoff,
+                    limit=self._config.max_scenarios_per_cutoff,
+                    min_users=self._config.min_scenario_users,
+                    user_sample_modulo=self._config.user_sample_modulo,
+                    user_sample_remainder=self._config.user_sample_remainder,
+                    season=self._config.season,
+                    excluded_destination_ids=(
+                        self._config.excluded_destination_ids
+                    ),
+                )
+            else:
+                scenarios = list(fixed_scenarios.get(normalized_cutoff, ()))
             log.info(
                 "backtest_cutoff_started",
                 {
@@ -602,6 +660,25 @@ class ExpediaSegmentBacktestService:
         )
         return response
 
+    def run_scenarios(
+        self,
+        scenarios: Sequence[ExpediaBacktestScenario],
+    ) -> ExpediaBacktestRun:
+        scenarios_by_cutoff: dict[datetime, list[ExpediaBacktestScenario]] = (
+            defaultdict(list)
+        )
+        for scenario in scenarios:
+            cutoff = _as_utc_datetime(scenario.cutoff)
+            if cutoff is None:
+                raise ValueError("scenario cutoff must not be null")
+            scenarios_by_cutoff[cutoff].append(scenario)
+        if not scenarios_by_cutoff:
+            raise ValueError("sealed scenario list must not be empty")
+        return self.run(
+            sorted(scenarios_by_cutoff),
+            fixed_scenarios=scenarios_by_cutoff,
+        )
+
 
 def run_temporal_holdout_backtest(
     repository: ExpediaBacktestRepository,
@@ -611,7 +688,7 @@ def run_temporal_holdout_backtest(
     holdout_cutoffs: Sequence[datetime],
 ) -> ExpediaTemporalHoldoutRun:
     if not training_cutoffs or not holdout_cutoffs:
-        raise ValueError("training and holdout cutoffs must not be empty")
+        raise ValueError("training and validation cutoffs must not be empty")
     normalized_training = tuple(
         value
         for cutoff in training_cutoffs
@@ -627,7 +704,7 @@ def run_temporal_holdout_backtest(
     )
     if training_outcome_end > min(normalized_holdout):
         raise ValueError(
-            "training outcomes must end before the first holdout cutoff"
+            "training outcomes must end before the first validation cutoff"
         )
 
     training_config = replace(
@@ -949,31 +1026,32 @@ def write_temporal_holdout_artifacts(
             ),
         ),
     )
-    holdout_paths = write_backtest_artifacts(
+    validation_paths = write_backtest_artifacts(
         run.holdout_run,
-        output_dir=output_dir / "holdout-2014",
+        output_dir=output_dir / "development-validation-2014",
         source_stats=source_stats,
         config=config,
     )
     model_path = output_dir / "contextual_booking_calibration_v1.json"
     write_segment_performance_model(run.calibration_model, model_path)
-    summary_path = output_dir / "temporal_holdout_summary.json"
+    summary_path = output_dir / "temporal_validation_summary.json"
     summary = {
         "split": {
             "training": "2013",
-            "holdout": "2014",
+            "development_validation": "2014",
+            "final_test": "not_run",
             "target": "future_contextual_booking_rate",
         },
         "config": asdict(config),
         "model": run.calibration_model.to_json(),
         "training_metrics": summarize_backtest(run.training_run),
-        "holdout_metrics": summarize_backtest(run.holdout_run),
+        "validation_metrics": summarize_backtest(run.holdout_run),
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
         encoding="utf-8",
     )
-    report_path = output_dir / "temporal_holdout_report.md"
+    report_path = output_dir / "temporal_validation_report.md"
     report_path.write_text(
         _temporal_holdout_markdown_report(summary),
         encoding="utf-8",
@@ -983,7 +1061,7 @@ def write_temporal_holdout_artifacts(
         "summary": summary_path,
         "report": report_path,
         "training_results": training_paths["results"],
-        "holdout_results": holdout_paths["results"],
+        "validation_results": validation_paths["results"],
     }
 
 
@@ -1367,33 +1445,33 @@ def _markdown_report(
 
 def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
     training = summary["training_metrics"]
-    holdout = summary["holdout_metrics"]
+    validation = summary["validation_metrics"]
     model = summary["model"]
     return "\n".join(
         [
-            "# Expedia 2013 학습 / 2014 홀드아웃 검증",
+            "# Expedia 2013 학습 / 2014 개발 검증",
             "",
             "## 시간 분리",
             "",
             "- 2013년 기준일 이전 행동과 이후 30일 목적지 예약으로 보정식을 학습했습니다.",
-            "- 2014년 결과는 학습에 사용하지 않고 최종 예상값과 Rank 검증에만 사용했습니다.",
+            "- 2014년 결과는 모델 학습에는 사용하지 않았지만 반복적인 로직 개선에 사용한 개발 검증 데이터입니다.",
             f"- 학습 예시: {model['training_metadata']['training_example_count']}개",
             "",
-            "## 2014년 홀드아웃 결과",
+            "## 2014년 개발 검증 결과",
             "",
-            f"- 평가 시나리오: {holdout['scenario_count']}개",
+            f"- 평가 시나리오: {validation['scenario_count']}개",
             "- Rank 1이 실제 최고 후보였던 비율: "
-            f"{_format_percent(holdout['rank_one_is_best_rate'])}",
+            f"{_format_percent(validation['rank_one_is_best_rate'])}",
             "- Rank 1이 기준선을 이긴 비율: "
-            f"{_format_percent(holdout['rank_one_beats_baseline_rate'])}",
+            f"{_format_percent(validation['rank_one_beats_baseline_rate'])}",
             "- Rank 1 평균 절대 오차: "
-            f"{holdout['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
-            f"- Rank 1 Brier score: {holdout['rank_one_brier_score']:.6f}",
+            f"{validation['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
+            f"- Rank 1 Brier score: {validation['rank_one_brier_score']:.6f}",
             "- 전체 후보 평균 절대 오차: "
-            f"{holdout['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
-            f"- 전체 후보 Brier score: {holdout['all_candidate_brier_score']:.6f}",
+            f"{validation['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
+            f"- 전체 후보 Brier score: {validation['all_candidate_brier_score']:.6f}",
             "- 전체 후보 예측 편향: "
-            f"{holdout['all_candidate_prediction_bias_percentage_points']:.2f}%p",
+            f"{validation['all_candidate_prediction_bias_percentage_points']:.2f}%p",
             "",
             "## 학습 구간 참고 지표",
             "",
@@ -1404,7 +1482,8 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 해석 주의사항",
             "",
             "- Expedia에는 실제 광고 노출 대조군이 없으므로 미래 목적지 예약 가능성을 검증한 결과입니다.",
-            "- 홀드아웃의 MAE와 Brier score가 낮아져야 예상 전환율의 절대값을 신뢰할 수 있습니다.",
+            "- 이 결과를 본 뒤 추천 규칙을 수정했으므로 최종 일반화 성능으로 주장할 수 없습니다.",
+            "- 최종 성능은 별도로 봉인한 미평가 목적지 테스트를 코드 동결 후 한 번만 실행해 확인해야 합니다.",
             "- `user_sample_modulo=1`은 해시 표본 없이 전체 원천 데이터에서 운영과 같은 후보 풀을 조회합니다.",
             "",
         ]
