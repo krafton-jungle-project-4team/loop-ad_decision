@@ -21,6 +21,7 @@ from app.analysis.raw_event_segments import (
     generate_raw_event_segment_definitions,
     season_months_from_intent,
 )
+from app.analysis.segment_performance import SegmentPerformancePredictor
 from app.analysis.vector_service import DEFAULT_VECTOR_VERSION, VECTOR_DIM
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -257,6 +258,7 @@ class VectorClusterSegmentSuggester:
         user_behavior_vector_repository: UserBehaviorVectorSampler,
         raw_event_signal_repository: RawEventUserSignalSampler | None = None,
         promotion_intent_extractor: PromotionIntentExtractor | None = None,
+        performance_predictor: SegmentPerformancePredictor | None = None,
         vector_pool_limit: int = DEFAULT_VECTOR_POOL_LIMIT,
         vector_sample_limit: int = DEFAULT_VECTOR_SAMPLE_LIMIT,
         max_suggested_segments: int = DEFAULT_MAX_SUGGESTED_SEGMENTS,
@@ -279,6 +281,7 @@ class VectorClusterSegmentSuggester:
         self._user_behavior_vector_repository = user_behavior_vector_repository
         self._raw_event_signal_repository = raw_event_signal_repository
         self._promotion_intent_extractor = promotion_intent_extractor
+        self._performance_predictor = performance_predictor
         self._vector_pool_limit = vector_pool_limit
         self._vector_sample_limit = vector_sample_limit
         self._max_suggested_segments = max_suggested_segments
@@ -414,6 +417,7 @@ class VectorClusterSegmentSuggester:
                 profiles=profiles[: self._vector_sample_limit],
                 max_suggested_segments=self._max_suggested_segments,
                 min_sample_size=self._min_cluster_size,
+                performance_predictor=self._performance_predictor,
             )
         except Exception as exc:
             log.warn(

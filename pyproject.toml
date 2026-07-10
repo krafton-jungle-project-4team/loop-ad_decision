@@ -28,6 +28,9 @@ build-backend = "setuptools.build_meta"
 include = ["app*"]
 exclude = ["agent*", "tests*"]
 
+[tool.setuptools.package-data]
+"app.analysis" = ["models/*.json"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
