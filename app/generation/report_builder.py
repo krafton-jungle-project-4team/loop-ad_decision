@@ -4,7 +4,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from app.content_brief import NormalizedContentBrief, normalize_content_brief
+from app.content_brief import (
+    CONTENT_BRIEF_SCHEMA_VERSION,
+    NormalizedContentBrief,
+    normalize_content_brief,
+)
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import GenerationStatus
 
@@ -112,7 +116,6 @@ def _data_evidence(
     target_segment = prompt_input.target_segment
     raw_brief = content_brief.raw
     keywords = content_brief.keywords
-    top_common_features = _string_list(raw_brief.get("top_common_features"))
     goal_target_value = _optional_float(promotion.goal_target_value)
 
     evidence: dict[str, Any] = {
@@ -123,13 +126,6 @@ def _data_evidence(
         "segment_vector_id": target_segment.segment_vector_id,
         "sample_size": target_segment.estimated_size,
         "sample_ratio": _optional_float(target_segment.sample_ratio),
-        "booking_conversion_rate": _optional_float(
-            raw_brief.get("booking_conversion_rate")
-        ),
-        "comparison_group_conversion_rate": _optional_float(
-            raw_brief.get("comparison_group_conversion_rate")
-        ),
-        "top_common_features": top_common_features or keywords,
         "priority": target_segment.priority,
         "target_segment_status": target_segment.status,
         "goal_metric": promotion.goal_metric,
@@ -142,6 +138,19 @@ def _data_evidence(
         "fallback_guidance_used": content_brief.fallback_guidance_used,
         "content_brief_keywords": keywords,
     }
+    if content_brief.schema_version != CONTENT_BRIEF_SCHEMA_VERSION:
+        top_common_features = _string_list(raw_brief.get("top_common_features"))
+        evidence.update(
+            {
+                "booking_conversion_rate": _optional_float(
+                    raw_brief.get("booking_conversion_rate")
+                ),
+                "comparison_group_conversion_rate": _optional_float(
+                    raw_brief.get("comparison_group_conversion_rate")
+                ),
+                "top_common_features": top_common_features or keywords,
+            }
+        )
     if content_brief.audience_evidence:
         evidence["audience_evidence"] = content_brief.audience_evidence
     return evidence
