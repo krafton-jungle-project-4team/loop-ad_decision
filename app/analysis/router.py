@@ -15,6 +15,7 @@ from app.analysis.repositories import (
 )
 from app.analysis.report_generator import build_segment_suggestion_report_generator
 from app.analysis.raw_event_segments import build_promotion_intent_extractor
+from app.analysis.segment_performance import build_segment_performance_predictor
 from app.analysis.schemas import (
     AnalysisRequest,
     AnalysisResponse,
@@ -73,6 +74,9 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
                 user_behavior_vector_repository=user_behavior_vector_repository,
                 raw_event_signal_repository=user_behavior_vector_repository,
                 promotion_intent_extractor=build_promotion_intent_extractor(settings),
+                performance_predictor=build_segment_performance_predictor(
+                    settings.segment_performance_model_path
+                ),
             ),
             segment_report_generator=segment_report_generator,
         )

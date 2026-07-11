@@ -483,6 +483,7 @@ class UserBehaviorVectorReader(Protocol):
         vector_version: str,
         limit: int,
         source: str | None = None,
+        after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         ...
 
@@ -520,12 +521,19 @@ class PromotionEvaluationWriter(Protocol):
 
 
 class EvaluationMetricReader(Protocol):
-    def count_inflow_rate(self, experiment: AdExperimentRecord) -> MetricCountRecord:
+    def count_inflow_rate(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
+    ) -> MetricCountRecord:
         ...
 
     def count_booking_conversion_rate(
         self,
         experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
     ) -> MetricCountRecord:
         ...
 
@@ -753,7 +761,6 @@ class ContentCandidateRepository:
             (generation_id,),
         )
         return [ContentCandidateRecord(**row) for row in rows]
-
 
 class PromotionRunRepository:
     def __init__(self, db: PostgresExecutor) -> None:
@@ -1433,10 +1440,16 @@ class UserBehaviorVectorRepository:
         vector_version: str,
         limit: int,
         source: str | None = None,
+        after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         source_filter = (
             "                  AND source = {source:String}\n"
             if source is not None
+            else ""
+        )
+        cursor_filter = (
+            "                  AND user_id > {after_user_id:String}\n"
+            if after_user_id is not None
             else ""
         )
         parameters: dict[str, Any] = {
@@ -1447,6 +1460,8 @@ class UserBehaviorVectorRepository:
         }
         if source is not None:
             parameters["source"] = source
+        if after_user_id is not None:
+            parameters["after_user_id"] = after_user_id
 
         query = (
             """
@@ -1472,6 +1487,7 @@ class UserBehaviorVectorRepository:
                   AND vector_dim = {vector_dim:UInt16}
             """
             + source_filter
+            + cursor_filter
             + """
             )
             GROUP BY project_id, user_id, vector_version
@@ -1601,7 +1617,12 @@ class EvaluationMetricRepository:
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
 
-    def count_inflow_rate(self, experiment: AdExperimentRecord) -> MetricCountRecord:
+    def count_inflow_rate(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
+    ) -> MetricCountRecord:
         result = self._client.query(
             """
             WITH
@@ -1618,12 +1639,14 @@ class EvaluationMetricRepository:
               AND promotion_run_id = {promotion_run_id:String}
               AND ad_experiment_id = {ad_experiment_id:String}
               AND event_name IN ('campaign_redirect_click', 'campaign_landing')
+              AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
               AND (notEmpty(ifNull(redirect_id, '')) OR notEmpty(user_id))
             """,
             parameters={
                 "project_id": experiment.project_id,
                 "promotion_run_id": experiment.promotion_run_id,
                 "ad_experiment_id": experiment.ad_experiment_id,
+                "evaluation_cutoff_at": evaluation_cutoff_at,
             },
         )
         return _metric_count_from_result(result)
@@ -1631,6 +1654,8 @@ class EvaluationMetricRepository:
     def count_booking_conversion_rate(
         self,
         experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
     ) -> MetricCountRecord:
         denominator_event_name = _booking_conversion_denominator_event(experiment)
         result = self._client.query(
@@ -1645,6 +1670,7 @@ class EvaluationMetricRepository:
                       AND promotion_run_id = {promotion_run_id:String}
                       AND ad_experiment_id = {ad_experiment_id:String}
                       AND event_name = 'booking_complete'
+                      AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
                 ) AS numerator_count,
                 (
                     SELECT countDistinct(user_id)
@@ -1653,6 +1679,7 @@ class EvaluationMetricRepository:
                       AND promotion_run_id = {promotion_run_id:String}
                       AND ad_experiment_id = {ad_experiment_id:String}
                       AND event_name = {denominator_event_name:String}
+                      AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
                 ) AS denominator_count
             """,
             parameters={
@@ -1660,6 +1687,7 @@ class EvaluationMetricRepository:
                 "promotion_run_id": experiment.promotion_run_id,
                 "ad_experiment_id": experiment.ad_experiment_id,
                 "denominator_event_name": denominator_event_name,
+                "evaluation_cutoff_at": evaluation_cutoff_at,
             },
         )
         return _metric_count_from_result(result)

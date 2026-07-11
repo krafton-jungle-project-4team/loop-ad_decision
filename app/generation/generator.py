@@ -3,11 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.generation.image_prompt_builder import RichImagePromptBuilder
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import ContentChannel, missing_channel_fields
 
 
-CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v2"
+CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v4"
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,7 @@ class DeterministicContentGenerator:
                 segment_name=segment_name,
                 landing_url=landing_url,
                 option_index=option_index,
+                prompt_result=prompt_result,
             )
         return _banner_content(
             segment_name=segment_name,
@@ -98,16 +100,29 @@ def _email_content(
     option_index: int,
     prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
-    del segment_name, prompt_result
+    del segment_name
+
+    strategy_lead = _strategy_copy_lead(prompt_result)
+    body = _variant(
+        option_index,
+        (
+            "여행 일정에 맞는 호텔과 예약 조건을 지금 확인해보세요.",
+            "최근 관심을 보인 호텔 상품을 다시 살펴보고, "
+            "객실 정보를 편하게 비교해보세요.",
+            "원하는 날짜에 맞는 숙소 정보를 확인하고 예약을 이어가세요.",
+        ),
+    )
+    if strategy_lead:
+        body = f"{strategy_lead} {body}"
 
     return GeneratedContent(
         subject=_compact(
             _variant(
                 option_index,
                 (
-                    "이번 주말 호텔 특가를 확인해보세요",
-                    "환불 가능한 호텔 객실을 만나보세요",
-                    "여름 숙박 혜택이 준비됐어요",
+                    "이번 주말 호텔 예약 정보를 확인해보세요",
+                    "관심 호텔의 예약 조건을 확인해보세요",
+                    "여름 숙박 정보를 확인해보세요",
                 ),
             ),
             max_length=88,
@@ -116,28 +131,18 @@ def _email_content(
             _variant(
                 option_index,
                 (
-                    "원하는 일정에 맞는 숙소와 예약 혜택을 비교해보세요.",
-                    "지금 예약 가능한 호텔 상품을 한눈에 확인하세요.",
-                    "객실이 마감되기 전에 숙박 혜택을 살펴보세요.",
+                    "원하는 일정에 맞는 숙소와 예약 조건을 비교해보세요.",
+                    "관심 있는 호텔 정보를 한눈에 확인하세요.",
+                    "여행 일정에 맞는 객실 정보를 살펴보세요.",
                 ),
             ),
             max_length=96,
         ),
         body=_compact(
-            _variant(
-                option_index,
-                (
-                    "환불 가능한 객실과 여름 숙박 혜택을 지금 확인하고, "
-                    "여행 일정에 맞는 호텔을 놓치지 마세요.",
-                    "최근 관심을 보인 호텔 상품을 다시 살펴보고, "
-                    "예약 가능한 객실을 편하게 비교해보세요.",
-                    "준비된 호텔 혜택을 확인하고 원하는 날짜에 맞는 "
-                    "숙소를 빠르게 예약해보세요.",
-                ),
-            ),
+            body,
             max_length=280,
         ),
-        cta="호텔 특가 보기",
+        cta="호텔 정보 보기",
         landing_url=landing_url,
     )
 
@@ -147,17 +152,21 @@ def _sms_content(
     segment_name: str,
     landing_url: str,
     option_index: int,
+    prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
     del segment_name
 
     message = _variant(
         option_index,
         (
-            "환불 가능한 호텔 특가가 준비되어 있어요.",
-            "지금 예약 가능한 호텔 혜택을 확인해보세요.",
-            "원하는 일정에 맞는 숙박 혜택을 놓치지 마세요.",
+            "관심 호텔의 예약 정보를 확인해보세요.",
+            "여행 일정에 맞는 호텔 정보를 살펴보세요.",
+            "원하는 날짜의 숙소와 예약 조건을 비교해보세요.",
         ),
     )
+    strategy_lead = _strategy_copy_lead(prompt_result)
+    if strategy_lead:
+        message = f"{strategy_lead} {message}"
     return GeneratedContent(
         message=_compact(
             f"{message} {{{{redirect_url}}}}",
@@ -174,38 +183,74 @@ def _banner_content(
     option_index: int,
     prompt_result: PromptBuildResult,
 ) -> GeneratedContent:
-    del segment_name, prompt_result
+    del segment_name
+
+    body = _variant(
+        option_index,
+        (
+            "관심 호텔의 객실 정보와 예약 조건을 지금 비교해보세요.",
+            "원하는 일정에 맞는 객실 정보를 확인해보세요.",
+            "호텔 정보를 편하게 비교하고 예약을 이어가세요.",
+        ),
+    )
+    strategy_lead = _strategy_copy_lead(prompt_result)
+    if strategy_lead:
+        body = f"{strategy_lead} {body}"
 
     return GeneratedContent(
         title=_compact(
             _variant(
                 option_index,
                 (
-                    "이번 주말 호텔 특가",
-                    "지금 예약 가능한 호텔",
-                    "여름 숙박 혜택 확인",
+                    "이번 주말 호텔 확인",
+                    "관심 호텔 예약 정보",
+                    "여름 숙박 정보 확인",
                 ),
             ),
             max_length=72,
         ),
         body=_compact(
-            _variant(
-                option_index,
-                (
-                    "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요.",
-                    "원하는 일정에 맞는 객실을 객실 마감 전에 확인하세요.",
-                    "편하게 비교하고 바로 예약할 수 있는 호텔 혜택을 만나보세요.",
-                ),
-            ),
+            body,
             max_length=180,
         ),
-        cta="호텔 특가 보기",
-        image_prompt=(
-            "modern hotel room summer promotion banner, clean bright travel "
-            "layout, no visible text"
-        ),
+        cta="호텔 정보 보기",
+        image_prompt=RichImagePromptBuilder().build(prompt_result),
         landing_url=landing_url,
     )
+
+
+def _strategy_copy_lead(prompt_result: PromptBuildResult) -> str | None:
+    strategy_plan = prompt_result.strategy_plan
+    if strategy_plan is None or not strategy_plan.evidence_refs:
+        return None
+
+    audience_label = _audience_label(strategy_plan.audience_focus)
+    if strategy_plan.message_angle == "booking_confidence":
+        action = "예약 결정을 돕는 정보를 안내합니다."
+    elif strategy_plan.message_angle == "landing_motivation":
+        action = "호텔 혜택을 확인할 이유를 분명하게 전합니다."
+    else:
+        action = "프로모션 내용을 알기 쉽게 전합니다."
+    if audience_label:
+        return f"{audience_label}에게 {action}"
+    return action
+
+
+def _audience_label(values: tuple[str, ...]) -> str | None:
+    if not values:
+        return None
+    normalized = values[0].strip().lower()
+    labels = (
+        (("near_checkin", "checkin"), "체크인 일정이 가까운 고객"),
+        (("repeat", "same_hotel"), "관심 호텔을 다시 살펴본 고객"),
+        (("booking_start", "no_booking"), "예약을 완료하지 않은 고객"),
+        (("mobile",), "모바일로 호텔을 찾는 고객"),
+        (("redirect", "landing"), "호텔 정보를 확인한 고객"),
+    )
+    for terms, label in labels:
+        if any(term in normalized for term in terms):
+            return label
+    return "선택된 호텔 고객군"
 
 
 def _variant(option_index: int, values: tuple[str, ...]) -> str:

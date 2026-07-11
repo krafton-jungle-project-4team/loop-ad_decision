@@ -5,7 +5,7 @@ from decimal import Decimal
 import pytest
 
 from app.decision.assignment_service import (
-    DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT,
+    ASSIGNMENT_PAGE_SIZE,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
@@ -43,6 +43,13 @@ def vector(index: int, value: float = 1.0) -> list[float]:
     return values
 
 
+def user_vector_records(count: int) -> list[UserBehaviorVectorRecord]:
+    return [
+        user_vector_record(f"user_{index:06d}", vector(0))
+        for index in range(count)
+    ]
+
+
 def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> None:
     service, repos = make_service(
         user_vectors=[
@@ -69,11 +76,11 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     assert response.invalid_user_vector_fallback_count == 0
     assert response.ann_underfilled_user_count == 0
     assert response.insufficient_segment_count == 0
-    assert [assignment.user_id for assignment in repos.assignments.inserted] == [
-        "user_family",
-        "user_fallback",
-    ]
-    regular, fallback = repos.assignments.inserted
+    assignments_by_user = {
+        assignment.user_id: assignment for assignment in repos.assignments.inserted
+    }
+    regular = assignments_by_user["user_family"]
+    fallback = assignments_by_user["user_fallback"]
     assert regular.segment_id == "seg_family_trip"
     assert regular.ad_experiment_id == "adexp_seg_family_trip"
     assert regular.content_id == "content_seg_family_trip"
@@ -212,10 +219,7 @@ def test_assignment_service_falls_back_for_valid_users_without_candidates() -> N
 
 def test_assignment_service_deduplicates_users_before_batch_ann() -> None:
     service, repos = make_service(
-        user_vectors=[
-            user_vector_record("user_family", vector(0)),
-            user_vector_record("user_family", vector(1)),
-        ],
+        user_vectors=[user_vector_record("user_family", vector(0))],
     )
 
     response = service.build_assignments(
@@ -364,11 +368,13 @@ def test_assignment_service_uses_project_limit_when_user_ids_omitted() -> None:
         request=SegmentAssignmentBuildRequest(eligible_user_limit=50),
     )
 
-    assert repos.user_vectors.project_calls == [("hotel-client-a", "v1", 50, None)]
+    assert repos.user_vectors.project_calls == [
+        ("hotel-client-a", "v1", 50, None, None)
+    ]
     assert repos.user_vectors.user_id_calls == []
 
 
-def test_assignment_service_uses_default_limit_for_implicit_project_scope() -> None:
+def test_assignment_service_uses_page_size_for_unlimited_project_scope() -> None:
     service, repos = make_service(user_vectors=[])
 
     service.build_assignments(
@@ -380,10 +386,223 @@ def test_assignment_service_uses_default_limit_for_implicit_project_scope() -> N
         (
             "hotel-client-a",
             "v1",
-            DEFAULT_ASSIGNMENT_ELIGIBLE_USER_LIMIT,
+            ASSIGNMENT_PAGE_SIZE,
+            None,
             None,
         )
     ]
+
+
+@pytest.mark.parametrize(
+    ("user_count", "expected_page_sizes", "expected_after_user_ids"),
+    [
+        (0, [10_000], [None]),
+        (1, [10_000], [None]),
+        (10_000, [10_000, 10_000], [None, "user_009999"]),
+        (10_001, [10_000, 10_000], [None, "user_009999"]),
+        (
+            25_001,
+            [10_000, 10_000, 10_000],
+            [None, "user_009999", "user_019999"],
+        ),
+    ],
+)
+def test_assignment_service_scans_all_project_vector_pages(
+    user_count: int,
+    expected_page_sizes: list[int],
+    expected_after_user_ids: list[str | None],
+) -> None:
+    service, repos = make_service(user_vectors=user_vector_records(user_count))
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert response.assignment_count == user_count
+    assert [call[2] for call in repos.user_vectors.project_calls] == (
+        expected_page_sizes
+    )
+    assert [call[4] for call in repos.user_vectors.project_calls] == (
+        expected_after_user_ids
+    )
+    assigned_at_values = {
+        assignment.assigned_at for assignment in repos.assignments.inserted
+    }
+    assert len(assigned_at_values) <= 1
+
+    if user_count == 25_001:
+        first_assignments = list(repos.assignments.inserted)
+        second = service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+        assert second.assignment_count == 0
+        assert second.skipped_existing_count == 25_001
+        assert second.ann_candidate_count == 0
+        assert second.exact_reranked_pair_count == 0
+        assert second.fallback_count == 0
+        assert second.batch_has_fallback is False
+        assert repos.assignments.inserted == first_assignments
+
+
+@pytest.mark.parametrize(
+    ("total_limit", "expected_page_sizes", "expected_after_user_ids"),
+    [
+        (5_000, [5_000], [None]),
+        (15_000, [10_000, 5_000], [None, "user_009999"]),
+    ],
+)
+def test_assignment_service_applies_total_limit_across_project_pages(
+    total_limit: int,
+    expected_page_sizes: list[int],
+    expected_after_user_ids: list[str | None],
+) -> None:
+    service, repos = make_service(user_vectors=user_vector_records(25_001))
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(eligible_user_limit=total_limit),
+    )
+
+    assert response.assignment_count == total_limit
+    assert [call[2] for call in repos.user_vectors.project_calls] == (
+        expected_page_sizes
+    )
+    assert [call[4] for call in repos.user_vectors.project_calls] == (
+        expected_after_user_ids
+    )
+
+
+def test_assignment_service_chunks_sorted_unique_explicit_user_ids() -> None:
+    records = user_vector_records(10_001)
+    requested_user_ids = [record.user_id for record in reversed(records)]
+    requested_user_ids.extend(["user_000000", "user_010000"])
+    service, repos = make_service(user_vectors=records)
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=requested_user_ids),
+    )
+
+    assert response.assignment_count == 10_001
+    assert [len(call[1]) for call in repos.user_vectors.user_id_calls] == [10_000, 1]
+    assert repos.user_vectors.user_id_calls[0][1][0] == "user_000000"
+    assert repos.user_vectors.user_id_calls[0][1][-1] == "user_009999"
+    assert repos.user_vectors.user_id_calls[1][1] == ("user_010000",)
+
+
+def test_assignment_service_applies_total_limit_to_explicit_user_ids() -> None:
+    records = user_vector_records(10)
+    service, repos = make_service(user_vectors=records)
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(
+            user_ids=[record.user_id for record in reversed(records)],
+            eligible_user_limit=5,
+        ),
+    )
+
+    assert response.assignment_count == 5
+    assert repos.user_vectors.user_id_calls[0][1] == tuple(
+        f"user_{index:06d}" for index in range(5)
+    )
+
+
+def test_assignment_service_rejects_duplicate_user_ids_in_vector_page() -> None:
+    duplicate = user_vector_record("user_000001", vector(0))
+    service, repos = make_service(
+        user_vectors=[],
+        project_pages=[[duplicate, duplicate]],
+    )
+
+    with pytest.raises(SegmentAssignmentValidationError, match="duplicate user_id"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_rejects_unordered_vector_page() -> None:
+    service, repos = make_service(
+        user_vectors=[],
+        project_pages=[
+            [
+                user_vector_record("user_000002", vector(0)),
+                user_vector_record("user_000001", vector(0)),
+            ]
+        ],
+    )
+
+    with pytest.raises(SegmentAssignmentValidationError, match="ordered"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_rejects_non_increasing_page_cursor(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.decision.assignment_service.ASSIGNMENT_PAGE_SIZE",
+        2,
+    )
+    service, repos = make_service(
+        user_vectors=[],
+        project_pages=[
+            [
+                user_vector_record("user_000001", vector(0)),
+                user_vector_record("user_000002", vector(0)),
+            ],
+            [
+                user_vector_record("user_000002", vector(0)),
+                user_vector_record("user_000003", vector(0)),
+            ],
+        ],
+    )
+
+    with pytest.raises(SegmentAssignmentValidationError, match="monotonically"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(),
+        )
+
+    assert len(repos.assignments.inserted) == 2
+
+
+def test_assignment_service_recall_skips_existing_without_diagnostics() -> None:
+    service, repos = make_service(
+        user_vectors=[
+            user_vector_record("user_family", vector(0)),
+            user_vector_record("user_fallback", vector(1)),
+        ]
+    )
+    request = SegmentAssignmentBuildRequest()
+
+    first = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=request,
+    )
+    first_assignments = list(repos.assignments.inserted)
+    second = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=request,
+    )
+
+    assert first.assignment_count == 2
+    assert first.skipped_existing_count == 0
+    assert second.assignment_count == 0
+    assert second.skipped_existing_count == 2
+    assert second.ann_candidate_count == 0
+    assert second.exact_reranked_pair_count == 0
+    assert second.fallback_count == 0
+    assert second.batch_has_fallback is False
+    assert repos.assignments.inserted == first_assignments
 
 
 def test_assignment_service_uses_audience_scope_vector_version_when_request_omits_it() -> None:
@@ -404,7 +623,9 @@ def test_assignment_service_uses_audience_scope_vector_version_when_request_omit
     )
 
     assert response.vector_version == "v2"
-    assert repos.user_vectors.project_calls == [("hotel-client-a", "v2", 10, None)]
+    assert repos.user_vectors.project_calls == [
+        ("hotel-client-a", "v2", 10, None, None)
+    ]
     assert repos.segment_vectors.ann_calls[0]["vector_version"] == "v2"
 
 
@@ -509,7 +730,35 @@ def test_assignment_service_applies_scope_source_filter_and_min_limit() -> None:
     )
 
     assert repos.user_vectors.project_calls == [
-        ("hotel-client-a", "v1", 5, "booking_profile")
+        ("hotel-client-a", "v1", 5, "booking_profile", None)
+    ]
+
+
+def test_assignment_service_preserves_scope_filters_across_pages(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "app.decision.assignment_service.ASSIGNMENT_PAGE_SIZE",
+        2,
+    )
+    run = promotion_run_record(
+        goal_snapshot_json={
+            "min_sample_size": 1,
+            "audience_scope": {
+                "vector_version": "v2",
+                "filters": {"source": "booking_profile"},
+                "selection_policy": {"ordering": "user_id_asc"},
+            },
+        }
+    )
+    service, repos = make_service(run=run, user_vectors=user_vector_records(3))
+
+    service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert repos.user_vectors.project_calls == [
+        ("hotel-client-a", "v2", 2, "booking_profile", None),
+        ("hotel-client-a", "v2", 2, "booking_profile", "user_000001"),
     ]
 
 
@@ -612,10 +861,17 @@ class FakeSegmentVectorRepository:
 
 
 class FakeUserBehaviorVectorRepository:
-    def __init__(self, vectors: list[UserBehaviorVectorRecord]) -> None:
+    def __init__(
+        self,
+        vectors: list[UserBehaviorVectorRecord],
+        project_pages: list[list[UserBehaviorVectorRecord]] | None = None,
+    ) -> None:
         self.vectors = vectors
+        self.project_pages = project_pages
         self.user_id_calls: list[tuple[str, tuple[str, ...], str, str | None]] = []
-        self.project_calls: list[tuple[str, str, int, str | None]] = []
+        self.project_calls: list[
+            tuple[str, str, int, str | None, str | None]
+        ] = []
 
     def list_by_user_ids(
         self,
@@ -626,7 +882,15 @@ class FakeUserBehaviorVectorRepository:
         source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         self.user_id_calls.append((project_id, tuple(user_ids), vector_version, source))
-        return self.vectors
+        requested_user_ids = set(user_ids)
+        return sorted(
+            [
+                record
+                for record in self.vectors
+                if record.user_id in requested_user_ids
+            ],
+            key=lambda record: record.user_id,
+        )
 
     def list_for_project(
         self,
@@ -635,9 +899,22 @@ class FakeUserBehaviorVectorRepository:
         vector_version: str,
         limit: int,
         source: str | None = None,
+        after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        self.project_calls.append((project_id, vector_version, limit, source))
-        return self.vectors
+        self.project_calls.append(
+            (project_id, vector_version, limit, source, after_user_id)
+        )
+        if self.project_pages is not None:
+            call_index = len(self.project_calls) - 1
+            if call_index >= len(self.project_pages):
+                return []
+            return self.project_pages[call_index]
+        records = sorted(self.vectors, key=lambda record: record.user_id)
+        if after_user_id is not None:
+            records = [
+                record for record in records if record.user_id > after_user_id
+            ]
+        return records[:limit]
 
 
 class FakeUserSegmentAssignmentRepository:
@@ -656,6 +933,9 @@ class FakeUserSegmentAssignmentRepository:
 
     def insert_many(self, assignments: list[UserSegmentAssignmentWrite]) -> int:
         self.inserted.extend(assignments)
+        self.existing_user_ids.update(
+            assignment.user_id for assignment in assignments
+        )
         return len(assignments)
 
     def count_by_run_segments(
@@ -680,6 +960,7 @@ class FakeRepositoryBundle:
         ann_candidates: AnnCandidates,
         ann_error: Exception | None,
         user_vectors: list[UserBehaviorVectorRecord],
+        project_pages: list[list[UserBehaviorVectorRecord]] | None,
         segment_counts: dict[str, int],
         existing_user_ids: set[str],
     ) -> None:
@@ -691,7 +972,10 @@ class FakeRepositoryBundle:
             ann_candidates,
             ann_error,
         )
-        self.user_vectors = FakeUserBehaviorVectorRepository(user_vectors)
+        self.user_vectors = FakeUserBehaviorVectorRepository(
+            user_vectors,
+            project_pages,
+        )
         self.assignments = FakeUserSegmentAssignmentRepository(
             segment_counts,
             existing_user_ids,
@@ -706,6 +990,7 @@ def make_service(
     ann_candidates: AnnCandidates = None,
     ann_error: Exception | None = None,
     user_vectors: list[UserBehaviorVectorRecord] | None = None,
+    project_pages: list[list[UserBehaviorVectorRecord]] | None = None,
     segment_counts: dict[str, int] | None = None,
     existing_user_ids: set[str] | None = None,
 ) -> tuple[SegmentAssignmentService, FakeRepositoryBundle]:
@@ -729,6 +1014,7 @@ def make_service(
         else [
             user_vector_record("user_family", vector(0)),
         ],
+        project_pages=project_pages,
         segment_counts=segment_counts or {"seg_family_trip": 1},
         existing_user_ids=existing_user_ids or set(),
     )

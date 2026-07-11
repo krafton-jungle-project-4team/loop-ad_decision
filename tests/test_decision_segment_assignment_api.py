@@ -197,6 +197,55 @@ def test_segment_assignment_api_rolls_back_and_closes_on_failure(monkeypatch) ->
     assert clickhouse_clients[0].close_count == 1
 
 
+def test_segment_assignment_api_rolls_back_when_later_page_cursor_fails(
+    monkeypatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+    clickhouse_clients: list[RecordingClickHouseClient] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
+        client = RecordingClickHouseClient()
+        clickhouse_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "app.decision.assignment_service.ASSIGNMENT_PAGE_SIZE",
+        1,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        fake_create_clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
+        json={},
+    )
+
+    assert response.status_code == 422
+    assert "cursor" in response.json()["detail"]
+    connection = connections[0]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert any(
+        "insert into user_segment_assignments" in compact_sql(query)
+        for query, _params in connection.executed
+    )
+    assert len(clickhouse_clients[0].calls) == 2
+    assert clickhouse_clients[0].calls[1][1]["after_user_id"] == "user_001"
+
+
 class FakeAssignmentService:
     def __init__(self, exc: Exception | None = None) -> None:
         self.exc = exc

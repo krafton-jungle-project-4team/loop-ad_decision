@@ -1,18 +1,19 @@
 from __future__ import annotations
 
+from datetime import datetime
 from decimal import Decimal
 from typing import Sequence
 
 import pytest
 
 from app.decision.evaluation_service import (
+    EvaluationContext,
     PromotionRunEvaluationNotFoundError,
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
 )
 from app.decision.repositories import (
     AdExperimentRecord,
-    PromotionEvaluationRecord,
     PromotionEvaluationWrite,
     PromotionRunRecord,
 )
@@ -71,28 +72,27 @@ def test_promotion_run_evaluation_aggregates_all_segments_mixed_status() -> None
     assert inserted.denominator_count == 0
     assert inserted.sample_size == 0
     assert inserted.result_json["failed_segment_ids"] == ["seg_luxury"]
+    assert inserted.result_json["evaluation_scope"] == "promotion_run_aggregate"
     assert repos.runs.status_updates == [
         ("prun_banner_001_loop_1", PromotionRunStatus.PARTIAL_GOAL_MET.value)
     ]
 
 
-def test_promotion_run_evaluation_evaluates_missing_ad_experiments_first() -> None:
+def test_promotion_run_evaluation_reevaluates_every_experiment_without_latest_reads() -> None:
     repos = FakeRunEvaluationRepos(
         evaluations=[
             evaluation_record(
                 ad_experiment_id="adexp_family_trip_001",
                 segment_id="seg_family_trip",
                 status=PromotionEvaluationStatus.GOAL_MET.value,
-            )
+            ),
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.GOAL_MET.value,
+            ),
         ],
     )
-    repos.ad_evaluation_service.generated = {
-        "adexp_luxury_001": evaluation_record(
-            ad_experiment_id="adexp_luxury_001",
-            segment_id="seg_luxury",
-            status=PromotionEvaluationStatus.GOAL_MET.value,
-        )
-    }
     service = make_service(repos)
 
     response = service.evaluate(
@@ -100,7 +100,12 @@ def test_promotion_run_evaluation_evaluates_missing_ad_experiments_first() -> No
         request=PromotionRunEvaluateRequest(),
     )
 
-    assert repos.ad_evaluation_service.calls == ["adexp_luxury_001"]
+    assert repos.ad_evaluation_service.calls == [
+        "adexp_family_trip_001",
+        "adexp_luxury_001",
+    ]
+    assert len(set(repos.ad_evaluation_service.cutoffs)) == 1
+    assert repos.evaluations.latest_calls == []
     assert response.status == PromotionRunStatus.GOAL_MET
     assert repos.evaluations.inserted[0].status == PromotionRunStatus.GOAL_MET.value
 
@@ -285,7 +290,7 @@ class FakeRunEvaluationRepos:
         *,
         run: PromotionRunRecord | None | object = object(),
         experiments: Sequence[AdExperimentRecord] | None = None,
-        evaluations: list[PromotionEvaluationRecord] | None = None,
+        evaluations: list[PromotionEvaluationWrite] | None = None,
     ) -> None:
         self.runs = FakePromotionRunRepository(
             promotion_run_record() if not isinstance(run, PromotionRunRecord) and run is not None else run
@@ -328,9 +333,10 @@ class FakeAdExperimentRepository:
 
 
 class FakePromotionEvaluationRepository:
-    def __init__(self, evaluations: list[PromotionEvaluationRecord]) -> None:
+    def __init__(self, evaluations: list[PromotionEvaluationWrite]) -> None:
         self.evaluations = evaluations
         self.inserted: list[PromotionEvaluationWrite] = []
+        self.latest_calls: list[str] = []
 
     def insert(self, evaluation: PromotionEvaluationWrite) -> None:
         self.inserted.append(evaluation)
@@ -338,7 +344,8 @@ class FakePromotionEvaluationRepository:
     def list_latest_by_run_ad_experiments(
         self,
         promotion_run_id: str,
-    ) -> list[PromotionEvaluationRecord]:
+    ) -> list[PromotionEvaluationWrite]:
+        self.latest_calls.append(promotion_run_id)
         return [
             evaluation
             for evaluation in self.evaluations
@@ -351,19 +358,24 @@ class FakeAdExperimentEvaluationService:
     def __init__(self, evaluations: FakePromotionEvaluationRepository) -> None:
         self._evaluations = evaluations
         self.calls: list[str] = []
-        self.generated: dict[str, PromotionEvaluationRecord] = {}
+        self.cutoffs: list[datetime] = []
+        self.generated: dict[str, PromotionEvaluationWrite] = {
+            str(evaluation.ad_experiment_id): evaluation
+            for evaluation in evaluations.evaluations
+            if evaluation.ad_experiment_id is not None
+        }
 
-    def evaluate(
+    def evaluate_with_context(
         self,
         *,
         ad_experiment_id: str,
         request: AdExperimentEvaluateRequest,
-    ) -> object:
+        context: EvaluationContext,
+    ) -> PromotionEvaluationWrite:
         _ = request
         self.calls.append(ad_experiment_id)
-        generated = self.generated[ad_experiment_id]
-        self._evaluations.evaluations.append(generated)
-        return object()
+        self.cutoffs.append(context.evaluation_cutoff_at)
+        return self.generated[ad_experiment_id]
 
 
 def promotion_run_record(
@@ -436,8 +448,8 @@ def evaluation_record(
     actual_value: Decimal = Decimal("0.200000"),
     numerator_count: int = 2,
     denominator_count: int = 10,
-) -> PromotionEvaluationRecord:
-    return PromotionEvaluationRecord(
+) -> PromotionEvaluationWrite:
+    return PromotionEvaluationWrite(
         evaluation_id=f"eval_{ad_experiment_id}",
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
@@ -457,5 +469,14 @@ def evaluation_record(
         status=status,
         feedback=None,
         next_loop_required=status == PromotionEvaluationStatus.GOAL_NOT_MET.value,
-        result_json={"status": status},
+        result_json={
+            "status": status,
+            "status_reason": "target_met"
+            if status == PromotionEvaluationStatus.GOAL_MET.value
+            else "target_not_met",
+            "event_names": {
+                "numerator": "booking_complete",
+                "denominator": "promotion_click",
+            },
+        },
     )

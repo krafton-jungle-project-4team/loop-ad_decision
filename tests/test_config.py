@@ -14,6 +14,7 @@ def valid_env() -> dict[str, str]:
             "PORT": "8080",
             "LOOPAD_AURORA_PORT": "15432",
             "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
+            "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH": "/models/segment.json",
         }
     )
     return values
@@ -59,3 +60,4 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.aurora_port == 15432
     assert settings.openai_content_model == "gpt-test"
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
+    assert settings.segment_performance_model_path == "/models/segment.json"

@@ -6,6 +6,7 @@ from typing import Any, Protocol
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.content_brief import CONTENT_BRIEF_SCHEMA_VERSION
 from app.generation.artifacts import (
     attribution_for_candidate,
     creative_format_for_channel,
@@ -690,6 +691,8 @@ def _target_segment_prompt_input(
 
 def _content_brief_json(row: Mapping[str, Any]) -> dict[str, Any]:
     content_brief = _json_object(row.get("content_brief_json"))
+    if content_brief.get("schema_version") == CONTENT_BRIEF_SCHEMA_VERSION:
+        return content_brief
     data_evidence = _json_object(row.get("data_evidence_json"))
     for key in (
         "booking_conversion_rate",

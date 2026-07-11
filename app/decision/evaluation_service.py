@@ -34,6 +34,47 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 DECIMAL_SCALE = Decimal("0.000001")
+EVALUATOR_VERSION = "dec.target-threshold-evaluator.v1"
+METRIC_SQL_VERSION = "dec.evaluation-metric-sql.v1"
+EVALUATION_MODE = "target_threshold"
+
+
+def _normalize_utc_milliseconds(value: datetime, *, field_name: str) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must be timezone-aware")
+    normalized = value.astimezone(UTC)
+    return normalized.replace(microsecond=(normalized.microsecond // 1000) * 1000)
+
+
+@dataclass(frozen=True)
+class EvaluationContext:
+    evaluation_cutoff_at: datetime
+    window_start: datetime | None = None
+    evaluator_version: str = EVALUATOR_VERSION
+    metric_sql_version: str = METRIC_SQL_VERSION
+
+    def __post_init__(self) -> None:
+        cutoff = _normalize_utc_milliseconds(
+            self.evaluation_cutoff_at,
+            field_name="evaluation_cutoff_at",
+        )
+        object.__setattr__(self, "evaluation_cutoff_at", cutoff)
+        if self.window_start is not None:
+            window_start = _normalize_utc_milliseconds(
+                self.window_start,
+                field_name="window_start",
+            )
+            if window_start > cutoff:
+                raise ValueError("window_start must not be after evaluation_cutoff_at")
+            object.__setattr__(self, "window_start", window_start)
+        if not self.evaluator_version:
+            raise ValueError("evaluator_version must not be empty")
+        if not self.metric_sql_version:
+            raise ValueError("metric_sql_version must not be empty")
+
+
+def _new_evaluation_context() -> EvaluationContext:
+    return EvaluationContext(evaluation_cutoff_at=datetime.now(UTC))
 
 
 @dataclass(frozen=True)
@@ -89,6 +130,22 @@ class AdExperimentEvaluationService:
         started_at = now_ms()
         log.assign_context({"adExperimentId": ad_experiment_id})
         log.info("started", {"adExperimentId": ad_experiment_id, "request": request})
+        evaluation = self.evaluate_with_context(
+            ad_experiment_id=ad_experiment_id,
+            request=request,
+            context=_new_evaluation_context(),
+        )
+        response = _to_ad_experiment_response(evaluation)
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
+
+    def evaluate_with_context(
+        self,
+        *,
+        ad_experiment_id: str,
+        request: AdExperimentEvaluateRequest,
+        context: EvaluationContext,
+    ) -> PromotionEvaluationWrite:
         _ = request
         experiment = self._ad_experiment_repository.get_by_id(ad_experiment_id)
         if experiment is None:
@@ -126,10 +183,12 @@ class AdExperimentEvaluationService:
 
         target_value = _parse_target_value(run.goal_snapshot_json)
         min_sample_size = _parse_min_sample_size(run.goal_snapshot_json)
-        counts = self._load_counts(experiment)
+        counts = self._load_counts(experiment, context=context)
         log.info("metric_counts_loaded", {"counts": counts})
+        _validate_metric_counts(counts)
         sample_size = counts.denominator_count
         actual_value = _calculate_actual_value(counts)
+        _validate_metric_rate(actual_value)
         status = _decide_status(
             actual_value=actual_value,
             target_value=target_value,
@@ -171,6 +230,7 @@ class AdExperimentEvaluationService:
                 actual_value=actual_value,
                 min_sample_size=min_sample_size,
                 status=status,
+                context=context,
             ),
         )
         self._promotion_evaluation_repository.insert(evaluation)
@@ -179,38 +239,54 @@ class AdExperimentEvaluationService:
             status=status,
         )
         log.info("promotion_evaluation_created", {"evaluation": evaluation, "status": status})
+        return evaluation
 
-        response = AdExperimentEvaluateResponse(
-            evaluation_id=evaluation.evaluation_id,
-            ad_experiment_id=experiment.ad_experiment_id,
-            promotion_run_id=experiment.promotion_run_id,
-            promotion_id=experiment.promotion_id,
-            segment_id=experiment.segment_id,
-            metric=GoalMetric(metric),
-            target_value=evaluation.target_value,
-            actual_value=evaluation.actual_value,
-            numerator_count=evaluation.numerator_count,
-            denominator_count=evaluation.denominator_count,
-            sample_size=evaluation.sample_size,
-            basis=GoalBasis.ALL_SEGMENTS,
-            status=PromotionEvaluationStatus(status),
-            next_loop_required=evaluation.next_loop_required,
-            feedback=evaluation.feedback,
-        )
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
-        return response
-
-    def _load_counts(self, experiment: AdExperimentRecord) -> MetricCountRecord:
+    def _load_counts(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        context: EvaluationContext,
+    ) -> MetricCountRecord:
         if experiment.goal_metric == GoalMetric.INFLOW_RATE.value:
-            return self._evaluation_metric_repository.count_inflow_rate(experiment)
+            return self._evaluation_metric_repository.count_inflow_rate(
+                experiment,
+                evaluation_cutoff_at=context.evaluation_cutoff_at,
+            )
         if experiment.goal_metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
             return self._evaluation_metric_repository.count_booking_conversion_rate(
-                experiment
+                experiment,
+                evaluation_cutoff_at=context.evaluation_cutoff_at,
             )
         log.warn("goal_metric_unsupported", {"metric": experiment.goal_metric})
         raise AdExperimentEvaluationValidationError(
             f"unsupported goal metric: {experiment.goal_metric}"
         )
+
+
+def _to_ad_experiment_response(
+    evaluation: PromotionEvaluationWrite,
+) -> AdExperimentEvaluateResponse:
+    if evaluation.ad_experiment_id is None or evaluation.segment_id is None:
+        raise AdExperimentEvaluationValidationError(
+            "individual evaluation must include experiment and segment ids"
+        )
+    return AdExperimentEvaluateResponse(
+        evaluation_id=evaluation.evaluation_id,
+        ad_experiment_id=evaluation.ad_experiment_id,
+        promotion_run_id=evaluation.promotion_run_id,
+        promotion_id=evaluation.promotion_id,
+        segment_id=evaluation.segment_id,
+        metric=GoalMetric(evaluation.metric),
+        target_value=evaluation.target_value,
+        actual_value=evaluation.actual_value,
+        numerator_count=evaluation.numerator_count,
+        denominator_count=evaluation.denominator_count,
+        sample_size=evaluation.sample_size,
+        basis=GoalBasis.ALL_SEGMENTS,
+        status=PromotionEvaluationStatus(evaluation.status),
+        next_loop_required=evaluation.next_loop_required,
+        feedback=evaluation.feedback,
+    )
 
 
 class PromotionRunEvaluationService:
@@ -238,6 +314,7 @@ class PromotionRunEvaluationService:
         log.assign_context({"promotionRunId": promotion_run_id})
         log.info("started", {"promotionRunId": promotion_run_id, "request": request})
         _ = request
+        context = _new_evaluation_context()
         run = self._promotion_run_repository.get_by_id(promotion_run_id)
         if run is None:
             log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
@@ -273,40 +350,28 @@ class PromotionRunEvaluationService:
         target_value = _parse_run_target_value(run.goal_snapshot_json)
         min_sample_size = _parse_run_min_sample_size(run.goal_snapshot_json)
 
-        latest_by_experiment = self._latest_by_experiment(promotion_run_id)
-        missing_experiments = [
-            experiment
-            for experiment in experiments
-            if experiment.ad_experiment_id not in latest_by_experiment
-        ]
-        for experiment in missing_experiments:
-            log.info("ad_experiment_evaluation_missing", {"adExperimentId": experiment.ad_experiment_id})
-            self._ad_experiment_evaluation_service.evaluate(
+        request_evaluations: list[PromotionEvaluationWrite] = []
+        for experiment in experiments:
+            log.info(
+                "ad_experiment_evaluation_started",
+                {"adExperimentId": experiment.ad_experiment_id},
+            )
+            evaluation = self._ad_experiment_evaluation_service.evaluate_with_context(
                 ad_experiment_id=experiment.ad_experiment_id,
                 request=AdExperimentEvaluateRequest(),
+                context=context,
             )
-
-        if missing_experiments:
-            latest_by_experiment = self._latest_by_experiment(promotion_run_id)
-
-        latest_evaluations = []
-        for experiment in experiments:
-            evaluation = latest_by_experiment.get(experiment.ad_experiment_id)
-            if evaluation is None:
-                log.warn("ad_experiment_evaluation_not_found", {"adExperimentId": experiment.ad_experiment_id})
-                raise PromotionRunEvaluationValidationError(
-                    "latest ad experiment evaluation is required before aggregate"
-                )
             _validate_individual_evaluation(evaluation, metric)
-            latest_evaluations.append(evaluation)
+            request_evaluations.append(evaluation)
 
         aggregate = _aggregate_run_evaluations(
             run=run,
-            evaluations=latest_evaluations,
+            evaluations=request_evaluations,
             metric=metric,
             basis=basis,
             target_value=target_value,
             min_sample_size=min_sample_size,
+            context=context,
         )
 
         evaluation_id = build_bounded_decision_id(
@@ -364,18 +429,6 @@ class PromotionRunEvaluationService:
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
-
-    def _latest_by_experiment(
-        self,
-        promotion_run_id: str,
-    ) -> dict[str, PromotionEvaluationRecord]:
-        return {
-            str(evaluation.ad_experiment_id): evaluation
-            for evaluation in self._promotion_evaluation_repository.list_latest_by_run_ad_experiments(
-                promotion_run_id
-            )
-            if evaluation.ad_experiment_id is not None
-        }
 
 
 def _parse_target_value(snapshot: Mapping[str, Any]) -> Decimal:
@@ -464,11 +517,12 @@ def _parse_goal_basis(snapshot: Mapping[str, Any]) -> str:
 def _aggregate_run_evaluations(
     *,
     run: PromotionRunRecord,
-    evaluations: list[PromotionEvaluationRecord],
+    evaluations: list[PromotionEvaluationRecord | PromotionEvaluationWrite],
     metric: str,
     basis: str,
     target_value: Decimal,
     min_sample_size: int,
+    context: EvaluationContext,
 ) -> _RunAggregate:
     failed_evaluations = [
         evaluation
@@ -503,9 +557,17 @@ def _aggregate_run_evaluations(
             failed_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
             result_json={
+                **_evaluation_context_json(
+                    context,
+                    evaluation_scope="promotion_run_aggregate",
+                ),
                 "basis": basis,
                 "metric": metric,
+                "event_names": _aggregate_event_names(evaluations),
                 "target_value": str(target_value),
+                "numerator_count": 0,
+                "denominator_count": 0,
+                "sample_size": 0,
                 "status_reason": _aggregate_status_reason(status, basis),
                 "ad_experiment_results": experiment_results,
                 "failed_segment_ids": failed_segment_ids,
@@ -524,12 +586,13 @@ def _aggregate_run_evaluations(
     numerator_count = sum(evaluation.numerator_count for evaluation in evaluations)
     denominator_count = sum(evaluation.denominator_count for evaluation in evaluations)
     sample_size = denominator_count
-    actual_value = _calculate_actual_value(
-        MetricCountRecord(
-            numerator_count=numerator_count,
-            denominator_count=denominator_count,
-        )
+    aggregate_counts = MetricCountRecord(
+        numerator_count=numerator_count,
+        denominator_count=denominator_count,
     )
+    _validate_metric_counts(aggregate_counts)
+    actual_value = _calculate_actual_value(aggregate_counts)
+    _validate_metric_rate(actual_value)
     status = _decide_status(
         actual_value=actual_value,
         target_value=target_value,
@@ -547,8 +610,13 @@ def _aggregate_run_evaluations(
         failed_segment_ids=failed_segment_ids,
         failed_ad_experiment_ids=failed_ad_experiment_ids,
         result_json={
+            **_evaluation_context_json(
+                context,
+                evaluation_scope="promotion_run_aggregate",
+            ),
             "basis": basis,
             "metric": metric,
+            "event_names": _aggregate_event_names(evaluations),
             "target_value": str(target_value),
             "actual_value": str(actual_value),
             "numerator_count": numerator_count,
@@ -570,7 +638,7 @@ def _aggregate_run_evaluations(
 
 
 def _validate_individual_evaluation(
-    evaluation: PromotionEvaluationRecord,
+    evaluation: PromotionEvaluationRecord | PromotionEvaluationWrite,
     metric: str,
 ) -> None:
     if evaluation.metric != metric:
@@ -590,7 +658,7 @@ def _validate_individual_evaluation(
 
 
 def _aggregate_all_segments_status(
-    evaluations: list[PromotionEvaluationRecord],
+    evaluations: list[PromotionEvaluationRecord | PromotionEvaluationWrite],
 ) -> str:
     statuses = [evaluation.status for evaluation in evaluations]
     if all(status == PromotionEvaluationStatus.GOAL_MET.value for status in statuses):
@@ -608,7 +676,7 @@ def _aggregate_all_segments_status(
 
 
 def _evaluation_summary(
-    evaluation: PromotionEvaluationRecord,
+    evaluation: PromotionEvaluationRecord | PromotionEvaluationWrite,
 ) -> dict[str, Any]:
     return {
         "evaluation_id": evaluation.evaluation_id,
@@ -617,6 +685,7 @@ def _evaluation_summary(
         "actual_value": str(evaluation.actual_value),
         "target_value": str(evaluation.target_value),
         "status": evaluation.status,
+        "status_reason": evaluation.result_json.get("status_reason"),
         "numerator_count": evaluation.numerator_count,
         "denominator_count": evaluation.denominator_count,
         "sample_size": evaluation.sample_size,
@@ -631,6 +700,24 @@ def _aggregate_status_reason(status: str, basis: str) -> str:
     if status == PromotionEvaluationStatus.INSUFFICIENT_DATA.value:
         return f"{basis}_only_insufficient_data"
     return f"{basis}_mixed_status"
+
+
+def _validate_metric_counts(counts: MetricCountRecord) -> None:
+    if counts.numerator_count < 0 or counts.denominator_count < 0:
+        raise AdExperimentEvaluationValidationError(
+            "metric counts must not be negative"
+        )
+    if counts.numerator_count > counts.denominator_count:
+        raise AdExperimentEvaluationValidationError(
+            "metric numerator_count must not exceed denominator_count"
+        )
+
+
+def _validate_metric_rate(actual_value: Decimal) -> None:
+    if actual_value < 0 or actual_value > 1:
+        raise AdExperimentEvaluationValidationError(
+            "metric actual_value must be between 0 and 1"
+        )
 
 
 def _calculate_actual_value(counts: MetricCountRecord) -> Decimal:
@@ -657,6 +744,58 @@ def _decide_status(
     return PromotionEvaluationStatus.GOAL_NOT_MET.value
 
 
+def _evaluation_context_json(
+    context: EvaluationContext,
+    *,
+    evaluation_scope: str,
+) -> dict[str, Any]:
+    return {
+        "evaluation_cutoff_at": _rfc3339_milliseconds(
+            context.evaluation_cutoff_at
+        ),
+        "window_start": (
+            _rfc3339_milliseconds(context.window_start)
+            if context.window_start is not None
+            else None
+        ),
+        "evaluation_mode": EVALUATION_MODE,
+        "evaluation_scope": evaluation_scope,
+        "evaluator_version": context.evaluator_version,
+        "metric_sql_version": context.metric_sql_version,
+    }
+
+
+def _rfc3339_milliseconds(value: datetime) -> str:
+    normalized = _normalize_utc_milliseconds(value, field_name="datetime")
+    return normalized.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _aggregate_event_names(
+    evaluations: list[PromotionEvaluationRecord | PromotionEvaluationWrite],
+) -> dict[str, str | list[str] | None]:
+    event_names_by_role: dict[str, list[str]] = {
+        "numerator": [],
+        "denominator": [],
+    }
+    for evaluation in evaluations:
+        raw_event_names = evaluation.result_json.get("event_names")
+        if not isinstance(raw_event_names, Mapping):
+            continue
+        for role in event_names_by_role:
+            value = raw_event_names.get(role)
+            if isinstance(value, str) and value not in event_names_by_role[role]:
+                event_names_by_role[role].append(value)
+    result: dict[str, str | list[str] | None] = {}
+    for role, values in event_names_by_role.items():
+        if not values:
+            result[role] = None
+        elif len(values) == 1:
+            result[role] = values[0]
+        else:
+            result[role] = values
+    return result
+
+
 def _build_result_json(
     *,
     experiment: AdExperimentRecord,
@@ -665,8 +804,10 @@ def _build_result_json(
     actual_value: Decimal,
     min_sample_size: int,
     status: str,
+    context: EvaluationContext,
 ) -> dict[str, Any]:
     return {
+        **_evaluation_context_json(context, evaluation_scope="ad_experiment"),
         "metric_source": _metric_source(experiment.goal_metric),
         "event_names": _event_names(experiment.goal_metric, experiment.channel),
         "status_reason": _status_reason(

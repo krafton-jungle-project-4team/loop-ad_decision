@@ -1038,6 +1038,7 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
     assert "from ( select project_id, user_id, vector_dim" in sql
     assert "limit {limit:uint32}" in sql
     assert "user_id in" not in sql
+    assert "after_user_id" not in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
@@ -1067,6 +1068,33 @@ def test_user_behavior_vector_repository_filters_project_scope_by_source() -> No
         "vector_dim": 64,
         "limit": 500,
         "source": "booking_profile",
+    }
+
+
+def test_user_behavior_vector_repository_applies_keyset_cursor() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    repo.list_for_project(
+        project_id="hotel-client-a",
+        vector_version="v2",
+        limit=10_000,
+        source="booking_profile",
+        after_user_id="user_009999",
+    )
+
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "user_id > {after_user_id:string}" in sql
+    assert "order by user_id asc" in sql
+    assert "limit {limit:uint32}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "vector_version": "v2",
+        "vector_dim": 64,
+        "limit": 10_000,
+        "source": "booking_profile",
+        "after_user_id": "user_009999",
     }
 
 
@@ -1186,7 +1214,8 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_inflow_rate(
-        ad_experiment_record(goal_metric=GoalMetric.INFLOW_RATE.value)
+        ad_experiment_record(goal_metric=GoalMetric.INFLOW_RATE.value),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 4
@@ -1201,10 +1230,14 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     assert "project_id = {project_id:string}" in sql
     assert "promotion_run_id = {promotion_run_id:string}" in sql
     assert "ad_experiment_id = {ad_experiment_id:string}" in sql
+    assert "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_family_trip_001",
+        "evaluation_cutoff_at": datetime(
+            2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC
+        ),
     }
 
 
@@ -1213,7 +1246,8 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
-        ad_experiment_record(goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value)
+        ad_experiment_record(goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 0
@@ -1226,11 +1260,17 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
     assert "denominator_event_name:string" in sql
     assert "promotion_run_id is not null" in sql
     assert "ad_experiment_id is not null" in sql
+    assert sql.count(
+        "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}"
+    ) == 2
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_family_trip_001",
         "denominator_event_name": "promotion_click",
+        "evaluation_cutoff_at": datetime(
+            2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC
+        ),
     }
 
 
@@ -1242,7 +1282,8 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
         ad_experiment_record(
             goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
             channel=Channel.EMAIL.value,
-        )
+        ),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 1

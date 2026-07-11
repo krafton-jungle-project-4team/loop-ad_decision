@@ -39,6 +39,7 @@ class Settings:
     gemini_api_key: str
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
+    segment_performance_model_path: str | None = None
 
 
 REQUIRED_ENV_NAMES = (
@@ -99,6 +100,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
+        segment_performance_model_path=_read_optional(
+            source,
+            "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
+        ),
     )
 
 
