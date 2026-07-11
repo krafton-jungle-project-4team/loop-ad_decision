@@ -113,15 +113,37 @@ class SegmentAssignmentBuildResponse(BaseModel):
     ann_candidate_limit: int = Field(ge=1)
     ann_candidate_count: int = Field(ge=0)
     exact_reranked_pair_count: int = Field(ge=0)
+    page_count: int = Field(ge=0)
+    processed_user_count: int = Field(ge=0)
     assignment_count: int = Field(ge=0)
+    insert_conflict_count: int = Field(ge=0)
+    segment_assignment_counts: dict[str, int]
     batch_has_fallback: bool
     fallback_count: int = Field(ge=0)
+    fallback_rate: float | None = Field(default=None, ge=0, le=1)
+    fallback_reason_counts: dict[str, int]
     below_threshold_fallback_count: int = Field(ge=0)
     no_candidate_fallback_count: int = Field(ge=0)
     invalid_user_vector_fallback_count: int = Field(ge=0)
+    similarity_score_buckets: dict[str, int]
     ann_underfilled_user_count: int = Field(ge=0)
+    ann_applied: bool
+    ann_not_applied_reason: Literal[
+        "no_users_to_match",
+        "no_valid_user_vectors",
+    ] | None = None
     skipped_existing_count: int = Field(ge=0)
-    insufficient_segment_count: int = Field(ge=0)
+    insufficient_segment_count: Literal[0] = Field(
+        default=0,
+        deprecated=True,
+        description=(
+            "Deprecated: assignment no longer determines insufficient_data. "
+            "This field is always zero."
+        ),
+    )
+    completion_scope: Literal["current_request"] = "current_request"
+    assignment_mode: Literal["live_keyset", "explicit_user_ids"]
+    input_stability: Literal["not_snapshotted"] = "not_snapshotted"
     status: Literal["completed"] = "completed"
 
 
