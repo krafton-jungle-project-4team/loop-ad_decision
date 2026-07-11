@@ -327,7 +327,7 @@ def assert_no_forbidden_public_terms(payload: Any) -> None:
 
 def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
     response = make_client().post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 
@@ -414,7 +414,7 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
 
 def test_analysis_api_rejects_focus_segment_ids_contract() -> None:
     response = make_client().post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(focus_segment_ids=["seg_near_checkin"]),
     )
 

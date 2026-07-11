@@ -1,6 +1,6 @@
 from enum import Enum
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Channel(str, Enum):
@@ -34,6 +34,20 @@ class AnalysisRequest(BaseModel):
     campaign_id: str
     promotion_id: str
     operator_instruction: str | None = None
+
+
+class SegmentAnalysisRequest(AnalysisRequest):
+    segment_ids: list[str] = Field(min_length=1)
+
+    @field_validator("segment_ids")
+    @classmethod
+    def validate_segment_ids(cls, values: list[str]) -> list[str]:
+        cleaned = [value.strip() for value in values]
+        if any(not value for value in cleaned):
+            raise ValueError("segment_ids must not contain empty values")
+        if len(set(cleaned)) != len(cleaned):
+            raise ValueError("segment_ids must not contain duplicates")
+        return cleaned
 
 
 class ContentBriefResponse(BaseModel):

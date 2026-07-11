@@ -26,7 +26,13 @@ from app.analysis.report_generator import (
     SegmentSuggestionReportGenerator,
     SegmentSuggestionReportInput,
 )
-from app.analysis.schemas import AnalysisRequest, AnalysisStatus, Channel, GoalMetric
+from app.analysis.schemas import (
+    AnalysisRequest,
+    AnalysisStatus,
+    Channel,
+    GoalMetric,
+    SegmentAnalysisRequest,
+)
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorBuildResult,
@@ -412,7 +418,10 @@ class PromotionAnalysisService:
         self._max_default_target_segments = max_default_target_segments
 
     @log_context_scope
-    def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
+    def recommend_segments(
+        self,
+        request: AnalysisRequest,
+    ) -> PromotionAnalysisResult:
         started_at = now_ms()
         log.assign_context(
             {
@@ -426,9 +435,45 @@ class PromotionAnalysisService:
             request=request,
             focus_segment_ids=None,
             next_loop_context=None,
+            refresh_segment_suggestions=True,
+            persist_target_segments=False,
+            persist_segment_suggestions=True,
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
+
+    def analyze(self, request: AnalysisRequest) -> PromotionAnalysisResult:
+        """Compatibility alias for the former combined recommendation endpoint."""
+        return self.recommend_segments(request)
+
+    @log_context_scope
+    def analyze_segments(
+        self,
+        request: SegmentAnalysisRequest,
+    ) -> PromotionAnalysisResult:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": request.project_id,
+                "campaignId": request.campaign_id,
+                "promotionId": request.promotion_id,
+            }
+        )
+        log.info("started", {"request": request})
+        response = self._analyze(
+            request=request,
+            focus_segment_ids=request.segment_ids,
+            next_loop_context=None,
+            refresh_segment_suggestions=False,
+            persist_target_segments=True,
+            persist_segment_suggestions=False,
+        )
+        log.assign_context({"analysisId": response.analysis.analysis_id})
+        log.info(
+            "completed",
+            {"response": response, "durationMs": duration_ms(started_at)},
+        )
         return response
 
     @log_context_scope
@@ -461,6 +506,9 @@ class PromotionAnalysisService:
                     request.source_failed_ad_experiment_ids
                 ),
             ),
+            refresh_segment_suggestions=False,
+            persist_target_segments=True,
+            persist_segment_suggestions=False,
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -472,6 +520,9 @@ class PromotionAnalysisService:
         request: AnalysisRequest,
         focus_segment_ids: Sequence[str] | None,
         next_loop_context: NextLoopAnalysisContext | None,
+        refresh_segment_suggestions: bool,
+        persist_target_segments: bool,
+        persist_segment_suggestions: bool,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
         log.info("promotion_loaded", {"promotion": promotion})
@@ -481,7 +532,17 @@ class PromotionAnalysisService:
             promotion_id=request.promotion_id,
         )
         log.info("segment_definitions_loaded", {"segmentDefinitionCount": len(segment_definitions)})
-        suggested_segment_definitions = self._suggest_segment_definitions(promotion)
+        suggested_segment_definitions: list[SegmentDefinitionRecord] = []
+        if refresh_segment_suggestions:
+            suggested_segment_definitions = self._suggest_segment_definitions(promotion)
+        else:
+            log.info(
+                "segment_suggestion_refresh_skipped",
+                {
+                    "reason": "existing_segments_analysis",
+                    "focusSegmentIds": list(focus_segment_ids or ()),
+                },
+            )
         if suggested_segment_definitions:
             self._segment_definition_repository.save_ai_suggested(
                 suggested_segment_definitions
@@ -555,25 +616,31 @@ class PromotionAnalysisService:
             )
             for rank, candidate in enumerate(selected_candidates)
         ]
-        segment_suggestions = [
-            self._build_segment_suggestion(
-                analysis_id=analysis_id,
-                promotion=promotion,
-                target_segment=target_segment,
-                candidate=selected_candidates[rank],
-                booking_prediction=booking_predictions.get(
-                    selected_candidates[rank].segment_id,
-                ),
-                booking_model=booking_model,
-                rank=rank,
-            )
-            for rank, target_segment in enumerate(target_segments)
-        ]
-        if next_loop_context is not None:
+        segment_suggestions: list[PromotionSegmentSuggestionWrite] = []
+        if persist_segment_suggestions:
+            segment_suggestions = [
+                self._build_segment_suggestion(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    target_segment=target_segment,
+                    candidate=selected_candidates[rank],
+                    booking_prediction=booking_predictions.get(
+                        selected_candidates[rank].segment_id,
+                    ),
+                    booking_model=booking_model,
+                    rank=rank,
+                )
+                for rank, target_segment in enumerate(target_segments)
+            ]
+        if persist_target_segments:
             self._promotion_analysis_repository.save_target_segments(target_segments)
             log.info("promotion_target_segments_created", {"targetSegments": target_segments})
-        self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
-        log.info("promotion_segment_suggestions_created", {"segmentSuggestions": segment_suggestions})
+        if persist_segment_suggestions:
+            self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
+            log.info(
+                "promotion_segment_suggestions_created",
+                {"segmentSuggestions": segment_suggestions},
+            )
         return PromotionAnalysisResult(
             analysis=analysis,
             target_segments=target_segments,

@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from typing import NoReturn
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from psycopg import IntegrityError, errors
@@ -21,6 +22,7 @@ from app.analysis.schemas import (
     AnalysisResponse,
     AnalysisStatus,
     ContentBriefResponse,
+    SegmentAnalysisRequest,
     TargetSegmentResponse,
 )
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
@@ -89,42 +91,90 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
         _close_clickhouse_client(clickhouse_client)
 
 
-@router.post("/{promotion_id}/analysis", response_model=AnalysisResponse)
-def analyze_promotion(
+@router.post(
+    "/{promotion_id}/segment-suggestions/recommend",
+    response_model=AnalysisResponse,
+)
+def recommend_promotion_segments(
     promotion_id: str,
     request: AnalysisRequest,
     analysis_service: PromotionAnalysisService = Depends(get_analysis_service),
 ) -> AnalysisResponse:
-    if promotion_id != request.promotion_id:
+    _validate_promotion_id(promotion_id, request.promotion_id)
+
+    try:
+        return _analysis_response_from_result(
+            analysis_service.recommend_segments(request)
+        )
+    except Exception as exc:
+        _raise_analysis_http_error(exc)
+
+
+@router.post("/{promotion_id}/analyses", response_model=AnalysisResponse)
+def analyze_promotion_segments(
+    promotion_id: str,
+    request: SegmentAnalysisRequest,
+    analysis_service: PromotionAnalysisService = Depends(get_analysis_service),
+) -> AnalysisResponse:
+    _validate_promotion_id(promotion_id, request.promotion_id)
+
+    try:
+        return _analysis_response_from_result(
+            analysis_service.analyze_segments(request)
+        )
+    except Exception as exc:
+        _raise_analysis_http_error(exc)
+
+
+@router.post(
+    "/{promotion_id}/analysis",
+    response_model=AnalysisResponse,
+    deprecated=True,
+    include_in_schema=False,
+)
+def analyze_promotion_legacy(
+    promotion_id: str,
+    request: AnalysisRequest,
+    analysis_service: PromotionAnalysisService = Depends(get_analysis_service),
+) -> AnalysisResponse:
+    """Compatibility alias for clients migrating to the recommendation endpoint."""
+    return recommend_promotion_segments(
+        promotion_id=promotion_id,
+        request=request,
+        analysis_service=analysis_service,
+    )
+
+
+def _validate_promotion_id(path_promotion_id: str, request_promotion_id: str) -> None:
+    if path_promotion_id != request_promotion_id:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="path promotion_id must match request promotion_id",
         )
 
-    try:
-        return _analysis_response_from_result(analysis_service.analyze(request))
-    except PromotionNotFoundError as exc:
+
+def _raise_analysis_http_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, PromotionNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
-    except SegmentSelectionError as exc:
-        raise HTTPException(
-            status_code=422,
-            detail=str(exc),
-        ) from exc
-    except SegmentVectorDataUnavailableError as exc:
+    if isinstance(exc, SegmentSelectionError):
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if isinstance(exc, SegmentVectorDataUnavailableError):
         raise HTTPException(
             status_code=422,
             detail="segment vector data unavailable",
         ) from exc
-    except IntegrityError as exc:
-        if _is_unique_violation(exc):
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="promotion analysis already exists or contains duplicate segment suggestions",
-            ) from exc
-        raise
+    if isinstance(exc, IntegrityError) and _is_unique_violation(exc):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "promotion analysis already exists or contains duplicate "
+                "segment suggestions"
+            ),
+        ) from exc
+    raise exc
 
 
 def _analysis_response_from_result(
