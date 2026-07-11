@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal
 import math
@@ -169,6 +169,7 @@ class ContentCandidateRecord:
     segment_id: str
     channel: str
     status: str
+    metadata_json: Mapping[str, Any] | None = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,11 @@ class ContentCandidateReader(Protocol):
         self,
         generation_id: str,
     ) -> list[ContentCandidateRecord]:
+        ...
+
+
+class ContentCandidateMetadataReader(Protocol):
+    def get_by_id(self, content_id: str) -> ContentCandidateRecord | None:
         ...
 
 
@@ -761,6 +767,30 @@ class ContentCandidateRepository:
             (generation_id,),
         )
         return [ContentCandidateRecord(**row) for row in rows]
+
+    def get_by_id(self, content_id: str) -> ContentCandidateRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                content_id,
+                content_option_id,
+                generation_id,
+                analysis_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                segment_id,
+                channel,
+                status,
+                metadata_json
+            FROM content_candidates
+            WHERE content_id = %s
+            """,
+            (content_id,),
+        )
+        if row is None:
+            return None
+        return ContentCandidateRecord(**row)
 
 class PromotionRunRepository:
     def __init__(self, db: PostgresExecutor) -> None:

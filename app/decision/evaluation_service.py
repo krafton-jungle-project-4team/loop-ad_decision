@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
@@ -8,6 +9,8 @@ from typing import Any, Mapping
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
+    ContentCandidateRecord,
+    ContentCandidateMetadataReader,
     EvaluationMetricReader,
     MetricCountRecord,
     PromotionEvaluationRecord,
@@ -21,6 +24,7 @@ from app.decision.schemas import (
     AdExperimentEvaluateResponse,
     AdExperimentStatus,
     Channel,
+    EvaluationStrategySnapshot,
     GoalBasis,
     GoalMetric,
     PromotionRunAdExperimentResult,
@@ -84,6 +88,7 @@ class _RunAggregate:
     numerator_count: int
     denominator_count: int
     sample_size: int
+    target_gap: Decimal | None
     next_loop_required: bool
     failed_segment_ids: list[str]
     failed_ad_experiment_ids: list[str]
@@ -112,11 +117,13 @@ class AdExperimentEvaluationService:
         *,
         ad_experiment_repository: AdExperimentWriter,
         promotion_run_repository: PromotionRunWriter,
+        content_candidate_repository: ContentCandidateMetadataReader,
         promotion_evaluation_repository: PromotionEvaluationWriter,
         evaluation_metric_repository: EvaluationMetricReader,
     ) -> None:
         self._ad_experiment_repository = ad_experiment_repository
         self._promotion_run_repository = promotion_run_repository
+        self._content_candidate_repository = content_candidate_repository
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._evaluation_metric_repository = evaluation_metric_repository
 
@@ -183,12 +190,28 @@ class AdExperimentEvaluationService:
 
         target_value = _parse_target_value(run.goal_snapshot_json)
         min_sample_size = _parse_min_sample_size(run.goal_snapshot_json)
+        candidate = self._content_candidate_repository.get_by_id(
+            experiment.content_id
+        )
+        if candidate is None:
+            log.warn("content_candidate_not_found", {"contentId": experiment.content_id})
+            raise AdExperimentEvaluationValidationError(
+                f"content candidate not found: {experiment.content_id}"
+            )
+        _validate_content_candidate_link(
+            candidate=candidate,
+            experiment=experiment,
+            run=run,
+        )
+        strategy_snapshot = _strategy_snapshot(candidate.metadata_json)
+        log.info("content_candidate_loaded", {"contentCandidate": candidate})
         counts = self._load_counts(experiment, context=context)
         log.info("metric_counts_loaded", {"counts": counts})
         _validate_metric_counts(counts)
         sample_size = counts.denominator_count
         actual_value = _calculate_actual_value(counts)
         _validate_metric_rate(actual_value)
+        target_gap = _calculate_target_gap(actual_value, target_value)
         status = _decide_status(
             actual_value=actual_value,
             target_value=target_value,
@@ -228,9 +251,11 @@ class AdExperimentEvaluationService:
                 counts=counts,
                 target_value=target_value,
                 actual_value=actual_value,
+                target_gap=target_gap,
                 min_sample_size=min_sample_size,
                 status=status,
                 context=context,
+                strategy_snapshot=strategy_snapshot,
             ),
         )
         self._promotion_evaluation_repository.insert(evaluation)
@@ -279,11 +304,16 @@ def _to_ad_experiment_response(
         metric=GoalMetric(evaluation.metric),
         target_value=evaluation.target_value,
         actual_value=evaluation.actual_value,
+        target_gap=Decimal(str(evaluation.result_json["target_gap"])),
         numerator_count=evaluation.numerator_count,
         denominator_count=evaluation.denominator_count,
         sample_size=evaluation.sample_size,
         basis=GoalBasis.ALL_SEGMENTS,
         status=PromotionEvaluationStatus(evaluation.status),
+        status_reason=str(evaluation.result_json["status_reason"]),
+        strategy_snapshot=EvaluationStrategySnapshot.model_validate(
+            evaluation.result_json["strategy_snapshot"]
+        ),
         next_loop_required=evaluation.next_loop_required,
         feedback=evaluation.feedback,
     )
@@ -413,13 +443,31 @@ class PromotionRunEvaluationService:
         response = PromotionRunEvaluateResponse(
             promotion_run_id=run.promotion_run_id,
             promotion_id=run.promotion_id,
+            metric=GoalMetric(metric),
+            target_value=target_value,
+            actual_value=aggregate.actual_value,
+            target_gap=aggregate.target_gap,
+            numerator_count=aggregate.numerator_count,
+            denominator_count=aggregate.denominator_count,
+            sample_size=aggregate.sample_size,
             status=PromotionRunStatus(aggregate.status),
+            status_reason=str(aggregate.result_json["status_reason"]),
             ad_experiment_results=[
                 PromotionRunAdExperimentResult(
                     ad_experiment_id=item["ad_experiment_id"],
                     segment_id=item["segment_id"],
+                    metric=GoalMetric(item["metric"]),
+                    target_value=Decimal(item["target_value"]),
                     actual_value=Decimal(item["actual_value"]),
+                    target_gap=Decimal(item["target_gap"]),
+                    numerator_count=item["numerator_count"],
+                    denominator_count=item["denominator_count"],
+                    sample_size=item["sample_size"],
                     status=PromotionEvaluationStatus(item["status"]),
+                    status_reason=item["status_reason"],
+                    strategy_snapshot=EvaluationStrategySnapshot.model_validate(
+                        item["strategy_snapshot"]
+                    ),
                 )
                 for item in aggregate.result_json["ad_experiment_results"]
             ],
@@ -553,6 +601,7 @@ def _aggregate_run_evaluations(
             numerator_count=0,
             denominator_count=0,
             sample_size=0,
+            target_gap=None,
             next_loop_required=next_loop_required,
             failed_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
@@ -565,6 +614,7 @@ def _aggregate_run_evaluations(
                 "metric": metric,
                 "event_names": _aggregate_event_names(evaluations),
                 "target_value": str(target_value),
+                "target_gap": None,
                 "numerator_count": 0,
                 "denominator_count": 0,
                 "sample_size": 0,
@@ -593,6 +643,7 @@ def _aggregate_run_evaluations(
     _validate_metric_counts(aggregate_counts)
     actual_value = _calculate_actual_value(aggregate_counts)
     _validate_metric_rate(actual_value)
+    target_gap = _calculate_target_gap(actual_value, target_value)
     status = _decide_status(
         actual_value=actual_value,
         target_value=target_value,
@@ -606,6 +657,7 @@ def _aggregate_run_evaluations(
         numerator_count=numerator_count,
         denominator_count=denominator_count,
         sample_size=sample_size,
+        target_gap=target_gap,
         next_loop_required=next_loop_required,
         failed_segment_ids=failed_segment_ids,
         failed_ad_experiment_ids=failed_ad_experiment_ids,
@@ -619,6 +671,7 @@ def _aggregate_run_evaluations(
             "event_names": _aggregate_event_names(evaluations),
             "target_value": str(target_value),
             "actual_value": str(actual_value),
+            "target_gap": str(target_gap),
             "numerator_count": numerator_count,
             "denominator_count": denominator_count,
             "sample_size": sample_size,
@@ -682,13 +735,18 @@ def _evaluation_summary(
         "evaluation_id": evaluation.evaluation_id,
         "ad_experiment_id": evaluation.ad_experiment_id,
         "segment_id": evaluation.segment_id,
+        "metric": evaluation.metric,
         "actual_value": str(evaluation.actual_value),
         "target_value": str(evaluation.target_value),
+        "target_gap": evaluation.result_json.get("target_gap"),
         "status": evaluation.status,
         "status_reason": evaluation.result_json.get("status_reason"),
         "numerator_count": evaluation.numerator_count,
         "denominator_count": evaluation.denominator_count,
         "sample_size": evaluation.sample_size,
+        "strategy_snapshot": deepcopy(
+            evaluation.result_json.get("strategy_snapshot")
+        ),
     }
 
 
@@ -724,6 +782,13 @@ def _calculate_actual_value(counts: MetricCountRecord) -> Decimal:
     if counts.denominator_count == 0:
         return Decimal("0.000000")
     return (Decimal(counts.numerator_count) / Decimal(counts.denominator_count)).quantize(
+        DECIMAL_SCALE,
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def _calculate_target_gap(actual_value: Decimal, target_value: Decimal) -> Decimal:
+    return (actual_value - target_value).quantize(
         DECIMAL_SCALE,
         rounding=ROUND_HALF_UP,
     )
@@ -802,9 +867,11 @@ def _build_result_json(
     counts: MetricCountRecord,
     target_value: Decimal,
     actual_value: Decimal,
+    target_gap: Decimal,
     min_sample_size: int,
     status: str,
     context: EvaluationContext,
+    strategy_snapshot: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         **_evaluation_context_json(context, evaluation_scope="ad_experiment"),
@@ -819,9 +886,59 @@ def _build_result_json(
         "min_sample_size": min_sample_size,
         "target_value": str(target_value),
         "actual_value": str(actual_value),
+        "target_gap": str(target_gap),
         "numerator_count": counts.numerator_count,
         "denominator_count": counts.denominator_count,
+        "sample_size": counts.denominator_count,
+        "strategy_snapshot": deepcopy(strategy_snapshot),
     }
+
+
+def _validate_content_candidate_link(
+    *,
+    candidate: ContentCandidateRecord,
+    experiment: AdExperimentRecord,
+    run: PromotionRunRecord,
+) -> None:
+    expected_by_field = {
+        "content_option_id": experiment.content_option_id,
+        "project_id": experiment.project_id,
+        "campaign_id": experiment.campaign_id,
+        "promotion_id": experiment.promotion_id,
+        "segment_id": experiment.segment_id,
+        "generation_id": run.generation_id,
+    }
+    for field_name, expected in expected_by_field.items():
+        actual = getattr(candidate, field_name)
+        if actual != expected:
+            log.warn(
+                "content_candidate_context_mismatch",
+                {"fieldName": field_name, "expected": expected, "actual": actual},
+            )
+            raise AdExperimentEvaluationValidationError(
+                f"content candidate {field_name} must match evaluation context"
+            )
+
+
+def _strategy_snapshot(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    source = metadata or {}
+    snapshot = {
+        field_name: deepcopy(source[field_name]) if field_name in source else None
+        for field_name in (
+            "strategy_key",
+            "strategy_plan",
+            "evidence_refs",
+            "brief_fingerprint",
+            "prompt_builder_version",
+            "fallback_guidance_used",
+        )
+    }
+    try:
+        return EvaluationStrategySnapshot.model_validate(snapshot).model_dump()
+    except ValueError as exc:
+        raise AdExperimentEvaluationValidationError(
+            "content candidate strategy metadata is invalid"
+        ) from exc
 
 
 def _metric_source(metric: str) -> str:

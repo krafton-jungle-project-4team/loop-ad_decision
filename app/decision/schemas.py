@@ -129,6 +129,17 @@ class AdExperimentEvaluateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
 
+class EvaluationStrategySnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    strategy_key: str | None
+    strategy_plan: dict[str, Any] | None
+    evidence_refs: list[str] | None
+    brief_fingerprint: str | None
+    prompt_builder_version: str | None
+    fallback_guidance_used: bool | None
+
+
 class AdExperimentEvaluateResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -140,11 +151,14 @@ class AdExperimentEvaluateResponse(BaseModel):
     metric: GoalMetric
     target_value: Decimal
     actual_value: Decimal
+    target_gap: Decimal
     numerator_count: int = Field(ge=0)
     denominator_count: int = Field(ge=0)
     sample_size: int = Field(ge=0)
     basis: GoalBasis
     status: PromotionEvaluationStatus
+    status_reason: str = Field(min_length=1)
+    strategy_snapshot: EvaluationStrategySnapshot
     next_loop_required: bool
     feedback: str | None = None
 
@@ -158,8 +172,16 @@ class PromotionRunAdExperimentResult(BaseModel):
 
     ad_experiment_id: str = Field(min_length=1)
     segment_id: str = Field(min_length=1)
+    metric: GoalMetric
+    target_value: Decimal
     actual_value: Decimal
+    target_gap: Decimal
+    numerator_count: int = Field(ge=0)
+    denominator_count: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
     status: PromotionEvaluationStatus
+    status_reason: str = Field(min_length=1)
+    strategy_snapshot: EvaluationStrategySnapshot
 
 
 class PromotionRunEvaluateResponse(BaseModel):
@@ -167,7 +189,15 @@ class PromotionRunEvaluateResponse(BaseModel):
 
     promotion_run_id: str = Field(min_length=1)
     promotion_id: str = Field(min_length=1)
+    metric: GoalMetric
+    target_value: Decimal
+    actual_value: Decimal
+    target_gap: Decimal | None
+    numerator_count: int = Field(ge=0)
+    denominator_count: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
     status: PromotionRunStatus
+    status_reason: str = Field(min_length=1)
     ad_experiment_results: list[PromotionRunAdExperimentResult]
     next_loop_required: bool
     failed_segment_ids: list[str]

@@ -186,6 +186,7 @@ def get_ad_experiment_evaluation_service(
         yield AdExperimentEvaluationService(
             ad_experiment_repository=AdExperimentRepository(executor),
             promotion_run_repository=PromotionRunRepository(executor),
+            content_candidate_repository=ContentCandidateRepository(executor),
             promotion_evaluation_repository=PromotionEvaluationRepository(executor),
             evaluation_metric_repository=EvaluationMetricRepository(
                 clickhouse_client,
@@ -214,6 +215,7 @@ def get_promotion_run_evaluation_service(
         ad_experiment_evaluation_service = AdExperimentEvaluationService(
             ad_experiment_repository=ad_experiment_repository,
             promotion_run_repository=promotion_run_repository,
+            content_candidate_repository=ContentCandidateRepository(executor),
             promotion_evaluation_repository=promotion_evaluation_repository,
             evaluation_metric_repository=EvaluationMetricRepository(
                 clickhouse_client,
