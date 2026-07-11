@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass, replace
 from typing import Any, Protocol, Sequence
@@ -44,6 +45,10 @@ from app.generation.schemas import (
     GenerationStatus,
 )
 from app.logging import log, log_context_scope, now_ms, duration_ms
+
+
+MAX_CONTENT_IDENTIFIER_LENGTH = 100
+CONTENT_SLUG_HASH_LENGTH = 16
 
 
 class GenerationRunWriter(Protocol):
@@ -523,6 +528,11 @@ class GenerationService:
         content_slug = (
             f"{segment_slug}_{generation_slug}" if generation_slug else segment_slug
         )
+        content_slug = _bounded_content_slug(
+            channel_slug=channel_slug,
+            content_slug=content_slug,
+            index=index,
+        )
         segment_id = prompt_input.target_segment.segment_id
         content_id = f"content_{channel_slug}_{content_slug}_{index:03d}"
         content_option_id = f"{channel_slug}_{content_slug}_option_{index:03d}"
@@ -751,6 +761,28 @@ def _segment_slug(target_segment: TargetSegmentPromptInput) -> str:
         return target_segment.content_slug
     segment_id = target_segment.segment_id.removeprefix("seg_")
     return re.sub(r"[^a-zA-Z0-9_]+", "_", segment_id).strip("_") or "segment"
+
+
+def _bounded_content_slug(
+    *,
+    channel_slug: str,
+    content_slug: str,
+    index: int,
+) -> str:
+    content_id_overhead = len(f"content_{channel_slug}__{index:03d}")
+    content_option_id_overhead = len(f"{channel_slug}__option_{index:03d}")
+    max_slug_length = MAX_CONTENT_IDENTIFIER_LENGTH - max(
+        content_id_overhead,
+        content_option_id_overhead,
+    )
+    if len(content_slug) <= max_slug_length:
+        return content_slug
+
+    digest = hashlib.sha256(content_slug.encode("utf-8")).hexdigest()[
+        :CONTENT_SLUG_HASH_LENGTH
+    ]
+    prefix_length = max_slug_length - CONTENT_SLUG_HASH_LENGTH - 1
+    return f"{content_slug[:prefix_length]}_{digest}"
 
 
 def _safe_generation_error_code(exc: Exception) -> str:
