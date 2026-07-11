@@ -313,6 +313,59 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     assert content_insert_params["status"] == "approved"
 
 
+def test_next_loop_api_reuses_stored_ai_segment_without_refreshing_rank(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stored_segment_id = (
+        "seg_ai_raw_promo_banner_001_1_"
+        "target_destination_affinity_membership"
+    )
+    connections: list[RecordingConnection] = []
+    clickhouse_client = FakeClickHouseClient(fail_on_segment_refresh=True)
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(segment_id=stored_segment_id)
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": [stored_segment_id],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["next_analysis_id"] == "analysis_banner_001_loop_2"
+    assert body["next_generation_id"] == "generation_banner_001_loop_2"
+    assert [
+        experiment["segment_id"] for experiment in body["next_ad_experiments"]
+    ] == [stored_segment_id, "seg_existing_all"]
+    assert not any("from raw_events" in query for query in clickhouse_client.queries)
+    connection = connections[0]
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_analyses" in query for query in executed_sql)
+    assert any("insert into promotion_target_segments" in query for query in executed_sql)
+    assert any("insert into generation_runs" in query for query in executed_sql)
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert any("insert into ad_experiments" in query for query in executed_sql)
+
+
 def test_next_loop_api_maps_approved_content_unique_violation_to_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -526,7 +579,7 @@ class RecordingCursor:
         if "insert into content_candidates" in sql:
             return content_candidate_insert_row(self._last_params)
         if "from promotion_analyses" in sql:
-            return promotion_analysis_row()
+            return promotion_analysis_row(self._connection.segment_id)
         if "from generation_runs" in sql:
             return generation_run_row(self._last_params)
         if "from promotion_runs" in sql and "where promotion_run_id = %s" in sql:
@@ -542,17 +595,17 @@ class RecordingCursor:
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
         if "from ad_experiments" in sql:
-            return [ad_experiment_row()]
+            return [ad_experiment_row(self._connection.segment_id)]
         if "from promotion_evaluations" in sql:
-            return [promotion_evaluation_row()]
+            return [promotion_evaluation_row(self._connection.segment_id)]
         if "from segment_definitions" in sql:
-            return [segment_definition_row()]
+            return [segment_definition_row(self._connection.segment_id)]
         if "from promotion_target_segments" in sql:
             if "project_id" in sql:
-                return [decision_target_segment_row()]
-            return [target_segment_row()]
+                return [decision_target_segment_row(self._connection.segment_id)]
+            return [target_segment_row(self._connection.segment_id)]
         if "from content_candidates" in sql:
-            return [approved_content_candidate_row()]
+            return [approved_content_candidate_row(self._connection.segment_id)]
         return []
 
 
@@ -564,6 +617,7 @@ class RecordingConnection:
         raise_unique_on_content_candidate_insert: bool = False,
         content_candidate_unique_constraint_name: str | None = None,
         raise_unique_on_promotion_run_insert: bool = False,
+        segment_id: str = "seg_luxury",
     ) -> None:
         self.promotion_run_row = (
             default_promotion_run_row()
@@ -578,6 +632,7 @@ class RecordingConnection:
             content_candidate_unique_constraint_name
         )
         self.raise_unique_on_promotion_run_insert = raise_unique_on_promotion_run_insert
+        self.segment_id = segment_id
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
@@ -660,7 +715,7 @@ def promotion_row(sql: str) -> dict[str, object]:
     }
 
 
-def ad_experiment_row() -> dict[str, object]:
+def ad_experiment_row(segment_id: str = "seg_luxury") -> dict[str, object]:
     return {
         "ad_experiment_id": "adexp_luxury_001",
         "project_id": "hotel-client-a",
@@ -669,7 +724,7 @@ def ad_experiment_row() -> dict[str, object]:
         "promotion_run_id": "prun_banner_001_loop_1",
         "analysis_id": "analysis_banner_001",
         "generation_id": "generation_banner_001",
-        "segment_id": "seg_luxury",
+        "segment_id": segment_id,
         "segment_name": "Luxury hotel users",
         "content_id": "content_luxury_001",
         "content_option_id": "option_luxury_001",
@@ -682,7 +737,7 @@ def ad_experiment_row() -> dict[str, object]:
     }
 
 
-def promotion_evaluation_row() -> dict[str, object]:
+def promotion_evaluation_row(segment_id: str = "seg_luxury") -> dict[str, object]:
     return {
         "evaluation_id": "eval_luxury_001",
         "project_id": "hotel-client-a",
@@ -690,7 +745,7 @@ def promotion_evaluation_row() -> dict[str, object]:
         "promotion_id": "promo_banner_001",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_luxury_001",
-        "segment_id": "seg_luxury",
+        "segment_id": segment_id,
         "content_id": "content_luxury_001",
         "content_option_id": "option_luxury_001",
         "metric": "booking_conversion_rate",
@@ -707,20 +762,21 @@ def promotion_evaluation_row() -> dict[str, object]:
     }
 
 
-def segment_definition_row() -> dict[str, object]:
+def segment_definition_row(segment_id: str = "seg_luxury") -> dict[str, object]:
+    ai_suggested = segment_id.startswith("seg_ai_")
     return {
-        "segment_id": "seg_luxury",
+        "segment_id": segment_id,
         "project_id": "hotel-client-a",
-        "segment_name": "Luxury hotel users",
-        "source": "system_default",
+        "segment_name": "Stored AI hotel audience",
+        "source": "ai_suggested" if ai_suggested else "system_default",
         "query_preview_id": None,
         "natural_language_query": "luxury hotel users",
         "generated_sql": None,
         "rule_json": {
-            "segment_id": "seg_luxury",
+            "segment_id": segment_id,
             "candidate_user_ids": ["user_luxury_001", "user_luxury_002"],
         },
-        "profile_json": {"primary_segment": "seg_luxury"},
+        "profile_json": {"primary_segment": segment_id},
         "sample_size": 1200,
         "total_eligible_user_count": 50000,
         "sample_ratio": Decimal("0.024000"),
@@ -728,11 +784,11 @@ def segment_definition_row() -> dict[str, object]:
     }
 
 
-def target_segment_row() -> dict[str, object]:
+def target_segment_row(segment_id: str = "seg_luxury") -> dict[str, object]:
     return {
         "analysis_id": "analysis_banner_001_loop_2",
         "promotion_id": "promo_banner_001",
-        "segment_id": "seg_luxury",
+        "segment_id": segment_id,
         "segment_name": "Luxury hotel users",
         "content_brief_json": {
             "message_direction": "Use a hotel booking message tailored to this segment.",
@@ -743,33 +799,35 @@ def target_segment_row() -> dict[str, object]:
             "sample_size": 1200,
             "sample_ratio": "0.024000",
         },
-        "segment_vector_id": "segvec_seg_luxury_v1",
+        "segment_vector_id": f"segvec_{segment_id}_v1",
         "estimated_size": 1200,
         "priority": "high",
     }
 
 
-def decision_target_segment_row() -> dict[str, object]:
+def decision_target_segment_row(
+    segment_id: str = "seg_luxury",
+) -> dict[str, object]:
     return {
-        **target_segment_row(),
+        **target_segment_row(segment_id),
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "rule_json": {
-            "segment_id": "seg_luxury",
+            "segment_id": segment_id,
             "candidate_user_ids": ["user_luxury_001", "user_luxury_002"],
         },
-        "profile_json": {"primary_segment": "seg_luxury"},
+        "profile_json": {"primary_segment": segment_id},
         "status": "active",
     }
 
 
-def promotion_analysis_row() -> dict[str, object]:
+def promotion_analysis_row(segment_id: str = "seg_luxury") -> dict[str, object]:
     return {
         "analysis_id": "analysis_banner_001_loop_2",
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "focus_segment_ids_json": ["seg_luxury"],
+        "focus_segment_ids_json": [segment_id],
         "operator_instruction": None,
         "input_snapshot_json": {},
         "profile_summary_json": {},
@@ -795,7 +853,9 @@ def generation_run_row(params: Any) -> dict[str, object]:
     }
 
 
-def approved_content_candidate_row() -> dict[str, object]:
+def approved_content_candidate_row(
+    segment_id: str = "seg_luxury",
+) -> dict[str, object]:
     return {
         "content_id": "content_banner_luxury_hotel_users_001",
         "content_option_id": "banner_luxury_hotel_users_option_001",
@@ -804,7 +864,7 @@ def approved_content_candidate_row() -> dict[str, object]:
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "segment_id": "seg_luxury",
+        "segment_id": segment_id,
         "channel": "onsite_banner",
         "status": "approved",
     }
@@ -874,8 +934,11 @@ class FakeClickHouseClient:
         self,
         *,
         user_vector_rows: list[dict[str, object]] | None = None,
+        fail_on_segment_refresh: bool = False,
     ) -> None:
         self.close_count = 0
+        self.queries: list[str] = []
+        self.fail_on_segment_refresh = fail_on_segment_refresh
         self.user_vector_rows = (
             user_behavior_vector_rows()
             if user_vector_rows is None
@@ -888,7 +951,12 @@ class FakeClickHouseClient:
         parameters: dict[str, object] | None = None,
     ) -> FakeClickHouseResult:
         sql = compact_sql(query)
+        self.queries.append(sql)
         _ = parameters
+        if self.fail_on_segment_refresh and "from raw_events" in sql:
+            raise AssertionError(
+                "next-loop focus analysis must not refresh AI segment ranks"
+            )
         if "from user_behavior_vectors" in sql and "user_id in" in sql:
             return FakeClickHouseResult(self.user_vector_rows)
         return FakeClickHouseResult()
