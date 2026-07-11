@@ -537,6 +537,23 @@ def assignment_write(
     )
 
 
+def assignment_insert_row(
+    user_id: str,
+    *,
+    segment_id: str = "seg_existing_all",
+    fallback: bool = True,
+    fallback_reason: str | None = "below_threshold",
+    similarity_score: Decimal | None = Decimal("0.410000"),
+) -> dict[str, object]:
+    return {
+        "user_id": user_id,
+        "segment_id": segment_id,
+        "fallback": fallback,
+        "fallback_reason": fallback_reason,
+        "similarity_score": similarity_score,
+    }
+
+
 def test_segment_vector_repository_filters_run_context_and_version() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[
@@ -788,10 +805,21 @@ def test_segment_vector_repository_rejects_unexpected_batch_query_user() -> None
 def test_user_segment_assignment_repository_bulk_inserts_official_columns_only() -> None:
     assigned_at = datetime(2026, 7, 3, tzinfo=UTC)
     expires_at = datetime(2026, 8, 3, tzinfo=UTC)
-    db = FakePostgresExecutor(fetchall_result=[{"id": 1}, {"id": 2}])
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            assignment_insert_row("user_001"),
+            assignment_insert_row(
+                "user_002",
+                segment_id="seg_family_trip",
+                fallback=False,
+                fallback_reason=None,
+                similarity_score=None,
+            ),
+        ]
+    )
     repo = UserSegmentAssignmentRepository(db)
 
-    inserted_count = repo.insert_many(
+    inserted_records = repo.insert_many(
         [
             assignment_write(
                 "user_001",
@@ -820,7 +848,12 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
         ]
     )
 
-    assert inserted_count == 2
+    assert [record.user_id for record in inserted_records] == [
+        "user_001",
+        "user_002",
+    ]
+    assert inserted_records[0].fallback_reason == "below_threshold"
+    assert inserted_records[1].similarity_score is None
     call = db.calls[0]
     assert call.operation == "fetchall"
     sql = compact_sql(call.query)
@@ -840,7 +873,7 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
     assert "assignment_source" in sql
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
-    assert "returning id" in sql
+    assert "returning user_id, segment_id, fallback" in sql
     assert "%s::text[]" in sql
     assert "%s::numeric[]" in sql
     assert "%s::boolean[]" in sql
@@ -866,41 +899,43 @@ def test_user_segment_assignment_repository_skips_empty_bulk_insert() -> None:
     db = FakePostgresExecutor()
     repo = UserSegmentAssignmentRepository(db)
 
-    assert repo.insert_many([]) == 0
+    assert repo.insert_many([]) == []
     assert db.calls == []
 
 
 def test_user_segment_assignment_repository_splits_bulk_insert_chunks() -> None:
     db = FakePostgresExecutor(
         fetchall_results=[
-            [{"id": index} for index in range(1000)],
-            [{"id": 1001}],
+            [assignment_insert_row(f"user_{index:04d}") for index in range(1000)],
+            [assignment_insert_row("user_1000")],
         ]
     )
     repo = UserSegmentAssignmentRepository(db)
 
-    inserted_count = repo.insert_many(
+    inserted_records = repo.insert_many(
         [assignment_write(f"user_{index:04d}") for index in range(1001)]
     )
 
-    assert inserted_count == 1001
+    assert len(inserted_records) == 1001
     assert len(db.calls) == 2
     assert len(db.calls[0].params[0]) == 1000
     assert len(db.calls[1].params[0]) == 1
 
 
 def test_user_segment_assignment_repository_counts_returned_bulk_rows() -> None:
-    db = FakePostgresExecutor(fetchall_result=[{"id": 1}])
+    db = FakePostgresExecutor(
+        fetchall_result=[assignment_insert_row("user_001")]
+    )
     repo = UserSegmentAssignmentRepository(db)
 
-    inserted_count = repo.insert_many(
+    inserted_records = repo.insert_many(
         [
             assignment_write("user_001"),
             assignment_write("user_002"),
         ]
     )
 
-    assert inserted_count == 1
+    assert [record.user_id for record in inserted_records] == ["user_001"]
 
 
 def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
@@ -926,35 +961,6 @@ def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
     assert call.params == (
         "prun_banner_001_loop_1",
         ["user_001", "user_002"],
-    )
-
-
-def test_user_segment_assignment_repository_counts_final_assignments() -> None:
-    db = FakePostgresExecutor(
-        fetchall_result=[
-            {
-                "segment_id": "seg_family_trip",
-                "assigned_user_count": 42,
-            }
-        ]
-    )
-    repo = UserSegmentAssignmentRepository(db)
-
-    counts = repo.count_by_run_segments(
-        promotion_run_id="prun_banner_001_loop_1",
-        segment_ids=["seg_family_trip", "seg_mobile_user"],
-    )
-
-    assert counts == {"seg_family_trip": 42}
-    call = db.calls[0]
-    sql = compact_sql(call.query)
-    assert "from user_segment_assignments" in sql
-    assert "where promotion_run_id = %s" in sql
-    assert "segment_id = any(%s)" in sql
-    assert "group by segment_id" in sql
-    assert call.params == (
-        "prun_banner_001_loop_1",
-        ["seg_family_trip", "seg_mobile_user"],
     )
 
 
