@@ -15,6 +15,7 @@ from app.decision.router import get_ad_experiment_evaluation_service
 from app.decision.schemas import (
     AdExperimentEvaluateRequest,
     AdExperimentEvaluateResponse,
+    EvaluationStrategySnapshot,
     GoalBasis,
     GoalMetric,
     PromotionEvaluationStatus,
@@ -70,6 +71,9 @@ def test_ad_experiment_evaluation_api_returns_response_shape() -> None:
     assert body["metric"] == GoalMetric.BOOKING_CONVERSION_RATE.value
     assert body["basis"] == GoalBasis.ALL_SEGMENTS.value
     assert body["status"] == PromotionEvaluationStatus.GOAL_NOT_MET.value
+    assert body["target_gap"] == "-0.100000"
+    assert body["status_reason"] == "target_not_met"
+    assert body["strategy_snapshot"]["strategy_plan"] == {}
     assert body["next_loop_required"] is True
     assert body["feedback"] is None
     assert service.calls[0][0] == "adexp_family_trip_001"
@@ -150,8 +154,54 @@ def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from ad_experiments" in query for query in executed_sql)
     assert any("from promotion_runs" in query for query in executed_sql)
+    assert any("from content_candidates" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
     assert any("update ad_experiments" in query for query in executed_sql)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "mismatched_value"),
+    [
+        ("content_option_id", "option_b"),
+        ("project_id", "other-project"),
+        ("campaign_id", "other-campaign"),
+        ("promotion_id", "other-promotion"),
+        ("segment_id", "other-segment"),
+        ("generation_id", "other-generation"),
+    ],
+)
+def test_ad_experiment_evaluation_api_rejects_candidate_context_before_writes(
+    monkeypatch,
+    field_name: str,
+    mismatched_value: str,
+) -> None:
+    candidate = {**default_content_candidate_row(), field_name: mismatched_value}
+    connection = RecordingConnection(content_candidate_row=candidate)
+    clickhouse_client = RecordingClickHouseClient(rows=[(2, 10)])
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/ad-experiments/adexp_family_trip_001/evaluate",
+        json={},
+    )
+
+    assert response.status_code == 422
+    assert field_name in response.json()["detail"]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert not any("insert into promotion_evaluations" in query for query in executed_sql)
+    assert not any("update ad_experiments" in query for query in executed_sql)
+    assert clickhouse_client.queries == []
 
 
 def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
@@ -219,11 +269,21 @@ class FakeEvaluationService:
             metric=GoalMetric.BOOKING_CONVERSION_RATE,
             target_value=Decimal("0.300000"),
             actual_value=Decimal("0.200000"),
+            target_gap=Decimal("-0.100000"),
             numerator_count=2,
             denominator_count=10,
             sample_size=10,
             basis=GoalBasis.ALL_SEGMENTS,
             status=PromotionEvaluationStatus.GOAL_NOT_MET,
+            status_reason="target_not_met",
+            strategy_snapshot=EvaluationStrategySnapshot(
+                strategy_key="booking_confidence__family",
+                strategy_plan={},
+                evidence_refs=[],
+                brief_fingerprint="sha256:brief",
+                prompt_builder_version="dec-c2.v4",
+                fallback_guidance_used=False,
+            ),
             next_loop_required=True,
             feedback=None,
         )
@@ -250,6 +310,8 @@ class RecordingCursor:
             return self._connection.ad_experiment_row
         if "from promotion_runs" in sql:
             return self._connection.promotion_run_row
+        if "from content_candidates" in sql:
+            return self._connection.content_candidate_row
         return None
 
     def fetchall(self) -> list[dict[str, object]]:
@@ -262,6 +324,7 @@ class RecordingConnection:
         *,
         ad_experiment_row: dict[str, object] | None | object = DEFAULT_ROW,
         promotion_run_row: dict[str, object] | None | object = DEFAULT_ROW,
+        content_candidate_row: dict[str, object] | None | object = DEFAULT_ROW,
     ) -> None:
         self.ad_experiment_row = (
             default_ad_experiment_row()
@@ -272,6 +335,11 @@ class RecordingConnection:
             default_promotion_run_row()
             if promotion_run_row is DEFAULT_ROW
             else promotion_run_row
+        )
+        self.content_candidate_row = (
+            default_content_candidate_row()
+            if content_candidate_row is DEFAULT_ROW
+            else content_candidate_row
         )
         self.executed: list[tuple[str, Any]] = []
         self.commit_count = 0
@@ -326,6 +394,29 @@ def default_promotion_run_row() -> dict[str, object]:
         "goal_snapshot_json": {
             "goal_target_value": "0.300000",
             "min_sample_size": 10,
+        },
+    }
+
+
+def default_content_candidate_row() -> dict[str, object]:
+    return {
+        "content_id": "content_family_trip_001",
+        "content_option_id": "option_a",
+        "generation_id": "generation_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "segment_id": "seg_family_trip",
+        "channel": "onsite_banner",
+        "status": "approved",
+        "metadata_json": {
+            "strategy_key": "booking_confidence__family",
+            "strategy_plan": {},
+            "evidence_refs": [],
+            "brief_fingerprint": "sha256:brief",
+            "prompt_builder_version": "dec-c2.v4",
+            "fallback_guidance_used": False,
         },
     }
 

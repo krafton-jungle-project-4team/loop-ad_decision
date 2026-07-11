@@ -13,6 +13,8 @@ from app.decision.evaluation_service import (
 )
 from app.decision.router import get_promotion_run_evaluation_service
 from app.decision.schemas import (
+    EvaluationStrategySnapshot,
+    GoalMetric,
     PromotionEvaluationStatus,
     PromotionRunAdExperimentResult,
     PromotionRunEvaluateRequest,
@@ -65,6 +67,8 @@ def test_promotion_run_evaluation_api_returns_response_shape() -> None:
     assert body["promotion_run_id"] == "prun_banner_001_loop_1"
     assert body["promotion_id"] == "promo_banner_001"
     assert body["status"] == PromotionRunStatus.PARTIAL_GOAL_MET.value
+    assert body["target_gap"] is None
+    assert body["ad_experiment_results"][0]["target_gap"] == "0.100000"
     assert body["next_loop_required"] is True
     assert body["failed_segment_ids"] == ["seg_luxury"]
     assert body["failed_ad_experiment_ids"] == ["adexp_luxury_001"]
@@ -148,6 +152,7 @@ def test_promotion_run_evaluation_api_wires_repositories_and_commits(
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
     assert any("from ad_experiments" in query for query in executed_sql)
+    assert any("from content_candidates" in query for query in executed_sql)
     assert not any("from promotion_evaluations" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
     assert any("update promotion_runs" in query for query in executed_sql)
@@ -251,19 +256,43 @@ class FakePromotionRunEvaluationService:
         return PromotionRunEvaluateResponse(
             promotion_run_id=promotion_run_id,
             promotion_id="promo_banner_001",
+            metric=GoalMetric.BOOKING_CONVERSION_RATE,
+            target_value=Decimal("0.300000"),
+            actual_value=Decimal("0.000000"),
+            target_gap=None,
+            numerator_count=0,
+            denominator_count=0,
+            sample_size=0,
             status=PromotionRunStatus.PARTIAL_GOAL_MET,
+            status_reason="all_segments_mixed_status",
             ad_experiment_results=[
                 PromotionRunAdExperimentResult(
                     ad_experiment_id="adexp_family_trip_001",
                     segment_id="seg_family_trip",
+                    metric=GoalMetric.BOOKING_CONVERSION_RATE,
+                    target_value=Decimal("0.300000"),
                     actual_value=Decimal("0.400000"),
+                    target_gap=Decimal("0.100000"),
+                    numerator_count=4,
+                    denominator_count=10,
+                    sample_size=10,
                     status=PromotionEvaluationStatus.GOAL_MET,
+                    status_reason="target_met",
+                    strategy_snapshot=empty_strategy_snapshot(),
                 ),
                 PromotionRunAdExperimentResult(
                     ad_experiment_id="adexp_luxury_001",
                     segment_id="seg_luxury",
+                    metric=GoalMetric.BOOKING_CONVERSION_RATE,
+                    target_value=Decimal("0.300000"),
                     actual_value=Decimal("0.100000"),
+                    target_gap=Decimal("-0.200000"),
+                    numerator_count=1,
+                    denominator_count=10,
+                    sample_size=10,
                     status=PromotionEvaluationStatus.GOAL_NOT_MET,
+                    status_reason="target_not_met",
+                    strategy_snapshot=empty_strategy_snapshot(),
                 ),
             ],
             next_loop_required=True,
@@ -303,6 +332,16 @@ class RecordingCursor:
                 ),
                 None,
             )
+        if "from content_candidates" in sql:
+            content_id = self._last_params[0]
+            return next(
+                (
+                    row
+                    for row in self._connection.content_candidate_rows
+                    if row["content_id"] == content_id
+                ),
+                None,
+            )
         return None
 
     def fetchall(self) -> list[dict[str, object]]:
@@ -327,6 +366,10 @@ class RecordingConnection:
             else promotion_run_row
         )
         self.ad_experiment_rows = ad_experiment_rows or default_ad_experiment_rows()
+        self.content_candidate_rows = [
+            content_candidate_row(experiment)
+            for experiment in self.ad_experiment_rows
+        ]
         self.evaluation_rows = default_evaluation_rows()
         self.executed: list[tuple[str, Any]] = []
         self.commit_count = 0
@@ -429,3 +472,30 @@ def default_evaluation_rows() -> list[dict[str, object]]:
             "result_json": {"status_reason": "target_met"},
         }
     ]
+
+
+def content_candidate_row(experiment: dict[str, object]) -> dict[str, object]:
+    return {
+        "content_id": experiment["content_id"],
+        "content_option_id": experiment["content_option_id"],
+        "generation_id": experiment["generation_id"],
+        "analysis_id": experiment["analysis_id"],
+        "project_id": experiment["project_id"],
+        "campaign_id": experiment["campaign_id"],
+        "promotion_id": experiment["promotion_id"],
+        "segment_id": experiment["segment_id"],
+        "channel": experiment["channel"],
+        "status": "approved",
+        "metadata_json": {},
+    }
+
+
+def empty_strategy_snapshot() -> EvaluationStrategySnapshot:
+    return EvaluationStrategySnapshot(
+        strategy_key=None,
+        strategy_plan=None,
+        evidence_refs=None,
+        brief_fingerprint=None,
+        prompt_builder_version=None,
+        fallback_guidance_used=None,
+    )

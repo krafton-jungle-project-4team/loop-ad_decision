@@ -13,6 +13,7 @@ from app.decision.evaluation_service import (
 )
 from app.decision.repositories import (
     AdExperimentRecord,
+    ContentCandidateRecord,
     MetricCountRecord,
     PromotionEvaluationWrite,
     PromotionRunRecord,
@@ -29,6 +30,7 @@ from app.decision.schemas import (
 
 
 DEFAULT_EXPERIMENT = object()
+DEFAULT_CANDIDATE = object()
 
 
 def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
@@ -52,6 +54,9 @@ def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
     assert response.promotion_id == "promo_banner_001"
     assert response.segment_id == "seg_family_trip"
     assert response.actual_value == Decimal("0.500000")
+    assert response.target_gap == Decimal("0.000000")
+    assert response.status_reason == "target_met"
+    assert response.strategy_snapshot.strategy_key == "booking_confidence__family"
     assert response.status == PromotionEvaluationStatus.GOAL_MET
     assert response.next_loop_required is False
     assert response.feedback is None
@@ -68,6 +73,11 @@ def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
     }
     assert inserted.result_json["evaluation_mode"] == "target_threshold"
     assert inserted.result_json["evaluation_scope"] == "ad_experiment"
+    assert inserted.result_json["target_gap"] == "0.000000"
+    assert inserted.result_json["sample_size"] == 10
+    assert inserted.result_json["strategy_snapshot"]["evidence_refs"] == [
+        "content_brief.benefit_evidence.free_cancellation"
+    ]
     assert repos.experiments.status_updates == [
         ("adexp_family_trip_001", AdExperimentStatus.GOAL_MET.value)
     ]
@@ -94,6 +104,7 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
     )
 
     assert response.actual_value == Decimal("0.200000")
+    assert response.target_gap == Decimal("-0.100000")
     assert response.status == PromotionEvaluationStatus.GOAL_NOT_MET
     assert response.next_loop_required is True
     inserted = repos.evaluations.inserted[0]
@@ -105,6 +116,27 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
     assert repos.experiments.status_updates == [
         ("adexp_family_trip_001", AdExperimentStatus.GOAL_NOT_MET.value)
     ]
+
+
+def test_ad_experiment_evaluation_calculates_positive_target_gap() -> None:
+    repos = FakeEvaluationRepos(
+        run=promotion_run_record(
+            goal_snapshot_json={
+                "goal_target_value": "0.100000",
+                "min_sample_size": 10,
+            }
+        ),
+        counts=MetricCountRecord(numerator_count=2, denominator_count=10),
+    )
+    service = make_service(repos)
+
+    response = service.evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    assert response.target_gap == Decimal("0.100000")
+    assert repos.evaluations.inserted[0].result_json["target_gap"] == "0.100000"
 
 
 def test_email_booking_conversion_uses_campaign_landing_denominator() -> None:
@@ -221,6 +253,110 @@ def test_ad_experiment_evaluation_rejects_missing_snapshot_target() -> None:
     assert repos.evaluations.inserted == []
 
 
+@pytest.mark.parametrize(
+    ("field_name", "mismatched_value"),
+    [
+        ("content_option_id", "option_b"),
+        ("project_id", "other-project"),
+        ("campaign_id", "other-campaign"),
+        ("promotion_id", "other-promotion"),
+        ("segment_id", "other-segment"),
+        ("generation_id", "other-generation"),
+    ],
+)
+def test_ad_experiment_evaluation_rejects_candidate_context_mismatch_without_writes(
+    field_name: str,
+    mismatched_value: str,
+) -> None:
+    candidate_values = {field_name: mismatched_value}
+    repos = FakeEvaluationRepos(
+        candidate=content_candidate_record(**candidate_values),
+    )
+    service = make_service(repos)
+
+    with pytest.raises(
+        AdExperimentEvaluationValidationError,
+        match=field_name,
+    ):
+        service.evaluate(
+            ad_experiment_id="adexp_family_trip_001",
+            request=AdExperimentEvaluateRequest(),
+        )
+
+    assert repos.evaluations.inserted == []
+    assert repos.experiments.status_updates == []
+    assert repos.metrics.cutoffs == []
+
+
+def test_ad_experiment_evaluation_rejects_missing_candidate_without_writes() -> None:
+    repos = FakeEvaluationRepos(candidate=None)
+    service = make_service(repos)
+
+    with pytest.raises(AdExperimentEvaluationValidationError, match="not found"):
+        service.evaluate(
+            ad_experiment_id="adexp_family_trip_001",
+            request=AdExperimentEvaluateRequest(),
+        )
+
+    assert repos.evaluations.inserted == []
+    assert repos.experiments.status_updates == []
+
+
+def test_strategy_snapshot_distinguishes_missing_keys_from_explicit_empty_values() -> None:
+    repos = FakeEvaluationRepos(
+        candidate=content_candidate_record(
+            metadata_json={
+                "strategy_plan": {},
+                "evidence_refs": [],
+            }
+        )
+    )
+    service = make_service(repos)
+
+    response = service.evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    snapshot = repos.evaluations.inserted[0].result_json["strategy_snapshot"]
+    assert snapshot == {
+        "strategy_key": None,
+        "strategy_plan": {},
+        "evidence_refs": [],
+        "brief_fingerprint": None,
+        "prompt_builder_version": None,
+        "fallback_guidance_used": None,
+    }
+    assert response.strategy_snapshot.model_dump() == snapshot
+
+
+def test_strategy_snapshot_deep_copies_nested_metadata() -> None:
+    metadata = {
+        "strategy_key": "booking_confidence__family",
+        "strategy_plan": {"benefit_focus": ["free_cancellation"]},
+        "evidence_refs": ["content_brief.benefit_evidence.free_cancellation"],
+    }
+    repos = FakeEvaluationRepos(
+        candidate=content_candidate_record(metadata_json=metadata)
+    )
+    service = make_service(repos)
+
+    service.evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+    metadata["strategy_plan"]["benefit_focus"].append("breakfast")
+    metadata["evidence_refs"].append("content_brief.benefit_evidence.breakfast")
+
+    snapshot = repos.evaluations.inserted[0].result_json["strategy_snapshot"]
+    assert snapshot["strategy_plan"] == {
+        "benefit_focus": ["free_cancellation"]
+    }
+    assert snapshot["evidence_refs"] == [
+        "content_brief.benefit_evidence.free_cancellation"
+    ]
+
+
 def test_ad_experiment_evaluation_maps_missing_experiment() -> None:
     repos = FakeEvaluationRepos(experiment=None)
     service = make_service(repos)
@@ -310,6 +446,7 @@ def make_service(repos: "FakeEvaluationRepos") -> AdExperimentEvaluationService:
     return AdExperimentEvaluationService(
         ad_experiment_repository=repos.experiments,
         promotion_run_repository=repos.runs,
+        content_candidate_repository=repos.candidates,
         promotion_evaluation_repository=repos.evaluations,
         evaluation_metric_repository=repos.metrics,
     )
@@ -320,6 +457,7 @@ class FakeEvaluationRepos:
         self,
         *,
         experiment: AdExperimentRecord | None | object = DEFAULT_EXPERIMENT,
+        candidate: ContentCandidateRecord | None | object = DEFAULT_CANDIDATE,
         run: PromotionRunRecord | None = None,
         counts: MetricCountRecord | None = None,
     ) -> None:
@@ -329,6 +467,11 @@ class FakeEvaluationRepos:
             else experiment
         )
         self.runs = FakePromotionRunRepository(run or promotion_run_record())
+        self.candidates = FakeContentCandidateRepository(
+            content_candidate_record()
+            if candidate is DEFAULT_CANDIDATE
+            else candidate
+        )
         self.evaluations = FakePromotionEvaluationRepository()
         self.metrics = FakeEvaluationMetricRepository(
             counts or MetricCountRecord(numerator_count=2, denominator_count=10)
@@ -361,6 +504,16 @@ class FakePromotionRunRepository:
         if self.run.promotion_run_id != promotion_run_id:
             return None
         return self.run
+
+
+class FakeContentCandidateRepository:
+    def __init__(self, candidate: ContentCandidateRecord | None) -> None:
+        self.candidate = candidate
+
+    def get_by_id(self, content_id: str) -> ContentCandidateRecord | None:
+        if self.candidate is None or self.candidate.content_id != content_id:
+            return None
+        return self.candidate
 
 
 class FakePromotionEvaluationRepository:
@@ -439,5 +592,41 @@ def promotion_run_record(
         else {
             "goal_target_value": "0.300000",
             "min_sample_size": 10,
+        },
+    )
+
+
+def content_candidate_record(
+    *,
+    content_option_id: str = "option_a",
+    generation_id: str = "generation_banner_001",
+    project_id: str = "hotel-client-a",
+    campaign_id: str = "camp_summer_2026",
+    promotion_id: str = "promo_banner_001",
+    segment_id: str = "seg_family_trip",
+    metadata_json: dict[str, object] | None = None,
+) -> ContentCandidateRecord:
+    return ContentCandidateRecord(
+        content_id="content_family_trip_001",
+        content_option_id=content_option_id,
+        generation_id=generation_id,
+        analysis_id="analysis_banner_001",
+        project_id=project_id,
+        campaign_id=campaign_id,
+        promotion_id=promotion_id,
+        segment_id=segment_id,
+        channel=Channel.ONSITE_BANNER.value,
+        status="approved",
+        metadata_json=metadata_json
+        if metadata_json is not None
+        else {
+            "strategy_key": "booking_confidence__family",
+            "strategy_plan": {"benefit_focus": ["free_cancellation"]},
+            "evidence_refs": [
+                "content_brief.benefit_evidence.free_cancellation"
+            ],
+            "brief_fingerprint": "sha256:brief",
+            "prompt_builder_version": "dec-c2.v4",
+            "fallback_guidance_used": False,
         },
     )

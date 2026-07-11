@@ -55,6 +55,7 @@ def test_promotion_run_evaluation_aggregates_all_segments_mixed_status() -> None
 
     assert response.status == PromotionRunStatus.PARTIAL_GOAL_MET
     assert response.next_loop_required is True
+    assert response.target_gap is None
     assert response.failed_segment_ids == ["seg_luxury"]
     assert response.failed_ad_experiment_ids == ["adexp_luxury_001"]
     assert [item.status for item in response.ad_experiment_results] == [
@@ -73,6 +74,14 @@ def test_promotion_run_evaluation_aggregates_all_segments_mixed_status() -> None
     assert inserted.sample_size == 0
     assert inserted.result_json["failed_segment_ids"] == ["seg_luxury"]
     assert inserted.result_json["evaluation_scope"] == "promotion_run_aggregate"
+    assert inserted.result_json["target_gap"] is None
+    assert "strategy_snapshot" not in inserted.result_json
+    assert inserted.result_json["ad_experiment_results"][0]["target_gap"] == (
+        "0.100000"
+    )
+    assert inserted.result_json["ad_experiment_results"][0][
+        "strategy_snapshot"
+    ]["strategy_key"] is None
     assert repos.runs.status_updates == [
         ("prun_banner_001_loop_1", PromotionRunStatus.PARTIAL_GOAL_MET.value)
     ]
@@ -180,6 +189,8 @@ def test_promotion_run_evaluation_sums_promotion_average_counts() -> None:
     assert inserted.numerator_count == 7
     assert inserted.denominator_count == 20
     assert inserted.sample_size == 20
+    assert inserted.result_json["target_gap"] == "0.050000"
+    assert response.target_gap == Decimal("0.050000")
 
 
 def test_promotion_run_evaluation_rejects_promotion_average_min_sample() -> None:
@@ -477,6 +488,19 @@ def evaluation_record(
             "event_names": {
                 "numerator": "booking_complete",
                 "denominator": "promotion_click",
+            },
+            "target_gap": str(
+                (actual_value - Decimal("0.300000")).quantize(
+                    Decimal("0.000001")
+                )
+            ),
+            "strategy_snapshot": {
+                "strategy_key": None,
+                "strategy_plan": None,
+                "evidence_refs": None,
+                "brief_fingerprint": None,
+                "prompt_builder_version": None,
+                "fallback_guidance_used": None,
             },
         },
     )

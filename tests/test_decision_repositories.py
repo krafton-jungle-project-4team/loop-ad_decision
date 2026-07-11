@@ -277,6 +277,43 @@ def test_content_candidate_repository_lists_approved_or_active_with_segment_keys
     assert call.params == ("generation_banner_001",)
 
 
+def test_content_candidate_repository_gets_candidate_by_content_id_without_status_filter() -> None:
+    metadata = {
+        "strategy_key": "booking_confidence__family",
+        "strategy_plan": {},
+        "evidence_refs": [],
+    }
+    db = FakePostgresExecutor(
+        fetchone_result={
+            "content_id": "content_family_trip_001",
+            "content_option_id": "option_a",
+            "generation_id": "generation_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "segment_id": "seg_family_trip",
+            "channel": Channel.ONSITE_BANNER.value,
+            "status": "archived",
+            "metadata_json": metadata,
+        }
+    )
+    repo = ContentCandidateRepository(db)
+
+    candidate = repo.get_by_id("content_family_trip_001")
+
+    assert candidate is not None
+    assert candidate.status == "archived"
+    assert candidate.metadata_json == metadata
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from content_candidates" in sql
+    assert "where content_id = %s" in sql
+    assert "status in" not in sql
+    assert "metadata_json" in sql
+    assert call.params == ("content_family_trip_001",)
+
+
 def test_promotion_run_repository_inserts_all_required_fields() -> None:
     db = FakePostgresExecutor()
     repo = PromotionRunRepository(db)
