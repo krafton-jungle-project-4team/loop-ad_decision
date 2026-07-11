@@ -1190,7 +1190,6 @@ def _segment_definition_from_candidate(
     segment_id = _raw_event_segment_id(
         promotion_id=promotion.promotion_id,
         candidate_type=candidate.candidate_type,
-        rank=rank,
         candidate_user_ids=candidate.candidate_user_ids,
     )
     profile_json: dict[str, Any] = {
@@ -2023,15 +2022,18 @@ def _raw_event_segment_id(
     *,
     promotion_id: str,
     candidate_type: str,
-    rank: int,
     candidate_user_ids: Sequence[str],
 ) -> str:
+    stable_user_ids = sorted(set(candidate_user_ids))
     digest = hashlib.sha1(  # noqa: S324 - stable non-security identifier.
-        ":".join([promotion_id, candidate_type, ",".join(candidate_user_ids[:20])]).encode(
-            "utf-8"
-        )
+        ":".join(
+            [promotion_id, candidate_type, ",".join(stable_user_ids)]
+        ).encode("utf-8")
     ).hexdigest()[:10]
-    return f"seg_ai_raw_{_safe_identifier_part(promotion_id)[:32]}_{rank + 1}_{candidate_type}_{digest}"
+    return (
+        f"seg_ai_raw_{_safe_identifier_part(promotion_id)[:32]}_"
+        f"{candidate_type}_{digest}"
+    )
 
 
 def _safe_identifier_part(value: str) -> str:

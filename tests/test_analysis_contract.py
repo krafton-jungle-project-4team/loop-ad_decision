@@ -124,10 +124,10 @@ def test_server_port_has_no_default(monkeypatch: pytest.MonkeyPatch) -> None:
         load_settings(env)
 
 
-def test_analysis_returns_v1_6_contract_shape() -> None:
+def test_segment_recommendation_returns_contract_shape() -> None:
     service = FakeAnalysisService()
     response = make_client(service).post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 
@@ -158,29 +158,29 @@ def test_analysis_returns_v1_6_contract_shape() -> None:
     assert service.calls[0].promotion_id == "promo_banner_001"
 
 
-def test_analysis_requires_mandatory_fields() -> None:
+def test_segment_recommendation_requires_mandatory_fields() -> None:
     response = make_client(FakeAnalysisService()).post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json={"project_id": "hotel-client-a"},
     )
 
     assert response.status_code == 422
 
 
-def test_analysis_rejects_focus_segment_ids() -> None:
+def test_segment_recommendation_rejects_segment_ids() -> None:
     service = FakeAnalysisService()
     response = make_client(service).post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
-        json=analysis_payload(focus_segment_ids=["seg_family_trip"]),
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
+        json=analysis_payload(segment_ids=["seg_family_trip"]),
     )
 
     assert response.status_code == 422
     assert service.calls == []
 
 
-def test_analysis_rejects_promotion_id_mismatch() -> None:
+def test_segment_recommendation_rejects_promotion_id_mismatch() -> None:
     response = make_client(FakeAnalysisService()).post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(promotion_id="promo_email_001"),
     )
 
@@ -190,9 +190,9 @@ def test_analysis_rejects_promotion_id_mismatch() -> None:
     }
 
 
-def test_analysis_response_does_not_expose_forbidden_terms() -> None:
+def test_segment_recommendation_response_does_not_expose_forbidden_terms() -> None:
     response = make_client(FakeAnalysisService()).post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 
@@ -202,7 +202,7 @@ def test_analysis_response_does_not_expose_forbidden_terms() -> None:
         assert term not in response_text
 
 
-def test_analysis_maps_service_errors() -> None:
+def test_segment_recommendation_maps_service_errors() -> None:
     cases = [
         (PromotionNotFoundError("promotion not found"), 404),
         (SegmentSelectionError("no active segment candidates matched analysis request"), 422),
@@ -210,11 +210,45 @@ def test_analysis_maps_service_errors() -> None:
 
     for exc, expected_status in cases:
         response = make_client(FakeAnalysisService(exc=exc)).post(
-            "/decision/v1/promotions/promo_banner_001/analysis",
+            "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
             json=analysis_payload(),
         )
 
         assert response.status_code == expected_status
+
+
+def test_segment_analysis_requires_and_preserves_requested_segment_ids() -> None:
+    service = FakeAnalysisService()
+
+    response = make_client(service).post(
+        "/decision/v1/promotions/promo_banner_001/analyses",
+        json=analysis_payload(segment_ids=["seg_family_trip"]),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["target_segments"][0]["segment_id"] == "seg_family_trip"
+    assert service.calls[0].segment_ids == ["seg_family_trip"]
+
+
+def test_segment_analysis_rejects_missing_duplicate_and_empty_segment_ids() -> None:
+    client = make_client(FakeAnalysisService())
+    path = "/decision/v1/promotions/promo_banner_001/analyses"
+
+    assert client.post(path, json=analysis_payload()).status_code == 422
+    assert (
+        client.post(
+            path,
+            json=analysis_payload(segment_ids=["seg_family_trip", "seg_family_trip"]),
+        ).status_code
+        == 422
+    )
+    assert (
+        client.post(
+            path,
+            json=analysis_payload(segment_ids=[" "]),
+        ).status_code
+        == 422
+    )
 
 
 def test_v1_6_enum_values() -> None:
@@ -238,11 +272,20 @@ class FakeAnalysisService:
         self.exc = exc
         self.calls: list[Any] = []
 
+    def recommend_segments(self, request: Any) -> PromotionAnalysisResult:
+        return self._result(request)
+
+    def analyze_segments(self, request: Any) -> PromotionAnalysisResult:
+        return self._result(request)
+
     def analyze(self, request: Any) -> PromotionAnalysisResult:
+        return self._result(request)
+
+    def _result(self, request: Any) -> PromotionAnalysisResult:
         self.calls.append(request)
         if self.exc is not None:
             raise self.exc
-        focus_segment_ids = getattr(request, "focus_segment_ids", None)
+        focus_segment_ids = getattr(request, "segment_ids", None)
         segment_id = (
             focus_segment_ids[0] if focus_segment_ids else "seg_repeat_hotel_no_booking"
         )

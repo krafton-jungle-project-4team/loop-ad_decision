@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -271,6 +272,13 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         for segment in segments
     ]
     assert len(set(candidate_types)) == 3
+    assert all(
+        re.fullmatch(
+            r"seg_ai_raw_promo_banner_001_[a-z_]+_[0-9a-f]{10}",
+            segment.segment_id,
+        )
+        for segment in segments
+    )
     assert all(segment.rule_json["source"] == "raw_event_intent" for segment in segments)
     assert all(segment.profile_json["source"] == "raw_event_intent" for segment in segments)
     assert all("rank_role" in segment.profile_json for segment in segments)
@@ -505,6 +513,17 @@ def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
     assert {
         segment.rule_json["candidate_type"] for segment in calibration_pool
     } == {"intent_matched", "funnel_recovery"}
+    ranked_ids = {
+        segment.rule_json["candidate_type"]: segment.segment_id for segment in ranked
+    }
+    calibration_ids = {
+        segment.rule_json["candidate_type"]: segment.segment_id
+        for segment in calibration_pool
+    }
+    assert all(
+        calibration_ids[candidate_type] == segment_id
+        for candidate_type, segment_id in ranked_ids.items()
+    )
 
 
 def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:
@@ -792,7 +811,10 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
     assert len(segments) == 2
     assert {segment.source for segment in segments} == {"ai_suggested"}
     assert all(
-        segment.segment_id.startswith("seg_ai_cluster_promo_banner_001_")
+        re.fullmatch(
+            r"seg_ai_cluster_promo_banner_001_[0-9a-f]{10}",
+            segment.segment_id,
+        )
         for segment in segments
     )
     assert [segment.sample_size for segment in segments] == [2, 2]
