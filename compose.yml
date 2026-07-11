@@ -1,0 +1,39 @@
+name: loopad-decision
+
+services:
+  decision-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: loopad-decision-api:dev
+    container_name: loopad-decision-api-dev
+    command:
+      - uvicorn
+      - app.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+      - --reload
+      - --reload-dir
+      - /app/app
+    env_file:
+      - .env
+    environment:
+      PORT: "8080"
+      LOOPAD_AURORA_HOST: host.docker.internal
+      LOOPAD_CLICKHOUSE_URL: http://host.docker.internal:18123
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./app:/app/app
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
