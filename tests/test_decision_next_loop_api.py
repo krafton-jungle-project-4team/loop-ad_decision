@@ -180,6 +180,43 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     assert any("from promotion_runs" in query for query in executed_sql)
 
 
+def test_next_loop_service_wires_s3_artifact_publisher_outside_test_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = load_settings({**valid_env(), "LOOPAD_ENV": "dev"})
+    artifact_publisher = object()
+
+    monkeypatch.setattr(
+        "app.decision.router.get_settings",
+        lambda _request: settings,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: RecordingConnection(),
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    monkeypatch.setattr(
+        "app.decision.router.build_external_content_generator",
+        lambda _settings: object(),
+    )
+    monkeypatch.setattr(
+        "app.decision.router.build_s3_creative_artifact_publisher",
+        lambda _settings: artifact_publisher,
+    )
+
+    service_iterator = get_next_loop_service(object())
+    service = next(service_iterator)
+    try:
+        generation_gateway = service._generation_gateway
+        generation_service = generation_gateway._generation_service
+        assert generation_service._artifact_publisher is artifact_publisher
+    finally:
+        service_iterator.close()
+
+
 def test_next_loop_api_rolls_back_and_closes_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

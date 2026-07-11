@@ -414,6 +414,55 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
     assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
 
 
+def test_generation_service_bounds_long_next_loop_content_identifiers() -> None:
+    segment_id = (
+        "seg_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
+        "target_destination_affinity_9e2a5d129c"
+    )
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                replace(
+                    target_segment_input(
+                        analysis_id="analysis_banner_001_loop_2",
+                        segment_id=segment_id,
+                    ),
+                    content_slug=None,
+                )
+            ],
+            channel=ContentChannel.EMAIL,
+        ),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=[segment_id],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+        )
+    )
+
+    assert result.status == "completed"
+    candidate = content_candidate_repository.saved[0]
+    assert candidate.content_id == (
+        "content_email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
+        "target_destination_affi_6c87bac404eb7fd3_001"
+    )
+    assert candidate.content_option_id == (
+        "email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
+        "target_destination_affi_6c87bac404eb7fd3_option_001"
+    )
+    assert len(candidate.content_id) == 100
+    assert len(candidate.content_option_id) == 99
+
+
 def test_generation_service_focus_generation_bypasses_confirmed_status_filter() -> None:
     content_candidate_repository = FakeContentCandidateRepository()
     service = GenerationService(

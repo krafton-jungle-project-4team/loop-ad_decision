@@ -82,7 +82,10 @@ from app.decision.service import (
     RunValidationError,
 )
 from app.dependencies import get_settings
-from app.generation.adapters import build_external_content_generator
+from app.generation.adapters import (
+    build_external_content_generator,
+    build_s3_creative_artifact_publisher,
+)
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
     GenerationInputRepository,
@@ -273,8 +276,10 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_report_generator=build_segment_suggestion_report_generator(settings),
         )
         content_generator = None
+        artifact_publisher = None
         if settings.env != "test":
             content_generator = build_external_content_generator(settings)
+            artifact_publisher = build_s3_creative_artifact_publisher(settings)
         generation_run_repository = GenerationGenerationRunRepository(connection)
         generation_service = GenerationService(
             generation_run_repository=generation_run_repository,
@@ -283,6 +288,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             ),
             generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
+            artifact_publisher=artifact_publisher,
         )
         run_creator = PromotionRunService(
             promotion_repository=promotion_repository,

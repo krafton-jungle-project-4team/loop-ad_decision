@@ -539,7 +539,11 @@ class PromotionAnalysisService:
             log.info(
                 "segment_suggestion_refresh_skipped",
                 {
-                    "reason": "existing_segments_analysis",
+                    "reason": (
+                        "next_loop_focus"
+                        if next_loop_context is not None
+                        else "existing_segments_analysis"
+                    ),
                     "focusSegmentIds": list(focus_segment_ids or ()),
                 },
             )
