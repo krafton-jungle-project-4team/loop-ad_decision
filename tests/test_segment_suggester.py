@@ -5,7 +5,12 @@ from typing import Any, Mapping
 
 import pytest
 
-from app.analysis.raw_event_segments import DeterministicPromotionIntentExtractor
+from app.analysis.raw_event_segments import (
+    DeterministicPromotionIntentExtractor,
+    compile_raw_event_intent,
+    generate_raw_event_segment_candidate_pool,
+    generate_raw_event_segment_definitions,
+)
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -288,7 +293,13 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert all(
         segment.profile_json["score_components"]["weights"]
         ["promotion_condition_match"]
-        == 0.35
+        == 0.10
+        for segment in segments
+    )
+    assert all(
+        segment.profile_json["score_components"]["weights"]
+        ["expected_goal_performance"]
+        == 0.85
         for segment in segments
     )
     assert all(
@@ -301,7 +312,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
 
 
-def test_destination_candidates_are_split_and_contextual_candidates_exclude_other_destinations() -> None:
+def test_destination_candidates_exclude_users_without_target_interest() -> None:
     vector_reader = FakeUserBehaviorVectorRepository([])
     raw_reader = FakeRawEventSignalRepository(
         [
@@ -398,13 +409,10 @@ def test_destination_candidates_are_split_and_contextual_candidates_exclude_othe
         for segment in segments
     }
     assert "target_destination_affinity" in by_type
-    assert "general_destination_explorer" in by_type
+    assert "general_destination_explorer" not in by_type
     assert set(
         by_type["target_destination_affinity"].rule_json["candidate_user_ids"]
     ) == {"target_repeat_1", "target_repeat_2"}
-    assert set(
-        by_type["general_destination_explorer"].rule_json["candidate_user_ids"]
-    ) == {"general_1", "general_2"}
     assert set(by_type["funnel_recovery"].rule_json["candidate_user_ids"]) == {
         "funnel_target_1",
         "funnel_target_2",
@@ -412,6 +420,91 @@ def test_destination_candidates_are_split_and_contextual_candidates_exclude_othe
     assert set(
         by_type["benefit_value_seeker"].rule_json["candidate_user_ids"]
     ) == {"benefit_target_1", "benefit_target_2"}
+
+
+def test_general_destination_explorer_is_available_without_target_destination() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository([])
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "general_1",
+                hotel_search_count=4,
+                destination_values=("부산", "서울"),
+                hotel_market_values=("10", "20"),
+            ),
+            raw_signal(
+                "general_2",
+                hotel_search_count=3,
+                destination_values=("강릉", "여수"),
+                hotel_market_values=("30", "40"),
+            ),
+            raw_signal("single_destination_1", hotel_search_count=1),
+            raw_signal("single_destination_2", hotel_search_count=1),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        max_suggested_segments=6,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여러 호텔과 여행지를 비교하는 고객을 위한 프로모션",
+        )
+    )
+
+    general = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "general_destination_explorer"
+    )
+    assert set(general.rule_json["candidate_user_ids"]) == {
+        "general_1",
+        "general_2",
+    }
+
+
+def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 할인 프로모션으로 예약 전환을 높인다.",
+    )
+    extractor = DeterministicPromotionIntentExtractor()
+    intent = extractor.extract(promotion)
+    profiles = [
+        raw_signal(
+            f"overlap_{index}",
+            hotel_detail_view_count=2,
+            booking_start_count=1,
+            destination_match_count=1,
+            season_match_count=1,
+        )
+        for index in range(2)
+    ]
+    compilation = compile_raw_event_intent(intent)
+
+    ranked = generate_raw_event_segment_definitions(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        max_suggested_segments=6,
+        min_sample_size=2,
+    )
+    calibration_pool = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+    )
+
+    assert len(ranked) == 1
+    assert {
+        segment.rule_json["candidate_type"] for segment in calibration_pool
+    } == {"intent_matched", "funnel_recovery"}
 
 
 def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:

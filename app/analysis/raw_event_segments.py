@@ -29,7 +29,7 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v2"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v3"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 RAW_EVENT_CANDIDATE_USER_LIMIT = 160
@@ -53,14 +53,14 @@ DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
     "rank_distinctiveness": 0.10,
 }
 
-# A named destination is the strongest piece of promotion context. Generic past
-# activity must not outrank a higher predicted contextual booking rate.
+# Destination-specific candidates already require a matching destination event.
+# Keep condition fit as a tie-breaker instead of counting the same signal twice.
 DESTINATION_SCORE_WEIGHTS: Mapping[str, float] = {
-    "promotion_condition_match": 0.35,
-    "expected_goal_performance": 0.55,
-    "behavior_lift_vs_baseline": 0.03,
-    "sample_reliability": 0.05,
-    "rank_distinctiveness": 0.02,
+    "promotion_condition_match": 0.10,
+    "expected_goal_performance": 0.85,
+    "behavior_lift_vs_baseline": 0.02,
+    "sample_reliability": 0.02,
+    "rank_distinctiveness": 0.01,
 }
 
 CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
@@ -481,9 +481,77 @@ def generate_raw_event_segment_definitions(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None = None,
 ) -> list[SegmentDefinitionRecord]:
-    if len(profiles) < min_sample_size:
+    candidates = _generate_raw_event_candidates(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=min_sample_size,
+        performance_predictor=performance_predictor,
+    )
+    if not candidates:
         return []
     total_eligible_user_count = len(profiles)
+    ranked = _rank_candidates(
+        candidates,
+        max_suggested_segments=max_suggested_segments,
+    )
+    return [
+        _segment_definition_from_candidate(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            candidate=candidate,
+            rank=rank,
+            total_eligible_user_count=total_eligible_user_count,
+        )
+        for rank, candidate in enumerate(ranked)
+    ]
+
+
+def generate_raw_event_segment_candidate_pool(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor | None = None,
+) -> list[SegmentDefinitionRecord]:
+    """Return every eligible candidate type for offline model calibration."""
+    candidates = _generate_raw_event_candidates(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=min_sample_size,
+        performance_predictor=performance_predictor,
+    )
+    total_eligible_user_count = len(profiles)
+    return [
+        _segment_definition_from_candidate(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            candidate=candidate,
+            rank=rank,
+            total_eligible_user_count=total_eligible_user_count,
+        )
+        for rank, candidate in enumerate(candidates)
+    ]
+
+
+def _generate_raw_event_candidates(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor | None,
+) -> list[_RawEventCandidate]:
+    if len(profiles) < min_sample_size:
+        return []
     baseline = _baseline_metrics(profiles)
     predictor = performance_predictor or ContextualBookingHeuristicPredictor()
     raw_candidates = [
@@ -542,21 +610,9 @@ def generate_raw_event_segment_definitions(
             performance_predictor=predictor,
         ),
     ]
-    candidates = _normalize_expected_performance(
+    return _normalize_expected_performance(
         [candidate for candidate in raw_candidates if candidate is not None]
     )
-    ranked = _rank_candidates(candidates, max_suggested_segments=max_suggested_segments)
-    return [
-        _segment_definition_from_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            candidate=candidate,
-            rank=rank,
-            total_eligible_user_count=total_eligible_user_count,
-        )
-        for rank, candidate in enumerate(ranked)
-    ]
 
 
 def destination_terms_from_intent(intent: PromotionIntent) -> tuple[str, ...]:
@@ -760,6 +816,8 @@ def _general_destination_explorer_candidate(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
+    if intent.destinations:
+        return None
     matched_profiles = [
         profile
         for profile in profiles
@@ -769,7 +827,6 @@ def _general_destination_explorer_candidate(
             or len(profile.hotel_cluster_values) >= 2
         )
         and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
-        and (not intent.destinations or profile.destination_match_count == 0)
     ]
     matched_condition_keys = (
         "general_destination_exploration",

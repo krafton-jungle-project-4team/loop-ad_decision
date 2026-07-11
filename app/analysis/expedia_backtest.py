@@ -14,11 +14,11 @@ from typing import Any, Protocol
 from app.analysis.raw_event_segments import (
     PromotionIntent,
     compile_raw_event_intent,
+    generate_raw_event_segment_candidate_pool,
     generate_raw_event_segment_definitions,
 )
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
 from app.analysis.segment_performance import (
-    MODEL_CANDIDATE_TYPES,
     CalibrationTrainingExample,
     LogisticSegmentPerformanceModel,
     SegmentPerformanceFeatures,
@@ -527,10 +527,12 @@ class ExpediaSegmentBacktestService:
         *,
         config: ExpediaBacktestConfig,
         performance_predictor: SegmentPerformancePredictor | None = None,
+        calibration_candidate_pool: bool = False,
     ) -> None:
         self._repository = repository
         self._config = config
         self._performance_predictor = performance_predictor
+        self._calibration_candidate_pool = calibration_candidate_pool
 
     @log_context_scope
     def run(
@@ -548,6 +550,7 @@ class ExpediaSegmentBacktestService:
                 "lookbackDays": self._config.lookback_days,
                 "outcomeDays": self._config.outcome_days,
                 "profilePoolLimit": self._config.profile_pool_limit,
+                "calibrationCandidatePool": self._calibration_candidate_pool,
             },
         )
         results: list[ExpediaBacktestResult] = []
@@ -607,15 +610,26 @@ class ExpediaSegmentBacktestService:
                     continue
                 promotion = _promotion_for_scenario(scenario, self._config)
                 intent = _intent_for_scenario(scenario)
-                segments = generate_raw_event_segment_definitions(
-                    promotion=promotion,
-                    intent=intent,
-                    compilation=compile_raw_event_intent(intent),
-                    profiles=profiles,
-                    max_suggested_segments=self._config.max_suggested_segments,
-                    min_sample_size=self._config.min_sample_size,
-                    performance_predictor=self._performance_predictor,
-                )
+                compilation = compile_raw_event_intent(intent)
+                if self._calibration_candidate_pool:
+                    segments = generate_raw_event_segment_candidate_pool(
+                        promotion=promotion,
+                        intent=intent,
+                        compilation=compilation,
+                        profiles=profiles,
+                        min_sample_size=self._config.min_sample_size,
+                        performance_predictor=self._performance_predictor,
+                    )
+                else:
+                    segments = generate_raw_event_segment_definitions(
+                        promotion=promotion,
+                        intent=intent,
+                        compilation=compilation,
+                        profiles=profiles,
+                        max_suggested_segments=self._config.max_suggested_segments,
+                        min_sample_size=self._config.min_sample_size,
+                        performance_predictor=self._performance_predictor,
+                    )
                 if not segments:
                     skipped.append(
                         ExpediaBacktestSkippedScenario(
@@ -707,32 +721,32 @@ def run_temporal_holdout_backtest(
             "training outcomes must end before the first validation cutoff"
         )
 
-    training_config = replace(
-        config,
-        max_suggested_segments=max(
-            config.max_suggested_segments,
-            len(MODEL_CANDIDATE_TYPES),
-        ),
-    )
     training_feature_run = ExpediaSegmentBacktestService(
         repository,
-        config=training_config,
+        config=config,
+        calibration_candidate_pool=True,
     ).run(normalized_training)
     examples = calibration_examples_from_run(training_feature_run)
     model = fit_logistic_segment_performance_model(
         examples,
+        optimizer_selection_basis="2014_development_validation",
         training_metadata={
             "target": "future_contextual_booking_rate",
+            "training_dataset": "expedia_hotel_recommendations_train",
+            "applicability_scope": (
+                "destination_specific_hotel_booking_promotions"
+            ),
             "training_start_cutoff": min(normalized_training).isoformat(),
             "training_end_cutoff": max(normalized_training).isoformat(),
             "outcome_days": config.outcome_days,
             "user_sample_modulo": config.user_sample_modulo,
             "profile_pool_limit": config.profile_pool_limit,
+            "candidate_training_scope": "all_eligible_candidate_types",
         },
     )
     training_run = ExpediaSegmentBacktestService(
         repository,
-        config=training_config,
+        config=config,
         performance_predictor=model,
     ).run(normalized_training)
     holdout_run = ExpediaSegmentBacktestService(
@@ -1018,13 +1032,7 @@ def write_temporal_holdout_artifacts(
         run.training_run,
         output_dir=output_dir / "training-2013",
         source_stats=source_stats,
-        config=replace(
-            config,
-            max_suggested_segments=max(
-                config.max_suggested_segments,
-                len(MODEL_CANDIDATE_TYPES),
-            ),
-        ),
+        config=config,
     )
     validation_paths = write_backtest_artifacts(
         run.holdout_run,
@@ -1032,7 +1040,7 @@ def write_temporal_holdout_artifacts(
         source_stats=source_stats,
         config=config,
     )
-    model_path = output_dir / "contextual_booking_calibration_v1.json"
+    model_path = output_dir / "contextual_booking_calibration_v2.json"
     write_segment_performance_model(run.calibration_model, model_path)
     summary_path = output_dir / "temporal_validation_summary.json"
     summary = {
@@ -1226,25 +1234,9 @@ def _profile_query(source_table: str) -> str:
         toUInt64(0) AS booking_cancel_count,
         countIf(
             is_package = 1
-            OR (
-                NOT isNull(srch_ci)
-                AND dateDiff('day', toDate(date_time), assumeNotNull(srch_ci)) >= 30
-            )
-            OR cnt >= 4
         ) AS deal_event_count,
-        countIf(
-            is_package = 1
-            OR (
-                NOT isNull(srch_ci)
-                AND dateDiff('day', toDate(date_time), assumeNotNull(srch_ci)) >= 14
-            )
-        ) AS free_cancellation_count,
-        countIf(
-            is_package = 1
-            AND NOT isNull(srch_ci)
-            AND NOT isNull(srch_co)
-            AND dateDiff('day', assumeNotNull(srch_ci), assumeNotNull(srch_co)) >= 2
-        ) AS breakfast_included_count,
+        toUInt64(0) AS free_cancellation_count,
+        toUInt64(0) AS breakfast_included_count,
         toUInt64(0) AS price_event_count,
         toFloat64(0) AS avg_price,
         groupUniqArray(20)(toString(srch_destination_id)) AS destination_values,

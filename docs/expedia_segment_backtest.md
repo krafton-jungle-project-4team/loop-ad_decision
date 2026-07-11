@@ -104,10 +104,20 @@ python3 scripts/backtest_expedia_segments.py validation
 이 명령은 다음 순서를 자동으로 수행한다.
 
 1. 2013-05-01부터 2013-12-01까지 기준일 이전 90일 행동으로 후보 feature를 만든다.
+   이때 기존 휴리스틱 Top 3가 아니라 생성 가능한 모든 후보 타입을 학습 표본으로 쓴다.
 2. 각 기준일 이후 30일의 동일 목적지 `is_booking=1`을 학습 target으로 연결한다.
 3. 목적지 일치율, 목적지별 기본 수요, 퍼널 행동, 혜택 반응으로 logistic 보정식을 학습한다.
 4. 학습에 사용하지 않은 2014-01-01부터 2014-12-01까지의 예상값과 Rank를 계산한다.
 5. 2014년 미래 결과와 비교해 MAE, Brier score, lift, Rank 1 적중률을 기록한다.
+
+전체 후보 풀을 학습하는 이유는 보정 전 휴리스틱이 먼저 선택한 후보만 학습할 때 생기는
+선택 편향을 막기 위해서다. 사용자에게 노출되는 개발 검증 결과에는 운영과 동일하게
+사용자 중복 제한과 Rank 점수를 적용한 최대 3개 후보만 기록한다.
+
+Expedia 원본에는 무료 취소와 조식 포함 속성이 없다. 따라서 백테스트의 혜택 신호는
+실제 `is_package=1`만 `deal_event_count`로 사용하며, `free_cancellation_count`와
+`breakfast_included_count`는 0으로 둔다. 관찰할 수 없는 혜택을 체류 기간이나 예약
+리드타임으로 임의 생성하지 않는다.
 
 5번 결과를 본 뒤 로직을 수정했다면 2014년은 통계적인 학습 데이터는 아니더라도
 human-in-the-loop 개발 검증 데이터다. 이 수치를 최종 일반화 성능으로 발표하지 않는다.
@@ -129,7 +139,7 @@ python3 scripts/backtest_expedia_segments.py validation \
 
 ```text
 artifacts/expedia-segment-backtest/validation-<timestamp>/
-├── contextual_booking_calibration_v1.json
+├── contextual_booking_calibration_v2.json
 ├── temporal_validation_report.md
 ├── temporal_validation_summary.json
 ├── training-2013/
@@ -144,7 +154,7 @@ artifacts/expedia-segment-backtest/validation-<timestamp>/
 지정하지 않으면 저장소에 포함된 기본 보정 모델을 사용한다.
 
 ```dotenv
-LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH=/path/to/contextual_booking_calibration_v1.json
+LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH=/path/to/contextual_booking_calibration_v2.json
 ```
 
 ## 4. 봉인 최종 테스트

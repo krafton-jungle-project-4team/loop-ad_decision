@@ -268,6 +268,18 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     assert temporal_run.calibration_model.training_metadata["target"] == (
         "future_contextual_booking_rate"
     )
+    assert temporal_run.calibration_model.training_metadata[
+        "candidate_training_scope"
+    ] == "all_eligible_candidate_types"
+    assert temporal_run.calibration_model.training_metadata[
+        "training_dataset"
+    ] == "expedia_hotel_recommendations_train"
+    assert temporal_run.calibration_model.training_metadata[
+        "applicability_scope"
+    ] == "destination_specific_hotel_booking_promotions"
+    assert temporal_run.calibration_model.training_metadata[
+        "training_example_count"
+    ] > len(temporal_run.training_run.results)
     assert all(
         result.cutoff.year == 2013
         for result in temporal_run.training_run.results
@@ -407,6 +419,32 @@ def test_future_booking_query_does_not_shadow_source_user_id() -> None:
     assert future.contextual_booking_user_ids == {"expedia-user-1"}
     assert "AS backtest_user_id" in client.queries[0]
     assert client.parameters[0]["user_ids"] == [1, 2]
+
+
+def test_profile_query_does_not_invent_unsupported_benefit_properties() -> None:
+    client = FakeClickHouseClient([])
+    repository = ClickHouseExpediaBacktestRepository(client)
+    scenario = ExpediaBacktestScenario(
+        scenario_id="20140701_destination_8250",
+        cutoff=datetime(2014, 7, 1, tzinfo=UTC),
+        target_destination_id=8250,
+        historical_user_count=20,
+        historical_event_count=40,
+    )
+
+    repository.list_user_profiles(
+        scenario=scenario,
+        observation_start=datetime(2014, 4, 2, tzinfo=UTC),
+        cutoff=scenario.cutoff,
+        limit=1000,
+        user_sample_modulo=1,
+        user_sample_remainder=0,
+    )
+
+    query = client.queries[0]
+    assert "countIf(\n            is_package = 1\n        ) AS deal_event_count" in query
+    assert "toUInt64(0) AS free_cancellation_count" in query
+    assert "toUInt64(0) AS breakfast_included_count" in query
 
 
 def test_scenario_query_excludes_development_destinations() -> None:
