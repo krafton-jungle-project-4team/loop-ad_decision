@@ -157,9 +157,6 @@ def get_segment_assignment_service(
         yield SegmentAssignmentService(
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
-            promotion_target_segment_repository=PromotionTargetSegmentRepository(
-                executor,
-            ),
             segment_vector_repository=SegmentVectorRepository(executor),
             user_behavior_vector_repository=UserBehaviorVectorRepository(
                 clickhouse_client,

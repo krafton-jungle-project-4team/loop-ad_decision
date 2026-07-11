@@ -166,7 +166,7 @@ def test_ad_experiment_evaluation_marks_denominator_zero_insufficient() -> None:
     )
 
 
-def test_ad_experiment_evaluation_marks_min_sample_insufficient() -> None:
+def test_ad_experiment_evaluation_uses_event_denominator_for_min_sample() -> None:
     repos = FakeEvaluationRepos(
         run=promotion_run_record(
             goal_snapshot_json={
@@ -184,6 +184,8 @@ def test_ad_experiment_evaluation_marks_min_sample_insufficient() -> None:
     )
 
     assert response.status == PromotionEvaluationStatus.INSUFFICIENT_DATA
+    assert response.denominator_count == 20
+    assert response.sample_size == 20
     assert response.next_loop_required is False
     assert repos.evaluations.inserted[0].result_json["status_reason"] == (
         "sample_size_below_minimum"

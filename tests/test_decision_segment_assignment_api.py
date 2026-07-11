@@ -62,19 +62,52 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "ann_candidate_limit": 50,
         "ann_candidate_count": 1,
         "exact_reranked_pair_count": 1,
+        "page_count": 1,
+        "processed_user_count": 1,
         "assignment_count": 1,
+        "insert_conflict_count": 0,
+        "segment_assignment_counts": {"seg_family_trip": 1},
         "batch_has_fallback": False,
         "fallback_count": 0,
+        "fallback_rate": 0.0,
+        "fallback_reason_counts": {
+            "below_threshold": 0,
+            "no_candidate": 0,
+            "invalid_user_vector": 0,
+        },
         "below_threshold_fallback_count": 0,
         "no_candidate_fallback_count": 0,
         "invalid_user_vector_fallback_count": 0,
+        "similarity_score_buckets": {
+            "not_available": 0,
+            "lt_0_00": 0,
+            "0_00_to_0_50": 0,
+            "0_50_to_0_65": 0,
+            "0_65_to_0_80": 0,
+            "0_80_to_0_90": 0,
+            "gte_0_90": 1,
+        },
         "ann_underfilled_user_count": 0,
+        "ann_applied": True,
+        "ann_not_applied_reason": None,
         "skipped_existing_count": 0,
         "insufficient_segment_count": 0,
+        "completion_scope": "current_request",
+        "assignment_mode": "explicit_user_ids",
+        "input_stability": "not_snapshotted",
         "status": "completed",
     }
     assert service.calls[0][0] == "prun_banner_001_loop_1"
     assert service.calls[0][1].user_ids == ["user_001"]
+
+
+def test_segment_assignment_response_marks_insufficient_count_deprecated() -> None:
+    property_schema = SegmentAssignmentBuildResponse.model_json_schema()[
+        "properties"
+    ]["insufficient_segment_count"]
+
+    assert property_schema["deprecated"] is True
+    assert property_schema["const"] == 0
 
 
 def test_segment_assignment_api_allows_empty_json_body_to_reach_service() -> None:
@@ -267,15 +300,39 @@ class FakeAssignmentService:
             ann_candidate_limit=50,
             ann_candidate_count=1,
             exact_reranked_pair_count=1,
+            page_count=1,
+            processed_user_count=1,
             assignment_count=1,
+            insert_conflict_count=0,
+            segment_assignment_counts={"seg_family_trip": 1},
             batch_has_fallback=False,
             fallback_count=0,
+            fallback_rate=0.0,
+            fallback_reason_counts={
+                "below_threshold": 0,
+                "no_candidate": 0,
+                "invalid_user_vector": 0,
+            },
             below_threshold_fallback_count=0,
             no_candidate_fallback_count=0,
             invalid_user_vector_fallback_count=0,
+            similarity_score_buckets={
+                "not_available": 0,
+                "lt_0_00": 0,
+                "0_00_to_0_50": 0,
+                "0_50_to_0_65": 0,
+                "0_65_to_0_80": 0,
+                "0_80_to_0_90": 0,
+                "gte_0_90": 1,
+            },
             ann_underfilled_user_count=0,
+            ann_applied=True,
+            ann_not_applied_reason=None,
             skipped_existing_count=0,
             insufficient_segment_count=0,
+            completion_scope="current_request",
+            assignment_mode="explicit_user_ids",
+            input_stability="not_snapshotted",
             status="completed",
         )
 
@@ -304,7 +361,15 @@ class RecordingCursor:
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
         if "insert into user_segment_assignments" in sql:
-            return [{"id": 1}]
+            return [
+                {
+                    "user_id": "user_001",
+                    "segment_id": "seg_family_trip",
+                    "fallback": False,
+                    "fallback_reason": None,
+                    "similarity_score": Decimal("1.000000"),
+                }
+            ]
         if "from ad_experiments" in sql:
             return [
                 ad_experiment_row("seg_family_trip"),

@@ -287,6 +287,15 @@ class UserSegmentAssignmentWrite:
 
 
 @dataclass(frozen=True)
+class UserSegmentAssignmentInsertRecord:
+    user_id: str
+    segment_id: str
+    fallback: bool
+    fallback_reason: str | None
+    similarity_score: Decimal | None
+
+
+@dataclass(frozen=True)
 class PromotionEvaluationWrite:
     evaluation_id: str
     project_id: str
@@ -400,14 +409,16 @@ class PromotionRunWriter(Protocol):
         ...
 
 
-class AdExperimentWriter(Protocol):
+class AdExperimentReader(Protocol):
+    def list_by_run(self, promotion_run_id: str) -> list[AdExperimentRecord]:
+        ...
+
+
+class AdExperimentWriter(AdExperimentReader, Protocol):
     def get_by_id(self, ad_experiment_id: str) -> AdExperimentRecord | None:
         ...
 
     def insert_many(self, experiments: Sequence[AdExperimentWrite]) -> None:
-        ...
-
-    def list_by_run(self, promotion_run_id: str) -> list[AdExperimentRecord]:
         ...
 
     def exists_for_run_segment(
@@ -497,15 +508,10 @@ class UserSegmentAssignmentWriter(Protocol):
     ) -> set[str]:
         ...
 
-    def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
-        ...
-
-    def count_by_run_segments(
+    def insert_many(
         self,
-        *,
-        promotion_run_id: str,
-        segment_ids: Sequence[str],
-    ) -> dict[str, int]:
+        assignments: Sequence[UserSegmentAssignmentWrite],
+    ) -> list[UserSegmentAssignmentInsertRecord]:
         ...
 
 
@@ -1233,8 +1239,11 @@ class UserSegmentAssignmentRepository:
         )
         return {str(row["user_id"]) for row in rows}
 
-    def insert_many(self, assignments: Sequence[UserSegmentAssignmentWrite]) -> int:
-        inserted_count = 0
+    def insert_many(
+        self,
+        assignments: Sequence[UserSegmentAssignmentWrite],
+    ) -> list[UserSegmentAssignmentInsertRecord]:
+        inserted_records: list[UserSegmentAssignmentInsertRecord] = []
         for chunk in _chunks(assignments, self.INSERT_BATCH_SIZE):
             rows = self._db.fetchall(
                 """
@@ -1317,7 +1326,12 @@ class UserSegmentAssignmentRepository:
                 FROM assignment_rows
                 ORDER BY row_ordinal ASC
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
-                RETURNING id
+                RETURNING
+                    user_id,
+                    segment_id,
+                    fallback,
+                    fallback_reason,
+                    similarity_score
                 """,
                 (
                     [assignment.project_id for assignment in chunk],
@@ -1335,34 +1349,21 @@ class UserSegmentAssignmentRepository:
                     [assignment.expires_at for assignment in chunk],
                 ),
             )
-            inserted_count += len(rows)
-        return inserted_count
-
-    def count_by_run_segments(
-        self,
-        *,
-        promotion_run_id: str,
-        segment_ids: Sequence[str],
-    ) -> dict[str, int]:
-        if not segment_ids:
-            return {}
-
-        rows = self._db.fetchall(
-            """
-            SELECT
-                segment_id,
-                count(*) AS assigned_user_count
-            FROM user_segment_assignments
-            WHERE promotion_run_id = %s
-              AND segment_id = ANY(%s)
-            GROUP BY segment_id
-            """,
-            (promotion_run_id, list(segment_ids)),
-        )
-        return {
-            str(row["segment_id"]): int(row["assigned_user_count"])
-            for row in rows
-        }
+            inserted_records.extend(
+                UserSegmentAssignmentInsertRecord(
+                    user_id=str(row["user_id"]),
+                    segment_id=str(row["segment_id"]),
+                    fallback=bool(row["fallback"]),
+                    fallback_reason=(
+                        str(row["fallback_reason"])
+                        if row["fallback_reason"] is not None
+                        else None
+                    ),
+                    similarity_score=row["similarity_score"],
+                )
+                for row in rows
+            )
+        return inserted_records
 
 
 class UserBehaviorVectorRepository:

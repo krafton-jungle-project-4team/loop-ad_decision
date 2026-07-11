@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterator, Mapping, Sequence
@@ -23,18 +23,17 @@ from app.decision.matcher import (
 )
 from app.decision.repositories import (
     AdExperimentRecord,
-    AdExperimentWriter,
+    AdExperimentReader,
     PromotionRunWriter,
-    PromotionTargetSegmentReader,
     SegmentVectorReader,
     SegmentVectorRecord,
     UserBehaviorVectorRecord,
     UserBehaviorVectorReader,
+    UserSegmentAssignmentInsertRecord,
     UserSegmentAssignmentWrite,
     UserSegmentAssignmentWriter,
 )
 from app.decision.schemas import (
-    AdExperimentStatus,
     AssignmentSource,
     SegmentAssignmentBuildRequest,
     SegmentAssignmentBuildResponse,
@@ -42,11 +41,28 @@ from app.decision.schemas import (
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
-INSUFFICIENT_REASON_STATUS = AdExperimentStatus.INSUFFICIENT_DATA.value
 MATCHING_MODE = "pgvector_hnsw_rerank"
 ASSIGNMENT_PAGE_SIZE = 10_000
 DEFAULT_VECTOR_VERSION = "v1"
 AUDIENCE_SCOPE_BASE = "user_behavior_vectors"
+ASSIGNMENT_MODE_LIVE_KEYSET = "live_keyset"
+ASSIGNMENT_MODE_EXPLICIT_USER_IDS = "explicit_user_ids"
+ANN_NOT_APPLIED_NO_USERS = "no_users_to_match"
+ANN_NOT_APPLIED_NO_VALID_VECTORS = "no_valid_user_vectors"
+FALLBACK_REASON_KEYS = (
+    FALLBACK_REASON_BELOW_THRESHOLD,
+    FALLBACK_REASON_NO_CANDIDATE,
+    FALLBACK_REASON_INVALID_USER_VECTOR,
+)
+SIMILARITY_BUCKET_KEYS = (
+    "not_available",
+    "lt_0_00",
+    "0_00_to_0_50",
+    "0_50_to_0_65",
+    "0_65_to_0_80",
+    "0_80_to_0_90",
+    "gte_0_90",
+)
 
 
 class SegmentAssignmentRunNotFoundError(Exception):
@@ -77,6 +93,7 @@ class _BuildMatchResult:
     ann_candidate_count: int
     exact_reranked_pair_count: int
     ann_underfilled_user_count: int
+    ann_query_user_count: int
 
     @property
     def fallback_count(self) -> int:
@@ -100,30 +117,92 @@ class _BuildMatchResult:
 
 @dataclass
 class _BuildDiagnostics:
+    page_count: int = 0
+    processed_user_count: int = 0
+    users_to_match_count: int = 0
     ann_candidate_count: int = 0
     exact_reranked_pair_count: int = 0
-    assignment_count: int = 0
-    batch_has_fallback: bool = False
-    fallback_count: int = 0
-    below_threshold_fallback_count: int = 0
-    no_candidate_fallback_count: int = 0
-    invalid_user_vector_fallback_count: int = 0
     ann_underfilled_user_count: int = 0
+    ann_applied: bool = False
+    assignment_count: int = 0
+    insert_conflict_count: int = 0
+    segment_assignment_counts: dict[str, int] = field(default_factory=dict)
+    fallback_count: int = 0
+    fallback_reason_counts: dict[str, int] = field(
+        default_factory=lambda: {reason: 0 for reason in FALLBACK_REASON_KEYS}
+    )
+    similarity_score_buckets: dict[str, int] = field(
+        default_factory=lambda: {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
+    )
     skipped_existing_count: int = 0
 
-    def accumulate_matches(self, result: _BuildMatchResult) -> None:
+    def accumulate_page(
+        self,
+        *,
+        processed_user_count: int,
+        users_to_match_count: int,
+        skipped_existing_count: int,
+    ) -> None:
+        self.page_count += 1
+        self.processed_user_count += processed_user_count
+        self.users_to_match_count += users_to_match_count
+        self.skipped_existing_count += skipped_existing_count
+
+    def accumulate_matching(self, result: _BuildMatchResult) -> None:
         self.ann_candidate_count += result.ann_candidate_count
         self.exact_reranked_pair_count += result.exact_reranked_pair_count
-        self.batch_has_fallback = (
-            self.batch_has_fallback or result.fallback_count > 0
-        )
-        self.fallback_count += result.fallback_count
-        self.below_threshold_fallback_count += result.below_threshold_fallback_count
-        self.no_candidate_fallback_count += result.no_candidate_fallback_count
-        self.invalid_user_vector_fallback_count += (
-            result.invalid_user_vector_fallback_count
-        )
         self.ann_underfilled_user_count += result.ann_underfilled_user_count
+        self.ann_applied = self.ann_applied or result.ann_query_user_count > 0
+
+    def accumulate_inserted(
+        self,
+        *,
+        attempted_count: int,
+        inserted_records: Sequence[UserSegmentAssignmentInsertRecord],
+    ) -> None:
+        inserted_count = len(inserted_records)
+        if inserted_count > attempted_count:
+            raise SegmentAssignmentValidationError(
+                "inserted assignment count exceeded attempted count"
+            )
+
+        self.assignment_count += inserted_count
+        self.insert_conflict_count += attempted_count - inserted_count
+        for record in inserted_records:
+            self.segment_assignment_counts[record.segment_id] = (
+                self.segment_assignment_counts.get(record.segment_id, 0) + 1
+            )
+            if record.fallback:
+                self.fallback_count += 1
+                if record.fallback_reason in self.fallback_reason_counts:
+                    self.fallback_reason_counts[record.fallback_reason] += 1
+            bucket = _similarity_score_bucket(record.similarity_score)
+            self.similarity_score_buckets[bucket] += 1
+
+    @property
+    def fallback_rate(self) -> float | None:
+        if self.assignment_count == 0:
+            return None
+        return round(self.fallback_count / self.assignment_count, 6)
+
+    @property
+    def ann_not_applied_reason(self) -> str | None:
+        if self.ann_applied:
+            return None
+        if self.users_to_match_count == 0:
+            return ANN_NOT_APPLIED_NO_USERS
+        return ANN_NOT_APPLIED_NO_VALID_VECTORS
+
+    def validate_totals(self) -> None:
+        expected_processed_count = (
+            self.skipped_existing_count
+            + self.assignment_count
+            + self.insert_conflict_count
+        )
+        if self.processed_user_count != expected_processed_count:
+            raise SegmentAssignmentValidationError(
+                "assignment diagnostics totals are inconsistent"
+            )
 
 
 class SegmentAssignmentService:
@@ -131,8 +210,7 @@ class SegmentAssignmentService:
         self,
         *,
         promotion_run_repository: PromotionRunWriter,
-        ad_experiment_repository: AdExperimentWriter,
-        promotion_target_segment_repository: PromotionTargetSegmentReader,
+        ad_experiment_repository: AdExperimentReader,
         segment_vector_repository: SegmentVectorReader,
         user_behavior_vector_repository: UserBehaviorVectorReader,
         user_segment_assignment_repository: UserSegmentAssignmentWriter,
@@ -140,7 +218,6 @@ class SegmentAssignmentService:
     ) -> None:
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
-        self._promotion_target_segment_repository = promotion_target_segment_repository
         self._segment_vector_repository = segment_vector_repository
         self._user_behavior_vector_repository = user_behavior_vector_repository
         self._user_segment_assignment_repository = user_segment_assignment_repository
@@ -173,7 +250,6 @@ class SegmentAssignmentService:
         )
         log.info("promotion_run_loaded", {"promotionRun": run})
 
-        min_sample_size = _extract_min_sample_size(run.goal_snapshot_json)
         audience_scope = _build_effective_audience_scope(
             goal_snapshot_json=run.goal_snapshot_json,
             request=request,
@@ -208,6 +284,8 @@ class SegmentAssignmentService:
             ),
             start=1,
         ):
+            if not eligible_users:
+                continue
             log.info(
                 "eligible_users_page_loaded",
                 {
@@ -221,12 +299,16 @@ class SegmentAssignmentService:
                     user_ids=[user.user_id for user in eligible_users],
                 )
             )
-            diagnostics.skipped_existing_count += len(existing_user_ids)
             users_to_match = [
                 user
                 for user in eligible_users
                 if user.user_id not in existing_user_ids
             ]
+            diagnostics.accumulate_page(
+                processed_user_count=len(eligible_users),
+                users_to_match_count=len(users_to_match),
+                skipped_existing_count=len(existing_user_ids),
+            )
             if existing_user_ids:
                 log.info(
                     "existing_assignments_skipped",
@@ -280,37 +362,29 @@ class SegmentAssignmentService:
                 assigned_at=assigned_at,
                 expires_in_days=request.expires_in_days,
             )
-            inserted_count = self._user_segment_assignment_repository.insert_many(
-                assignments
+            inserted_records = (
+                self._user_segment_assignment_repository.insert_many(assignments)
             )
-            diagnostics.assignment_count += inserted_count
-            diagnostics.accumulate_matches(build_result)
+            diagnostics.accumulate_matching(build_result)
+            diagnostics.accumulate_inserted(
+                attempted_count=len(assignments),
+                inserted_records=inserted_records,
+            )
             log.info(
                 "segment_assignments_page_created",
                 {
                     "pageNumber": page_number,
-                    "assignmentCount": inserted_count,
+                    "assignmentCount": len(inserted_records),
+                    "insertConflictCount": len(assignments) - len(inserted_records),
                 },
             )
 
-        # #193 keeps the assignment-count readiness behavior for response
-        # compatibility. #194 will move readiness to evaluation event samples.
-        segment_counts = (
-            self._user_segment_assignment_repository.count_by_run_segments(
-                promotion_run_id=run.promotion_run_id,
-                segment_ids=[
-                    experiment.segment_id for experiment in experiments.non_fallback
-                ],
-            )
+        diagnostics.validate_totals()
+        assignment_mode = (
+            ASSIGNMENT_MODE_EXPLICIT_USER_IDS
+            if audience_scope.user_ids is not None
+            else ASSIGNMENT_MODE_LIVE_KEYSET
         )
-        insufficient_count = self._mark_insufficient_segments(
-            analysis_id=run.analysis_id,
-            experiments=experiments.non_fallback,
-            segment_counts=segment_counts,
-            min_sample_size=min_sample_size,
-        )
-        if insufficient_count:
-            log.info("segments_marked_insufficient", {"insufficientSegmentCount": insufficient_count})
 
         response = SegmentAssignmentBuildResponse(
             promotion_run_id=run.promotion_run_id,
@@ -319,20 +393,42 @@ class SegmentAssignmentService:
             ann_candidate_limit=ANN_CANDIDATE_LIMIT,
             ann_candidate_count=diagnostics.ann_candidate_count,
             exact_reranked_pair_count=diagnostics.exact_reranked_pair_count,
+            page_count=diagnostics.page_count,
+            processed_user_count=diagnostics.processed_user_count,
             assignment_count=diagnostics.assignment_count,
-            batch_has_fallback=diagnostics.batch_has_fallback,
+            insert_conflict_count=diagnostics.insert_conflict_count,
+            segment_assignment_counts=diagnostics.segment_assignment_counts,
+            batch_has_fallback=diagnostics.fallback_count > 0,
             fallback_count=diagnostics.fallback_count,
+            fallback_rate=diagnostics.fallback_rate,
+            fallback_reason_counts=diagnostics.fallback_reason_counts,
             below_threshold_fallback_count=(
-                diagnostics.below_threshold_fallback_count
+                diagnostics.fallback_reason_counts[
+                    FALLBACK_REASON_BELOW_THRESHOLD
+                ]
             ),
-            no_candidate_fallback_count=diagnostics.no_candidate_fallback_count,
+            no_candidate_fallback_count=diagnostics.fallback_reason_counts[
+                FALLBACK_REASON_NO_CANDIDATE
+            ],
             invalid_user_vector_fallback_count=(
-                diagnostics.invalid_user_vector_fallback_count
+                diagnostics.fallback_reason_counts[
+                    FALLBACK_REASON_INVALID_USER_VECTOR
+                ]
             ),
+            similarity_score_buckets=diagnostics.similarity_score_buckets,
             ann_underfilled_user_count=diagnostics.ann_underfilled_user_count,
+            ann_applied=diagnostics.ann_applied,
+            ann_not_applied_reason=diagnostics.ann_not_applied_reason,
             skipped_existing_count=diagnostics.skipped_existing_count,
-            insufficient_segment_count=insufficient_count,
+            insufficient_segment_count=0,
+            completion_scope="current_request",
+            assignment_mode=assignment_mode,
+            input_stability="not_snapshotted",
             status="completed",
+        )
+        log.info(
+            "assignment_diagnostics",
+            {"diagnostics": response.model_dump(mode="json")},
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
@@ -407,6 +503,7 @@ class SegmentAssignmentService:
             ann_candidate_count=ann_candidate_count,
             exact_reranked_pair_count=exact_reranked_pair_count,
             ann_underfilled_user_count=ann_underfilled_user_count,
+            ann_query_user_count=len(normalized_users),
         )
 
     def _load_segment_vectors(
@@ -508,33 +605,6 @@ class SegmentAssignmentService:
                     return
             if page_count < page_size:
                 return
-
-    def _mark_insufficient_segments(
-        self,
-        *,
-        analysis_id: str,
-        experiments: Sequence[AdExperimentRecord],
-        segment_counts: Mapping[str, int],
-        min_sample_size: int,
-    ) -> int:
-        insufficient_count = 0
-        for experiment in experiments:
-            assigned_user_count = segment_counts.get(experiment.segment_id, 0)
-            if assigned_user_count >= min_sample_size:
-                continue
-
-            insufficient_count += 1
-            self._ad_experiment_repository.update_status(
-                ad_experiment_id=experiment.ad_experiment_id,
-                status=INSUFFICIENT_REASON_STATUS,
-            )
-            self._promotion_target_segment_repository.update_status(
-                analysis_id=analysis_id,
-                segment_id=experiment.segment_id,
-                status=INSUFFICIENT_REASON_STATUS,
-            )
-        return insufficient_count
-
 
 def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _ExperimentSet:
     if not experiments:
@@ -809,29 +879,6 @@ def _build_assignment_writes(
     return assignments
 
 
-def _extract_min_sample_size(snapshot: Mapping[str, Any]) -> int:
-    if "min_sample_size" not in snapshot:
-        raise SegmentAssignmentValidationError(
-            "goal_snapshot_json.min_sample_size is required"
-        )
-    value = snapshot["min_sample_size"]
-    if isinstance(value, bool):
-        raise SegmentAssignmentValidationError(
-            "goal_snapshot_json.min_sample_size must be an integer"
-        )
-    try:
-        min_sample_size = int(value)
-    except (TypeError, ValueError) as exc:
-        raise SegmentAssignmentValidationError(
-            "goal_snapshot_json.min_sample_size must be an integer"
-        ) from exc
-    if min_sample_size < 0:
-        raise SegmentAssignmentValidationError(
-            "goal_snapshot_json.min_sample_size must not be negative"
-        )
-    return min_sample_size
-
-
 def _segment_vector_from_record(
     record: SegmentVectorRecord,
     *,
@@ -876,3 +923,19 @@ def _score_to_decimal(score: float | None) -> Decimal | None:
         Decimal("0.000001"),
         rounding=ROUND_HALF_UP,
     )
+
+
+def _similarity_score_bucket(score: Decimal | None) -> str:
+    if score is None:
+        return "not_available"
+    if score < Decimal("0.00"):
+        return "lt_0_00"
+    if score < Decimal("0.50"):
+        return "0_00_to_0_50"
+    if score < Decimal("0.65"):
+        return "0_50_to_0_65"
+    if score < Decimal("0.80"):
+        return "0_65_to_0_80"
+    if score < Decimal("0.90"):
+        return "0_80_to_0_90"
+    return "gte_0_90"
