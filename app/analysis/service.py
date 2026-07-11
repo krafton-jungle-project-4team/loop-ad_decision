@@ -481,7 +481,17 @@ class PromotionAnalysisService:
             promotion_id=request.promotion_id,
         )
         log.info("segment_definitions_loaded", {"segmentDefinitionCount": len(segment_definitions)})
-        suggested_segment_definitions = self._suggest_segment_definitions(promotion)
+        suggested_segment_definitions: list[SegmentDefinitionRecord] = []
+        if next_loop_context is None:
+            suggested_segment_definitions = self._suggest_segment_definitions(promotion)
+        else:
+            log.info(
+                "segment_suggestion_refresh_skipped",
+                {
+                    "reason": "next_loop_focus",
+                    "focusSegmentIds": list(focus_segment_ids or ()),
+                },
+            )
         if suggested_segment_definitions:
             self._segment_definition_repository.save_ai_suggested(
                 suggested_segment_definitions

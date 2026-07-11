@@ -476,6 +476,68 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
     ]
 
 
+def test_service_keeps_stored_ai_focus_segment_when_rank_changes() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    stored_segment_id = (
+        "seg_ai_raw_promo_onsite_banner_001_1_"
+        "target_destination_affinity_membership"
+    )
+    refreshed_segment_id = (
+        "seg_ai_raw_promo_onsite_banner_001_2_"
+        "target_destination_affinity_membership"
+    )
+    stored_segment = replace(
+        segment_record(
+            stored_segment_id,
+            source="ai_suggested",
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    refreshed_segment = replace(
+        segment_record(
+            refreshed_segment_id,
+            source="ai_suggested",
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["user_101", "user_102"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    suggester = FakeSegmentSuggester([refreshed_segment])
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stored_segment, *default_segments()],
+        segment_suggester=suggester,
+    )
+
+    result = service.analyze_focus(
+        NextLoopFocusAnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=[stored_segment_id],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_failed_ad_experiment_ids=["adexp_target_affinity_001"],
+            operator_instruction=None,
+        ),
+    )
+
+    assert segment_ids(result.target_segments) == [stored_segment_id]
+    assert suggester.calls == []
+    assert segment_definition_repository.saved_ai_suggested == []
+    assert result.analysis.input_snapshot_json["focus_segment_ids"] == [
+        stored_segment_id
+    ]
+
+
 def test_service_populates_segment_vector_ids_when_vector_service_is_configured() -> None:
     promotion = promotion_record(channel="onsite_banner")
     vector_service = FakeSegmentVectorService()
