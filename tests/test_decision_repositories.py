@@ -1214,7 +1214,8 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_inflow_rate(
-        ad_experiment_record(goal_metric=GoalMetric.INFLOW_RATE.value)
+        ad_experiment_record(goal_metric=GoalMetric.INFLOW_RATE.value),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 4
@@ -1229,10 +1230,14 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     assert "project_id = {project_id:string}" in sql
     assert "promotion_run_id = {promotion_run_id:string}" in sql
     assert "ad_experiment_id = {ad_experiment_id:string}" in sql
+    assert "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_family_trip_001",
+        "evaluation_cutoff_at": datetime(
+            2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC
+        ),
     }
 
 
@@ -1241,7 +1246,8 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
-        ad_experiment_record(goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value)
+        ad_experiment_record(goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 0
@@ -1254,11 +1260,17 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
     assert "denominator_event_name:string" in sql
     assert "promotion_run_id is not null" in sql
     assert "ad_experiment_id is not null" in sql
+    assert sql.count(
+        "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}"
+    ) == 2
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
         "ad_experiment_id": "adexp_family_trip_001",
         "denominator_event_name": "promotion_click",
+        "evaluation_cutoff_at": datetime(
+            2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC
+        ),
     }
 
 
@@ -1270,7 +1282,8 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
         ad_experiment_record(
             goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
             channel=Channel.EMAIL.value,
-        )
+        ),
+        evaluation_cutoff_at=datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC),
     )
 
     assert counts.numerator_count == 1

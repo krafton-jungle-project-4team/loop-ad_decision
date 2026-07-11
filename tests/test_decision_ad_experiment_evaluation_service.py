@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -8,6 +9,7 @@ from app.decision.evaluation_service import (
     AdExperimentEvaluationNotFoundError,
     AdExperimentEvaluationService,
     AdExperimentEvaluationValidationError,
+    EvaluationContext,
 )
 from app.decision.repositories import (
     AdExperimentRecord,
@@ -46,7 +48,6 @@ def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
         ad_experiment_id="adexp_family_trip_001",
         request=AdExperimentEvaluateRequest(),
     )
-
     assert response.metric == GoalMetric.INFLOW_RATE
     assert response.promotion_id == "promo_banner_001"
     assert response.segment_id == "seg_family_trip"
@@ -65,6 +66,8 @@ def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
         "numerator": "campaign_landing",
         "denominator": "campaign_redirect_click",
     }
+    assert inserted.result_json["evaluation_mode"] == "target_threshold"
+    assert inserted.result_json["evaluation_scope"] == "ad_experiment"
     assert repos.experiments.status_updates == [
         ("adexp_family_trip_001", AdExperimentStatus.GOAL_MET.value)
     ]
@@ -229,6 +232,80 @@ def test_ad_experiment_evaluation_maps_missing_experiment() -> None:
         )
 
 
+def test_ad_experiment_evaluation_uses_fixed_context_and_serializes_utc_ms() -> None:
+    repos = FakeEvaluationRepos()
+    service = make_service(repos)
+    context = EvaluationContext(
+        evaluation_cutoff_at=datetime(
+            2026,
+            7,
+            10,
+            12,
+            34,
+            56,
+            567890,
+            tzinfo=UTC,
+        ),
+        window_start=datetime(
+            2026,
+            7,
+            9,
+            12,
+            34,
+            56,
+            123456,
+            tzinfo=UTC,
+        ),
+        evaluator_version="evaluator-test-v1",
+        metric_sql_version="metric-sql-test-v1",
+    )
+
+    evaluation = service.evaluate_with_context(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+        context=context,
+    )
+
+    assert repos.metrics.cutoffs == [
+        datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
+    ]
+    assert evaluation.result_json["evaluation_cutoff_at"] == (
+        "2026-07-10T12:34:56.567Z"
+    )
+    assert evaluation.result_json["window_start"] == "2026-07-09T12:34:56.123Z"
+    assert evaluation.result_json["evaluator_version"] == "evaluator-test-v1"
+    assert evaluation.result_json["metric_sql_version"] == "metric-sql-test-v1"
+
+
+def test_evaluation_context_rejects_naive_datetime() -> None:
+    with pytest.raises(ValueError, match="timezone-aware"):
+        EvaluationContext(evaluation_cutoff_at=datetime(2026, 7, 10))
+
+
+@pytest.mark.parametrize(
+    "counts",
+    [
+        MetricCountRecord(numerator_count=-1, denominator_count=10),
+        MetricCountRecord(numerator_count=1, denominator_count=-1),
+        MetricCountRecord(numerator_count=11, denominator_count=10),
+    ],
+)
+def test_ad_experiment_evaluation_rejects_invalid_counts_without_writes(
+    counts: MetricCountRecord,
+) -> None:
+    repos = FakeEvaluationRepos(counts=counts)
+    service = make_service(repos)
+
+    with pytest.raises(AdExperimentEvaluationValidationError, match="metric"):
+        service.evaluate(
+            ad_experiment_id="adexp_family_trip_001",
+            request=AdExperimentEvaluateRequest(),
+        )
+
+    assert repos.evaluations.inserted == []
+    assert repos.experiments.status_updates == []
+
+
 def make_service(repos: "FakeEvaluationRepos") -> AdExperimentEvaluationService:
     return AdExperimentEvaluationService(
         ad_experiment_repository=repos.experiments,
@@ -297,14 +374,24 @@ class FakePromotionEvaluationRepository:
 class FakeEvaluationMetricRepository:
     def __init__(self, counts: MetricCountRecord) -> None:
         self.counts = counts
+        self.cutoffs: list[datetime] = []
 
-    def count_inflow_rate(self, _experiment: AdExperimentRecord) -> MetricCountRecord:
+    def count_inflow_rate(
+        self,
+        _experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
+    ) -> MetricCountRecord:
+        self.cutoffs.append(evaluation_cutoff_at)
         return self.counts
 
     def count_booking_conversion_rate(
         self,
         _experiment: AdExperimentRecord,
+        *,
+        evaluation_cutoff_at: datetime,
     ) -> MetricCountRecord:
+        self.cutoffs.append(evaluation_cutoff_at)
         return self.counts
 
 

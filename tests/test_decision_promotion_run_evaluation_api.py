@@ -148,7 +148,7 @@ def test_promotion_run_evaluation_api_wires_repositories_and_commits(
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
     assert any("from ad_experiments" in query for query in executed_sql)
-    assert any("from promotion_evaluations" in query for query in executed_sql)
+    assert not any("from promotion_evaluations" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
     assert any("update promotion_runs" in query for query in executed_sql)
 
@@ -193,6 +193,47 @@ def test_promotion_run_evaluation_api_rolls_back_and_closes_on_failure(
     assert clickhouse_clients[0].close_count == 1
 
 
+def test_promotion_run_metric_guard_rolls_back_partial_request(monkeypatch) -> None:
+    experiments = default_ad_experiment_rows()
+    experiments.append(
+        {
+            **experiments[0],
+            "ad_experiment_id": "adexp_luxury_001",
+            "segment_id": "seg_luxury",
+            "segment_name": "Luxury hotel",
+            "content_id": "content_luxury_001",
+        }
+    )
+    connection = RecordingConnection(ad_experiment_rows=experiments)
+    clickhouse_client = RecordingClickHouseClient(rows=[(4, 10), (11, 10)])
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/evaluate",
+        json={},
+    )
+
+    assert response.status_code == 422
+    assert "numerator_count" in response.json()["detail"]
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert sum("insert into promotion_evaluations" in query for query in executed_sql) == 1
+    assert sum("update ad_experiments" in query for query in executed_sql) == 1
+    assert not any("update promotion_runs" in query for query in executed_sql)
+    cutoffs = [parameters["evaluation_cutoff_at"] for _query, parameters in clickhouse_client.queries]
+    assert len(set(cutoffs)) == 1
+
+
 class FakePromotionRunEvaluationService:
     def __init__(self, exc: Exception | None = None) -> None:
         self.exc = exc
@@ -235,6 +276,7 @@ class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
         self._last_query = ""
+        self._last_params: Any = None
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -244,12 +286,23 @@ class RecordingCursor:
 
     def execute(self, query: str, params: Any = None) -> None:
         self._last_query = query
+        self._last_params = params
         self._connection.executed.append((query, params))
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
         if "from promotion_runs" in sql:
             return self._connection.promotion_run_row
+        if "from ad_experiments" in sql:
+            ad_experiment_id = self._last_params[0]
+            return next(
+                (
+                    row
+                    for row in self._connection.ad_experiment_rows
+                    if row["ad_experiment_id"] == ad_experiment_id
+                ),
+                None,
+            )
         return None
 
     def fetchall(self) -> list[dict[str, object]]:
@@ -266,13 +319,14 @@ class RecordingConnection:
         self,
         *,
         promotion_run_row: dict[str, object] | None | object = DEFAULT_ROW,
+        ad_experiment_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self.promotion_run_row = (
             default_promotion_run_row()
             if promotion_run_row is DEFAULT_ROW
             else promotion_run_row
         )
-        self.ad_experiment_rows = default_ad_experiment_rows()
+        self.ad_experiment_rows = ad_experiment_rows or default_ad_experiment_rows()
         self.evaluation_rows = default_evaluation_rows()
         self.executed: list[tuple[str, Any]] = []
         self.commit_count = 0
@@ -294,8 +348,14 @@ class RecordingConnection:
 
 
 class RecordingClickHouseClient:
-    def __init__(self) -> None:
+    def __init__(self, rows: list[tuple[int, int]] | None = None) -> None:
         self.close_count = 0
+        self.queries: list[tuple[str, Any]] = []
+        self.rows = list(rows or [(4, 10)])
+
+    def query(self, query: str, parameters: Any = None) -> object:
+        self.queries.append((query, parameters))
+        return type("Result", (), {"result_rows": [self.rows.pop(0)]})()
 
     def close(self) -> None:
         self.close_count += 1
