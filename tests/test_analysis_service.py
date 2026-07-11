@@ -16,7 +16,7 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
-from app.analysis.schemas import AnalysisRequest
+from app.analysis.schemas import AnalysisRequest, SegmentAnalysisRequest
 from app.analysis.service import (
     NextLoopFocusAnalysisRequest,
     PromotionAnalysisService,
@@ -455,8 +455,8 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
     assert analysis_repository.events == [
         "analysis",
         "target_segments",
-        "segment_suggestions",
     ]
+    assert result.segment_suggestions == []
     saved_analysis = analysis_repository.saved.analysis
     assert saved_analysis is not None
     assert saved_analysis.focus_segment_ids_json == ["seg_near_checkin"]
@@ -476,15 +476,49 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
     ]
 
 
-def test_service_keeps_stored_ai_focus_segment_when_rank_changes() -> None:
+def test_service_analyzes_requested_segments_without_refreshing_suggestions() -> None:
+    promotion = promotion_record(channel="email")
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_raw_should_not_be_created",
+            source="ai_suggested",
+            rule_json={"candidate_user_ids": ["user_999"]},
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    suggester = FakeSegmentSuggester([fresh_ai_segment])
+    service, analysis_repository, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=suggester,
+    )
+
+    result = service.analyze_segments(
+        SegmentAnalysisRequest(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=["seg_family_trip"],
+        )
+    )
+
+    assert segment_ids(result.target_segments) == ["seg_family_trip"]
+    assert result.segment_suggestions == []
+    assert suggester.calls == []
+    assert segment_definition_repository.saved_ai_suggested == []
+    assert analysis_repository.events == ["analysis", "target_segments"]
+
+
+def test_service_keeps_stored_ai_focus_segment_without_refreshing_suggestions() -> None:
     promotion = promotion_record(channel="onsite_banner")
     stored_segment_id = (
-        "seg_ai_raw_promo_onsite_banner_001_1_"
+        "seg_ai_raw_promo_onsite_banner_001_"
         "target_destination_affinity_membership"
     )
     refreshed_segment_id = (
-        "seg_ai_raw_promo_onsite_banner_001_2_"
-        "target_destination_affinity_membership"
+        "seg_ai_raw_promo_onsite_banner_001_"
+        "benefit_value_seeker_other_membership"
     )
     stored_segment = replace(
         segment_record(

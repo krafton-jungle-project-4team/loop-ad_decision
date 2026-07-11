@@ -62,7 +62,7 @@ def test_analysis_api_wires_real_service_and_commits(monkeypatch) -> None:
     client = TestClient(app)
 
     response = client.post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 
@@ -105,6 +105,58 @@ def test_analysis_api_wires_real_service_and_commits(monkeypatch) -> None:
     )
 
 
+def test_segment_analysis_api_uses_existing_segment_without_recommending(
+    monkeypatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+    clickhouse_clients: list[RecordingClickHouseClient] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
+        client = RecordingClickHouseClient()
+        clickhouse_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "app.analysis.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.analysis.router.create_clickhouse_client",
+        fake_create_clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/analyses",
+        json={**analysis_payload(), "segment_ids": ["seg_family_trip"]},
+    )
+
+    assert response.status_code == 200
+    assert [
+        segment["segment_id"] for segment in response.json()["target_segments"]
+    ] == ["seg_family_trip"]
+    connection = connections[0]
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_analyses" in query for query in executed_sql)
+    assert any("insert into promotion_target_segments" in query for query in executed_sql)
+    assert not any(
+        "insert into promotion_segment_suggestions" in query
+        for query in executed_sql
+    )
+    clickhouse_sql = [
+        compact_sql(query) for query, _parameters in clickhouse_clients[0].queries
+    ]
+    assert not any("from raw_events" in query for query in clickhouse_sql)
+
+
 def test_analysis_api_rolls_back_when_promotion_is_missing(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
     clickhouse_clients: list[RecordingClickHouseClient] = []
@@ -131,7 +183,7 @@ def test_analysis_api_rolls_back_when_promotion_is_missing(monkeypatch) -> None:
     client = TestClient(app)
 
     response = client.post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 
@@ -170,7 +222,7 @@ def test_analysis_api_rolls_back_when_segment_vector_data_is_unavailable(monkeyp
     client = TestClient(app)
 
     response = client.post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json=analysis_payload(),
     )
 

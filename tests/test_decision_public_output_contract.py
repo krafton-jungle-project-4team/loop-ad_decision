@@ -155,7 +155,7 @@ def test_readme_documents_decision_boundary_and_dashboard_serving_path() -> None
 
 
 class FakeAnalysisService:
-    def analyze(self, request: Any) -> PromotionAnalysisResult:
+    def recommend_segments(self, request: Any) -> PromotionAnalysisResult:
         return PromotionAnalysisResult(
             analysis=PromotionAnalysisWrite(
                 analysis_id=f"analysis_{request.promotion_id}",
@@ -218,7 +218,7 @@ def public_payload_text(client: TestClient) -> str:
     payloads.append(health_response.json())
 
     analysis_response = client.post(
-        "/decision/v1/promotions/promo_banner_001/analysis",
+        "/decision/v1/promotions/promo_banner_001/segment-suggestions/recommend",
         json={
             "project_id": "hotel-client-a",
             "campaign_id": "camp_summer_2026",

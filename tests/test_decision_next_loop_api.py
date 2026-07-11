@@ -350,15 +350,15 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     assert content_insert_params["status"] == "approved"
 
 
-def test_next_loop_api_reuses_stored_ai_segment_without_refreshing_rank(
+def test_next_loop_api_reuses_stored_ai_segment_without_recommending_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     stored_segment_id = (
-        "seg_ai_raw_promo_banner_001_1_"
+        "seg_ai_raw_promo_banner_001_"
         "target_destination_affinity_membership"
     )
     connections: list[RecordingConnection] = []
-    clickhouse_client = FakeClickHouseClient(fail_on_segment_refresh=True)
+    clickhouse_client = FakeClickHouseClient(fail_on_recommendation_query=True)
 
     def fake_create_postgres_connection(_settings) -> RecordingConnection:
         connection = RecordingConnection(segment_id=stored_segment_id)
@@ -398,6 +398,10 @@ def test_next_loop_api_reuses_stored_ai_segment_without_refreshing_rank(
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into promotion_analyses" in query for query in executed_sql)
     assert any("insert into promotion_target_segments" in query for query in executed_sql)
+    assert not any(
+        "insert into promotion_segment_suggestions" in query
+        for query in executed_sql
+    )
     assert any("insert into generation_runs" in query for query in executed_sql)
     assert any("insert into promotion_runs" in query for query in executed_sql)
     assert any("insert into ad_experiments" in query for query in executed_sql)
@@ -971,11 +975,11 @@ class FakeClickHouseClient:
         self,
         *,
         user_vector_rows: list[dict[str, object]] | None = None,
-        fail_on_segment_refresh: bool = False,
+        fail_on_recommendation_query: bool = False,
     ) -> None:
         self.close_count = 0
         self.queries: list[str] = []
-        self.fail_on_segment_refresh = fail_on_segment_refresh
+        self.fail_on_recommendation_query = fail_on_recommendation_query
         self.user_vector_rows = (
             user_behavior_vector_rows()
             if user_vector_rows is None
@@ -990,9 +994,9 @@ class FakeClickHouseClient:
         sql = compact_sql(query)
         self.queries.append(sql)
         _ = parameters
-        if self.fail_on_segment_refresh and "from raw_events" in sql:
+        if self.fail_on_recommendation_query and "from raw_events" in sql:
             raise AssertionError(
-                "next-loop focus analysis must not refresh AI segment ranks"
+                "next-loop analysis must not run segment recommendation queries"
             )
         if "from user_behavior_vectors" in sql and "user_id in" in sql:
             return FakeClickHouseResult(self.user_vector_rows)

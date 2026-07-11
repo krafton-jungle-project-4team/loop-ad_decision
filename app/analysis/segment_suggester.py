@@ -901,7 +901,6 @@ def _segment_definition_from_cluster(
     cluster = scored_cluster.cluster
     segment_id = _suggested_segment_id(
         promotion_id=promotion.promotion_id,
-        rank=rank,
         centroid=cluster.centroid,
     )
     sample_size = len(cluster.users)
@@ -1071,20 +1070,18 @@ def _feature_label(index: int) -> str | None:
 def _suggested_segment_id(
     *,
     promotion_id: str,
-    rank: int,
     centroid: Sequence[float],
 ) -> str:
     digest = hashlib.sha1(  # noqa: S324 - stable non-security identifier.
         ":".join(
             [
                 promotion_id,
-                str(rank),
-                ",".join(f"{value:.6f}" for value in centroid[:8]),
+                ",".join(f"{value:.6f}" for value in centroid),
             ]
         ).encode("utf-8")
     ).hexdigest()[:10]
     promotion_part = _safe_identifier_part(promotion_id)[:36]
-    return f"seg_ai_cluster_{promotion_part}_{rank + 1}_{digest}"
+    return f"seg_ai_cluster_{promotion_part}_{digest}"
 
 
 def _safe_identifier_part(value: str) -> str:
