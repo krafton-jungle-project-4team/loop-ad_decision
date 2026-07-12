@@ -150,6 +150,7 @@ def test_promotion_run_evaluation_api_wires_repositories_and_commits(
     assert any("from ad_experiments" in query for query in executed_sql)
     assert not any("from promotion_evaluations" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
+    assert not any("update ad_experiments" in query for query in executed_sql)
     assert any("update promotion_runs" in query for query in executed_sql)
 
 
@@ -228,7 +229,7 @@ def test_promotion_run_metric_guard_rolls_back_partial_request(monkeypatch) -> N
     assert connection.rollback_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert sum("insert into promotion_evaluations" in query for query in executed_sql) == 1
-    assert sum("update ad_experiments" in query for query in executed_sql) == 1
+    assert sum("update ad_experiments" in query for query in executed_sql) == 0
     assert not any("update promotion_runs" in query for query in executed_sql)
     cutoffs = [parameters["evaluation_cutoff_at"] for _query, parameters in clickhouse_client.queries]
     assert len(set(cutoffs)) == 1

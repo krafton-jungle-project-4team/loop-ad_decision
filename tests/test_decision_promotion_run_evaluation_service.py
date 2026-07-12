@@ -110,6 +110,46 @@ def test_promotion_run_evaluation_reevaluates_every_experiment_without_latest_re
     assert repos.evaluations.inserted[0].status == PromotionRunStatus.GOAL_MET.value
 
 
+def test_promotion_run_failed_arrays_use_current_individual_results_only() -> None:
+    repos = FakeRunEvaluationRepos(
+        evaluations=[
+            evaluation_record(
+                ad_experiment_id="adexp_family_trip_001",
+                segment_id="seg_family_trip",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.INSUFFICIENT_DATA.value,
+            ),
+        ],
+    )
+    repos.evaluations.evaluations = [
+        evaluation_record(
+            ad_experiment_id="adexp_family_trip_001",
+            segment_id="seg_family_trip",
+            status=PromotionEvaluationStatus.GOAL_MET.value,
+        ),
+        evaluation_record(
+            ad_experiment_id="adexp_luxury_001",
+            segment_id="seg_luxury",
+            status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+        ),
+    ]
+    service = make_service(repos)
+
+    response = service.evaluate(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=PromotionRunEvaluateRequest(),
+    )
+
+    assert repos.evaluations.latest_calls == []
+    assert response.next_loop_required is True
+    assert response.failed_segment_ids == ["seg_family_trip"]
+    assert response.failed_ad_experiment_ids == ["adexp_family_trip_001"]
+
+
 def test_promotion_run_evaluation_marks_only_insufficient_all_segments() -> None:
     repos = FakeRunEvaluationRepos(
         evaluations=[
