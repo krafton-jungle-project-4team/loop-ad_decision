@@ -396,7 +396,10 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
         segment_record("seg_near_checkin"),
         segment_record("seg_existing_all"),
     ]
-    service, _, _ = build_service(promotion=promotion, segments=segments)
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=segments,
+    )
 
     result = service.analyze(
         analysis_request(promotion_id=promotion.promotion_id),
@@ -409,7 +412,9 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
         "seg_near_checkin",
     ]
     assert result.target_segments[0].priority == "high"
-    assert result.target_segments[0].status == "planned"
+    assert {segment.status for segment in result.target_segments} == {"planned"}
+    assert analysis_repository.saved.target_segments is None
+    assert analysis_repository.events == ["analysis", "segment_suggestions"]
 
 
 def test_service_applies_sms_default_segment_order() -> None:
@@ -452,6 +457,7 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
 
     assert segment_ids(result.target_segments) == ["seg_near_checkin"]
     assert analysis_repository.saved.target_segments == result.target_segments
+    assert {segment.status for segment in result.target_segments} == {"planned"}
     assert analysis_repository.events == [
         "analysis",
         "target_segments",
@@ -504,6 +510,8 @@ def test_service_analyzes_requested_segments_without_refreshing_suggestions() ->
     )
 
     assert segment_ids(result.target_segments) == ["seg_family_trip"]
+    assert {segment.status for segment in result.target_segments} == {"approved"}
+    assert analysis_repository.saved.target_segments == result.target_segments
     assert result.segment_suggestions == []
     assert suggester.calls == []
     assert segment_definition_repository.saved_ai_suggested == []
