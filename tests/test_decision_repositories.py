@@ -6,6 +6,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from psycopg import errors
 
 from app.decision.repositories import (
     AdExperimentRepository,
@@ -13,6 +14,10 @@ from app.decision.repositories import (
     ContentCandidateRepository,
     EvaluationMetricRepository,
     GenerationRunRepository,
+    NextLoopPreparationConflictError,
+    NextLoopPreparationRecord,
+    NextLoopPreparationRepository,
+    NextLoopPreparationWrite,
     PromotionAnalysisRepository,
     PromotionEvaluationRepository,
     PromotionEvaluationRecord,
@@ -49,10 +54,12 @@ class FakePostgresExecutor:
         self,
         *,
         fetchone_result: Mapping[str, Any] | None = None,
+        fetchone_exception: Exception | None = None,
         fetchall_result: list[Mapping[str, Any]] | None = None,
         fetchall_results: list[list[Mapping[str, Any]]] | None = None,
     ) -> None:
         self.fetchone_result = fetchone_result
+        self.fetchone_exception = fetchone_exception
         self.fetchall_result = fetchall_result or []
         self.fetchall_results = list(fetchall_results or [])
         self.calls: list[DbCall] = []
@@ -63,6 +70,8 @@ class FakePostgresExecutor:
         params: Sequence[Any] | Mapping[str, Any] = (),
     ) -> Mapping[str, Any] | None:
         self.calls.append(DbCall("fetchone", query, params))
+        if self.fetchone_exception is not None:
+            raise self.fetchone_exception
         return self.fetchone_result
 
     def fetchall(
@@ -102,8 +111,55 @@ class FakeClickHouseClient:
         return FakeClickHouseResult(self.rows)
 
 
+class _FakeDiag:
+    def __init__(self, constraint_name: str) -> None:
+        self.constraint_name = constraint_name
+
+
+class UniqueViolationWithConstraint(errors.UniqueViolation):
+    def __init__(self, constraint_name: str) -> None:
+        super().__init__("duplicate next-loop preparation")
+        self._constraint_name = constraint_name
+
+    @property
+    def diag(self) -> _FakeDiag:
+        return _FakeDiag(self._constraint_name)
+
+
 def compact_sql(query: str) -> str:
     return " ".join(query.split()).lower()
+
+
+def next_loop_preparation_row(**overrides: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "next_loop_preparation_id": "prep_email_next_loop_01",
+        "source_promotion_run_id": "run_email_a1",
+        "analysis_id": "analysis_email_a2",
+        "generation_id": "generation_email_a2",
+        "attempt_no": 1,
+        "failed_segment_ids_json": ["seg_mobile_user"],
+        "failed_ad_experiment_ids_json": ["exp_email_a1_mobile"],
+        "source_evaluation_ids_json": ["eval_email_a1_goal_not_met"],
+        "status": "awaiting_content_approval",
+        "activated_promotion_run_id": None,
+        "created_at": datetime(2026, 7, 12, 1, 0, tzinfo=UTC),
+        "updated_at": datetime(2026, 7, 12, 1, 0, tzinfo=UTC),
+    }
+    row.update(overrides)
+    return row
+
+
+def next_loop_preparation_write() -> NextLoopPreparationWrite:
+    return NextLoopPreparationWrite(
+        next_loop_preparation_id="prep_email_next_loop_01",
+        source_promotion_run_id="run_email_a1",
+        analysis_id="analysis_email_a2",
+        generation_id="generation_email_a2",
+        attempt_no=1,
+        failed_segment_ids_json=("seg_mobile_user",),
+        failed_ad_experiment_ids_json=("exp_email_a1_mobile",),
+        source_evaluation_ids_json=("eval_email_a1_goal_not_met",),
+    )
 
 
 def test_promotion_repository_get_by_id_includes_b2_goal_and_loop_fields() -> None:
@@ -1213,6 +1269,294 @@ def test_promotion_evaluation_repository_lists_latest_individual_evaluations() -
     assert "select distinct on (ad_experiment_id)" in sql
     assert "order by ad_experiment_id asc, created_at desc, evaluation_id desc" in sql
     assert call.params == ("prun_banner_001_loop_1",)
+
+
+def test_next_loop_preparation_repository_insert_read_round_trip() -> None:
+    inserted_row = next_loop_preparation_row(
+        failed_segment_ids_json=[
+            "seg_mobile_user",
+            "seg_family_trip",
+            "seg_mobile_user",
+        ],
+        failed_ad_experiment_ids_json=[
+            "exp_email_a1_mobile",
+            "exp_email_a1_family",
+        ],
+        source_evaluation_ids_json=[
+            "eval_email_a1_goal_not_met",
+            "eval_email_a1_family_goal_not_met",
+        ],
+    )
+    db = FakePostgresExecutor(fetchone_result=inserted_row)
+    repo = NextLoopPreparationRepository(db)
+    preparation = NextLoopPreparationWrite(
+        next_loop_preparation_id="prep_email_next_loop_01",
+        source_promotion_run_id="run_email_a1",
+        analysis_id="analysis_email_a2",
+        generation_id="generation_email_a2",
+        attempt_no=1,
+        failed_segment_ids_json=(
+            "seg_mobile_user",
+            "seg_family_trip",
+            "seg_mobile_user",
+        ),
+        failed_ad_experiment_ids_json=(
+            "exp_email_a1_mobile",
+            "exp_email_a1_family",
+        ),
+        source_evaluation_ids_json=(
+            "eval_email_a1_goal_not_met",
+            "eval_email_a1_family_goal_not_met",
+        ),
+    )
+
+    inserted = repo.insert(preparation)
+
+    assert inserted == NextLoopPreparationRecord(
+        next_loop_preparation_id="prep_email_next_loop_01",
+        source_promotion_run_id="run_email_a1",
+        analysis_id="analysis_email_a2",
+        generation_id="generation_email_a2",
+        attempt_no=1,
+        failed_segment_ids_json=("seg_family_trip", "seg_mobile_user"),
+        failed_ad_experiment_ids_json=(
+            "exp_email_a1_family",
+            "exp_email_a1_mobile",
+        ),
+        source_evaluation_ids_json=(
+            "eval_email_a1_family_goal_not_met",
+            "eval_email_a1_goal_not_met",
+        ),
+        status="awaiting_content_approval",
+        activated_promotion_run_id=None,
+        created_at=datetime(2026, 7, 12, 1, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 7, 12, 1, 0, tzinfo=UTC),
+    )
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "fetchone"
+    assert "insert into next_loop_preparations" in sql
+    assert "'awaiting_content_approval', null" in sql
+    assert "returning next_loop_preparation_id" in sql
+    assert call.params[:5] == (
+        "prep_email_next_loop_01",
+        "run_email_a1",
+        "analysis_email_a2",
+        "generation_email_a2",
+        1,
+    )
+    assert call.params[5].obj == ["seg_family_trip", "seg_mobile_user"]
+    assert call.params[6].obj == ["exp_email_a1_family", "exp_email_a1_mobile"]
+    assert call.params[7].obj == [
+        "eval_email_a1_family_goal_not_met",
+        "eval_email_a1_goal_not_met",
+    ]
+
+
+def test_next_loop_preparation_repository_gets_active_by_source_run() -> None:
+    db = FakePostgresExecutor(fetchone_result=next_loop_preparation_row())
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.get_active_by_source_run("run_email_a1")
+
+    assert preparation is not None
+    assert preparation.next_loop_preparation_id == "prep_email_next_loop_01"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from next_loop_preparations" in sql
+    assert "where source_promotion_run_id = %s" in sql
+    assert "and status = 'awaiting_content_approval'" in sql
+    assert call.params == ("run_email_a1",)
+
+
+def test_next_loop_preparation_repository_tolerates_json_string_and_tuple_rows(
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(
+            failed_segment_ids_json='["seg_mobile_user", "seg_family_trip", "seg_mobile_user"]',
+            failed_ad_experiment_ids_json=(
+                "exp_email_a1_mobile",
+                "exp_email_a1_family",
+            ),
+            source_evaluation_ids_json='["eval_email_a1_goal_not_met"]',
+        )
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.get_by_id("prep_email_next_loop_01")
+
+    assert preparation is not None
+    assert preparation.failed_segment_ids_json == (
+        "seg_family_trip",
+        "seg_mobile_user",
+    )
+    assert preparation.failed_ad_experiment_ids_json == (
+        "exp_email_a1_family",
+        "exp_email_a1_mobile",
+    )
+    assert preparation.source_evaluation_ids_json == (
+        "eval_email_a1_goal_not_met",
+    )
+    assert preparation.activated_promotion_run_id is None
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "where next_loop_preparation_id = %s" in sql
+    assert call.params == ("prep_email_next_loop_01",)
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("failed_segment_ids_json", "not-json"),
+        ("failed_segment_ids_json", {"segment_id": "seg_mobile_user"}),
+        ("failed_ad_experiment_ids_json", []),
+        ("source_evaluation_ids_json", ["eval_valid", 7]),
+        ("source_evaluation_ids_json", ["   "]),
+    ],
+)
+def test_next_loop_preparation_repository_rejects_invalid_id_set_rows(
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(**{field_name: invalid_value})
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(ValueError, match=field_name):
+        repo.get_by_id("prep_email_next_loop_01")
+
+
+@pytest.mark.parametrize(
+    ("next_attempt_no", "expected"),
+    [(1, 1), (4, 4)],
+)
+def test_next_loop_preparation_repository_gets_next_attempt_no(
+    next_attempt_no: int,
+    expected: int,
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_result={"next_attempt_no": next_attempt_no}
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    result = repo.get_next_attempt_no("run_email_a1")
+
+    assert result == expected
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "coalesce(max(attempt_no), 0) + 1 as next_attempt_no" in sql
+    assert "where source_promotion_run_id = %s" in sql
+    assert call.params == ("run_email_a1",)
+
+
+def test_next_loop_preparation_repository_marks_awaiting_row_rejected() -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(
+            status="rejected",
+            updated_at=datetime(2026, 7, 12, 2, 0, tzinfo=UTC),
+        )
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.mark_rejected("prep_email_next_loop_01")
+
+    assert preparation is not None
+    assert preparation.status == "rejected"
+    assert preparation.activated_promotion_run_id is None
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "update next_loop_preparations" in sql
+    assert "set status = 'rejected'" in sql
+    assert "and status = 'awaiting_content_approval'" in sql
+    assert "updated_at = now()" in sql
+    assert call.params == ("prep_email_next_loop_01",)
+
+
+def test_next_loop_preparation_repository_marks_awaiting_row_activated() -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(
+            status="activated",
+            activated_promotion_run_id="run_email_a2",
+            updated_at=datetime(2026, 7, 12, 2, 0, tzinfo=UTC),
+        )
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.mark_activated(
+        next_loop_preparation_id="prep_email_next_loop_01",
+        activated_promotion_run_id="run_email_a2",
+    )
+
+    assert preparation is not None
+    assert preparation.status == "activated"
+    assert preparation.activated_promotion_run_id == "run_email_a2"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "set status = 'activated'" in sql
+    assert "activated_promotion_run_id = %s" in sql
+    assert "and status = 'awaiting_content_approval'" in sql
+    assert call.params == ("run_email_a2", "prep_email_next_loop_01")
+
+
+def test_next_loop_preparation_repository_does_not_retransition_terminal_row(
+) -> None:
+    db = FakePostgresExecutor(fetchone_result=None)
+    repo = NextLoopPreparationRepository(db)
+
+    rejected = repo.mark_rejected("prep_email_next_loop_01")
+    activated = repo.mark_activated(
+        next_loop_preparation_id="prep_email_next_loop_01",
+        activated_promotion_run_id="run_email_a2",
+    )
+
+    assert rejected is None
+    assert activated is None
+    assert all(
+        "and status = 'awaiting_content_approval'" in compact_sql(call.query)
+        for call in db.calls
+    )
+
+
+@pytest.mark.parametrize(
+    "constraint_name",
+    [
+        "next_loop_preparations_pkey",
+        "uq_next_loop_preparations_source_attempt",
+        "uq_next_loop_preparations_awaiting_source_run",
+    ],
+)
+def test_next_loop_preparation_insert_maps_unique_conflicts(
+    constraint_name: str,
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_exception=UniqueViolationWithConstraint(constraint_name)
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(NextLoopPreparationConflictError) as exc_info:
+        repo.insert(next_loop_preparation_write())
+
+    assert exc_info.value.constraint_name == constraint_name
+    assert constraint_name in str(exc_info.value)
+
+
+def test_next_loop_preparation_activation_maps_activated_run_unique_conflict(
+) -> None:
+    constraint_name = "uq_next_loop_preparations_activated_run"
+    db = FakePostgresExecutor(
+        fetchone_exception=UniqueViolationWithConstraint(constraint_name)
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(NextLoopPreparationConflictError) as exc_info:
+        repo.mark_activated(
+            next_loop_preparation_id="prep_email_next_loop_01",
+            activated_promotion_run_id="run_email_a2",
+        )
+
+    assert exc_info.value.constraint_name == constraint_name
+    assert constraint_name in str(exc_info.value)
 
 
 def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
