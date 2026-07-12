@@ -1,8 +1,14 @@
 from enum import StrEnum
 from decimal import Decimal
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    model_serializer,
+)
 
 
 class Channel(StrEnum):
@@ -59,12 +65,25 @@ class AssignmentSource(StrEnum):
     FIXTURE = "fixture"
 
 
+class ContentApprovalMode(StrEnum):
+    AUTOMATIC = "automatic"
+    MANUAL = "manual"
+
+
+class NextLoopPreparationStatus(StrEnum):
+    AWAITING_CONTENT_APPROVAL = "awaiting_content_approval"
+    ACTIVATED = "activated"
+    REJECTED = "rejected"
+    CANCELLED = "cancelled"
+
+
 class RunCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     analysis_id: str | None = Field(default=None, min_length=1)
     generation_id: str | None = Field(default=None, min_length=1)
     loop_count: int = Field(default=1, ge=1)
+    next_loop_preparation_id: str | None = Field(default=None, min_length=1)
 
 
 class AdExperimentCreateResponse(BaseModel):
@@ -202,15 +221,39 @@ class NextLoopRequest(BaseModel):
     failed_segment_ids: list[str] = Field(default_factory=list)
     failed_ad_experiment_ids: list[str] = Field(default_factory=list)
     operator_instruction: str | None = None
+    content_approval_mode: ContentApprovalMode = ContentApprovalMode.AUTOMATIC
 
 
 class NextLoopResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
+    _ADDITIVE_MANUAL_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {
+            "status",
+            "content_approval_required",
+            "next_loop_preparation_id",
+            "pending_content_ids",
+        }
+    )
+
+    status: NextLoopPreparationStatus | None = None
+    content_approval_required: bool = False
+    next_loop_preparation_id: str | None = Field(default=None, min_length=1)
     previous_promotion_run_id: str = Field(min_length=1)
     next_promotion_run_id: str | None = None
     promotion_id: str = Field(min_length=1)
     loop_count: int = Field(ge=1)
     next_analysis_id: str | None = None
     next_generation_id: str | None = None
+    pending_content_ids: list[str] = Field(default_factory=list)
     next_ad_experiments: list[AdExperimentCreateResponse]
+
+    @model_serializer(mode="wrap")
+    def _serialize_explicit_manual_fields(
+        self,
+        handler: SerializerFunctionWrapHandler,
+    ):
+        serialized = handler(self)
+        for field_name in self._ADDITIVE_MANUAL_FIELDS - self.model_fields_set:
+            serialized.pop(field_name, None)
+        return serialized

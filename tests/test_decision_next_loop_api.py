@@ -18,6 +18,8 @@ from app.decision.schemas import (
     AdExperimentCreateResponse,
     AdExperimentStatus,
     Channel,
+    ContentApprovalMode,
+    NextLoopPreparationStatus,
     NextLoopRequest,
     NextLoopResponse,
     PromotionRunStatus,
@@ -91,9 +93,102 @@ def test_next_loop_api_returns_response_shape() -> None:
     assert [experiment["segment_id"] for experiment in body["next_ad_experiments"]] == [
         "seg_luxury"
     ]
-    assert "status" not in body
+    assert set(body) == {
+        "previous_promotion_run_id",
+        "next_promotion_run_id",
+        "promotion_id",
+        "loop_count",
+        "next_analysis_id",
+        "next_generation_id",
+        "next_ad_experiments",
+    }
     assert isinstance(service.calls[0][1], NextLoopRequest)
     assert service.calls[0][1].operator_instruction == "Emphasize breakfast benefits."
+    assert (
+        service.calls[0][1].content_approval_mode
+        is ContentApprovalMode.AUTOMATIC
+    )
+
+
+def test_next_loop_api_parses_manual_mode_without_changing_automatic_response() -> None:
+    service = FakeNextLoopService()
+    client = make_client(service)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200
+    assert (
+        service.calls[0][1].content_approval_mode is ContentApprovalMode.MANUAL
+    )
+    assert set(response.json()) == {
+        "previous_promotion_run_id",
+        "next_promotion_run_id",
+        "promotion_id",
+        "loop_count",
+        "next_analysis_id",
+        "next_generation_id",
+        "next_ad_experiments",
+    }
+
+
+def test_next_loop_response_serializes_explicit_manual_contract_fields() -> None:
+    response = NextLoopResponse(
+        status=NextLoopPreparationStatus.AWAITING_CONTENT_APPROVAL,
+        content_approval_required=True,
+        next_loop_preparation_id="nlprep_banner_001_loop_2_attempt_1",
+        previous_promotion_run_id="prun_banner_001_loop_1",
+        next_promotion_run_id=None,
+        promotion_id="promo_banner_001",
+        loop_count=2,
+        next_analysis_id="analysis_next_001",
+        next_generation_id="generation_next_001",
+        pending_content_ids=[],
+        next_ad_experiments=[],
+    )
+
+    assert response.model_dump(mode="json") == {
+        "status": "awaiting_content_approval",
+        "content_approval_required": True,
+        "next_loop_preparation_id": "nlprep_banner_001_loop_2_attempt_1",
+        "previous_promotion_run_id": "prun_banner_001_loop_1",
+        "next_promotion_run_id": None,
+        "promotion_id": "promo_banner_001",
+        "loop_count": 2,
+        "next_analysis_id": "analysis_next_001",
+        "next_generation_id": "generation_next_001",
+        "pending_content_ids": [],
+        "next_ad_experiments": [],
+    }
+
+
+def test_next_loop_response_keeps_explicit_manual_default_values() -> None:
+    response = NextLoopResponse(
+        status=NextLoopPreparationStatus.ACTIVATED,
+        content_approval_required=False,
+        next_loop_preparation_id=None,
+        previous_promotion_run_id="prun_banner_001_loop_1",
+        next_promotion_run_id="prun_banner_001_loop_2",
+        promotion_id="promo_banner_001",
+        loop_count=2,
+        next_analysis_id="analysis_next_001",
+        next_generation_id="generation_next_001",
+        pending_content_ids=[],
+        next_ad_experiments=[],
+    )
+
+    serialized = response.model_dump(mode="json")
+
+    assert serialized["status"] == "activated"
+    assert serialized["content_approval_required"] is False
+    assert serialized["next_loop_preparation_id"] is None
+    assert serialized["pending_content_ids"] == []
 
 
 def test_next_loop_api_rejects_extra_body() -> None:
@@ -171,7 +266,12 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     assert body["next_analysis_id"] is None
     assert body["next_generation_id"] is None
     assert body["next_ad_experiments"] == []
-    assert "status" not in body
+    assert {
+        "status",
+        "content_approval_required",
+        "next_loop_preparation_id",
+        "pending_content_ids",
+    }.isdisjoint(body)
     connection = connections[0]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
