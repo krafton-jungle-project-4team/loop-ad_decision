@@ -1228,10 +1228,29 @@ def _analysis_id(
 ) -> str:
     if next_loop_context is None:
         return f"analysis_{promotion_id}_run_{uuid.uuid4().hex[:8]}"
-    return (
-        f"analysis_{_slug_from_promotion_id(promotion_id)}"
-        f"_loop_{next_loop_context.loop_count}"
+    return _bounded_next_loop_lineage_id(
+        prefix="analysis",
+        promotion_id=promotion_id,
+        loop_count=next_loop_context.loop_count,
+        source_promotion_run_id=next_loop_context.source_promotion_run_id,
     )
+
+
+def _bounded_next_loop_lineage_id(
+    *,
+    prefix: str,
+    promotion_id: str,
+    loop_count: int,
+    source_promotion_run_id: str,
+) -> str:
+    lineage_digest = hashlib.sha256(
+        source_promotion_run_id.encode("utf-8")
+    ).hexdigest()[:12]
+    suffix = f"_loop_{loop_count}_{lineage_digest}"
+    max_slug_length = 100 - len(prefix) - len(suffix) - 1
+    promotion_slug = _slug_from_promotion_id(promotion_id)
+    promotion_slug = promotion_slug[:max_slug_length].rstrip("_") or "promotion"
+    return f"{prefix}_{promotion_slug}{suffix}"
 
 
 def _slug_from_promotion_id(promotion_id: str) -> str:

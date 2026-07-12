@@ -101,7 +101,7 @@ UNIQUE_CONSTRAINTS = {
     "generation_runs_pkey",
     "content_candidates_pkey",
     "uq_content_candidates_one_approved_per_segment",
-    "uq_promotion_runs_loop",
+    "uq_promotion_runs_segment_scope",
     "uq_ad_experiments_segment_per_run",
 }
 
@@ -158,6 +158,9 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
+            partial_segment_scope_enabled=(
+                settings.partial_promotion_run_scope_enabled
+            ),
         )
         connection.commit()
     except Exception:
@@ -319,6 +322,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
+            partial_segment_scope_enabled=(
+                settings.partial_promotion_run_scope_enabled
+            ),
         )
         yield NextLoopService(
             promotion_repository=promotion_repository,
@@ -339,6 +345,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
                     "manual_next_loop_enabled",
                     False,
                 )
+            ),
+            partial_segment_scope_enabled=(
+                settings.partial_promotion_run_scope_enabled
             ),
         )
         connection.commit()
