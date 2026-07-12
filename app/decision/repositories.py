@@ -3,9 +3,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
+import json
 import math
-from typing import Any, Mapping, NamedTuple, Protocol, Sequence, TypeVar
+from typing import (
+    Any,
+    ClassVar,
+    Literal,
+    Mapping,
+    NamedTuple,
+    Protocol,
+    Sequence,
+    TypeVar,
+)
 
+from psycopg import errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -18,6 +29,19 @@ EMAIL_CHANNEL = "email"
 
 
 _T = TypeVar("_T")
+
+NextLoopPreparationStatusValue = Literal[
+    "awaiting_content_approval",
+    "rejected",
+    "activated",
+]
+
+
+class NextLoopPreparationConflictError(Exception):
+    def __init__(self, constraint_name: str | None) -> None:
+        self.constraint_name = constraint_name
+        detail = constraint_name or "unknown constraint"
+        super().__init__(f"next-loop preparation unique conflict: {detail}")
 
 
 class PostgresExecutor(Protocol):
@@ -343,6 +367,37 @@ class PromotionEvaluationRecord:
     result_json: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class NextLoopPreparationRecord:
+    next_loop_preparation_id: str
+    source_promotion_run_id: str
+    analysis_id: str
+    generation_id: str
+    attempt_no: int
+    failed_segment_ids_json: tuple[str, ...]
+    failed_ad_experiment_ids_json: tuple[str, ...]
+    source_evaluation_ids_json: tuple[str, ...]
+    status: NextLoopPreparationStatusValue
+    activated_promotion_run_id: str | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@dataclass(frozen=True)
+class NextLoopPreparationWrite:
+    status: ClassVar[Literal["awaiting_content_approval"]] = (
+        "awaiting_content_approval"
+    )
+    next_loop_preparation_id: str
+    source_promotion_run_id: str
+    analysis_id: str
+    generation_id: str
+    attempt_no: int
+    failed_segment_ids_json: tuple[str, ...]
+    failed_ad_experiment_ids_json: tuple[str, ...]
+    source_evaluation_ids_json: tuple[str, ...]
+
+
 class PromotionReader(Protocol):
     def get_by_id(self, promotion_id: str) -> PromotionRecord | None:
         ...
@@ -523,6 +578,43 @@ class PromotionEvaluationWriter(Protocol):
         self,
         promotion_run_id: str,
     ) -> list[PromotionEvaluationRecord]:
+        ...
+
+
+class NextLoopPreparationWriter(Protocol):
+    def get_active_by_source_run(
+        self,
+        source_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        ...
+
+    def get_by_id(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        ...
+
+    def get_next_attempt_no(self, source_promotion_run_id: str) -> int:
+        ...
+
+    def insert(
+        self,
+        preparation: NextLoopPreparationWrite,
+    ) -> NextLoopPreparationRecord:
+        ...
+
+    def mark_rejected(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        ...
+
+    def mark_activated(
+        self,
+        *,
+        next_loop_preparation_id: str,
+        activated_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
         ...
 
 
@@ -1614,6 +1706,208 @@ class PromotionEvaluationRepository:
         return [PromotionEvaluationRecord(**row) for row in rows]
 
 
+class NextLoopPreparationRepository:
+    def __init__(self, db: PostgresExecutor) -> None:
+        self._db = db
+
+    def get_active_by_source_run(
+        self,
+        source_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                next_loop_preparation_id,
+                source_promotion_run_id,
+                analysis_id,
+                generation_id,
+                attempt_no,
+                failed_segment_ids_json,
+                failed_ad_experiment_ids_json,
+                source_evaluation_ids_json,
+                status,
+                activated_promotion_run_id,
+                created_at,
+                updated_at
+            FROM next_loop_preparations
+            WHERE source_promotion_run_id = %s
+              AND status = 'awaiting_content_approval'
+            LIMIT 1
+            """,
+            (source_promotion_run_id,),
+        )
+        return _next_loop_preparation_record_or_none(row)
+
+    def get_by_id(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                next_loop_preparation_id,
+                source_promotion_run_id,
+                analysis_id,
+                generation_id,
+                attempt_no,
+                failed_segment_ids_json,
+                failed_ad_experiment_ids_json,
+                source_evaluation_ids_json,
+                status,
+                activated_promotion_run_id,
+                created_at,
+                updated_at
+            FROM next_loop_preparations
+            WHERE next_loop_preparation_id = %s
+            """,
+            (next_loop_preparation_id,),
+        )
+        return _next_loop_preparation_record_or_none(row)
+
+    def get_next_attempt_no(self, source_promotion_run_id: str) -> int:
+        row = self._db.fetchone(
+            """
+            SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_attempt_no
+            FROM next_loop_preparations
+            WHERE source_promotion_run_id = %s
+            """,
+            (source_promotion_run_id,),
+        )
+        if row is None:
+            return 1
+        return int(row["next_attempt_no"])
+
+    def insert(
+        self,
+        preparation: NextLoopPreparationWrite,
+    ) -> NextLoopPreparationRecord:
+        failed_segment_ids = _normalize_id_set(
+            preparation.failed_segment_ids_json,
+            field_name="failed_segment_ids_json",
+        )
+        failed_ad_experiment_ids = _normalize_id_set(
+            preparation.failed_ad_experiment_ids_json,
+            field_name="failed_ad_experiment_ids_json",
+        )
+        source_evaluation_ids = _normalize_id_set(
+            preparation.source_evaluation_ids_json,
+            field_name="source_evaluation_ids_json",
+        )
+        try:
+            row = self._db.fetchone(
+                """
+                INSERT INTO next_loop_preparations (
+                    next_loop_preparation_id,
+                    source_promotion_run_id,
+                    analysis_id,
+                    generation_id,
+                    attempt_no,
+                    failed_segment_ids_json,
+                    failed_ad_experiment_ids_json,
+                    source_evaluation_ids_json,
+                    status,
+                    activated_promotion_run_id
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    'awaiting_content_approval', NULL
+                )
+                RETURNING
+                    next_loop_preparation_id,
+                    source_promotion_run_id,
+                    analysis_id,
+                    generation_id,
+                    attempt_no,
+                    failed_segment_ids_json,
+                    failed_ad_experiment_ids_json,
+                    source_evaluation_ids_json,
+                    status,
+                    activated_promotion_run_id,
+                    created_at,
+                    updated_at
+                """,
+                (
+                    preparation.next_loop_preparation_id,
+                    preparation.source_promotion_run_id,
+                    preparation.analysis_id,
+                    preparation.generation_id,
+                    preparation.attempt_no,
+                    Jsonb(list(failed_segment_ids)),
+                    Jsonb(list(failed_ad_experiment_ids)),
+                    Jsonb(list(source_evaluation_ids)),
+                ),
+            )
+        except errors.UniqueViolation as exc:
+            raise _next_loop_preparation_conflict(exc) from exc
+        if row is None:
+            raise RuntimeError("next-loop preparation insert returned no row")
+        return _next_loop_preparation_record(row)
+
+    def mark_rejected(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        row = self._db.fetchone(
+            """
+            UPDATE next_loop_preparations
+            SET status = 'rejected',
+                updated_at = now()
+            WHERE next_loop_preparation_id = %s
+              AND status = 'awaiting_content_approval'
+            RETURNING
+                next_loop_preparation_id,
+                source_promotion_run_id,
+                analysis_id,
+                generation_id,
+                attempt_no,
+                failed_segment_ids_json,
+                failed_ad_experiment_ids_json,
+                source_evaluation_ids_json,
+                status,
+                activated_promotion_run_id,
+                created_at,
+                updated_at
+            """,
+            (next_loop_preparation_id,),
+        )
+        return _next_loop_preparation_record_or_none(row)
+
+    def mark_activated(
+        self,
+        *,
+        next_loop_preparation_id: str,
+        activated_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        try:
+            row = self._db.fetchone(
+                """
+                UPDATE next_loop_preparations
+                SET status = 'activated',
+                    activated_promotion_run_id = %s,
+                    updated_at = now()
+                WHERE next_loop_preparation_id = %s
+                  AND status = 'awaiting_content_approval'
+                RETURNING
+                    next_loop_preparation_id,
+                    source_promotion_run_id,
+                    analysis_id,
+                    generation_id,
+                    attempt_no,
+                    failed_segment_ids_json,
+                    failed_ad_experiment_ids_json,
+                    source_evaluation_ids_json,
+                    status,
+                    activated_promotion_run_id,
+                    created_at,
+                    updated_at
+                """,
+                (activated_promotion_run_id, next_loop_preparation_id),
+            )
+        except errors.UniqueViolation as exc:
+            raise _next_loop_preparation_conflict(exc) from exc
+        return _next_loop_preparation_record_or_none(row)
+
+
 class EvaluationMetricRepository:
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
@@ -1692,6 +1986,65 @@ class EvaluationMetricRepository:
             },
         )
         return _metric_count_from_result(result)
+
+
+def _next_loop_preparation_record_or_none(
+    row: Mapping[str, Any] | None,
+) -> NextLoopPreparationRecord | None:
+    if row is None:
+        return None
+    return _next_loop_preparation_record(row)
+
+
+def _next_loop_preparation_record(
+    row: Mapping[str, Any],
+) -> NextLoopPreparationRecord:
+    return NextLoopPreparationRecord(
+        next_loop_preparation_id=str(row["next_loop_preparation_id"]),
+        source_promotion_run_id=str(row["source_promotion_run_id"]),
+        analysis_id=str(row["analysis_id"]),
+        generation_id=str(row["generation_id"]),
+        attempt_no=int(row["attempt_no"]),
+        failed_segment_ids_json=_normalize_id_set(
+            row["failed_segment_ids_json"],
+            field_name="failed_segment_ids_json",
+        ),
+        failed_ad_experiment_ids_json=_normalize_id_set(
+            row["failed_ad_experiment_ids_json"],
+            field_name="failed_ad_experiment_ids_json",
+        ),
+        source_evaluation_ids_json=_normalize_id_set(
+            row["source_evaluation_ids_json"],
+            field_name="source_evaluation_ids_json",
+        ),
+        status=row["status"],
+        activated_promotion_run_id=row["activated_promotion_run_id"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _normalize_id_set(value: Any, *, field_name: str) -> tuple[str, ...]:
+    decoded = value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{field_name} must be a JSON array") from exc
+    if not isinstance(decoded, (list, tuple)):
+        raise ValueError(f"{field_name} must be an array")
+    if not decoded:
+        raise ValueError(f"{field_name} must not be empty")
+    if any(not isinstance(item, str) or not item.strip() for item in decoded):
+        raise ValueError(f"{field_name} must contain non-empty string IDs")
+    return tuple(sorted(set(decoded)))
+
+
+def _next_loop_preparation_conflict(
+    exc: errors.UniqueViolation,
+) -> NextLoopPreparationConflictError:
+    constraint_name = getattr(getattr(exc, "diag", None), "constraint_name", None)
+    return NextLoopPreparationConflictError(constraint_name)
 
 
 def _booking_conversion_denominator_event(experiment: AdExperimentRecord) -> str:
