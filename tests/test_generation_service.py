@@ -16,6 +16,7 @@ from app.generation.repositories import (
     GenerationRunRecord,
 )
 from app.generation.schemas import (
+    ContentCandidateStatus,
     ContentChannel,
     GenerationRequest,
 )
@@ -461,6 +462,9 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         "source_promotion_run_id": "prun_banner_001_loop_1",
         "source_generation_id": "generation_banner_001",
         "focus_segment_ids": ["seg_near_checkin"],
+        "content_option_count": 1,
+        "attempt_no": None,
+        "candidate_status": "approved",
     }
     assert len(content_candidate_repository.saved) == 1
     assert {
@@ -472,6 +476,59 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
     candidate = content_candidate_repository.saved[0]
     assert candidate.content_id == "content_banner_near_checkin_loop_2_001"
     assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
+
+
+def test_generation_service_generates_attempt_aware_multi_draft_focus_candidates() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                )
+            ]
+        ),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+            operator_instruction="Stress breakfast.",
+            content_option_count=3,
+            attempt_no=1,
+            candidate_status=ContentCandidateStatus.DRAFT,
+        )
+    )
+
+    assert result.generation_id == "generation_banner_001_loop_2_attempt_1"
+    assert result.generated_segment_ids == ["seg_near_checkin"]
+    assert len(content_candidate_repository.saved) == 3
+    assert {
+        candidate.status for candidate in content_candidate_repository.saved
+    } == {"draft"}
+    assert {
+        candidate.content_id for candidate in content_candidate_repository.saved
+    } == {
+        "content_banner_near_checkin_loop_2_attempt_1_001",
+        "content_banner_near_checkin_loop_2_attempt_1_002",
+        "content_banner_near_checkin_loop_2_attempt_1_003",
+    }
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.content_option_count == 3
+    assert generation_run.input_json["next_loop"]["attempt_no"] == 1
+    assert generation_run.input_json["next_loop"]["candidate_status"] == "draft"
 
 
 def test_generation_service_bounds_long_next_loop_content_identifiers() -> None:
