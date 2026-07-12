@@ -116,7 +116,15 @@ class PromotionRunService:
                 "promotion_run already exists for promotion_id and loop_count"
             )
 
-        target_segments = self._load_target_segments(analysis, promotion)
+        target_segments = self._load_target_segments(
+            analysis,
+            promotion,
+            segment_ids=request.segment_ids,
+        )
+        self._validate_generation_segment_snapshot(
+            generation=generation,
+            requested_segment_ids=request.segment_ids,
+        )
         log.info("target_segments_loaded", {"targetSegmentCount": len(target_segments)})
         content_by_segment = self._load_content_by_segment(generation.generation_id)
         log.info("content_candidates_loaded", {"segmentCount": len(content_by_segment)})
@@ -272,12 +280,26 @@ class PromotionRunService:
         self,
         analysis: PromotionAnalysisRecord,
         promotion: PromotionRecord,
+        *,
+        segment_ids: Sequence[str] | None,
     ) -> list[PromotionTargetSegmentRecord]:
-        target_segments = self._promotion_target_segment_repository.list_for_analysis(
-            analysis.analysis_id,
-        )
+        if segment_ids is None:
+            target_segments = self._promotion_target_segment_repository.list_for_analysis(
+                analysis.analysis_id,
+            )
+        else:
+            target_segments = (
+                self._promotion_target_segment_repository.list_approved_for_analysis(
+                    analysis.analysis_id,
+                    segment_ids,
+                )
+            )
         if not target_segments:
             log.warn("target_segments_empty", {"analysisId": analysis.analysis_id})
+            if segment_ids is not None:
+                raise RunValidationError(
+                    "segment_ids must match approved promotion_target_segments"
+                )
             raise RunValidationError("at least one target segment is required")
 
         seen_segment_ids: set[str] = set()
@@ -300,7 +322,35 @@ class PromotionRunService:
                     f"duplicate target segment is not allowed: {segment.segment_id}"
                 )
             seen_segment_ids.add(segment.segment_id)
+
+        if segment_ids is not None and seen_segment_ids != set(segment_ids):
+            raise RunValidationError(
+                "segment_ids must match approved promotion_target_segments"
+            )
         return target_segments
+
+    def _validate_generation_segment_snapshot(
+        self,
+        *,
+        generation: GenerationRunRecord,
+        requested_segment_ids: Sequence[str] | None,
+    ) -> None:
+        if requested_segment_ids is None:
+            return
+
+        snapshot = generation.input_json.get("target_segment_ids")
+        if (
+            not isinstance(snapshot, list)
+            or any(not isinstance(segment_id, str) or not segment_id for segment_id in snapshot)
+            or len(snapshot) != len(set(snapshot))
+        ):
+            raise RunValidationError(
+                "generation run must include a valid target_segment_ids snapshot"
+            )
+        if set(snapshot) != set(requested_segment_ids):
+            raise RunValidationError(
+                "segment_ids must match the generation target_segment_ids snapshot"
+            )
 
     def _load_content_by_segment(
         self,

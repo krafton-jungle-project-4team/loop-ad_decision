@@ -1,3 +1,4 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
@@ -133,6 +134,7 @@ def test_generation_api_calls_generation_service() -> None:
             "campaign_id": "camp_summer_2026",
             "promotion_id": "promo_banner_001",
             "analysis_id": "analysis_banner_001",
+            "segment_ids": ["seg_mobile_user"],
             "content_option_count": 1,
             "operator_instruction": "Keep it short.",
         },
@@ -142,7 +144,33 @@ def test_generation_api_calls_generation_service() -> None:
     assert response.json()["generation_id"] == "generation_fake"
     assert len(fake_service.requests) == 1
     assert fake_service.requests[0].analysis_id == "analysis_banner_001"
+    assert fake_service.requests[0].segment_ids == ["seg_mobile_user"]
     assert fake_service.requests[0].operator_instruction == "Keep it short."
+
+
+@pytest.mark.parametrize(
+    "segment_ids",
+    [[], ["seg_family_trip", "seg_family_trip"], ["   "]],
+)
+def test_generation_api_rejects_empty_duplicate_or_blank_segment_ids(
+    segment_ids: list[str],
+) -> None:
+    client = make_generation_client()
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "segment_ids": segment_ids,
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 400
 
 
 def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:

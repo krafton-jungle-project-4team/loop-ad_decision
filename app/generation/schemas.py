@@ -1,7 +1,7 @@
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ContentChannel(StrEnum):
@@ -58,8 +58,20 @@ class GenerationRequest(BaseModel):
     campaign_id: str = Field(min_length=1)
     promotion_id: str = Field(min_length=1)
     analysis_id: str = Field(min_length=1)
+    segment_ids: list[str] | None = Field(default=None, min_length=1)
     content_option_count: int = Field(ge=1)
     operator_instruction: str | None = None
+
+    @field_validator("segment_ids")
+    @classmethod
+    def validate_segment_ids(cls, segment_ids: list[str] | None) -> list[str] | None:
+        if segment_ids is None:
+            return None
+        if any(not segment_id for segment_id in segment_ids):
+            raise ValueError("segment_ids must not contain blank values")
+        if len(segment_ids) != len(set(segment_ids)):
+            raise ValueError("segment_ids must not contain duplicates")
+        return segment_ids
 
 
 class CreativeArtifact(BaseModel):

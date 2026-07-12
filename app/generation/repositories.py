@@ -218,6 +218,7 @@ class GenerationRunRepository:
 
 class GenerationInputRepository:
     CONFIRMED_TARGET_SEGMENT_STATUS_FILTER = "AND pts.status = 'approved'"
+    REQUESTED_SEGMENT_IDS_FILTER = "AND pts.segment_id = ANY(%(segment_ids)s)"
 
     SELECT_PROMOTION_SQL = """
         SELECT
@@ -330,23 +331,27 @@ class GenerationInputRepository:
         request: GenerationRequest,
         confirmed_only: bool,
     ) -> list[TargetSegmentPromptInput]:
-        query = self.SELECT_TARGET_SEGMENTS_BASE_SQL.format(
-            status_filter=(
-                self.CONFIRMED_TARGET_SEGMENT_STATUS_FILTER
-                if confirmed_only
+        filters = [
+            self.CONFIRMED_TARGET_SEGMENT_STATUS_FILTER if confirmed_only else "",
+            (
+                self.REQUESTED_SEGMENT_IDS_FILTER
+                if confirmed_only and request.segment_ids is not None
                 else ""
-            )
+            ),
+        ]
+        query = self.SELECT_TARGET_SEGMENTS_BASE_SQL.format(
+            status_filter="\n          ".join(filter(None, filters)),
         )
+        params: dict[str, Any] = {
+            "project_id": request.project_id,
+            "campaign_id": request.campaign_id,
+            "promotion_id": request.promotion_id,
+            "analysis_id": request.analysis_id,
+        }
+        if confirmed_only and request.segment_ids is not None:
+            params["segment_ids"] = request.segment_ids
         with self._connection.cursor(row_factory=dict_row) as cursor:
-            cursor.execute(
-                query,
-                {
-                    "project_id": request.project_id,
-                    "campaign_id": request.campaign_id,
-                    "promotion_id": request.promotion_id,
-                    "analysis_id": request.analysis_id,
-                },
-            )
+            cursor.execute(query, params)
             rows = cursor.fetchall()
 
         return [_target_segment_prompt_input(row) for row in rows]

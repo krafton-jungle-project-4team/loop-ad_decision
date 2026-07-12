@@ -366,6 +366,13 @@ class PromotionTargetSegmentReader(Protocol):
     ) -> list[PromotionTargetSegmentRecord]:
         ...
 
+    def list_approved_for_analysis(
+        self,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[PromotionTargetSegmentRecord]:
+        ...
+
     def update_status(
         self,
         *,
@@ -658,6 +665,38 @@ class PromotionTargetSegmentRepository:
             ORDER BY id ASC
             """,
             (analysis_id,),
+        )
+        return [PromotionTargetSegmentRecord(**row) for row in rows]
+
+    def list_approved_for_analysis(
+        self,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[PromotionTargetSegmentRecord]:
+        rows = self._db.fetchall(
+            """
+            SELECT
+                analysis_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                segment_id,
+                segment_name,
+                segment_vector_id,
+                rule_json,
+                profile_json,
+                content_brief_json,
+                data_evidence_json,
+                estimated_size,
+                priority,
+                status
+            FROM promotion_target_segments
+            WHERE analysis_id = %s
+              AND status = 'approved'
+              AND segment_id = ANY(%s)
+            ORDER BY id ASC
+            """,
+            (analysis_id, list(segment_ids)),
         )
         return [PromotionTargetSegmentRecord(**row) for row in rows]
 

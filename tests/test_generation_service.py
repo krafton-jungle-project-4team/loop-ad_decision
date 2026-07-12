@@ -68,6 +68,7 @@ class FakeImageGenerationScheduler:
 def generation_request(
     *,
     project_id: str = "hotel-client-a",
+    segment_ids: list[str] | None = None,
     content_option_count: int = 2,
     operator_instruction: str | None = "Make the banner direct and concise.",
 ) -> GenerationRequest:
@@ -76,6 +77,7 @@ def generation_request(
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         analysis_id="analysis_banner_001",
+        segment_ids=segment_ids,
         content_option_count=content_option_count,
         operator_instruction=operator_instruction,
     )
@@ -299,6 +301,64 @@ def test_generation_service_requires_confirmed_target_segments_from_reader() -> 
 
     with pytest.raises(GenerationInputUnavailable, match="promotion_target_segments"):
         service.generate(generation_request(content_option_count=1))
+
+    assert generation_run_repository.saved == []
+    assert content_candidate_repository.saved == []
+
+
+def test_generation_service_generates_only_requested_segment_ids_and_snapshots_them() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    segment_id="seg_family_trip",
+                    content_slug="family_trip",
+                ),
+                target_segment_input(
+                    segment_id="seg_mobile_user",
+                    content_slug="mobile_user",
+                ),
+            ]
+        ),
+    )
+
+    response = service.generate(
+        generation_request(
+            segment_ids=["seg_mobile_user"],
+            content_option_count=1,
+        )
+    )
+
+    assert [
+        candidate.attribution.segment_id for candidate in response.content_candidates
+    ] == ["seg_mobile_user"]
+    assert generation_run_repository.saved[0].input_json["target_segment_ids"] == [
+        "seg_mobile_user"
+    ]
+
+
+def test_generation_service_rejects_requested_segment_ids_missing_from_reader() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [target_segment_input(segment_id="seg_family_trip")]
+        ),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match="segment_ids"):
+        service.generate(
+            generation_request(
+                segment_ids=["seg_family_trip", "seg_mobile_user"],
+                content_option_count=1,
+            )
+        )
 
     assert generation_run_repository.saved == []
     assert content_candidate_repository.saved == []
@@ -1069,8 +1129,14 @@ class StaticGenerationInputReader:
         self,
         request: GenerationRequest,
     ) -> list[TargetSegmentPromptInput]:
-        del request
-        return list(self._target_segments)
+        if request.segment_ids is None:
+            return list(self._target_segments)
+        requested_ids = set(request.segment_ids)
+        return [
+            target_segment
+            for target_segment in self._target_segments
+            if target_segment.segment_id in requested_ids
+        ]
 
     def list_focus_target_segment_inputs(
         self,
