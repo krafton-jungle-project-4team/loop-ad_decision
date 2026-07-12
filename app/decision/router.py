@@ -102,6 +102,7 @@ UNIQUE_CONSTRAINTS = {
     "content_candidates_pkey",
     "uq_content_candidates_one_approved_per_segment",
     "uq_promotion_runs_loop",
+    "uq_promotion_runs_segment_scope",
     "uq_ad_experiments_segment_per_run",
 }
 
@@ -158,6 +159,9 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
+            promotion_evaluation_repository=PromotionEvaluationRepository(executor),
+            next_loop_preparation_repository=NextLoopPreparationRepository(executor),
+            manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
     except Exception:
@@ -264,6 +268,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
     promotion_run_repository = PromotionRunRepository(executor)
     ad_experiment_repository = AdExperimentRepository(executor)
     promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+    next_loop_preparation_repository = SerializedNextLoopPreparationRepository(
+        executor
+    )
     try:
         clickhouse_client = create_clickhouse_client(settings)
         analysis_executor = AnalysisPostgresExecutor(connection)
@@ -319,27 +326,22 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
+            promotion_evaluation_repository=promotion_evaluation_repository,
+            next_loop_preparation_repository=next_loop_preparation_repository,
+            manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         yield NextLoopService(
             promotion_repository=promotion_repository,
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
-            next_loop_preparation_repository=(
-                SerializedNextLoopPreparationRepository(executor)
-            ),
+            next_loop_preparation_repository=next_loop_preparation_repository,
             generation_run_repository=GenerationRunRepository(executor),
             content_candidate_repository=generation_content_candidate_repository,
             analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
             generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
             run_creator=run_creator,
-            manual_prepare_enabled=bool(
-                getattr(
-                    getattr(getattr(request, "app", None), "state", None),
-                    "manual_next_loop_enabled",
-                    False,
-                )
-            ),
+            manual_prepare_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
     except Exception:
@@ -622,6 +624,16 @@ async def _parse_next_loop_request(request: Request) -> NextLoopRequest:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=jsonable_encoder(exc.errors()),
         ) from exc
+
+
+def _manual_next_loop_enabled(request: Request) -> bool:
+    return bool(
+        getattr(
+            getattr(getattr(request, "app", None), "state", None),
+            "manual_next_loop_enabled",
+            False,
+        )
+    )
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:
