@@ -74,7 +74,6 @@ class NextLoopPreparationStatus(StrEnum):
     AWAITING_CONTENT_APPROVAL = "awaiting_content_approval"
     ACTIVATED = "activated"
     REJECTED = "rejected"
-    CANCELLED = "cancelled"
 
 
 class RunCreateRequest(BaseModel):

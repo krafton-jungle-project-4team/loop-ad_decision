@@ -14,6 +14,7 @@ from typing import (
     Protocol,
     Sequence,
     TypeVar,
+    cast,
 )
 
 from psycopg import errors
@@ -1714,6 +1715,10 @@ class NextLoopPreparationRepository:
         self,
         source_promotion_run_id: str,
     ) -> NextLoopPreparationRecord | None:
+        _require_non_blank_string(
+            source_promotion_run_id,
+            field_name="source_promotion_run_id",
+        )
         row = self._db.fetchone(
             """
             SELECT
@@ -1742,6 +1747,10 @@ class NextLoopPreparationRepository:
         self,
         next_loop_preparation_id: str,
     ) -> NextLoopPreparationRecord | None:
+        _require_non_blank_string(
+            next_loop_preparation_id,
+            field_name="next_loop_preparation_id",
+        )
         row = self._db.fetchone(
             """
             SELECT
@@ -1765,6 +1774,10 @@ class NextLoopPreparationRepository:
         return _next_loop_preparation_record_or_none(row)
 
     def get_next_attempt_no(self, source_promotion_run_id: str) -> int:
+        _require_non_blank_string(
+            source_promotion_run_id,
+            field_name="source_promotion_run_id",
+        )
         row = self._db.fetchone(
             """
             SELECT COALESCE(MAX(attempt_no), 0) + 1 AS next_attempt_no
@@ -1781,6 +1794,24 @@ class NextLoopPreparationRepository:
         self,
         preparation: NextLoopPreparationWrite,
     ) -> NextLoopPreparationRecord:
+        _require_non_blank_string(
+            preparation.next_loop_preparation_id,
+            field_name="next_loop_preparation_id",
+        )
+        _require_non_blank_string(
+            preparation.source_promotion_run_id,
+            field_name="source_promotion_run_id",
+        )
+        _require_non_blank_string(
+            preparation.analysis_id,
+            field_name="analysis_id",
+        )
+        _require_non_blank_string(
+            preparation.generation_id,
+            field_name="generation_id",
+        )
+        if preparation.attempt_no < 1:
+            raise ValueError("attempt_no must be at least 1")
         failed_segment_ids = _normalize_id_set(
             preparation.failed_segment_ids_json,
             field_name="failed_segment_ids_json",
@@ -1847,6 +1878,10 @@ class NextLoopPreparationRepository:
         self,
         next_loop_preparation_id: str,
     ) -> NextLoopPreparationRecord | None:
+        _require_non_blank_string(
+            next_loop_preparation_id,
+            field_name="next_loop_preparation_id",
+        )
         row = self._db.fetchone(
             """
             UPDATE next_loop_preparations
@@ -1878,6 +1913,14 @@ class NextLoopPreparationRepository:
         next_loop_preparation_id: str,
         activated_promotion_run_id: str,
     ) -> NextLoopPreparationRecord | None:
+        _require_non_blank_string(
+            next_loop_preparation_id,
+            field_name="next_loop_preparation_id",
+        )
+        _require_non_blank_string(
+            activated_promotion_run_id,
+            field_name="activated_promotion_run_id",
+        )
         try:
             row = self._db.fetchone(
                 """
@@ -2017,11 +2060,28 @@ def _next_loop_preparation_record(
             row["source_evaluation_ids_json"],
             field_name="source_evaluation_ids_json",
         ),
-        status=row["status"],
+        status=_next_loop_preparation_status(row["status"]),
         activated_promotion_run_id=row["activated_promotion_run_id"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )
+
+
+def _require_non_blank_string(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return value
+
+
+def _next_loop_preparation_status(value: Any) -> NextLoopPreparationStatusValue:
+    allowed_statuses = {
+        "awaiting_content_approval",
+        "rejected",
+        "activated",
+    }
+    if not isinstance(value, str) or value not in allowed_statuses:
+        raise ValueError("status must be a valid next-loop preparation status")
+    return cast(NextLoopPreparationStatusValue, value)
 
 
 def _normalize_id_set(value: Any, *, field_name: str) -> tuple[str, ...]:
