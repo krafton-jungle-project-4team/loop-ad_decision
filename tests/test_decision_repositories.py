@@ -276,6 +276,19 @@ def test_target_segment_repository_lists_only_requested_approved_records() -> No
     assert call.params == ("analysis_banner_001", ["seg_family_trip"])
 
 
+def test_target_segment_repository_lists_all_approved_records_when_ids_omitted() -> None:
+    db = FakePostgresExecutor(fetchall_result=[])
+    repo = PromotionTargetSegmentRepository(db)
+
+    assert repo.list_approved_for_analysis("analysis_banner_001") == []
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "status = 'approved'" in sql
+    assert "segment_id = any" not in sql
+    assert call.params == ("analysis_banner_001",)
+
+
 def test_content_candidate_repository_lists_approved_or_active_with_segment_keys() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[

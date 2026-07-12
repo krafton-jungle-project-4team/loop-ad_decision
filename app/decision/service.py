@@ -123,7 +123,10 @@ class PromotionRunService:
         )
         self._validate_generation_segment_snapshot(
             generation=generation,
-            requested_segment_ids=request.segment_ids,
+            effective_segment_ids=[
+                target_segment.segment_id for target_segment in target_segments
+            ],
+            snapshot_required=request.segment_ids is not None,
         )
         log.info("target_segments_loaded", {"targetSegmentCount": len(target_segments)})
         content_by_segment = self._load_content_by_segment(generation.generation_id)
@@ -283,17 +286,12 @@ class PromotionRunService:
         *,
         segment_ids: Sequence[str] | None,
     ) -> list[PromotionTargetSegmentRecord]:
-        if segment_ids is None:
-            target_segments = self._promotion_target_segment_repository.list_for_analysis(
+        target_segments = (
+            self._promotion_target_segment_repository.list_approved_for_analysis(
                 analysis.analysis_id,
+                segment_ids,
             )
-        else:
-            target_segments = (
-                self._promotion_target_segment_repository.list_approved_for_analysis(
-                    analysis.analysis_id,
-                    segment_ids,
-                )
-            )
+        )
         if not target_segments:
             log.warn("target_segments_empty", {"analysisId": analysis.analysis_id})
             if segment_ids is not None:
@@ -333,12 +331,15 @@ class PromotionRunService:
         self,
         *,
         generation: GenerationRunRecord,
-        requested_segment_ids: Sequence[str] | None,
+        effective_segment_ids: Sequence[str],
+        snapshot_required: bool,
     ) -> None:
-        if requested_segment_ids is None:
+        snapshot = generation.input_json.get("target_segment_ids")
+        if snapshot is None and not snapshot_required:
+            # Generation rows created before target_segment_ids was introduced
+            # remain usable when callers choose the legacy all-approved scope.
             return
 
-        snapshot = generation.input_json.get("target_segment_ids")
         if (
             not isinstance(snapshot, list)
             or any(not isinstance(segment_id, str) or not segment_id for segment_id in snapshot)
@@ -347,7 +348,7 @@ class PromotionRunService:
             raise RunValidationError(
                 "generation run must include a valid target_segment_ids snapshot"
             )
-        if set(snapshot) != set(requested_segment_ids):
+        if set(snapshot) != set(effective_segment_ids):
             raise RunValidationError(
                 "segment_ids must match the generation target_segment_ids snapshot"
             )

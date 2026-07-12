@@ -45,8 +45,10 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
 
     assert repos.analyses.latest_calls == ["promo_banner_001"]
     assert repos.generations.latest_calls == ["promo_banner_001"]
-    assert repos.target_segments.calls == ["analysis_banner_001"]
-    assert repos.target_segments.approved_calls == []
+    assert repos.target_segments.calls == []
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", None)
+    ]
     assert response.analysis_id == "analysis_banner_001"
     assert response.generation_id == "generation_banner_001"
     assert response.status == PromotionRunStatus.PLANNED
@@ -318,6 +320,52 @@ def test_run_service_rejects_generation_snapshot_mismatch_without_writes() -> No
     assert repos.ad_experiments.inserted_batches == []
 
 
+def test_run_service_omitted_segment_ids_uses_all_approved_segments() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_family_trip",
+                status="approved",
+            ),
+            target_segment_record(
+                segment_id="seg_mobile_user",
+                status="planned",
+            ),
+        ],
+        candidates=[content_candidate_record(segment_id="seg_family_trip")],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", None)
+    ]
+    assert [experiment.segment_id for experiment in response.ad_experiments] == [
+        "seg_family_trip",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_omitted_segment_ids_rejects_changed_approved_snapshot() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_mobile_user"]),
+        target_segments=[target_segment_record(status="approved")],
+    )
+
+    with pytest.raises(RunValidationError, match="generation target_segment_ids snapshot"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
 def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
     service, repos = make_service(
         target_segments=[
@@ -478,7 +526,7 @@ class FakePromotionTargetSegmentRepository:
     def __init__(self, segments: list[PromotionTargetSegmentRecord]) -> None:
         self.segments = segments
         self.calls: list[str] = []
-        self.approved_calls: list[tuple[str, list[str]]] = []
+        self.approved_calls: list[tuple[str, list[str] | None]] = []
 
     def list_for_analysis(
         self,
@@ -490,9 +538,13 @@ class FakePromotionTargetSegmentRepository:
     def list_approved_for_analysis(
         self,
         analysis_id: str,
-        segment_ids: list[str],
+        segment_ids: list[str] | None = None,
     ) -> list[PromotionTargetSegmentRecord]:
-        self.approved_calls.append((analysis_id, list(segment_ids)))
+        self.approved_calls.append(
+            (analysis_id, list(segment_ids) if segment_ids is not None else None)
+        )
+        if segment_ids is None:
+            return [segment for segment in self.segments if segment.status == "approved"]
         requested_ids = set(segment_ids)
         return [
             segment
@@ -703,7 +755,7 @@ def target_segment_record(
     analysis_id: str = "analysis_banner_001",
     segment_id: str = "seg_family_trip",
     segment_name: str = "Family hotel trip",
-    status: str = "planned",
+    status: str = "approved",
 ) -> PromotionTargetSegmentRecord:
     return PromotionTargetSegmentRecord(
         analysis_id=analysis_id,

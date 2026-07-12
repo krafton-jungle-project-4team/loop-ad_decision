@@ -369,7 +369,7 @@ class PromotionTargetSegmentReader(Protocol):
     def list_approved_for_analysis(
         self,
         analysis_id: str,
-        segment_ids: Sequence[str],
+        segment_ids: Sequence[str] | None = None,
     ) -> list[PromotionTargetSegmentRecord]:
         ...
 
@@ -671,10 +671,15 @@ class PromotionTargetSegmentRepository:
     def list_approved_for_analysis(
         self,
         analysis_id: str,
-        segment_ids: Sequence[str],
+        segment_ids: Sequence[str] | None = None,
     ) -> list[PromotionTargetSegmentRecord]:
+        segment_filter = ""
+        params: Sequence[Any] = (analysis_id,)
+        if segment_ids is not None:
+            segment_filter = "AND segment_id = ANY(%s)"
+            params = (analysis_id, list(segment_ids))
         rows = self._db.fetchall(
-            """
+            f"""
             SELECT
                 analysis_id,
                 project_id,
@@ -693,10 +698,10 @@ class PromotionTargetSegmentRepository:
             FROM promotion_target_segments
             WHERE analysis_id = %s
               AND status = 'approved'
-              AND segment_id = ANY(%s)
+              {segment_filter}
             ORDER BY id ASC
             """,
-            (analysis_id, list(segment_ids)),
+            params,
         )
         return [PromotionTargetSegmentRecord(**row) for row in rows]
 
