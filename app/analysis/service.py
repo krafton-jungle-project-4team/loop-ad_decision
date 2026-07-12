@@ -5,7 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 from app.analysis.booking_model import (
     BookingPropensityModel,
@@ -42,6 +42,8 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 MAX_DEFAULT_TARGET_SEGMENTS = 4
+
+TargetSegmentStatus = Literal["planned", "approved"]
 
 CUSTOM_SEGMENT_SOURCES = {"custom_chatkit", "manual_rule"}
 
@@ -438,6 +440,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=True,
             persist_target_segments=False,
             persist_segment_suggestions=True,
+            target_status="planned",
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -468,6 +471,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=False,
             persist_target_segments=True,
             persist_segment_suggestions=False,
+            target_status="approved",
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info(
@@ -509,6 +513,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=False,
             persist_target_segments=True,
             persist_segment_suggestions=False,
+            target_status="planned",
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -523,6 +528,7 @@ class PromotionAnalysisService:
         refresh_segment_suggestions: bool,
         persist_target_segments: bool,
         persist_segment_suggestions: bool,
+        target_status: TargetSegmentStatus,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
         log.info("promotion_loaded", {"promotion": promotion})
@@ -612,6 +618,7 @@ class PromotionAnalysisService:
                 candidate=candidate,
                 rank=rank,
                 operator_instruction=request.operator_instruction,
+                status=target_status,
                 segment_vector_id=self._prepare_segment_vector_id(
                     analysis_id=analysis_id,
                     promotion=promotion,
@@ -820,6 +827,7 @@ class PromotionAnalysisService:
         candidate: SegmentCandidate,
         rank: int,
         operator_instruction: str | None,
+        status: TargetSegmentStatus,
         segment_vector_id: str,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
@@ -850,7 +858,7 @@ class PromotionAnalysisService:
                 min_sample_size=promotion.min_sample_size,
                 rank=rank,
             ),
-            status="planned",
+            status=status,
         )
 
     def _build_segment_suggestion(
