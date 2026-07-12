@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -278,6 +279,166 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     assert connection.close_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
+    assert not any("next_loop_preparations" in query for query in executed_sql)
+
+
+def test_manual_next_loop_flag_off_rejects_before_any_sql(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "manual next-loop preparation is disabled"
+    assert connection.executed == []
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+
+
+def test_manual_next_loop_api_persists_preparation_and_returns_pending_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury", "seg_luxury"],
+            "failed_ad_experiment_ids": [
+                "adexp_luxury_001",
+                "adexp_luxury_001",
+            ],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "awaiting_content_approval"
+    assert body["content_approval_required"] is True
+    assert body["next_promotion_run_id"] is None
+    assert body["next_ad_experiments"] == []
+    assert body["next_generation_id"].endswith("_loop_2_attempt_1")
+    assert len(body["pending_content_ids"]) == 3
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into next_loop_preparations" in query for query in executed_sql)
+    assert any("pg_advisory_xact_lock" in query for query in executed_sql)
+    assert not any("insert into promotion_runs" in query for query in executed_sql)
+    assert not any("insert into ad_experiments" in query for query in executed_sql)
+    evaluation_sql = next(
+        query for query in executed_sql if "from promotion_evaluations" in query
+    )
+    assert "created_at desc, evaluation_id desc" in evaluation_sql
+
+
+def test_manual_next_loop_api_reuses_canonical_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+    payload = {
+        "failed_segment_ids": ["seg_luxury"],
+        "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        "content_approval_mode": "manual",
+    }
+
+    first = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+    second = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json() == first.json()
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert sum("insert into next_loop_preparations" in query for query in executed_sql) == 1
+    assert sum("insert into generation_runs" in query for query in executed_sql) == 1
+    assert sum("insert into content_candidates" in query for query in executed_sql) == 3
+    assert sum("pg_advisory_xact_lock" in query for query in executed_sql) == 2
+    assert connection.commit_count == 2
+    assert connection.rollback_count == 0
+
+
+def test_manual_next_loop_api_rolls_back_generation_on_candidate_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection(
+        raise_unique_on_content_candidate_insert=True,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 409
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.rolled_back_inserts == ["generation_runs"]
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert not any("insert into next_loop_preparations" in query for query in executed_sql)
+    assert not any("insert into promotion_runs" in query for query in executed_sql)
+    assert not any("insert into ad_experiments" in query for query in executed_sql)
 
 
 def test_next_loop_service_wires_s3_artifact_publisher_outside_test_env(
@@ -712,6 +873,10 @@ class RecordingCursor:
         table_name = _inserted_table_name(sql)
         if table_name is not None:
             self._connection.pending_inserts.append(table_name)
+        if "insert into content_candidates" in sql:
+            self._connection.content_candidate_rows.append(
+                content_candidate_insert_row(params)
+            )
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
@@ -719,6 +884,14 @@ class RecordingCursor:
             return generation_run_insert_row(self._last_params)
         if "insert into content_candidates" in sql:
             return content_candidate_insert_row(self._last_params)
+        if "insert into next_loop_preparations" in sql:
+            row = next_loop_preparation_insert_row(self._last_params)
+            self._connection.active_preparation_row = row
+            return row
+        if "select coalesce(max(attempt_no), 0) + 1" in sql:
+            return {"next_attempt_no": self._connection.next_attempt_no}
+        if "from next_loop_preparations" in sql:
+            return self._connection.active_preparation_row
         if "from promotion_analyses" in sql:
             return promotion_analysis_row(self._connection.segment_id)
         if "from generation_runs" in sql:
@@ -746,6 +919,14 @@ class RecordingCursor:
                 return [decision_target_segment_row(self._connection.segment_id)]
             return [target_segment_row(self._connection.segment_id)]
         if "from content_candidates" in sql:
+            if self._connection.content_candidate_rows:
+                if "status in ('approved', 'active')" in sql:
+                    return [
+                        decision_content_candidate_row(candidate)
+                        for candidate in self._connection.content_candidate_rows
+                        if candidate["status"] in {"approved", "active"}
+                    ]
+                return list(self._connection.content_candidate_rows)
             return [approved_content_candidate_row(self._connection.segment_id)]
         return []
 
@@ -759,6 +940,8 @@ class RecordingConnection:
         content_candidate_unique_constraint_name: str | None = None,
         raise_unique_on_promotion_run_insert: bool = False,
         segment_id: str = "seg_luxury",
+        active_preparation_row: dict[str, object] | None = None,
+        next_attempt_no: int = 1,
     ) -> None:
         self.promotion_run_row = (
             default_promotion_run_row()
@@ -774,6 +957,9 @@ class RecordingConnection:
         )
         self.raise_unique_on_promotion_run_insert = raise_unique_on_promotion_run_insert
         self.segment_id = segment_id
+        self.active_preparation_row = active_preparation_row
+        self.next_attempt_no = next_attempt_no
+        self.content_candidate_rows: list[dict[str, object]] = []
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
@@ -803,6 +989,7 @@ def _inserted_table_name(sql: str) -> str | None:
     for table_name in (
         "generation_runs",
         "content_candidates",
+        "next_loop_preparations",
         "promotion_runs",
         "ad_experiments",
     ):
@@ -985,9 +1172,15 @@ def generation_run_row(params: Any) -> dict[str, object]:
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
-        "content_option_count": 1,
+        "content_option_count": 3,
         "operator_instruction": None,
-        "input_json": {},
+        "input_json": {
+            "next_loop": {
+                "loop_count": 2,
+                "source_promotion_run_id": "prun_banner_001_loop_1",
+                "source_generation_id": "generation_banner_001",
+            }
+        },
         "output_json": {},
         "generation_report_json": {},
         "status": "completed",
@@ -1059,6 +1252,49 @@ def content_candidate_insert_row(params: Any) -> dict[str, object]:
         "status": values["status"],
         "created_at": None,
         "updated_at": None,
+    }
+
+
+def decision_content_candidate_row(
+    candidate: dict[str, object],
+) -> dict[str, object]:
+    return {
+        field_name: candidate[field_name]
+        for field_name in (
+            "content_id",
+            "content_option_id",
+            "generation_id",
+            "analysis_id",
+            "project_id",
+            "campaign_id",
+            "promotion_id",
+            "segment_id",
+            "channel",
+            "status",
+        )
+    }
+
+
+def next_loop_preparation_insert_row(params: Any) -> dict[str, object]:
+    values = tuple(params or ())
+    now = datetime.now(UTC)
+
+    def json_value(value: object) -> object:
+        return getattr(value, "obj", value)
+
+    return {
+        "next_loop_preparation_id": values[0],
+        "source_promotion_run_id": values[1],
+        "analysis_id": values[2],
+        "generation_id": values[3],
+        "attempt_no": values[4],
+        "failed_segment_ids_json": json_value(values[5]),
+        "failed_ad_experiment_ids_json": json_value(values[6]),
+        "source_evaluation_ids_json": json_value(values[7]),
+        "status": "awaiting_content_approval",
+        "activated_promotion_run_id": None,
+        "created_at": now,
+        "updated_at": now,
     }
 
 

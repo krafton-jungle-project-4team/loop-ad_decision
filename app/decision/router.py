@@ -53,6 +53,8 @@ from app.decision.repositories import (
     ContentCandidateRepository,
     EvaluationMetricRepository,
     GenerationRunRepository,
+    NextLoopPreparationRecord,
+    NextLoopPreparationRepository,
     PromotionAnalysisRepository,
     PromotionEvaluationRepository,
     PromotionRepository,
@@ -104,6 +106,25 @@ UNIQUE_CONSTRAINTS = {
 }
 
 APPROVED_CONTENT_UNIQUE_CONSTRAINT = "uq_content_candidates_one_approved_per_segment"
+
+
+class SerializedNextLoopPreparationRepository(NextLoopPreparationRepository):
+    """Serialize manual preparation creation for a single source run."""
+
+    def get_active_by_source_run(
+        self,
+        source_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        self._db.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtext('next-loop-preparation'),
+                hashtext(%s)
+            )
+            """,
+            (source_promotion_run_id,),
+        )
+        return super().get_active_by_source_run(source_promotion_run_id)
 
 
 router = APIRouter(
@@ -278,11 +299,12 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             content_generator = build_external_content_generator(settings)
             artifact_publisher = build_s3_creative_artifact_publisher(settings)
         generation_run_repository = GenerationGenerationRunRepository(connection)
+        generation_content_candidate_repository = (
+            GenerationContentCandidateRepository(connection)
+        )
         generation_service = GenerationService(
             generation_run_repository=generation_run_repository,
-            content_candidate_repository=GenerationContentCandidateRepository(
-                connection
-            ),
+            content_candidate_repository=generation_content_candidate_repository,
             generation_input_reader=GenerationInputRepository(connection),
             content_generator=content_generator,
             artifact_publisher=artifact_publisher,
@@ -303,9 +325,21 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
+            next_loop_preparation_repository=(
+                SerializedNextLoopPreparationRepository(executor)
+            ),
+            generation_run_repository=GenerationRunRepository(executor),
+            content_candidate_repository=generation_content_candidate_repository,
             analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
             generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
             run_creator=run_creator,
+            manual_prepare_enabled=bool(
+                getattr(
+                    getattr(getattr(request, "app", None), "state", None),
+                    "manual_next_loop_enabled",
+                    False,
+                )
+            ),
         )
         connection.commit()
     except Exception:
