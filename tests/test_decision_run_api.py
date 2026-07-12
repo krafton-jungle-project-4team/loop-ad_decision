@@ -66,6 +66,34 @@ def test_run_api_returns_created_run_response_shape() -> None:
     assert payload["ad_experiments"][0]["ad_experiment_id"] == "adexp_fake"
     assert service.calls[0][0] == "promo_banner_001"
     assert service.calls[0][1].loop_count == 2
+    assert service.calls[0][1].next_loop_preparation_id is None
+
+
+def test_run_api_accepts_nullable_next_loop_preparation_id() -> None:
+    service = FakeRunService()
+    client = make_client(service)
+
+    legacy_response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={"next_loop_preparation_id": None},
+    )
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={
+            "analysis_id": "analysis_banner_002",
+            "generation_id": "generation_banner_002_attempt_1",
+            "loop_count": 2,
+            "next_loop_preparation_id": "nlprep_banner_001_loop_2_attempt_1",
+        },
+    )
+
+    assert legacy_response.status_code == 200
+    assert service.calls[0][1].next_loop_preparation_id is None
+    assert response.status_code == 200
+    assert (
+        service.calls[1][1].next_loop_preparation_id
+        == "nlprep_banner_001_loop_2_attempt_1"
+    )
 
 
 def test_run_api_rejects_invalid_body() -> None:
@@ -78,6 +106,18 @@ def test_run_api_rejects_invalid_body() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"][0]["type"] == "extra_forbidden"
+
+
+def test_run_api_rejects_blank_next_loop_preparation_id() -> None:
+    client = make_client(FakeRunService())
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={"next_loop_preparation_id": "   "},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"][0]["type"] == "string_too_short"
 
 
 def test_run_api_maps_service_errors() -> None:

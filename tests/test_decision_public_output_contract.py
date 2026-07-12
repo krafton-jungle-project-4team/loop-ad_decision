@@ -12,6 +12,12 @@ from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.decision.schemas import (
+    NextLoopPreparationStatus,
+    NextLoopRequest,
+    NextLoopResponse,
+    RunCreateRequest,
+)
 from app.generation.artifacts import render_banner_html
 from app.generation.router import get_generation_service
 from app.generation.service import GenerationService
@@ -125,6 +131,62 @@ def test_public_outputs_do_not_use_shopping_terms() -> None:
 
     for label, pattern in FORBIDDEN_SHOPPING_PATTERNS.items():
         assert not pattern.search(payload_text), f"shopping term leaked: {label}"
+
+
+def test_manual_next_loop_contract_does_not_expose_forbidden_public_terms() -> None:
+    payload_text = json.dumps(
+        NextLoopResponse(
+            status=NextLoopPreparationStatus.AWAITING_CONTENT_APPROVAL,
+            content_approval_required=True,
+            next_loop_preparation_id="nlprep_banner_001_loop_2_attempt_1",
+            previous_promotion_run_id="prun_banner_001_loop_1",
+            next_promotion_run_id=None,
+            promotion_id="promo_banner_001",
+            loop_count=2,
+            next_analysis_id="analysis_banner_002",
+            next_generation_id="generation_banner_002_attempt_1",
+            pending_content_ids=["content_banner_002_option_1"],
+            next_ad_experiments=[],
+        ).model_dump(mode="json"),
+        ensure_ascii=False,
+    )
+
+    for label, pattern in {
+        **FORBIDDEN_PUBLIC_PATTERNS,
+        **FORBIDDEN_SHOPPING_PATTERNS,
+    }.items():
+        assert not pattern.search(payload_text), f"forbidden public term: {label}"
+
+
+def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
+    request_schema = NextLoopRequest.model_json_schema()
+    run_request_schema = RunCreateRequest.model_json_schema()
+    openapi_schema = make_client().get("/openapi.json").json()
+    response_schema = openapi_schema["components"]["schemas"]["NextLoopResponse"]
+    preparation_status_schema = openapi_schema["components"]["schemas"][
+        "NextLoopPreparationStatus"
+    ]
+
+    assert request_schema["properties"]["content_approval_mode"]["default"] == (
+        "automatic"
+    )
+    assert set(request_schema["$defs"]["ContentApprovalMode"]["enum"]) == {
+        "automatic",
+        "manual",
+    }
+    assert "next_loop_preparation_id" in run_request_schema["properties"]
+    assert {
+        "status",
+        "content_approval_required",
+        "next_loop_preparation_id",
+        "pending_content_ids",
+    } <= response_schema["properties"].keys()
+    assert set(preparation_status_schema["enum"]) == {
+        "awaiting_content_approval",
+        "activated",
+        "rejected",
+        "cancelled",
+    }
 
 
 def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
