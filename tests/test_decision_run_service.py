@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timezone
 from decimal import Decimal
 
 import pytest
@@ -9,6 +11,7 @@ from app.decision.repositories import (
     AdExperimentWrite,
     ContentCandidateRecord,
     GenerationRunRecord,
+    NextLoopPreparationRecord,
     PromotionAnalysisRecord,
     PromotionRecord,
     PromotionRunRecord,
@@ -784,6 +787,93 @@ def test_run_service_rejects_explicit_scope_when_feature_flag_is_off() -> None:
     assert repos.ad_experiments.inserted_batches == []
 
 
+def test_run_service_rejects_preparation_activation_when_feature_flag_is_off() -> None:
+    service, repos = make_service(partial_segment_scope_enabled=False)
+
+    with pytest.raises(RunConflictError, match="scope is disabled"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(next_loop_preparation_id="nlprep_001"),
+        )
+
+    assert repos.promotions.calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_activates_preparation_with_exact_source_scope_idempotently() -> None:
+    preparation_repository = FakeNextLoopPreparationRepository(
+        next_loop_preparation_record(),
+    )
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        preparation_repository=preparation_repository,
+    )
+    repos.runs.records.append(source_promotion_run_record())
+    request = RunCreateRequest(next_loop_preparation_id="nlprep_001")
+
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=request,
+    )
+    second = service.create_run(
+        promotion_id="promo_banner_001",
+        request=request,
+    )
+
+    assert second == first
+    assert first.loop_count == 2
+    assert first.segment_ids == ["seg_family_trip"]
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+    assert preparation_repository.activation_calls == [
+        ("nlprep_001", first.promotion_run_id)
+    ]
+
+
+def test_run_service_rejects_activation_scope_outside_source_run_without_writes() -> None:
+    preparation_repository = FakeNextLoopPreparationRepository(
+        next_loop_preparation_record(failed_segment_ids=("seg_other",)),
+    )
+    service, repos = make_service(
+        preparation_repository=preparation_repository,
+    )
+    repos.runs.records.append(source_promotion_run_record())
+
+    with pytest.raises(RunValidationError, match="stay within its source"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(next_loop_preparation_id="nlprep_001"),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert preparation_repository.activation_calls == []
+
+
+def test_run_service_rejects_explicit_scope_that_differs_from_preparation() -> None:
+    preparation_repository = FakeNextLoopPreparationRepository(
+        next_loop_preparation_record(),
+    )
+    service, repos = make_service(
+        preparation_repository=preparation_repository,
+    )
+    repos.runs.records.append(source_promotion_run_record())
+
+    with pytest.raises(RunConflictError, match="must match"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(
+                next_loop_preparation_id="nlprep_001",
+                segment_ids=["seg_other"],
+            ),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert preparation_repository.activation_calls == []
+
+
 class FakePromotionRepository:
     def __init__(self, promotion: PromotionRecord | None) -> None:
         self.promotion = promotion
@@ -968,6 +1058,41 @@ class FakeAdExperimentRepository:
         return segment_id in self.existing_segments
 
 
+class FakeNextLoopPreparationRepository:
+    def __init__(self, record: NextLoopPreparationRecord) -> None:
+        self.record = record
+        self.activation_calls: list[tuple[str, str]] = []
+
+    def get_by_id(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        if self.record.next_loop_preparation_id != next_loop_preparation_id:
+            return None
+        return self.record
+
+    def mark_activated(
+        self,
+        *,
+        next_loop_preparation_id: str,
+        activated_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        if (
+            self.record.next_loop_preparation_id != next_loop_preparation_id
+            or self.record.status != "awaiting_content_approval"
+        ):
+            return None
+        self.activation_calls.append(
+            (next_loop_preparation_id, activated_promotion_run_id)
+        )
+        self.record = replace(
+            self.record,
+            status="activated",
+            activated_promotion_run_id=activated_promotion_run_id,
+        )
+        return self.record
+
+
 class FakeRepositoryBundle:
     def __init__(
         self,
@@ -1028,6 +1153,7 @@ def make_service(
     latest_generation: GenerationRunRecord | None | object = DEFAULT_LATEST,
     target_segments: list[PromotionTargetSegmentRecord] | None = None,
     candidates: list[ContentCandidateRecord] | None = None,
+    preparation_repository: FakeNextLoopPreparationRepository | None = None,
     partial_segment_scope_enabled: bool = True,
 ) -> tuple[PromotionRunService, FakeRepositoryBundle]:
     repos = FakeRepositoryBundle(
@@ -1048,6 +1174,7 @@ def make_service(
             content_candidate_repository=repos.contents,
             promotion_run_repository=repos.runs,
             ad_experiment_repository=repos.ad_experiments,
+            next_loop_preparation_repository=preparation_repository,
             partial_segment_scope_enabled=partial_segment_scope_enabled,
         ),
         repos,
@@ -1109,6 +1236,45 @@ def generation_record(
         output_json={"content_count": 1},
         generation_report_json={"status": "completed"},
         status=status,
+    )
+
+
+def source_promotion_run_record() -> PromotionRunRecord:
+    segment_ids = ["seg_family_trip"]
+    fingerprint = build_segment_scope_fingerprint(segment_ids=segment_ids)
+    return PromotionRunRecord(
+        promotion_run_id="prun_source_001",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        loop_count=1,
+        status=PromotionRunStatus.PARTIAL_GOAL_MET.value,
+        goal_snapshot_json={"source": "promotions"},
+        segment_scope_json=segment_ids,
+        segment_scope_fingerprint=fingerprint,
+    )
+
+
+def next_loop_preparation_record(
+    *,
+    failed_segment_ids: tuple[str, ...] = ("seg_family_trip",),
+) -> NextLoopPreparationRecord:
+    now = datetime.now(timezone.utc)
+    return NextLoopPreparationRecord(
+        next_loop_preparation_id="nlprep_001",
+        source_promotion_run_id="prun_source_001",
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        attempt_no=1,
+        failed_segment_ids_json=failed_segment_ids,
+        failed_ad_experiment_ids_json=("adexp_seg_family_trip",),
+        source_evaluation_ids_json=("peval_seg_family_trip",),
+        status="awaiting_content_approval",
+        activated_promotion_run_id=None,
+        created_at=now,
+        updated_at=now,
     )
 
 
