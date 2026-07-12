@@ -24,6 +24,9 @@ from offline_evaluation.external_backtest import (
 )
 
 
+SYNERISE_SELECTION_RECENCY_DAYS = 14
+
+
 @dataclass(frozen=True, slots=True)
 class ExternalAdapterConfig:
     profile_pool_limit: int = 1000
@@ -481,7 +484,10 @@ def load_synerise_dataset(
     selected_client_ids = _select_synerise_clients(
         tuple((event_kind, paths[event_kind]) for event_kind in ("search", "add", "remove", "buy")),
         config=config,
-        observation_start=observation_start,
+        selection_start=max(
+            observation_start,
+            config.cutoff - timedelta(days=SYNERISE_SELECTION_RECENCY_DAYS),
+        ),
         arrow_dataset=arrow_dataset,
     )
     selected_client_id_set = set(selected_client_ids)
@@ -558,7 +564,7 @@ def load_synerise_dataset(
         supported_claims=(
             "검색·장바구니·구매 이력으로 미래 구매 가능성이 높은 후보를 찾는 능력",
             "퍼널 이탈형·가격 민감형·카테고리 반복 관심형 후보의 Rank 품질",
-            "시간 분리된 미래 구매율과 예상 성과의 calibration 및 lift",
+            "시간 분리된 미래 구매율과 예상값의 차이 및 baseline 대비 lift",
         ),
         unsupported_claims=(
             "숙박 목적지 또는 호텔에 대한 도메인 정합성",
@@ -602,6 +608,7 @@ def load_synerise_dataset(
         notes=(
             f"관찰 구간은 {observation_start.isoformat()}부터 {config.cutoff.isoformat()} 직전까지입니다.",
             f"결과 구간은 {config.cutoff.isoformat()}부터 {outcome_end.isoformat()} 직전까지입니다.",
+            f"profile pool은 cutoff 이전 최근 {SYNERISE_SELECTION_RECENCY_DAYS}일 내 활동 사용자에서 선택합니다.",
             "page_visit는 URL과 SKU 관계가 없어 feature에서 제외합니다.",
             "리테일 신호는 후보 생성·랭킹 구조의 외부 검증이며 숙박 성능 근거로 합산하지 않습니다.",
         ),
@@ -613,13 +620,13 @@ def _select_synerise_clients(
     event_paths: Sequence[tuple[str, Path]],
     *,
     config: ExternalAdapterConfig,
-    observation_start: datetime,
+    selection_start: datetime,
     arrow_dataset: Any,
 ) -> list[int]:
     sampler: _BoundedStableSample[int] = _BoundedStableSample(
         config.profile_pool_limit
     )
-    start_text = observation_start.strftime("%Y-%m-%d %H:%M:%S")
+    start_text = selection_start.strftime("%Y-%m-%d %H:%M:%S")
     cutoff_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
     for _, path in event_paths:
         scanner = arrow_dataset.dataset(path, format="parquet").scanner(

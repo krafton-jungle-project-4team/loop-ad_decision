@@ -60,6 +60,8 @@ artifacts/external-datasets/
 
 cutoff 이전의 검색·장바구니 추가·제거·구매만 profile에 사용하고 cutoff 이후 target category 구매를 outcome으로 사용한다. 시나리오 category도 관찰 구간에서만 선택한다.
 
+운영 repository가 최근 활동 사용자부터 profile pool을 구성하는 동작에 맞춰, cutoff 이전 최근 14일 내 활동한 사용자 중에서 결정적으로 표본을 선택한 뒤 해당 사용자의 전체 lookback 이력을 집계한다.
+
 `page_visit`는 약 2억 건이지만 URL과 SKU의 관계가 제공되지 않아 상품 상세 조회로 변환하지 않는다. Synerise 결과는 퍼널 후보 생성과 Rank 구조를 검증하는 교차 도메인 자료이며 숙박 성능과 합산하지 않는다.
 
 ## 산출물

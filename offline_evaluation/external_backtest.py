@@ -407,7 +407,7 @@ def _markdown_report(
         "- 후순위 평균 사용자 중복도: "
         f"{_format_percent(metrics['mean_non_first_rank_overlap'])}",
         "",
-        "## 해석 가능한 주장",
+        "## 이 데이터로 평가할 수 있는 항목",
         "",
         *[f"- {value}" for value in manifest.supported_claims],
         "",

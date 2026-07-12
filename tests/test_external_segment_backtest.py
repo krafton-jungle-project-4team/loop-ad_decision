@@ -211,6 +211,7 @@ def test_synerise_adapter_keeps_future_purchase_out_of_observation_profiles(
         [
             {"client_id": 1, "timestamp": "2022-11-12 00:00:00", "sku": 100},
             {"client_id": 2, "timestamp": "2022-11-04 00:00:00", "sku": 200},
+            {"client_id": 3, "timestamp": "2022-11-12 00:00:00", "sku": 100},
         ],
     )
     _write_parquet(
@@ -244,6 +245,9 @@ def test_synerise_adapter_keeps_future_purchase_out_of_observation_profiles(
     )
     assert client_one.booking_complete_count == 0
     assert "synerise-client-1" in case.positive_user_ids
+    assert all(
+        profile.user_id != "synerise-client-3" for profile in case.profiles
+    )
     assert case.target_value == "10"
     assert bundle.manifest.supports_temporal_holdout is True
 
