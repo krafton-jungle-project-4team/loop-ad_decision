@@ -240,6 +240,42 @@ def test_target_segment_repository_lists_segments_for_analysis() -> None:
     assert call.params == ("analysis_banner_001",)
 
 
+def test_target_segment_repository_lists_only_requested_approved_records() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "analysis_id": "analysis_banner_001",
+                "project_id": "hotel-client-a",
+                "campaign_id": "camp_summer_2026",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_family_trip",
+                "segment_name": "Family hotel trip",
+                "segment_vector_id": "segvec_family_trip_v1",
+                "rule_json": {},
+                "profile_json": {},
+                "content_brief_json": {},
+                "data_evidence_json": {},
+                "estimated_size": 1200,
+                "priority": "high",
+                "status": "approved",
+            }
+        ]
+    )
+    repo = PromotionTargetSegmentRepository(db)
+
+    segments = repo.list_approved_for_analysis(
+        "analysis_banner_001",
+        ["seg_family_trip"],
+    )
+
+    assert [segment.segment_id for segment in segments] == ["seg_family_trip"]
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "status = 'approved'" in sql
+    assert "segment_id = any(%s)" in sql
+    assert call.params == ("analysis_banner_001", ["seg_family_trip"])
+
+
 def test_content_candidate_repository_lists_approved_or_active_with_segment_keys() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[

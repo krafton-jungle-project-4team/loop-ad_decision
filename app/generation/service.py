@@ -253,6 +253,7 @@ class GenerationService:
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
             analysis_id=request.analysis_id,
+            segment_ids=None,
             content_option_count=1,
             operator_instruction=request.operator_instruction,
         )
@@ -407,6 +408,10 @@ class GenerationService:
                 raise GenerationInputUnavailable(
                     "confirmed promotion_target_segments are required for generation"
                 )
+            _validate_requested_segment_ids(
+                requested_segment_ids=request.segment_ids,
+                target_segments=target_segments,
+            )
 
             return self._generation_input_builder.build(
                 request=request,
@@ -679,6 +684,22 @@ def _general_generation_attempt_slug(
     if re.fullmatch(r"(?:run|loop)_[2-9][0-9]*", attempt_slug):
         return attempt_slug
     return None
+
+
+def _validate_requested_segment_ids(
+    *,
+    requested_segment_ids: Sequence[str] | None,
+    target_segments: Sequence[TargetSegmentPromptInput],
+) -> None:
+    if requested_segment_ids is None:
+        return
+
+    requested_ids = set(requested_segment_ids)
+    actual_ids = {target_segment.segment_id for target_segment in target_segments}
+    if actual_ids != requested_ids:
+        raise GenerationInputUnavailable(
+            "segment_ids must match approved promotion_target_segments"
+        )
 
 
 def _focus_segment_ids(values: Sequence[str]) -> list[str]:

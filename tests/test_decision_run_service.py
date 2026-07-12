@@ -45,6 +45,8 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
 
     assert repos.analyses.latest_calls == ["promo_banner_001"]
     assert repos.generations.latest_calls == ["promo_banner_001"]
+    assert repos.target_segments.calls == ["analysis_banner_001"]
+    assert repos.target_segments.approved_calls == []
     assert response.analysis_id == "analysis_banner_001"
     assert response.generation_id == "generation_banner_001"
     assert response.status == PromotionRunStatus.PLANNED
@@ -230,6 +232,92 @@ def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
     ]
 
 
+def test_run_service_creates_experiments_only_for_requested_approved_segments() -> None:
+    target_segments = [
+        target_segment_record(
+            segment_id="seg_family_trip",
+            segment_name="Family hotel trip",
+            status="approved",
+        ),
+        target_segment_record(
+            segment_id="seg_mobile_user",
+            segment_name="Mobile hotel users",
+            status="approved",
+        ),
+    ]
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_mobile_user"]),
+        target_segments=target_segments,
+        candidates=[
+            content_candidate_record(
+                segment_id="seg_family_trip",
+                content_id="content_family_001",
+                content_option_id="family_option_a",
+            ),
+            content_candidate_record(
+                segment_id="seg_mobile_user",
+                content_id="content_mobile_001",
+                content_option_id="mobile_option_a",
+            ),
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_ids=["seg_mobile_user"],
+        ),
+    )
+
+    assert repos.target_segments.calls == []
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", ["seg_mobile_user"])
+    ]
+    assert [experiment.segment_id for experiment in response.ad_experiments] == [
+        "seg_mobile_user",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_rejects_requested_segment_ids_that_are_not_approved_without_writes() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[target_segment_record(status="planned")],
+    )
+
+    with pytest.raises(RunValidationError, match="segment_ids"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=["seg_family_trip"]),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_rejects_generation_snapshot_mismatch_without_writes() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_mobile_user",
+                status="approved",
+            )
+        ],
+    )
+
+    with pytest.raises(RunValidationError, match="generation target_segment_ids snapshot"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=["seg_mobile_user"]),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
 def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
     service, repos = make_service(
         target_segments=[
@@ -390,6 +478,7 @@ class FakePromotionTargetSegmentRepository:
     def __init__(self, segments: list[PromotionTargetSegmentRecord]) -> None:
         self.segments = segments
         self.calls: list[str] = []
+        self.approved_calls: list[tuple[str, list[str]]] = []
 
     def list_for_analysis(
         self,
@@ -397,6 +486,19 @@ class FakePromotionTargetSegmentRepository:
     ) -> list[PromotionTargetSegmentRecord]:
         self.calls.append(analysis_id)
         return self.segments
+
+    def list_approved_for_analysis(
+        self,
+        analysis_id: str,
+        segment_ids: list[str],
+    ) -> list[PromotionTargetSegmentRecord]:
+        self.approved_calls.append((analysis_id, list(segment_ids)))
+        requested_ids = set(segment_ids)
+        return [
+            segment
+            for segment in self.segments
+            if segment.segment_id in requested_ids and segment.status == "approved"
+        ]
 
 
 class FakeContentCandidateRepository:
@@ -575,8 +677,12 @@ def generation_record(
     *,
     generation_id: str = "generation_banner_001",
     analysis_id: str = "analysis_banner_001",
+    target_segment_ids: list[str] | None = None,
     status: str = "completed",
 ) -> GenerationRunRecord:
+    input_json = {"analysis_id": analysis_id}
+    if target_segment_ids is not None:
+        input_json["target_segment_ids"] = target_segment_ids
     return GenerationRunRecord(
         generation_id=generation_id,
         analysis_id=analysis_id,
@@ -585,7 +691,7 @@ def generation_record(
         promotion_id="promo_banner_001",
         content_option_count=2,
         operator_instruction=None,
-        input_json={"analysis_id": analysis_id},
+        input_json=input_json,
         output_json={"content_count": 1},
         generation_report_json={"status": "completed"},
         status=status,
@@ -597,6 +703,7 @@ def target_segment_record(
     analysis_id: str = "analysis_banner_001",
     segment_id: str = "seg_family_trip",
     segment_name: str = "Family hotel trip",
+    status: str = "planned",
 ) -> PromotionTargetSegmentRecord:
     return PromotionTargetSegmentRecord(
         analysis_id=analysis_id,
@@ -612,7 +719,7 @@ def target_segment_record(
         data_evidence_json={"event_count": 120},
         estimated_size=1200,
         priority="high",
-        status="planned",
+        status=status,
     )
 
 

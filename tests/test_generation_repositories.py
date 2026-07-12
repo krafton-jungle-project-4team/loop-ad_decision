@@ -37,13 +37,14 @@ class FakeCursor:
         return self.fetchone_result
 
     def fetchall(self) -> list[dict[str, object]]:
+        rows = list(self.fetchall_result)
         if "pts.status = 'approved'" in self._last_query:
-            return [
-                row
-                for row in self.fetchall_result
-                if row.get("status") == "approved"
-            ]
-        return self.fetchall_result
+            rows = [row for row in rows if row.get("status") == "approved"]
+        if "pts.segment_id = any(%(segment_ids)s)" in self._last_query.lower():
+            params = self.executed[-1][1] or {}
+            requested_ids = set(params["segment_ids"])
+            rows = [row for row in rows if row.get("segment_id") in requested_ids]
+        return rows
 
 
 class FakeConnection:
@@ -429,6 +430,71 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
         "promotion_id": "promo_banner_001",
         "analysis_id": "analysis_banner_001",
     }
+
+
+def test_generation_input_repository_limits_confirmed_targets_to_requested_segment_ids() -> None:
+    cursor = FakeCursor(
+        fetchall_result=[
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_family_trip",
+                "segment_name": "Family trip planners",
+                "content_brief_json": {"message_direction": "Family stays."},
+                "data_evidence_json": {},
+                "segment_vector_id": "segvec_family_trip_v1",
+                "estimated_size": 1200,
+                "priority": "high",
+                "status": "approved",
+                "segment_source": "manual_rule",
+                "query_preview_id": None,
+                "natural_language_query": None,
+                "generated_sql": None,
+                "segment_sample_size": 1200,
+                "segment_sample_ratio": "0.010000",
+            },
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_mobile_user",
+                "segment_name": "Mobile hotel users",
+                "content_brief_json": {"message_direction": "Mobile booking."},
+                "data_evidence_json": {},
+                "segment_vector_id": "segvec_mobile_user_v1",
+                "estimated_size": 900,
+                "priority": "medium",
+                "status": "approved",
+                "segment_source": "manual_rule",
+                "query_preview_id": None,
+                "natural_language_query": None,
+                "generated_sql": None,
+                "segment_sample_size": 900,
+                "segment_sample_ratio": "0.008000",
+            },
+        ]
+    )
+    repository = GenerationInputRepository(FakeConnection(cursor))
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_ids=["seg_mobile_user"],
+        content_option_count=1,
+        operator_instruction=None,
+    )
+
+    target_segments = repository.list_target_segment_inputs(request)
+
+    assert [segment.segment_id for segment in target_segments] == ["seg_mobile_user"]
+    query, params = next(
+        (query, params)
+        for query, params in cursor.executed
+        if "FROM promotion_target_segments" in query
+    )
+    assert "pts.segment_id = ANY(%(segment_ids)s)" in query
+    assert params is not None
+    assert params["segment_ids"] == ["seg_mobile_user"]
 
 
 def test_generation_input_repository_focus_read_bypasses_confirmed_status_filter() -> None:

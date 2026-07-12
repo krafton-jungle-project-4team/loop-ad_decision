@@ -69,6 +69,23 @@ def test_run_api_returns_created_run_response_shape() -> None:
     assert service.calls[0][1].next_loop_preparation_id is None
 
 
+def test_run_api_accepts_and_forwards_segment_ids() -> None:
+    service = FakeRunService()
+    client = make_client(service)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={
+            "analysis_id": "analysis_banner_001",
+            "generation_id": "generation_banner_001",
+            "segment_ids": ["seg_mobile_user"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert service.calls[0][1].segment_ids == ["seg_mobile_user"]
+
+
 def test_run_api_accepts_nullable_next_loop_preparation_id() -> None:
     service = FakeRunService()
     client = make_client(service)
@@ -118,6 +135,18 @@ def test_run_api_rejects_blank_next_loop_preparation_id() -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"][0]["type"] == "string_too_short"
+
+
+def test_run_api_rejects_empty_duplicate_or_blank_segment_ids() -> None:
+    client = make_client(FakeRunService())
+
+    for segment_ids in ([], ["seg_family_trip", "seg_family_trip"], ["   "]):
+        response = client.post(
+            "/decision/v1/promotions/promo_banner_001/runs",
+            json={"segment_ids": segment_ids},
+        )
+
+        assert response.status_code == 400
 
 
 def test_run_api_maps_service_errors() -> None:
