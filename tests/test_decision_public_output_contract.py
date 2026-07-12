@@ -185,7 +185,6 @@ def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
         "awaiting_content_approval",
         "activated",
         "rejected",
-        "cancelled",
     }
 
 

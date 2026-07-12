@@ -117,6 +117,9 @@ class NextLoopFocusGenerationRequest:
     source_promotion_run_id: str
     source_generation_id: str
     operator_instruction: str | None = None
+    content_option_count: int = 1
+    attempt_no: int | None = None
+    candidate_status: ContentCandidateStatus = ContentCandidateStatus.APPROVED
 
 
 @dataclass(frozen=True)
@@ -248,18 +251,23 @@ class GenerationService:
             }
         )
         log.info("started", {"request": request})
+        if request.content_option_count < 1:
+            raise ValueError("content_option_count must be at least 1")
+        if request.attempt_no is not None and request.attempt_no < 1:
+            raise ValueError("attempt_no must be at least 1")
         generation_request = GenerationRequest(
             project_id=request.project_id,
             campaign_id=request.campaign_id,
             promotion_id=request.promotion_id,
             analysis_id=request.analysis_id,
             segment_ids=None,
-            content_option_count=1,
+            content_option_count=request.content_option_count,
             operator_instruction=request.operator_instruction,
         )
         generation_id = _generation_id_from_promotion(
             request.promotion_id,
             loop_count=request.loop_count,
+            attempt_no=request.attempt_no,
         )
         log.assign_context({"generationId": generation_id})
         prompt_inputs = self._build_focus_prompt_inputs(
@@ -272,12 +280,7 @@ class GenerationService:
                 request=generation_request,
                 generation_id=generation_id,
                 prompt_inputs=prompt_inputs,
-                # v1.7 section 6.8 does not specify a separate approval gate for
-                # next-loop regenerated content. Temporarily approve the
-                # single internal focus candidate so /next-loop can create
-                # the next run; this may change if the team chooses draft +
-                # explicit approval for next-loop content.
-                candidate_status=ContentCandidateStatus.APPROVED,
+                candidate_status=request.candidate_status,
             )
         except Exception as exc:
             log.warn("content_generation_failed", {"err": exc})
@@ -659,12 +662,16 @@ def _generation_id_from_promotion(
     promotion_id: str,
     *,
     loop_count: int | None = None,
+    attempt_no: int | None = None,
     generation_run_number: int | None = None,
 ) -> str:
     promotion_slug = promotion_id.removeprefix("promo_")
     safe_slug = re.sub(r"[^a-zA-Z0-9_]+", "_", promotion_slug).strip("_")
     if loop_count is not None:
-        return f"generation_{safe_slug or 'content'}_loop_{loop_count}"
+        generation_id = f"generation_{safe_slug or 'content'}_loop_{loop_count}"
+        if attempt_no is not None:
+            return f"{generation_id}_attempt_{attempt_no}"
+        return generation_id
     generation_id = f"generation_{safe_slug or 'content'}"
     if generation_run_number is not None and generation_run_number > 1:
         return f"{generation_id}_run_{generation_run_number}"
@@ -681,7 +688,10 @@ def _general_generation_attempt_slug(
     if not generation_id.startswith(prefix):
         return None
     attempt_slug = generation_id.removeprefix(prefix)
-    if re.fullmatch(r"(?:run|loop)_[2-9][0-9]*", attempt_slug):
+    if re.fullmatch(
+        r"(?:run_[2-9][0-9]*|loop_[2-9][0-9]*(?:_attempt_[1-9][0-9]*)?)",
+        attempt_slug,
+    ):
         return attempt_slug
     return None
 
@@ -721,6 +731,9 @@ def _next_loop_source_context(
         "source_promotion_run_id": request.source_promotion_run_id,
         "source_generation_id": request.source_generation_id,
         "focus_segment_ids": list(request.focus_segment_ids),
+        "content_option_count": request.content_option_count,
+        "attempt_no": request.attempt_no,
+        "candidate_status": request.candidate_status.value,
     }
 
 
