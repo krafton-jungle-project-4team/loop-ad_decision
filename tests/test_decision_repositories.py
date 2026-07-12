@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
@@ -54,11 +54,13 @@ class FakePostgresExecutor:
         self,
         *,
         fetchone_result: Mapping[str, Any] | None = None,
+        fetchone_results: list[Mapping[str, Any] | None] | None = None,
         fetchone_exception: Exception | None = None,
         fetchall_result: list[Mapping[str, Any]] | None = None,
         fetchall_results: list[list[Mapping[str, Any]]] | None = None,
     ) -> None:
         self.fetchone_result = fetchone_result
+        self.fetchone_results = list(fetchone_results or [])
         self.fetchone_exception = fetchone_exception
         self.fetchall_result = fetchall_result or []
         self.fetchall_results = list(fetchall_results or [])
@@ -72,6 +74,8 @@ class FakePostgresExecutor:
         self.calls.append(DbCall("fetchone", query, params))
         if self.fetchone_exception is not None:
             raise self.fetchone_exception
+        if self.fetchone_results:
+            return self.fetchone_results.pop(0)
         return self.fetchone_result
 
     def fetchall(
@@ -1369,6 +1373,51 @@ def test_next_loop_preparation_repository_gets_active_by_source_run() -> None:
     assert call.params == ("run_email_a1",)
 
 
+@pytest.mark.parametrize(
+    ("status", "activated_promotion_run_id"),
+    [
+        ("awaiting_content_approval", None),
+        ("rejected", None),
+        ("activated", "run_email_a2"),
+    ],
+)
+def test_next_loop_preparation_repository_reads_all_contract_statuses(
+    status: str,
+    activated_promotion_run_id: str | None,
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(
+            status=status,
+            activated_promotion_run_id=activated_promotion_run_id,
+        )
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.get_by_id("prep_email_next_loop_01")
+
+    assert preparation is not None
+    assert preparation.status == status
+    assert preparation.activated_promotion_run_id == activated_promotion_run_id
+    assert len(db.calls) == 1
+    assert db.calls[0].operation == "fetchone"
+
+
+@pytest.mark.parametrize("status", ["cancelled", "unknown_status", 7])
+def test_next_loop_preparation_repository_rejects_invalid_row_status_after_fetch(
+    status: Any,
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_result=next_loop_preparation_row(status=status)
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(ValueError, match="status"):
+        repo.get_by_id("prep_email_next_loop_01")
+
+    assert len(db.calls) == 1
+    assert db.calls[0].operation == "fetchone"
+
+
 def test_next_loop_preparation_repository_tolerates_json_string_and_tuple_rows(
 ) -> None:
     db = FakePostgresExecutor(
@@ -1405,13 +1454,21 @@ def test_next_loop_preparation_repository_tolerates_json_string_and_tuple_rows(
 
 
 @pytest.mark.parametrize(
-    ("field_name", "invalid_value"),
+    "field_name",
     [
-        ("failed_segment_ids_json", "not-json"),
-        ("failed_segment_ids_json", {"segment_id": "seg_mobile_user"}),
-        ("failed_ad_experiment_ids_json", []),
-        ("source_evaluation_ids_json", ["eval_valid", 7]),
-        ("source_evaluation_ids_json", ["   "]),
+        "failed_segment_ids_json",
+        "failed_ad_experiment_ids_json",
+        "source_evaluation_ids_json",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        "not-json",
+        {"id": "not-an-array"},
+        [],
+        ["   "],
+        ["valid_id", 7],
     ],
 )
 def test_next_loop_preparation_repository_rejects_invalid_id_set_rows(
@@ -1426,23 +1483,131 @@ def test_next_loop_preparation_repository_rejects_invalid_id_set_rows(
     with pytest.raises(ValueError, match=field_name):
         repo.get_by_id("prep_email_next_loop_01")
 
+    assert len(db.calls) == 1
+    assert db.calls[0].operation == "fetchone"
+
 
 @pytest.mark.parametrize(
-    ("next_attempt_no", "expected"),
-    [(1, 1), (4, 4)],
+    "input_location",
+    [
+        "get_active_source_promotion_run_id",
+        "get_by_id_next_loop_preparation_id",
+        "get_next_attempt_source_promotion_run_id",
+        "insert_next_loop_preparation_id",
+        "insert_source_promotion_run_id",
+        "insert_analysis_id",
+        "insert_generation_id",
+        "mark_rejected_next_loop_preparation_id",
+        "mark_activated_next_loop_preparation_id",
+        "mark_activated_promotion_run_id",
+    ],
 )
-def test_next_loop_preparation_repository_gets_next_attempt_no(
-    next_attempt_no: int,
-    expected: int,
+@pytest.mark.parametrize("invalid_value", [7, "", "   "])
+def test_next_loop_preparation_repository_rejects_invalid_input_ids_before_sql(
+    input_location: str,
+    invalid_value: Any,
 ) -> None:
+    db = FakePostgresExecutor()
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        if input_location == "get_active_source_promotion_run_id":
+            repo.get_active_by_source_run(invalid_value)
+        elif input_location == "get_by_id_next_loop_preparation_id":
+            repo.get_by_id(invalid_value)
+        elif input_location == "get_next_attempt_source_promotion_run_id":
+            repo.get_next_attempt_no(invalid_value)
+        elif input_location.startswith("insert_"):
+            field_name = input_location.removeprefix("insert_")
+            repo.insert(
+                replace(
+                    next_loop_preparation_write(),
+                    **{field_name: invalid_value},
+                )
+            )
+        elif input_location == "mark_rejected_next_loop_preparation_id":
+            repo.mark_rejected(invalid_value)
+        elif input_location == "mark_activated_next_loop_preparation_id":
+            repo.mark_activated(
+                next_loop_preparation_id=invalid_value,
+                activated_promotion_run_id="run_email_a2",
+            )
+        else:
+            repo.mark_activated(
+                next_loop_preparation_id="prep_email_next_loop_01",
+                activated_promotion_run_id=invalid_value,
+            )
+
+    assert db.calls == []
+
+
+@pytest.mark.parametrize("attempt_no", [0, -1])
+def test_next_loop_preparation_repository_rejects_invalid_attempt_before_sql(
+    attempt_no: int,
+) -> None:
+    db = FakePostgresExecutor()
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(ValueError, match="attempt_no"):
+        repo.insert(replace(next_loop_preparation_write(), attempt_no=attempt_no))
+
+    assert db.calls == []
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "failed_segment_ids_json",
+        "failed_ad_experiment_ids_json",
+        "source_evaluation_ids_json",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_value",
+    [
+        (),
+        ("   ",),
+        ("valid_id", 7),
+    ],
+)
+def test_next_loop_preparation_repository_rejects_invalid_input_id_sets_before_sql(
+    field_name: str,
+    invalid_value: Any,
+) -> None:
+    db = FakePostgresExecutor()
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(ValueError, match=field_name):
+        repo.insert(
+            replace(
+                next_loop_preparation_write(),
+                **{field_name: invalid_value},
+            )
+        )
+
+    assert db.calls == []
+
+
+def test_next_loop_preparation_repository_returns_one_for_empty_attempt_history(
+) -> None:
+    db = FakePostgresExecutor(fetchone_result={"next_attempt_no": 1})
+    repo = NextLoopPreparationRepository(db)
+
+    assert repo.get_next_attempt_no("run_email_a1") == 1
+
+    assert len(db.calls) == 1
+    assert "coalesce(max(attempt_no), 0) + 1" in compact_sql(db.calls[0].query)
+
+
+def test_next_loop_preparation_repository_increments_next_attempt_no() -> None:
     db = FakePostgresExecutor(
-        fetchone_result={"next_attempt_no": next_attempt_no}
+        fetchone_result={"next_attempt_no": 4}
     )
     repo = NextLoopPreparationRepository(db)
 
     result = repo.get_next_attempt_no("run_email_a1")
 
-    assert result == expected
+    assert result == 4
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert "coalesce(max(attempt_no), 0) + 1 as next_attempt_no" in sql
@@ -1499,23 +1664,61 @@ def test_next_loop_preparation_repository_marks_awaiting_row_activated() -> None
     assert call.params == ("run_email_a2", "prep_email_next_loop_01")
 
 
-def test_next_loop_preparation_repository_does_not_retransition_terminal_row(
+@pytest.mark.parametrize("terminal_status", ["rejected", "activated"])
+@pytest.mark.parametrize("transition", ["reject", "activate"])
+def test_next_loop_preparation_repository_does_not_retransition_terminal_rows(
+    terminal_status: str,
+    transition: str,
 ) -> None:
     db = FakePostgresExecutor(fetchone_result=None)
     repo = NextLoopPreparationRepository(db)
 
-    rejected = repo.mark_rejected("prep_email_next_loop_01")
-    activated = repo.mark_activated(
-        next_loop_preparation_id="prep_email_next_loop_01",
-        activated_promotion_run_id="run_email_a2",
+    preparation_id = f"prep_email_{terminal_status}_01"
+    if transition == "reject":
+        result = repo.mark_rejected(preparation_id)
+    else:
+        result = repo.mark_activated(
+            next_loop_preparation_id=preparation_id,
+            activated_promotion_run_id="run_email_a2",
+        )
+
+    assert result is None
+    assert len(db.calls) == 1
+    assert "and status = 'awaiting_content_approval'" in compact_sql(
+        db.calls[0].query
     )
 
-    assert rejected is None
-    assert activated is None
-    assert all(
-        "and status = 'awaiting_content_approval'" in compact_sql(call.query)
-        for call in db.calls
+
+def test_next_loop_preparation_repository_allows_next_attempt_after_rejection(
+) -> None:
+    db = FakePostgresExecutor(
+        fetchone_results=[
+            next_loop_preparation_row(status="rejected"),
+            next_loop_preparation_row(
+                next_loop_preparation_id="prep_email_next_loop_02",
+                attempt_no=2,
+            ),
+        ]
     )
+    repo = NextLoopPreparationRepository(db)
+
+    rejected = repo.mark_rejected("prep_email_next_loop_01")
+    inserted = repo.insert(
+        replace(
+            next_loop_preparation_write(),
+            next_loop_preparation_id="prep_email_next_loop_02",
+            attempt_no=2,
+        )
+    )
+
+    assert rejected is not None
+    assert rejected.status == "rejected"
+    assert inserted.status == "awaiting_content_approval"
+    assert inserted.attempt_no == 2
+    assert len(db.calls) == 2
+    assert "set status = 'rejected'" in compact_sql(db.calls[0].query)
+    assert "insert into next_loop_preparations" in compact_sql(db.calls[1].query)
+    assert db.calls[1].params[4] == 2
 
 
 @pytest.mark.parametrize(
