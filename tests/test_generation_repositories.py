@@ -418,6 +418,17 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
     assert "pts.status = 'approved'" in executed_sql
     assert "LEFT JOIN segment_definitions" in executed_sql
     assert "promotion_segment_suggestions" not in executed_sql
+    target_segment_params = next(
+        params
+        for query, params in cursor.executed
+        if "FROM promotion_target_segments" in query
+    )
+    assert target_segment_params == {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+    }
 
 
 def test_generation_input_repository_focus_read_bypasses_confirmed_status_filter() -> None:
