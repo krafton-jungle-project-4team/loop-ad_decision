@@ -19,7 +19,6 @@ from app.decision.repositories import (
 from app.decision.schemas import (
     AdExperimentEvaluateRequest,
     AdExperimentEvaluateResponse,
-    AdExperimentStatus,
     Channel,
     GoalBasis,
     GoalMetric,
@@ -234,10 +233,6 @@ class AdExperimentEvaluationService:
             ),
         )
         self._promotion_evaluation_repository.insert(evaluation)
-        self._ad_experiment_repository.update_status(
-            ad_experiment_id=experiment.ad_experiment_id,
-            status=status,
-        )
         log.info("promotion_evaluation_created", {"evaluation": evaluation, "status": status})
         return evaluation
 
