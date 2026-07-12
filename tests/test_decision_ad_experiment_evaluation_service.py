@@ -68,9 +68,9 @@ def test_ad_experiment_evaluation_calculates_inflow_goal_met() -> None:
     }
     assert inserted.result_json["evaluation_mode"] == "target_threshold"
     assert inserted.result_json["evaluation_scope"] == "ad_experiment"
-    assert repos.experiments.status_updates == [
-        ("adexp_family_trip_001", AdExperimentStatus.GOAL_MET.value)
-    ]
+    assert repos.experiments.status_updates == []
+    assert repos.experiments.experiment is not None
+    assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
 
 
 def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
@@ -102,9 +102,9 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
         "numerator": "booking_complete",
         "denominator": "promotion_click",
     }
-    assert repos.experiments.status_updates == [
-        ("adexp_family_trip_001", AdExperimentStatus.GOAL_NOT_MET.value)
-    ]
+    assert repos.experiments.status_updates == []
+    assert repos.experiments.experiment is not None
+    assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
 
 
 def test_email_booking_conversion_uses_campaign_landing_denominator() -> None:
@@ -164,6 +164,9 @@ def test_ad_experiment_evaluation_marks_denominator_zero_insufficient() -> None:
     assert repos.evaluations.inserted[0].result_json["status_reason"] == (
         "denominator_zero"
     )
+    assert repos.experiments.status_updates == []
+    assert repos.experiments.experiment is not None
+    assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
 
 
 def test_ad_experiment_evaluation_uses_event_denominator_for_min_sample() -> None:
@@ -190,6 +193,37 @@ def test_ad_experiment_evaluation_uses_event_denominator_for_min_sample() -> Non
     assert repos.evaluations.inserted[0].result_json["status_reason"] == (
         "sample_size_below_minimum"
     )
+    assert repos.experiments.status_updates == []
+    assert repos.experiments.experiment is not None
+    assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
+
+
+def test_insufficient_data_evaluation_can_be_repeated_without_stopping_experiment() -> None:
+    repos = FakeEvaluationRepos(
+        counts=MetricCountRecord(numerator_count=0, denominator_count=0),
+    )
+    service = make_service(repos)
+
+    responses = [
+        service.evaluate(
+            ad_experiment_id="adexp_family_trip_001",
+            request=AdExperimentEvaluateRequest(),
+        )
+        for _ in range(2)
+    ]
+
+    assert [response.status for response in responses] == [
+        PromotionEvaluationStatus.INSUFFICIENT_DATA,
+        PromotionEvaluationStatus.INSUFFICIENT_DATA,
+    ]
+    assert len(repos.evaluations.inserted) == 2
+    assert all(
+        evaluation.status == PromotionEvaluationStatus.INSUFFICIENT_DATA.value
+        for evaluation in repos.evaluations.inserted
+    )
+    assert repos.experiments.status_updates == []
+    assert repos.experiments.experiment is not None
+    assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
 
 
 def test_ad_experiment_evaluation_rejects_funnel_step_rate_without_writes() -> None:
