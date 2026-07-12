@@ -386,6 +386,8 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
         loop_count=1,
         status=PromotionRunStatus.PLANNED.value,
         goal_snapshot_json={"metric": "booking_conversion_rate"},
+        segment_scope_json=("seg_family_trip",),
+        segment_scope_fingerprint="a" * 64,
     )
 
     repo.insert(run)
@@ -400,6 +402,8 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
     assert "analysis_id" in sql
     assert "generation_id" in sql
     assert "goal_snapshot_json" in sql
+    assert "segment_scope_json" in sql
+    assert "segment_scope_fingerprint" in sql
     assert call.params == (
         "prun_banner_001_loop_1",
         "hotel-client-a",
@@ -410,7 +414,37 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
         1,
         PromotionRunStatus.PLANNED.value,
         {"metric": "booking_conversion_rate"},
+        ("seg_family_trip",),
+        "a" * 64,
     )
+
+
+def test_promotion_run_repository_reads_segment_scope_contract() -> None:
+    db = FakePostgresExecutor(
+        fetchone_result={
+            "promotion_run_id": "prun_banner_001_loop_2",
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_002",
+            "generation_id": "generation_banner_002",
+            "loop_count": 2,
+            "status": PromotionRunStatus.PLANNED.value,
+            "goal_snapshot_json": {},
+            "segment_scope_json": ["seg_family_trip"],
+            "segment_scope_fingerprint": "b" * 64,
+        }
+    )
+    repo = PromotionRunRepository(db)
+
+    run = repo.get_by_id("prun_banner_001_loop_2")
+
+    assert run is not None
+    assert run.segment_scope_json == ["seg_family_trip"]
+    assert run.segment_scope_fingerprint == "b" * 64
+    sql = compact_sql(db.calls[0].query)
+    assert "segment_scope_json" in sql
+    assert "segment_scope_fingerprint" in sql
 
 
 def test_promotion_run_uniqueness_check_uses_promotion_id_and_loop_count() -> None:
@@ -488,6 +522,8 @@ def test_ad_experiment_repository_inserts_segment_content_and_goal_fields() -> N
     assert "segment_name" in sql
     assert "content_id" in sql
     assert "content_option_id" in sql
+    assert "parent_ad_experiment_id" in sql
+    assert "source_evaluation_id" in sql
     assert "goal_metric" in sql
     assert "goal_target_value" in sql
     assert "goal_basis" in sql
@@ -503,6 +539,8 @@ def test_ad_experiment_repository_inserts_segment_content_and_goal_fields() -> N
         "Family hotel trip",
         "content_family_trip_001",
         "option_a",
+        None,
+        None,
         Channel.ONSITE_BANNER.value,
         1,
         AdExperimentStatus.PLANNED.value,
@@ -546,6 +584,8 @@ def test_ad_experiment_repository_get_by_id_reads_evaluation_context() -> None:
             "segment_name": "Family hotel trip",
             "content_id": "content_family_trip_001",
             "content_option_id": "option_a",
+            "parent_ad_experiment_id": None,
+            "source_evaluation_id": None,
             "channel": Channel.ONSITE_BANNER.value,
             "loop_count": 1,
             "status": AdExperimentStatus.RUNNING.value,
@@ -561,6 +601,8 @@ def test_ad_experiment_repository_get_by_id_reads_evaluation_context() -> None:
     assert experiment is not None
     assert experiment.project_id == "hotel-client-a"
     assert experiment.content_option_id == "option_a"
+    assert experiment.parent_ad_experiment_id is None
+    assert experiment.source_evaluation_id is None
     call = db.calls[0]
     sql = compact_sql(call.query)
     assert "from ad_experiments" in sql
@@ -571,7 +613,42 @@ def test_ad_experiment_repository_get_by_id_reads_evaluation_context() -> None:
     assert "segment_id" in sql
     assert "content_id" in sql
     assert "content_option_id" in sql
+    assert "parent_ad_experiment_id" in sql
+    assert "source_evaluation_id" in sql
     assert call.params == ("adexp_family_trip_001",)
+
+
+def test_ad_experiment_repository_inserts_child_lineage() -> None:
+    db = FakePostgresExecutor()
+    repo = AdExperimentRepository(db)
+    experiment = AdExperimentWrite(
+        ad_experiment_id="adexp_family_trip_child",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        promotion_run_id="prun_banner_001_loop_2",
+        analysis_id="analysis_banner_002",
+        generation_id="generation_banner_002",
+        segment_id="seg_family_trip",
+        segment_name="Family hotel trip",
+        content_id="content_family_trip_002",
+        content_option_id="option_b",
+        channel=Channel.ONSITE_BANNER.value,
+        loop_count=2,
+        status=AdExperimentStatus.PLANNED.value,
+        goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+        goal_target_value=Decimal("0.030000"),
+        goal_basis=GoalBasis.ALL_SEGMENTS.value,
+        parent_ad_experiment_id="adexp_family_trip_parent",
+        source_evaluation_id="eval_family_trip_goal_not_met",
+    )
+
+    repo.insert_many([experiment])
+
+    assert db.calls[0].params[11:13] == (
+        "adexp_family_trip_parent",
+        "eval_family_trip_goal_not_met",
+    )
 
 
 def test_user_segment_assignment_write_carries_assignment_source() -> None:
@@ -1438,6 +1515,21 @@ def test_next_loop_preparation_repository_reads_all_contract_statuses(
     assert db.calls[0].operation == "fetchone"
 
 
+def test_next_loop_preparation_repository_locks_by_id_for_activation() -> None:
+    db = FakePostgresExecutor(fetchone_result=next_loop_preparation_row())
+    repo = NextLoopPreparationRepository(db)
+
+    preparation = repo.get_by_id_for_update("prep_email_next_loop_01")
+
+    assert preparation is not None
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from next_loop_preparations" in sql
+    assert "where next_loop_preparation_id = %s" in sql
+    assert "for update" in sql
+    assert call.params == ("prep_email_next_loop_01",)
+
+
 @pytest.mark.parametrize("status", ["cancelled", "unknown_status", 7])
 def test_next_loop_preparation_repository_rejects_invalid_row_status_after_fetch(
     status: Any,
@@ -1528,6 +1620,7 @@ def test_next_loop_preparation_repository_rejects_invalid_id_set_rows(
     [
         "get_active_source_promotion_run_id",
         "get_by_id_next_loop_preparation_id",
+        "get_by_id_for_update_next_loop_preparation_id",
         "get_next_attempt_source_promotion_run_id",
         "insert_next_loop_preparation_id",
         "insert_source_promotion_run_id",
@@ -1551,6 +1644,8 @@ def test_next_loop_preparation_repository_rejects_invalid_input_ids_before_sql(
             repo.get_active_by_source_run(invalid_value)
         elif input_location == "get_by_id_next_loop_preparation_id":
             repo.get_by_id(invalid_value)
+        elif input_location == "get_by_id_for_update_next_loop_preparation_id":
+            repo.get_by_id_for_update(invalid_value)
         elif input_location == "get_next_attempt_source_promotion_run_id":
             repo.get_next_attempt_no(invalid_value)
         elif input_location.startswith("insert_"):
