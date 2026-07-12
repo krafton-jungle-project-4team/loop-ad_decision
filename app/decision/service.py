@@ -15,6 +15,9 @@ from app.decision.repositories import (
     ContentCandidateRecord,
     GenerationRunReader,
     GenerationRunRecord,
+    NextLoopPreparationConflictError,
+    NextLoopPreparationRecord,
+    NextLoopPreparationWriter,
     PromotionAnalysisReader,
     PromotionAnalysisRecord,
     PromotionReader,
@@ -68,6 +71,7 @@ class PromotionRunService:
         content_candidate_repository: ContentCandidateReader,
         promotion_run_repository: PromotionRunWriter,
         ad_experiment_repository: AdExperimentWriter,
+        next_loop_preparation_repository: NextLoopPreparationWriter | None = None,
         partial_segment_scope_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
@@ -77,6 +81,7 @@ class PromotionRunService:
         self._content_candidate_repository = content_candidate_repository
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
+        self._next_loop_preparation_repository = next_loop_preparation_repository
         self._partial_segment_scope_enabled = partial_segment_scope_enabled
 
     @log_context_scope
@@ -91,12 +96,40 @@ class PromotionRunService:
         log.info("started", {"promotionId": promotion_id, "request": request})
         requested_segment_ids = normalize_explicit_segment_ids(request.segment_ids)
         if (
-            requested_segment_ids is not None
+            (
+                requested_segment_ids is not None
+                or request.next_loop_preparation_id is not None
+            )
             and not self._partial_segment_scope_enabled
         ):
             raise RunConflictError(
                 "explicit segment scope is disabled until Dashboard scope lineage is ready"
             )
+        preparation: NextLoopPreparationRecord | None = None
+        activation_run: PromotionRunRecord | None = None
+        analysis_id = request.analysis_id
+        generation_id = request.generation_id
+        loop_count = request.loop_count
+        if request.next_loop_preparation_id is not None:
+            preparation, requested_segment_ids, activation_run = (
+                self._resolve_activation_context(
+                    promotion_id=promotion_id,
+                    request=request,
+                    requested_segment_ids=requested_segment_ids,
+                )
+            )
+            analysis_id = preparation.analysis_id
+            generation_id = preparation.generation_id
+            source_run = self._promotion_run_repository.get_by_id(
+                preparation.source_promotion_run_id
+            )
+            if source_run is None:
+                raise RunValidationError(
+                    "next-loop preparation source promotion_run was not found"
+                )
+            loop_count = source_run.loop_count + 1
+            if activation_run is not None:
+                return self._reuse_existing_run(activation_run)
         promotion = self._get_promotion(promotion_id)
         log.assign_context(
             {
@@ -107,14 +140,14 @@ class PromotionRunService:
         log.info("promotion_loaded", {"promotion": promotion})
         analysis = self._select_analysis(
             promotion=promotion,
-            analysis_id=request.analysis_id,
+            analysis_id=analysis_id,
         )
         log.assign_context({"analysisId": analysis.analysis_id})
         log.info("promotion_analysis_loaded", {"analysis": analysis})
         generation = self._select_generation(
             promotion=promotion,
             analysis=analysis,
-            generation_id=request.generation_id,
+            generation_id=generation_id,
         )
         log.assign_context({"generationId": generation.generation_id})
         log.info("generation_run_loaded", {"generation": generation})
@@ -150,7 +183,7 @@ class PromotionRunService:
             promotion_id=promotion.promotion_id,
             analysis_id=analysis.analysis_id,
             generation_id=generation.generation_id,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
             segment_scope_fingerprint=segment_scope_fingerprint,
         )
         log.assign_context(
@@ -166,10 +199,11 @@ class PromotionRunService:
             analysis_id=analysis.analysis_id,
             generation_id=generation.generation_id,
             segment_scope_fingerprint=segment_scope_fingerprint,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
         )
         if existing_run is not None:
             response = self._reuse_existing_run(existing_run)
+            self._activate_preparation(preparation, existing_run.promotion_run_id)
             log.info(
                 "completed",
                 {"response": response, "durationMs": duration_ms(started_at)},
@@ -193,7 +227,7 @@ class PromotionRunService:
             analysis=analysis,
             generation=generation,
             promotion_run_id=promotion_run_id,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
             segment_ids=segment_ids,
             segment_scope_fingerprint=segment_scope_fingerprint,
         )
@@ -205,7 +239,7 @@ class PromotionRunService:
             target_segments=target_segments,
             selected_content=selected_content,
             content_by_segment=content_by_segment,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
         )
         log.assign_context({"promotionRunId": run.promotion_run_id})
         log.info("promotion_run_prepared", {"promotionRun": run, "adExperimentCount": len(ad_experiments)})
@@ -226,6 +260,10 @@ class PromotionRunService:
                     "promotion_run_id collided with a different segment scope"
                 )
             response = self._reuse_existing_run(concurrent_run)
+            self._activate_preparation(
+                preparation,
+                concurrent_run.promotion_run_id,
+            )
             log.info(
                 "completed",
                 {"response": response, "durationMs": duration_ms(started_at)},
@@ -233,10 +271,141 @@ class PromotionRunService:
             return response
 
         self._ad_experiment_repository.insert_many(ad_experiments)
+        self._activate_preparation(preparation, run.promotion_run_id)
         log.info("promotion_run_created", {"promotionRun": run, "adExperiments": ad_experiments})
         response = self._build_response(run, ad_experiments)
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
+
+    def _resolve_activation_context(
+        self,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+        requested_segment_ids: tuple[str, ...] | None,
+    ) -> tuple[
+        NextLoopPreparationRecord,
+        tuple[str, ...],
+        PromotionRunRecord | None,
+    ]:
+        repository = self._next_loop_preparation_repository
+        if repository is None or request.next_loop_preparation_id is None:
+            raise RunConflictError(
+                "next-loop preparation activation is not configured"
+            )
+        preparation = repository.get_by_id(request.next_loop_preparation_id)
+        if preparation is None:
+            raise RunValidationError("next-loop preparation was not found")
+        if preparation.status == "rejected":
+            raise RunConflictError("rejected next-loop preparation cannot be activated")
+
+        source_run = self._promotion_run_repository.get_by_id(
+            preparation.source_promotion_run_id
+        )
+        if source_run is None:
+            raise RunValidationError(
+                "next-loop preparation source promotion_run was not found"
+            )
+        if source_run.promotion_id != promotion_id:
+            raise RunValidationError(
+                "next-loop preparation must belong to the requested promotion"
+            )
+        preparation_segment_ids = normalize_explicit_segment_ids(
+            preparation.failed_segment_ids_json
+        )
+        if preparation_segment_ids is None:
+            raise RunValidationError("next-loop preparation segment scope is empty")
+        if not set(preparation_segment_ids).issubset(
+            set(source_run.segment_scope_json)
+        ):
+            raise RunValidationError(
+                "next-loop preparation scope must stay within its source promotion_run"
+            )
+        if (
+            requested_segment_ids is not None
+            and requested_segment_ids != preparation_segment_ids
+        ):
+            raise RunConflictError(
+                "segment_ids must match the next-loop preparation scope"
+            )
+        if request.analysis_id not in (None, preparation.analysis_id):
+            raise RunConflictError(
+                "analysis_id must match the next-loop preparation"
+            )
+        if request.generation_id not in (None, preparation.generation_id):
+            raise RunConflictError(
+                "generation_id must match the next-loop preparation"
+            )
+        expected_loop_count = source_run.loop_count + 1
+        if (
+            "loop_count" in request.model_fields_set
+            and request.loop_count != expected_loop_count
+        ):
+            raise RunConflictError(
+                "loop_count must follow the next-loop preparation source run"
+            )
+
+        activated_run: PromotionRunRecord | None = None
+        if preparation.status == "activated":
+            if preparation.activated_promotion_run_id is None:
+                raise RunConflictError(
+                    "activated next-loop preparation is missing its promotion_run"
+                )
+            activated_run = self._promotion_run_repository.get_by_id(
+                preparation.activated_promotion_run_id
+            )
+            if activated_run is None:
+                raise RunConflictError(
+                    "activated next-loop preparation promotion_run was not found"
+                )
+            expected_fingerprint = build_segment_scope_fingerprint(
+                segment_ids=preparation_segment_ids
+            )
+            if (
+                activated_run.promotion_id != promotion_id
+                or activated_run.analysis_id != preparation.analysis_id
+                or activated_run.generation_id != preparation.generation_id
+                or activated_run.loop_count != expected_loop_count
+                or activated_run.segment_scope_fingerprint != expected_fingerprint
+            ):
+                raise RunConflictError(
+                    "activated next-loop preparation promotion_run has a different scope"
+                )
+
+        return preparation, preparation_segment_ids, activated_run
+
+    def _activate_preparation(
+        self,
+        preparation: NextLoopPreparationRecord | None,
+        promotion_run_id: str,
+    ) -> None:
+        if preparation is None or preparation.status == "activated":
+            return
+        repository = self._next_loop_preparation_repository
+        if repository is None:
+            raise RunConflictError(
+                "next-loop preparation activation is not configured"
+            )
+        try:
+            activated = repository.mark_activated(
+                next_loop_preparation_id=preparation.next_loop_preparation_id,
+                activated_promotion_run_id=promotion_run_id,
+            )
+        except NextLoopPreparationConflictError as exc:
+            raise RunConflictError(
+                "next-loop preparation activation conflicted"
+            ) from exc
+        if activated is not None:
+            return
+        current = repository.get_by_id(preparation.next_loop_preparation_id)
+        if (
+            current is None
+            or current.status != "activated"
+            or current.activated_promotion_run_id != promotion_run_id
+        ):
+            raise RunConflictError(
+                "next-loop preparation could not be activated"
+            )
 
     def _reuse_existing_run(self, run: PromotionRunRecord) -> RunCreateResponse:
         ad_experiments = self._ad_experiment_repository.list_by_run(

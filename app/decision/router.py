@@ -158,6 +158,7 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
+            next_loop_preparation_repository=NextLoopPreparationRepository(executor),
             partial_segment_scope_enabled=(
                 settings.partial_promotion_run_scope_enabled
             ),
