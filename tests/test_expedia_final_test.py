@@ -21,6 +21,10 @@ from offline_evaluation.expedia_final_test import (
     write_sealed_final_test_artifacts,
     write_sealed_final_test_manifest,
 )
+from offline_evaluation.sealed_execution import (
+    mark_execution_failure,
+    mark_outcomes_opened,
+)
 from app.analysis.repositories import RawEventUserSignalRecord
 from app.analysis.segment_performance import (
     MODEL_FEATURE_NAMES,
@@ -32,6 +36,7 @@ from app.analysis.segment_performance import (
 class FakeSealedFinalTestRepository:
     def __init__(self) -> None:
         self.future_call_count = 0
+        self.outcome_events: list[str] = []
         self.scenario_calls: list[dict[str, object]] = []
 
     def source_stats(self) -> ExpediaSourceStats:
@@ -77,6 +82,7 @@ class FakeSealedFinalTestRepository:
 
     def future_booking_users(self, **kwargs):
         self.future_call_count += 1
+        self.outcome_events.append("future_query")
         return ExpediaFutureBookingUsers(
             any_booking_user_ids=frozenset(
                 {"expedia-user-1", "expedia-user-3", "expedia-user-5"}
@@ -149,25 +155,29 @@ def test_runtime_verification_rejects_changed_code_or_source(tmp_path) -> None:
         )
 
 
-def test_execution_marker_blocks_reusing_exposed_test_set(tmp_path) -> None:
+def test_expedia_execution_blocks_retry_after_outcomes_are_opened(tmp_path) -> None:
     repository = FakeSealedFinalTestRepository()
     model_path, model = model_fixture(tmp_path)
     manifest = build_manifest(repository, model_path, model)
     manifest_path = tmp_path / "sealed.json"
     write_sealed_final_test_manifest(manifest, manifest_path)
 
-    marker = reserve_sealed_final_test_execution(
+    execution = reserve_sealed_final_test_execution(
         manifest_path,
         manifest,
         code_commit="commit-1",
+        output_dir=tmp_path / "result",
     )
+    mark_outcomes_opened(execution)
+    mark_execution_failure(execution, RuntimeError("evaluation failed"))
 
-    assert marker.exists()
-    with pytest.raises(ExpediaBacktestError, match="already started"):
+    with pytest.raises(ExpediaBacktestError, match="repeat the final test"):
         reserve_sealed_final_test_execution(
             manifest_path,
             manifest,
             code_commit="commit-1",
+            output_dir=tmp_path / "result",
+            resume_execution_id=execution.execution_id,
         )
 
 
@@ -180,6 +190,9 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
         repository,
         manifest=manifest,
         model=model,
+        on_outcomes_opened=lambda: repository.outcome_events.append(
+            "outcomes_opened"
+        ),
     )
     artifacts = write_sealed_final_test_artifacts(
         result,
@@ -189,6 +202,13 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
     )
 
     assert repository.future_call_count == 4
+    assert repository.outcome_events == [
+        "outcomes_opened",
+        "future_query",
+        "future_query",
+        "future_query",
+        "future_query",
+    ]
     assert result.metrics["candidate_result_count"] > 0
     assert "all_candidate_brier_skill_score" in result.metrics
     summary = json.loads(artifacts["summary"].read_text(encoding="utf-8"))

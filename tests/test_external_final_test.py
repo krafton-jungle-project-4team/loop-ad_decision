@@ -10,7 +10,6 @@ import pytest
 from app.analysis.segment_performance import ContextualBookingHeuristicPredictor
 from offline_evaluation.external_backtest import (
     ExternalBacktestConfig,
-    ExternalBacktestError,
 )
 from offline_evaluation.external_datasets import (
     EXTERNAL_DEVELOPMENT_ROLE,
@@ -29,6 +28,7 @@ from offline_evaluation.external_final_test import (
     write_external_sealed_final_test_artifacts,
     write_external_sealed_final_test_manifest,
 )
+from offline_evaluation.sealed_execution import mark_execution_failure
 
 
 def test_external_development_and_final_user_cohorts_are_disjoint() -> None:
@@ -114,26 +114,33 @@ def test_external_manifest_integrity_and_runtime_fingerprint_are_enforced(
         load_external_sealed_final_test_manifest(manifest_path)
 
 
-def test_execution_marker_blocks_second_external_final_run(tmp_path: Path) -> None:
+def test_external_execution_can_resume_before_outcomes_are_opened(
+    tmp_path: Path,
+) -> None:
     source_dir = _booking_fixture(tmp_path)
     model_path = _model_file(tmp_path)
     manifest = _build_manifest(source_dir, model_path)
     manifest_path = tmp_path / "external-final.json"
     write_external_sealed_final_test_manifest(manifest, manifest_path)
 
-    marker = reserve_external_sealed_final_test_execution(
+    execution = reserve_external_sealed_final_test_execution(
         manifest_path,
         manifest,
         code_commit="commit-1",
+        output_dir=tmp_path / "result",
+    )
+    failed = mark_execution_failure(execution, RuntimeError("temporary failure"))
+
+    resumed = reserve_external_sealed_final_test_execution(
+        manifest_path,
+        manifest,
+        code_commit="commit-1",
+        output_dir=tmp_path / "result",
+        resume_execution_id=failed.execution_id,
     )
 
-    assert marker.is_file()
-    with pytest.raises(ExternalBacktestError, match="already started"):
-        reserve_external_sealed_final_test_execution(
-            manifest_path,
-            manifest,
-            code_commit="commit-1",
-        )
+    assert resumed.execution_id == execution.execution_id
+    assert resumed.attempt_count == 2
 
 
 def test_external_final_run_uses_official_booking_ground_truth_and_writes_result(
@@ -147,11 +154,13 @@ def test_external_final_run_uses_official_booking_ground_truth_and_writes_result
         model_path,
         model_metadata=predictor.metadata(),
     )
+    outcome_events: list[str] = []
 
     result = run_external_sealed_final_test(
         manifest=manifest,
         source_dir=source_dir,
         performance_predictor=predictor,
+        on_outcomes_opened=lambda: outcome_events.append("opened"),
     )
     artifacts = write_external_sealed_final_test_artifacts(
         result,
@@ -161,6 +170,7 @@ def test_external_final_run_uses_official_booking_ground_truth_and_writes_result
     )
 
     assert result.run.results
+    assert outcome_events == ["opened"]
     assert result.dataset_manifest.evaluation_role == EXTERNAL_SEALED_FINAL_ROLE
     assert result.run.summary["prediction_error_comparable"] is False
     assert (
