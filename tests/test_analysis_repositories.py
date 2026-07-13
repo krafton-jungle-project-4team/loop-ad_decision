@@ -623,7 +623,7 @@ def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
         "vector_dim": 64,
         "vector_version": "v2",
         "vector_source": "raw_events",
-        "destination_terms": (),
+        "destination_terms": [],
         "limit": 250,
     }
 
@@ -675,7 +675,7 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
     assert "countif( arrayexists(" in sql
     assert "positioncaseinsensitiveutf8(" in sql
     assert "{destination_terms:array(string)}" in sql
-    assert call.params["destination_terms"] == ("jeju", "제주")
+    assert call.params["destination_terms"] == ["jeju", "제주"]
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:

@@ -186,6 +186,7 @@ def _system_instruction() -> str:
     return (
         "당신은 숙박 예약 플랫폼의 기획자가 읽을 수 있는 마케팅 리포트를 작성합니다. "
         "한국어로만 답하고, 비전문가가 이해하기 쉬운 표현을 사용하세요. "
+        "고객 행동을 설명할 때는 전문적이고 구체적인 표현을 사용하고, 쳐다보다 같은 구어체나 모호한 표현은 쓰지 마세요. "
         "벡터, 군집, 클러스터, centroid, cosine, 유사도 같은 기술 용어는 절대 쓰지 마세요. "
         "데이터로 확인된 사실만 말하고, 과장하지 말고, 실행 가능한 마케팅 판단을 돕는 문장으로 작성하세요."
     )
@@ -196,6 +197,8 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
     display_copy = report_input.display_copy
     evidence = report_input.target_segment.data_evidence_json
     signal_chips = display_copy.get("signal_chips", [])
+    performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
+    rank_comparison = _mapping_value(display_copy.get("rank_comparison"))
     return "\n".join(
         [
             "아래 세그먼트 추천 결과를 대시보드 리포트로 정리하세요.",
@@ -210,6 +213,10 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             f"- 주요 행동 신호: {', '.join(map(str, signal_chips)) or '-'}",
             f"- 표본 수: {evidence.get('sample_size', report_input.target_segment.estimated_size)}",
             f"- 전체 분석 대상 수: {evidence.get('total_eligible_user_count', '-')}",
+            f"- 예상 목표 성과: {performance_estimate.get('label', '-')} {performance_estimate.get('formatted', '-')}",
+            f"- 예상 기준: {performance_estimate.get('window_label', performance_estimate.get('basis_label', '-'))}",
+            f"- 예측 신뢰도: {performance_estimate.get('confidence_label', '-')}",
+            f"- Rank 비교 사실: {rank_comparison.get('summary', display_copy.get('difference_summary', '-'))}",
             "",
             "JSON 필드 설명:",
             "- title: 카드 제목으로 쓸 짧은 고객군 이름",
@@ -281,6 +288,22 @@ def _sanitize_report(
     source: str,
 ) -> dict[str, Any]:
     fallback = _fallback_report(report_input=report_input, source=source)
+    computed_difference = _safe_text(report_input.display_copy.get("difference_summary"))
+    generated_differences = _safe_text_list(report.get("difference_from_other_ranks"))
+    difference_from_other_ranks = []
+    if computed_difference:
+        difference_from_other_ranks.append(computed_difference)
+    difference_from_other_ranks.extend(
+        difference
+        for difference in generated_differences
+        if difference not in difference_from_other_ranks
+    )
+    performance_estimate = _mapping_value(
+        report_input.display_copy.get("performance_estimate")
+    )
+    computed_confidence = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
     sanitized = {
         "version": REPORT_GENERATOR_VERSION,
         "source": source,
@@ -293,14 +316,13 @@ def _sanitize_report(
         "why_recommended": _safe_text_list(report.get("why_recommended"))
         or fallback["why_recommended"],
         "evidence": _safe_text_list(report.get("evidence")) or fallback["evidence"],
-        "difference_from_other_ranks": _safe_text_list(
-            report.get("difference_from_other_ranks")
-        )
+        "difference_from_other_ranks": difference_from_other_ranks[:2]
         or fallback["difference_from_other_ranks"],
         "action_hint": _safe_text(report.get("action_hint"))
         or fallback["action_hint"],
         "caution": _safe_text(report.get("caution")) or fallback["caution"],
-        "confidence_label": _confidence_label(report.get("confidence_label"))
+        "confidence_label": computed_confidence
+        or _confidence_label(report.get("confidence_label"))
         or fallback["confidence_label"],
     }
     if _contains_forbidden_terms(sanitized):
@@ -336,6 +358,10 @@ def _fallback_report(
         _promotion_message_sentence(report_input.promotion),
     ]
     difference_summary = str(display_copy.get("difference_summary", "")).strip()
+    performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
+    performance_confidence = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
 
     return {
         "version": REPORT_GENERATOR_VERSION,
@@ -359,7 +385,7 @@ def _fallback_report(
             sample_size=int(evidence.get("sample_size", 0) or 0),
             min_sample_size=report_input.promotion.min_sample_size,
         ),
-        "confidence_label": _fallback_confidence_label(
+        "confidence_label": performance_confidence or _fallback_confidence_label(
             sample_size=int(evidence.get("sample_size", 0) or 0),
             min_sample_size=report_input.promotion.min_sample_size,
         ),
@@ -410,6 +436,10 @@ def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str
 
 def _format_goal_value(value: Decimal) -> str:
     return f"{float(value) * 100:g}%"
+
+
+def _mapping_value(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _safe_text(value: object) -> str | None:

@@ -29,12 +29,13 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v3"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v4"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 RAW_EVENT_CANDIDATE_USER_LIMIT = 160
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 MAX_RANK_USER_OVERLAP = 0.70
+RANK_RATE_TIE_TOLERANCE = 0.001
 
 CANDIDATE_TYPE_ORDER = (
     "intent_matched",
@@ -46,11 +47,11 @@ CANDIDATE_TYPE_ORDER = (
 )
 
 DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
-    "promotion_condition_match": 0.30,
-    "expected_goal_performance": 0.25,
-    "behavior_lift_vs_baseline": 0.20,
-    "sample_reliability": 0.15,
-    "rank_distinctiveness": 0.10,
+    "promotion_condition_match": 0.15,
+    "expected_goal_performance": 0.70,
+    "behavior_lift_vs_baseline": 0.06,
+    "sample_reliability": 0.06,
+    "rank_distinctiveness": 0.03,
 }
 
 # Destination-specific candidates already require a matching destination event.
@@ -504,6 +505,7 @@ def generate_raw_event_segment_definitions(
             candidate=candidate,
             rank=rank,
             total_eligible_user_count=total_eligible_user_count,
+            ranked_candidates=ranked,
         )
         for rank, candidate in enumerate(ranked)
     ]
@@ -536,6 +538,7 @@ def generate_raw_event_segment_candidate_pool(
             candidate=candidate,
             rank=rank,
             total_eligible_user_count=total_eligible_user_count,
+            ranked_candidates=None,
         )
         for rank, candidate in enumerate(candidates)
     ]
@@ -1156,6 +1159,7 @@ def _segment_definition_from_candidate(
     candidate: _RawEventCandidate,
     rank: int,
     total_eligible_user_count: int,
+    ranked_candidates: Sequence[_RawEventCandidate] | None,
 ) -> SegmentDefinitionRecord:
     sample_ratio = _sample_ratio(
         sample_size=candidate.sample_size,
@@ -1173,20 +1177,43 @@ def _segment_definition_from_candidate(
         total_eligible_user_count=total_eligible_user_count,
         sample_ratio=sample_ratio,
     )
+    matching_user_count = int(
+        candidate.signal_metrics.get("matching_profile_count", candidate.sample_size)
+        or candidate.sample_size
+    )
+    audience = {
+        "total_eligible_user_count": total_eligible_user_count,
+        "matching_user_count": matching_user_count,
+        "selected_user_count": candidate.sample_size,
+        "selected_user_ratio": round(float(sample_ratio), 6),
+        "selection_limited": matching_user_count > candidate.sample_size,
+    }
     performance_estimate = _performance_estimate(
         promotion=promotion,
         candidate=candidate,
+    )
+    rank_comparison = _rank_comparison(
+        promotion=promotion,
+        ranked_candidates=ranked_candidates,
+        rank=rank,
     )
     display_copy = {
         "title": candidate.title,
         "rank_role": candidate.rank_role,
         "audience_summary": audience_summary,
+        "audience": audience,
         "performance_estimate": performance_estimate,
         "signal_chips": list(candidate.signal_chips),
         "reason": candidate.reason,
-        "difference_summary": _difference_summary(candidate, rank=rank),
+        "difference_summary": (
+            rank_comparison["summary"]
+            if rank_comparison is not None
+            else _strategy_difference_summary(candidate)
+        ),
         "action_hint": candidate.action_hint,
     }
+    if rank_comparison is not None:
+        display_copy["rank_comparison"] = rank_comparison
     segment_id = _raw_event_segment_id(
         promotion_id=promotion.promotion_id,
         candidate_type=candidate.candidate_type,
@@ -1201,6 +1228,7 @@ def _segment_definition_from_candidate(
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
         "signal_chips": list(candidate.signal_chips),
+        "audience": audience,
         "performance_estimate": performance_estimate,
         "performance_features": candidate.performance_features.to_json(),
         "signal_metrics": {
@@ -1212,6 +1240,12 @@ def _segment_definition_from_candidate(
         "compiled_intent": compilation.to_json(),
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
+        "ranking_basis": {
+            "primary_component": "expected_goal_performance",
+            "metric": promotion.goal_metric,
+            "metric_label": performance_estimate["label"],
+            "method": "goal_performance_weighted_rerank",
+        },
     }
     primary_signals = [
         key for key in candidate.matched_condition_keys if key.strip()
@@ -1883,6 +1917,7 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
         "final_score": round(final_score, 6),
         "weights": dict(weights),
         "destination_context_required": candidate.destination_context_required,
+        "primary_component": "expected_goal_performance",
     }
 
 
@@ -1903,13 +1938,27 @@ def _performance_estimate(
             "method": "empirical_bayes_user_rate",
             "calibration_status": "historical_signal_estimate",
         }
+    confidence_label, confidence_reason = _performance_confidence(
+        candidate=candidate,
+        calibration_status=str(model_metadata.get("calibration_status", "")),
+    )
+    window_days = _positive_int(model_metadata.get("outcome_days"))
     return {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
+        "availability": "available",
+        "unit": "rate",
         "value": round(value, 6),
         "formatted": _format_percent(value),
         "observed_value": round(observed_value, 6),
-        "basis_label": "과거 행동 기반 프로모션 조건 일치 성과 추정",
+        "basis_label": _performance_basis_label(promotion.goal_metric),
+        "window_days": window_days,
+        "window_label": _performance_window_label(
+            promotion.goal_metric,
+            window_days=window_days,
+        ),
+        "confidence_label": confidence_label,
+        "confidence_reason": confidence_reason,
         "method": model_metadata.get("method"),
         "model_version": model_metadata.get("model_version"),
         "calibration_status": model_metadata.get("calibration_status"),
@@ -1931,12 +1980,58 @@ def _observed_goal_rate(
 
 def _performance_estimate_label(goal_metric: str) -> str:
     if goal_metric == "booking_conversion_rate":
-        return "예상 전환율"
+        return "예상 예약 전환율"
     if goal_metric == "inflow_rate":
         return "예상 유입률"
     if goal_metric == "funnel_step_rate":
-        return "예상 퍼널 이동률"
+        return "예상 예약 시작 전환율"
     return "예상 성과"
+
+
+def _performance_basis_label(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return "과거 행동과 프로모션 조건을 반영한 예약 가능성"
+    if goal_metric == "inflow_rate":
+        return "최근 클릭·랜딩 행동을 전체 고객 기준으로 보정한 추정치"
+    if goal_metric == "funnel_step_rate":
+        return "최근 예약 시작 행동을 전체 고객 기준으로 보정한 추정치"
+    return "최근 행동과 프로모션 조건을 반영한 추정치"
+
+
+def _performance_window_label(goal_metric: str, *, window_days: int | None) -> str:
+    if goal_metric == "booking_conversion_rate":
+        if window_days is not None:
+            return f"향후 {window_days}일 내 프로모션 조건 일치 예약"
+        return "향후 프로모션 조건 일치 예약"
+    if goal_metric == "inflow_rate":
+        return "최근 행동 관찰 구간의 캠페인 랜딩"
+    if goal_metric == "funnel_step_rate":
+        return "최근 행동 관찰 구간의 예약 시작"
+    return "최근 행동 관찰 구간"
+
+
+def _performance_confidence(
+    *,
+    candidate: _RawEventCandidate,
+    calibration_status: str,
+) -> tuple[str, str]:
+    if calibration_status == "calibrated":
+        if candidate.sample_reliability >= 0.75:
+            return "high", "충분한 표본과 검증된 예약 예측 모델을 사용했습니다."
+        return "medium", "검증된 예약 예측 모델을 사용했지만 표본 규모가 제한적입니다."
+    if calibration_status == "historical_signal_estimate":
+        if candidate.sample_reliability >= 0.75:
+            return "medium", "충분한 표본의 최근 행동 신호를 전체 고객 기준으로 보정했습니다."
+        return "low", "최근 행동 신호를 사용했지만 표본 규모가 제한적입니다."
+    return "low", "현재 데이터에 적용 가능한 검증 모델이 없어 보수적인 추정식을 사용했습니다."
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _format_percent(value: float) -> str:
@@ -1996,20 +2091,82 @@ def _missing_condition_keys(
     )
 
 
-def _difference_summary(candidate: _RawEventCandidate, *, rank: int) -> str:
-    if rank == 0:
-        return "프로모션 조건과 가장 직접적으로 연결되는 행동 신호를 우선한 후보입니다."
+def _rank_comparison(
+    *,
+    promotion: PromotionRecord,
+    ranked_candidates: Sequence[_RawEventCandidate] | None,
+    rank: int,
+) -> dict[str, Any] | None:
+    if not ranked_candidates or len(ranked_candidates) < 2 or rank >= len(ranked_candidates):
+        return None
+    reference_index = 1 if rank == 0 else rank - 1
+    candidate = ranked_candidates[rank]
+    reference = ranked_candidates[reference_index]
+    rate_delta = candidate.predicted_goal_rate - reference.predicted_goal_rate
+    if abs(rate_delta) <= RANK_RATE_TIE_TOLERANCE:
+        direction = "similar"
+    elif rate_delta > 0:
+        direction = "higher"
+    else:
+        direction = "lower"
+    metric_label = _performance_estimate_label(promotion.goal_metric)
+    delta_percentage_points = round(rate_delta * 100.0, 3)
+    return {
+        "reference_rank": reference_index + 1,
+        "metric": promotion.goal_metric,
+        "metric_label": metric_label,
+        "direction": direction,
+        "delta_percentage_points": delta_percentage_points,
+        "summary": _rank_comparison_summary(
+            candidate=candidate,
+            reference_rank=reference_index + 1,
+            metric_label=metric_label,
+            direction=direction,
+            delta_percentage_points=delta_percentage_points,
+        ),
+    }
+
+
+def _rank_comparison_summary(
+    *,
+    candidate: _RawEventCandidate,
+    reference_rank: int,
+    metric_label: str,
+    direction: str,
+    delta_percentage_points: float,
+) -> str:
+    strategy_summary = _strategy_difference_summary(candidate)
+    absolute_delta = abs(delta_percentage_points)
+    if direction == "similar":
+        return (
+            f"Rank {reference_rank}과 {metric_label}이 비슷하며, "
+            f"{strategy_summary}"
+        )
+    if direction == "higher":
+        return (
+            f"Rank {reference_rank}보다 {metric_label}이 {absolute_delta:.1f}%p 높고, "
+            f"{strategy_summary}"
+        )
+    return (
+        f"Rank {reference_rank}보다 {metric_label}은 {absolute_delta:.1f}%p 낮지만, "
+        f"{strategy_summary}"
+    )
+
+
+def _strategy_difference_summary(candidate: _RawEventCandidate) -> str:
+    if candidate.candidate_type == "intent_matched":
+        return "프로모션 조건과 직접 맞는 숙소 관심 행동을 우선한 전략입니다."
     if candidate.candidate_type == "funnel_recovery":
-        return "상위 후보보다 목적지 조건은 약할 수 있지만 예약 의도 깊이가 더 강합니다."
+        return "예약 시작 후 완료하지 않은 고객을 회수하는 전략입니다."
     if candidate.candidate_type == "promotion_responsive":
-        return "상위 후보보다 구매 단계는 넓지만 캠페인 메시지 반응 가능성이 더 높습니다."
+        return "캠페인 메시지에 반응한 고객을 확장하는 전략입니다."
     if candidate.candidate_type == "target_destination_affinity":
-        return "상위 후보보다 퍼널 깊이는 낮아도 이번 프로모션 목적지를 반복 탐색했습니다."
+        return "이번 프로모션 목적지를 반복 탐색한 고객을 우선한 전략입니다."
     if candidate.candidate_type == "general_destination_explorer":
-        return "이번 목적지 직접 관심은 약하지만 여러 여행지를 비교하는 확장 타겟입니다."
+        return "여러 여행지를 비교하는 고객까지 넓히는 전략입니다."
     if candidate.candidate_type == "benefit_value_seeker":
-        return "상위 후보보다 넓은 타겟이지만 할인과 혜택 메시지에 반응할 가능성이 큽니다."
-    return "다른 Rank와 다른 행동 조건을 기준으로 분리한 후보입니다."
+        return "가격과 혜택에 민감한 고객을 우선한 전략입니다."
+    return "다른 후보와 겹치지 않는 행동 조건을 우선한 전략입니다."
 
 
 def _sample_ratio(*, sample_size: int, total_eligible_user_count: int) -> Decimal:

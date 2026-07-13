@@ -1414,7 +1414,10 @@ def _display_copy_from_report(
         enhanced["reason"] = why_recommended[0]
     elif summary := _text_value(report.get("summary")):
         enhanced["reason"] = summary
-    if difference := _text_list(report.get("difference_from_other_ranks")):
+    if (
+        "difference_summary" not in enhanced
+        and (difference := _text_list(report.get("difference_from_other_ranks")))
+    ):
         enhanced["difference_summary"] = difference[0]
     if action_hint := _text_value(report.get("action_hint")):
         enhanced["action_hint"] = action_hint

@@ -17,6 +17,7 @@ from app.analysis.repositories import (
     RawEventUserSignalRecord,
     UserBehaviorVectorRecord,
 )
+from app.analysis.segment_performance import SegmentPerformanceFeatures
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
 
@@ -65,6 +66,26 @@ class FakeRawEventSignalRepository:
             }
         )
         return self.profiles
+
+
+class CandidateTypePerformancePredictor:
+    version = "test.goal-performance.v1"
+    method = "test_candidate_type_rates"
+    calibration_status = "calibrated"
+
+    def __init__(self, rates: Mapping[str, float]) -> None:
+        self.rates = rates
+
+    def predict(self, features: SegmentPerformanceFeatures) -> float:
+        return self.rates.get(features.candidate_type, 0.01)
+
+    def metadata(self) -> Mapping[str, Any]:
+        return {
+            "model_version": self.version,
+            "method": self.method,
+            "calibration_status": self.calibration_status,
+            "outcome_days": 30,
+        }
 
 
 def promotion_record(
@@ -291,7 +312,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
     assert all(
         segment.profile_json["display_copy"]["performance_estimate"]["label"]
-        == "예상 전환율"
+        == "예상 예약 전환율"
         for segment in segments
     )
     assert all(
@@ -659,7 +680,7 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     assert performance_estimate["label"] == "예상 유입률"
     assert performance_estimate["metric"] == "inflow_rate"
     assert performance_estimate["basis_label"] == (
-        "과거 행동 기반 프로모션 조건 일치 성과 추정"
+        "최근 클릭·랜딩 행동을 전체 고객 기준으로 보정한 추정치"
     )
     assert performance_estimate["calibration_status"] == (
         "historical_signal_estimate"
@@ -667,6 +688,77 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     assert segments[0].profile_json["display_copy"]["performance_estimate"] == (
         performance_estimate
     )
+
+
+def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() -> None:
+    profiles = [
+        *[
+            raw_signal(
+                f"intent_{index}",
+                hotel_search_count=2,
+                hotel_detail_view_count=1,
+            )
+            for index in range(6)
+        ],
+        *[
+            raw_signal(
+                f"recovery_{index}",
+                booking_start_count=1,
+            )
+            for index in range(6)
+        ],
+    ]
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=FakeRawEventSignalRepository(profiles),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=CandidateTypePerformancePredictor(
+            {
+                "intent_matched": 0.18,
+                "funnel_recovery": 0.42,
+            }
+        ),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="숙소 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert [segment.rule_json["candidate_type"] for segment in segments] == [
+        "funnel_recovery",
+        "intent_matched",
+    ]
+    first_profile = segments[0].profile_json
+    assert first_profile["score_components"]["weights"][
+        "expected_goal_performance"
+    ] == 0.70
+    assert first_profile["score_components"]["primary_component"] == (
+        "expected_goal_performance"
+    )
+    estimate = first_profile["performance_estimate"]
+    assert estimate["label"] == "예상 예약 전환율"
+    assert estimate["value"] == 0.42
+    assert estimate["window_days"] == 30
+    assert estimate["window_label"] == "향후 30일 내 프로모션 조건 일치 예약"
+    assert estimate["confidence_label"] == "high"
+    display_copy = first_profile["display_copy"]
+    assert display_copy["audience"] == {
+        "total_eligible_user_count": 12,
+        "matching_user_count": 6,
+        "selected_user_count": 6,
+        "selected_user_ratio": 0.5,
+        "selection_limited": False,
+    }
+    assert display_copy["rank_comparison"]["reference_rank"] == 2
+    assert display_copy["rank_comparison"]["direction"] == "higher"
+    assert display_copy["rank_comparison"]["delta_percentage_points"] == 24.0
+    assert "24.0%p 높고" in display_copy["difference_summary"]
 
 
 def test_raw_event_suggester_uses_destination_context_for_expected_conversion_rate() -> None:
@@ -713,7 +805,7 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     )
 
     performance_estimate = segments[0].profile_json["performance_estimate"]
-    assert performance_estimate["label"] == "예상 전환율"
+    assert performance_estimate["label"] == "예상 예약 전환율"
     assert performance_estimate["value"] < 1.0
     assert performance_estimate["formatted"] != "100.0%"
     assert performance_estimate["observed_value"] == 1.0
