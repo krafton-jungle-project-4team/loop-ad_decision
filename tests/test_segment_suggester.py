@@ -17,7 +17,10 @@ from app.analysis.repositories import (
     RawEventUserSignalRecord,
     UserBehaviorVectorRecord,
 )
-from app.analysis.segment_performance import SegmentPerformanceFeatures
+from app.analysis.segment_performance import (
+    SegmentPerformanceFeatures,
+    build_segment_performance_predictor,
+)
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
 
@@ -817,6 +820,61 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     score_components = segments[0].profile_json["score_components"]
     assert score_components["predicted_goal_rate"] < 1.0
     assert score_components["expected_goal_performance"] == 1.0
+
+
+def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> None:
+    user_ids = [f"extreme_{index}" for index in range(4)]
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [user_vector(user_id, vector_values(8)) for user_id in user_ids]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                user_id,
+                hotel_search_count=20,
+                hotel_detail_view_count=20,
+                promotion_impression_count=5,
+                promotion_click_count=2,
+                campaign_landing_count=3,
+                booking_start_count=5,
+                booking_complete_count=4,
+                deal_event_count=10,
+                destination_match_count=30,
+                season_match_count=1,
+                destination_values=("jeju",),
+                checkin_dates=("2026-07-15",),
+            )
+            for user_id in user_ids
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=build_segment_performance_predictor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    estimate = segments[0].profile_json["performance_estimate"]
+    adjustment = estimate["prediction_adjustment"]
+    assert adjustment["raw_model_value"] > adjustment["adjusted_value"]
+    assert adjustment["distribution_guarded_value"] > (
+        adjustment["adjusted_value"]
+    )
+    assert adjustment["candidate_sample_size"] == 4
+    assert adjustment["out_of_distribution_feature_count"] > 0
+    assert estimate["value"] == adjustment["adjusted_value"]
+    assert estimate["value"] < 0.2
+    assert estimate["confidence_label"] == "low"
 
 
 def test_raw_event_suggester_requests_vector_window_signals() -> None:
