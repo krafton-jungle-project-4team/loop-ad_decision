@@ -15,9 +15,10 @@ from app.analysis.raw_event_segments import (
 )
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
 from app.analysis.segment_performance import SegmentPerformancePredictor
+from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
 
 
-EXTERNAL_BACKTEST_VERSION = "external.segment-backtest.v1"
+EXTERNAL_BACKTEST_VERSION = "external.segment-backtest.v3"
 
 
 class ExternalBacktestError(RuntimeError):
@@ -28,6 +29,10 @@ class ExternalBacktestError(RuntimeError):
 class ExternalBacktestConfig:
     max_suggested_segments: int = 3
     min_sample_size: int = 20
+    prediction_error_comparable: bool = False
+    prediction_error_comparability_reason: str = (
+        "external outcome semantics differ from the Expedia calibration target"
+    )
 
     def __post_init__(self) -> None:
         if self.max_suggested_segments <= 0:
@@ -47,6 +52,11 @@ class ExternalDatasetManifest:
     unsupported_claims: tuple[str, ...]
     signal_mappings: Mapping[str, Mapping[str, str]]
     source_files: tuple[Mapping[str, Any], ...]
+    evaluation_role: str = "development_diagnostic"
+    prediction_error_comparable: bool = False
+    prediction_error_comparability_reason: str = (
+        "external outcome semantics differ from the Expedia calibration target"
+    )
     notes: tuple[str, ...] = ()
     version: str = EXTERNAL_BACKTEST_VERSION
 
@@ -64,6 +74,11 @@ class ExternalDatasetManifest:
                 key: dict(value) for key, value in self.signal_mappings.items()
             },
             "source_files": [dict(value) for value in self.source_files],
+            "evaluation_role": self.evaluation_role,
+            "prediction_error_comparable": self.prediction_error_comparable,
+            "prediction_error_comparability_reason": (
+                self.prediction_error_comparability_reason
+            ),
             "notes": list(self.notes),
         }
 
@@ -112,7 +127,8 @@ class ExternalBacktestResult:
     baseline_outcome_rate: float
     absolute_lift_percentage_points: float
     relative_lift: float | None
-    absolute_prediction_error_percentage_points: float
+    prediction_error_comparable: bool
+    absolute_prediction_error_percentage_points: float | None
     recommendation_score: float
     maximum_prior_rank_overlap: float
 
@@ -164,18 +180,24 @@ def run_external_backtest(
                 }
             )
             continue
-        results.extend(_evaluate_case(case, segments))
+        results.extend(_evaluate_case(case, segments, config=config))
     response_results = tuple(results)
     return ExternalBacktestRun(
         results=response_results,
         skipped_scenarios=tuple(skipped),
-        summary=summarize_external_backtest(response_results, skipped),
+        summary=summarize_external_backtest(
+            response_results,
+            skipped,
+            config=config,
+        ),
     )
 
 
 def _evaluate_case(
     case: ExternalEvaluationCase,
     segments: Sequence[Any],
+    *,
+    config: ExternalBacktestConfig,
 ) -> list[ExternalBacktestResult]:
     eligible_ids = {profile.user_id for profile in case.profiles}
     baseline_rate = _safe_rate(len(case.positive_user_ids), len(eligible_ids))
@@ -221,10 +243,12 @@ def _evaluate_case(
                 )
                 * 100.0,
                 relative_lift=relative_lift,
-                absolute_prediction_error_percentage_points=abs(
-                    predicted_rate - actual_rate
-                )
-                * 100.0,
+                prediction_error_comparable=config.prediction_error_comparable,
+                absolute_prediction_error_percentage_points=(
+                    abs(predicted_rate - actual_rate) * 100.0
+                    if config.prediction_error_comparable
+                    else None
+                ),
                 recommendation_score=float(
                     segment.profile_json.get("recommendation_score", 0.0) or 0.0
                 ),
@@ -237,58 +261,56 @@ def _evaluate_case(
 def summarize_external_backtest(
     results: Sequence[ExternalBacktestResult],
     skipped_scenarios: Sequence[Mapping[str, str]] = (),
+    *,
+    config: ExternalBacktestConfig | None = None,
 ) -> dict[str, Any]:
     grouped: dict[tuple[str, str], list[ExternalBacktestResult]] = {}
     for result in results:
         grouped.setdefault((result.dataset_id, result.scenario_id), []).append(result)
-    rank_one_results: list[ExternalBacktestResult] = []
-    rank_comparable_scenarios: list[list[ExternalBacktestResult]] = []
-    rank_one_best_count = 0
-    for scenario_results in grouped.values():
-        ordered = sorted(scenario_results, key=lambda value: value.rank)
-        rank_one = ordered[0]
-        rank_one_results.append(rank_one)
-        if len(ordered) < 2 or not any(
-            value.positive_user_count > 0 for value in ordered
-        ):
-            continue
-        rank_comparable_scenarios.append(ordered)
-        if rank_one.actual_outcome_rate >= max(
-            value.actual_outcome_rate for value in ordered[1:]
-        ):
-            rank_one_best_count += 1
+    rank_quality = summarize_rank_quality(
+        [
+            [
+                RankedOutcome(
+                    rank=result.rank,
+                    actual_rate=result.actual_outcome_rate,
+                    baseline_rate=result.baseline_outcome_rate,
+                )
+                for result in scenario_results
+            ]
+            for scenario_results in grouped.values()
+        ]
+    )
     candidate_types = {result.candidate_type for result in results}
     non_first_overlaps = [
         result.maximum_prior_rank_overlap for result in results if result.rank > 1
     ]
+    comparable_errors = [
+        result.absolute_prediction_error_percentage_points
+        for result in results
+        if result.prediction_error_comparable
+        and result.absolute_prediction_error_percentage_points is not None
+    ]
+    prediction_error_comparable = bool(comparable_errors)
     return {
         "version": EXTERNAL_BACKTEST_VERSION,
         "scenario_count": len(grouped),
         "candidate_result_count": len(results),
         "skipped_scenario_count": len(skipped_scenarios),
-        "rank_comparable_scenario_count": len(rank_comparable_scenarios),
-        "scenario_with_observed_outcome_count": sum(
-            result.baseline_outcome_rate > 0 for result in rank_one_results
-        ),
-        "rank_one_beats_baseline_rate": _safe_rate(
-            sum(
-                result.actual_outcome_rate > result.baseline_outcome_rate
-                for result in rank_one_results
-            ),
-            len(rank_one_results),
-        ),
-        "rank_one_is_best_rate": (
-            _safe_rate(rank_one_best_count, len(rank_comparable_scenarios))
-            if rank_comparable_scenarios
+        "scenario_with_observed_outcome_count": rank_quality[
+            "observed_outcome_scenario_count"
+        ],
+        **rank_quality,
+        "prediction_error_comparable": prediction_error_comparable,
+        "prediction_error_comparability_reason": (
+            config.prediction_error_comparability_reason
+            if config is not None and not prediction_error_comparable
             else None
         ),
-        "mean_rank_one_lift_percentage_points": _mean(
-            result.absolute_lift_percentage_points for result in rank_one_results
-        ),
-        "mean_absolute_prediction_error_percentage_points": _mean(
-            result.absolute_prediction_error_percentage_points for result in results
+        "mean_absolute_prediction_error_percentage_points": (
+            _mean(comparable_errors) if comparable_errors else None
         ),
         "mean_non_first_rank_overlap": _mean(non_first_overlaps),
+        "maximum_non_first_rank_overlap": max(non_first_overlaps, default=0.0),
         "candidate_type_count": len(candidate_types),
         "candidate_type_diversity_rate": _safe_rate(
             len(candidate_types),
@@ -396,14 +418,26 @@ def _markdown_report(
         f"- 평가 시나리오: {metrics['scenario_count']}",
         f"- 후보 결과: {metrics['candidate_result_count']}",
         "- Rank 1 baseline 초과 비율: "
-        f"{_format_percent(metrics['rank_one_beats_baseline_rate'])}",
+        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
         f"- Rank 비교 가능 시나리오: {metrics['rank_comparable_scenario_count']}",
         "- Rank 1 실제 최고 성과 비율: "
         f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
+        "- Rank 1 실제 최고 동률 비율: "
+        f"{_format_optional_percent(metrics['rank_one_tied_best_rate'])}",
         "- Rank 1 평균 lift: "
-        f"{metrics['mean_rank_one_lift_percentage_points']:.2f}%p",
+        f"{_format_optional_lift(metrics['mean_rank_one_lift_percentage_points'])}",
+        "- Rank 2 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
+        "- Rank 3 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
+        "- 후보 쌍 순서 적중률: "
+        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
+        "- 후보 쌍 동률 비율: "
+        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
         "- 예상값과 외부 outcome의 평균 절대 차이: "
-        f"{metrics['mean_absolute_prediction_error_percentage_points']:.2f}%p",
+        f"{_format_optional_percentage_points(metrics['mean_absolute_prediction_error_percentage_points'])}",
+        "- 예상값 오차 비교 가능 여부: "
+        f"{'yes' if metrics['prediction_error_comparable'] else 'no'}",
         "- 후순위 평균 사용자 중복도: "
         f"{_format_percent(metrics['mean_non_first_rank_overlap'])}",
         "",
@@ -447,6 +481,18 @@ def _safe_rate(numerator: int | float, denominator: int | float) -> float:
 def _mean(values: Sequence[float] | Any) -> float:
     materialized = list(values)
     return mean(materialized) if materialized else 0.0
+
+
+def _format_optional_percentage_points(value: object) -> str:
+    if value is None:
+        return "N/A (outcome definition differs from the calibration target)"
+    return f"{float(value):.2f}%p"
+
+
+def _format_optional_lift(value: object) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):.2f}%p"
 
 
 def _format_percent(value: float) -> str:

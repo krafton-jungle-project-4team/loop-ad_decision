@@ -22,7 +22,6 @@ import argparse
 from datetime import UTC, date, datetime
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -46,6 +45,7 @@ from offline_evaluation.expedia_backtest import (  # noqa: E402
 )
 from offline_evaluation.expedia_final_test import (  # noqa: E402
     ExpediaFinalTestCriteria,
+    ExpediaSealedFinalTestManifest,
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,
     reserve_sealed_final_test_execution,
@@ -66,6 +66,18 @@ from app.logging import (  # noqa: E402
     log,
     log_context_scope,
     now_ms,
+)
+from offline_evaluation.git_state import (  # noqa: E402
+    inspect_clean_git_identity,
+)
+from offline_evaluation.sealed_execution import (  # noqa: E402
+    STATUS_RESULT_STAGED,
+    mark_execution_failure,
+    mark_outcomes_opened,
+    mark_result_staged,
+    prepare_staging_output,
+    publish_staged_result,
+    sealed_execution_attempt,
 )
 
 
@@ -244,7 +256,7 @@ def seal_final_test(
     *,
     started_at: float,
 ) -> int:
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = sealing_git_identity()
     config = backtest_config(args)
     development_cutoffs = monthly_cutoffs(
         args.development_start_cutoff,
@@ -332,7 +344,7 @@ def execute_final_test(
             "final test confirmation does not match the sealed manifest; "
             f"use {manifest.required_confirmation!r} only after code freeze"
         )
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = execution_git_identity()
     model_path = args.model_path.expanduser().resolve()
     model = load_segment_performance_model(model_path)
     stats = repository.source_stats()
@@ -359,39 +371,66 @@ def execute_final_test(
         lookback_days=config.lookback_days,
         outcome_days=config.outcome_days,
     )
-    output_dir = args.output_dir or default_output_dir("sealed-final-test")
-    if output_dir.exists():
-        raise ExpediaBacktestError(
-            "sealed final test output already exists; choose a new empty path "
-            "before opening outcomes"
-        )
-    marker_path = reserve_sealed_final_test_execution(
+    output_dir = args.output_dir or default_final_test_output_dir(manifest)
+    execution = reserve_sealed_final_test_execution(
         args.manifest,
         manifest,
         code_commit=code_commit,
-    )
-    result = run_sealed_final_test(
-        repository,
-        manifest=manifest,
-        model=model,
-    )
-    artifacts = write_sealed_final_test_artifacts(
-        result,
-        manifest=manifest,
         output_dir=output_dir,
-        source_stats=stats,
+        resume_execution_id=args.resume_execution_id,
     )
+    log.assign_context({"executionId": execution.execution_id})
+    with sealed_execution_attempt(execution):
+        if execution.status == STATUS_RESULT_STAGED:
+            completed = publish_staged_result(execution)
+            log.info(
+                "sealed_result_publication_resumed",
+                {
+                    "outputDir": completed.output_dir,
+                    "executionJournalPath": completed.journal_path,
+                },
+            )
+            return 0
+        staging_dir = prepare_staging_output(execution)
+        try:
+            result = run_sealed_final_test(
+                repository,
+                manifest=manifest,
+                model=model,
+                on_outcomes_opened=lambda: mark_outcomes_opened(execution),
+            )
+            write_sealed_final_test_artifacts(
+                result,
+                manifest=manifest,
+                output_dir=staging_dir,
+                source_stats=stats,
+            )
+            mark_result_staged(execution)
+            completed = publish_staged_result(execution)
+        except Exception as exc:
+            failed = mark_execution_failure(execution, exc)
+            log.info(
+                "sealed_execution_state_updated",
+                {
+                    "executionStatus": failed.status,
+                    "executionJournalPath": failed.journal_path,
+                },
+            )
+            raise
     log.info(
         "sealed_final_test_completed",
         {
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "scenarioResultCount": len(result.run.results),
             "skippedScenarioCount": len(result.run.skipped_scenarios),
-            "executionMarkerPath": marker_path,
-            "outputDir": output_dir,
-            "reportPath": artifacts["report"],
-            "summaryPath": artifacts["summary"],
+            "executionJournalPath": completed.journal_path,
+            "outputDir": completed.output_dir,
+            "reportPath": completed.output_dir
+            / "sealed_final_test_report.md",
+            "summaryPath": completed.output_dir
+            / "sealed_final_test_summary.json",
         },
     )
     log.info(
@@ -399,6 +438,7 @@ def execute_final_test(
         {
             "mode": args.command,
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "durationMs": duration_ms(started_at),
         },
@@ -563,6 +603,13 @@ def parse_args() -> argparse.Namespace:
     final_test.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     final_test.add_argument("--confirm", required=True)
     final_test.add_argument("--output-dir", type=Path, default=None)
+    final_test.add_argument(
+        "--resume-execution-id",
+        help=(
+            "Resume the same execution after a pre-outcome or publication "
+            "failure. The ID must match the execution journal."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -651,6 +698,16 @@ def default_output_dir(command: str) -> Path:
     return Path("artifacts") / "expedia-segment-backtest" / f"{command}-{run_at}"
 
 
+def default_final_test_output_dir(
+    manifest: ExpediaSealedFinalTestManifest,
+) -> Path:
+    return (
+        Path("artifacts")
+        / "expedia-segment-backtest"
+        / f"sealed-final-{manifest.manifest_id[:12]}"
+    )
+
+
 def parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -686,41 +743,17 @@ def unit_interval(value: str) -> float:
     return parsed
 
 
-def frozen_git_identity() -> tuple[str, str]:
-    branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
-    if branch != "dev":
-        raise ValueError(
-            "sealed final test must be created and executed from the dev branch"
-        )
-    tracked_status = _git_output(
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
+def sealing_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(
+        REPOSITORY_ROOT,
+        required_branch="dev",
     )
-    if tracked_status:
-        raise ValueError(
-            "sealed final test requires a clean tracked working tree"
-        )
-    return (
-        _git_output("rev-parse", "HEAD"),
-        _git_output("rev-parse", "HEAD^{tree}"),
-    )
+    return identity.commit, identity.tree
 
 
-def _git_output(*args: str) -> str:
-    try:
-        completed = subprocess.run(
-            ("git", *args),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            f"failed to inspect frozen git state: {' '.join(args)}"
-        ) from exc
-    return completed.stdout.strip()
+def execution_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(REPOSITORY_ROOT)
+    return identity.commit, identity.tree
 
 
 def _logging_settings(connection: dict[str, str]) -> Settings:

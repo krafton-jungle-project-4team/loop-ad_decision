@@ -215,7 +215,12 @@ def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
     assert summary["scenario_count"] == 1
     assert summary["candidate_result_count"] == len(run.results)
     assert 0 <= summary["rank_one_beats_baseline_rate"] <= 1
-    assert 0 <= summary["rank_one_is_best_rate"] <= 1
+    assert summary["rank_one_is_best_rate"] == 0.0
+    assert summary["rank_one_tied_best_rate"] == 1.0
+    assert summary["pairwise_rank_accuracy"] == 1.0
+    assert summary["pairwise_rank_tie_rate"] == pytest.approx(1 / 3)
+    assert summary["rank_two_beats_baseline_rate"] == 1.0
+    assert summary["rank_three_beats_baseline_rate"] == 0.0
 
 
 def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -> None:
@@ -242,7 +247,7 @@ def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -
     assert summary["scenario_count"] == 1
     assert summary["evaluable_scenario_count"] == 0
     assert summary["unevaluable_scenario_count"] == 1
-    assert summary["rank_one_is_best_rate"] == 0
+    assert summary["rank_one_is_best_rate"] is None
 
 
 def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:

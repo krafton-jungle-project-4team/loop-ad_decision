@@ -6,11 +6,11 @@ import io
 import itertools
 import zipfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TypeVar
 
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
@@ -25,6 +25,11 @@ from offline_evaluation.external_backtest import (
 
 
 SYNERISE_SELECTION_RECENCY_DAYS = 14
+EXTERNAL_DEVELOPMENT_ROLE = "development_diagnostic"
+EXTERNAL_SEALED_FINAL_ROLE = "sealed_final"
+EXTERNAL_EVALUATION_ROLES = frozenset(
+    {EXTERNAL_DEVELOPMENT_ROLE, EXTERNAL_SEALED_FINAL_ROLE}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +39,8 @@ class ExternalAdapterConfig:
     min_scenario_users: int = 20
     sample_modulo: int = 1
     sample_remainder: int = 0
+    sample_remainders: tuple[int, ...] = ()
+    evaluation_role: str = EXTERNAL_DEVELOPMENT_ROLE
     include_checksum: bool = True
     cutoff: datetime = datetime(2022, 11, 10, tzinfo=UTC)
     lookback_days: int = 90
@@ -48,10 +55,32 @@ class ExternalAdapterConfig:
             raise ValueError("sample_modulo must be positive")
         if not 0 <= self.sample_remainder < self.sample_modulo:
             raise ValueError("sample_remainder must be smaller than sample_modulo")
+        if self.sample_remainders:
+            if len(set(self.sample_remainders)) != len(self.sample_remainders):
+                raise ValueError("sample_remainders must not contain duplicates")
+            if any(
+                not 0 <= remainder < self.sample_modulo
+                for remainder in self.sample_remainders
+            ):
+                raise ValueError(
+                    "every sample remainder must be smaller than sample_modulo"
+                )
+        if self.evaluation_role not in EXTERNAL_EVALUATION_ROLES:
+            raise ValueError("unsupported external evaluation role")
         if self.lookback_days <= 0 or self.outcome_days <= 0:
             raise ValueError("lookback_days and outcome_days must be positive")
         if self.cutoff.tzinfo is None:
             raise ValueError("cutoff must be timezone-aware")
+
+    @property
+    def effective_sample_remainders(self) -> tuple[int, ...]:
+        return self.sample_remainders or (self.sample_remainder,)
+
+    def includes_subject(self, subject_id: str) -> bool:
+        return (
+            stable_bucket(subject_id, self.sample_modulo)
+            in self.effective_sample_remainders
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,17 +94,60 @@ def load_external_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     loaders = {
         "airbnb": load_airbnb_dataset,
-        "booking-com": load_booking_com_dataset,
+        "booking-com": (
+            load_booking_com_final_dataset
+            if config.evaluation_role == EXTERNAL_SEALED_FINAL_ROLE
+            else load_booking_com_dataset
+        ),
         "synerise": load_synerise_dataset,
     }
     try:
         loader = loaders[dataset_id]
     except KeyError as exc:
         raise ValueError(f"unsupported external dataset: {dataset_id}") from exc
-    return loader(source_dir, config=config)
+    return loader(
+        source_dir,
+        config=config,
+        on_outcomes_opened=on_outcomes_opened,
+    )
+
+
+def external_source_paths(
+    dataset_id: str,
+    source_dir: Path,
+    *,
+    evaluation_role: str,
+) -> tuple[Path, ...]:
+    if evaluation_role not in EXTERNAL_EVALUATION_ROLES:
+        raise ValueError("unsupported external evaluation role")
+    if dataset_id == "booking-com":
+        if evaluation_role == EXTERNAL_SEALED_FINAL_ROLE:
+            return (
+                source_dir / "test_set.csv",
+                source_dir / "ground_truth.csv",
+            )
+        return (source_dir / "train_set.csv",)
+    if dataset_id == "airbnb":
+        return (
+            source_dir / "train_users_2.csv.zip",
+            source_dir / "sessions.csv.zip",
+        )
+    if dataset_id == "synerise":
+        return tuple(
+            source_dir / name
+            for name in (
+                "search_query.parquet",
+                "add_to_cart.parquet",
+                "remove_from_cart.parquet",
+                "product_buy.parquet",
+                "product_properties.parquet",
+            )
+        )
+    raise ValueError(f"unsupported external dataset: {dataset_id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,13 +161,15 @@ def load_booking_com_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
+    del on_outcomes_opened
     train_path = source_dir / "train_set.csv"
     sampler: _BoundedStableSample[_BookingTrip] = _BoundedStableSample(
         config.profile_pool_limit
     )
     for trip in _iter_booking_trips(train_path):
-        if stable_bucket(trip.trip_id, config.sample_modulo) != config.sample_remainder:
+        if not config.includes_subject(trip.trip_id):
             continue
         sampler.add(trip.trip_id, trip)
     trips = sampler.values()
@@ -156,10 +230,127 @@ def load_booking_com_dataset(
                 include_checksum=config.include_checksum,
             ),
         ),
+        evaluation_role=config.evaluation_role,
+        prediction_error_comparability_reason=(
+            "Booking.com next itinerary city is not the Expedia model's "
+            "future same-destination booking target"
+        ),
         notes=(
             "기본 validation은 train_set 여행의 마지막 도시만 숨겨 평가합니다.",
             "test_set과 ground_truth.csv는 기본 validation에서 읽지 않아 별도 최종 검증용으로 보존됩니다.",
             "예약 생성 시각이 없어 시간 기반 마케팅 전환이 아니라 여행 순서 기반 holdout입니다.",
+        ),
+    )
+    return ExternalDatasetBundle(manifest=manifest, cases=cases)
+
+
+def load_booking_com_final_dataset(
+    source_dir: Path,
+    *,
+    config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
+) -> ExternalDatasetBundle:
+    if config.evaluation_role != EXTERNAL_SEALED_FINAL_ROLE:
+        raise ValueError("Booking.com official test requires the sealed final role")
+    test_path = source_dir / "test_set.csv"
+    ground_truth_path = source_dir / "ground_truth.csv"
+    sampler: _BoundedStableSample[_BookingTrip] = _BoundedStableSample(
+        config.profile_pool_limit
+    )
+    for trip in _iter_booking_final_observations(test_path):
+        if not config.includes_subject(trip.trip_id):
+            continue
+        sampler.add(trip.trip_id, trip)
+    trips = sampler.values()
+    if not trips:
+        raise ExternalBacktestError(
+            "Booking.com official test sampling produced no trips"
+        )
+
+    observed_city_users: Counter[str] = Counter()
+    for trip in trips:
+        observed_city_users.update(
+            set(_nonempty(row.get("city_id")) for row in trip.observation) - {""}
+        )
+    target_cities = _top_targets(
+        observed_city_users,
+        limit=config.max_scenarios,
+        min_users=config.min_scenario_users,
+    )
+    if not target_cities:
+        raise ExternalBacktestError(
+            "Booking.com official test produced no eligible target cities"
+        )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    ground_truth = _read_booking_ground_truth(ground_truth_path)
+    trips = [
+        replace(trip, outcome=ground_truth[trip.trip_id])
+        for trip in trips
+        if trip.trip_id in ground_truth
+    ]
+    if not trips:
+        raise ExternalBacktestError(
+            "Booking.com ground truth contains no sampled trip outcomes"
+        )
+    cases = tuple(
+        _booking_case(
+            target_city=target_city,
+            trips=trips,
+            config=config,
+            evaluation_design="official_test_ground_truth_holdout",
+            user_id_prefix="booking-final-trip",
+            scenario_prefix="booking-com-official-next-city",
+        )
+        for target_city in target_cities
+    )
+    manifest = ExternalDatasetManifest(
+        dataset_id="booking-com",
+        source_version="booking.multi-destination-trips.official-test.v1",
+        evaluation_design="official_test_ground_truth_holdout",
+        outcome_name="next_itinerary_city_match_rate",
+        supports_temporal_holdout=True,
+        supported_claims=(
+            "공식 test 여행 이력으로 다음 여행 도시와 맞는 세그먼트를 찾는 능력",
+            "개발용 train_set과 분리된 사용자에서의 baseline 대비 lift",
+            "후보 Rank별 다음 도시 적중률",
+        ),
+        unsupported_claims=(
+            "검색 또는 호텔 상세 조회 이후의 예약 전환율",
+            "프로모션 노출에 따른 증분 효과",
+            "Expedia 예상 예약률의 보정 정확도",
+        ),
+        signal_mappings={
+            "destination_values": {
+                "source": "non-placeholder city_id in official test itinerary",
+                "support": "direct",
+            },
+            "hotel_search_count": {
+                "source": "count of observed official test reservations",
+                "support": "proxy",
+            },
+            "booking_complete_count": {
+                "source": "count of observed official test reservations",
+                "support": "direct",
+            },
+            "outcome": {
+                "source": "ground_truth.csv city_id",
+                "support": "direct",
+            },
+        },
+        source_files=tuple(
+            source_file_descriptor(path, include_checksum=config.include_checksum)
+            for path in (test_path, ground_truth_path)
+        ),
+        evaluation_role=config.evaluation_role,
+        prediction_error_comparability_reason=(
+            "Booking.com next itinerary city is not the Expedia model's "
+            "future same-destination booking target"
+        ),
+        notes=(
+            "test_set.csv의 city_id=0 placeholder는 관찰 feature에서 제외합니다.",
+            "ground_truth.csv는 봉인 평가 실행을 시작한 뒤에만 outcome으로 읽습니다.",
+            "예약 생성 시각이 없어 여행 순서 기반 holdout으로 해석합니다.",
         ),
     )
     return ExternalDatasetBundle(manifest=manifest, cases=cases)
@@ -184,16 +375,67 @@ def _iter_booking_trips(path: Path) -> Iterator[_BookingTrip]:
             )
 
 
+def _read_booking_ground_truth(path: Path) -> dict[str, Mapping[str, str]]:
+    if not path.is_file():
+        raise ExternalBacktestError(
+            f"Booking.com ground_truth.csv not found: {path}"
+        )
+    outcomes: dict[str, Mapping[str, str]] = {}
+    with path.open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        required = {"utrip_id", "city_id"}
+        if not required.issubset(reader.fieldnames or ()):
+            raise ExternalBacktestError(
+                "Booking.com ground_truth.csv schema is invalid"
+            )
+        for row in reader:
+            trip_id = _nonempty(row.get("utrip_id"))
+            if trip_id:
+                outcomes[trip_id] = row
+    return outcomes
+
+
+def _iter_booking_final_observations(path: Path) -> Iterator[_BookingTrip]:
+    if not path.is_file():
+        raise ExternalBacktestError(f"Booking.com test_set.csv not found: {path}")
+    with path.open(encoding="utf-8", newline="") as source:
+        reader = csv.DictReader(source)
+        required = {"utrip_id", "city_id", "checkin", "checkout"}
+        if not required.issubset(reader.fieldnames or ()):
+            raise ExternalBacktestError("Booking.com test_set.csv schema is invalid")
+        for trip_id, rows in itertools.groupby(reader, key=lambda row: row["utrip_id"]):
+            observation = tuple(
+                sorted(
+                    (
+                        row
+                        for row in rows
+                        if _nonempty(row.get("city_id")) not in {"", "0"}
+                    ),
+                    key=lambda row: (row["checkin"], row["checkout"]),
+                )
+            )
+            if not observation:
+                continue
+            yield _BookingTrip(
+                trip_id=trip_id,
+                observation=observation,
+                outcome={},
+            )
+
+
 def _booking_case(
     *,
     target_city: str,
     trips: Sequence[_BookingTrip],
     config: ExternalAdapterConfig,
+    evaluation_design: str = "within_trip_sequential_holdout",
+    user_id_prefix: str = "booking-trip",
+    scenario_prefix: str = "booking-com-next-city",
 ) -> ExternalEvaluationCase:
     profiles: list[RawEventUserSignalRecord] = []
     positive_ids: set[str] = set()
     for trip in trips:
-        user_id = f"booking-trip-{trip.trip_id}"
+        user_id = f"{user_id_prefix}-{trip.trip_id}"
         observed_cities = tuple(
             _dedupe(_nonempty(row.get("city_id")) for row in trip.observation)
         )
@@ -229,7 +471,7 @@ def _booking_case(
         )
         if _nonempty(trip.outcome.get("city_id")) == target_city:
             positive_ids.add(user_id)
-    scenario_id = f"booking-com-next-city-{target_city}"
+    scenario_id = f"{scenario_prefix}-{target_city}"
     promotion, intent = _destination_promotion(
         dataset_id="booking-com",
         scenario_id=scenario_id,
@@ -243,7 +485,7 @@ def _booking_case(
         target_value=target_city,
         target_label=f"도시 {target_city}",
         outcome_name="next_itinerary_city_match_rate",
-        evaluation_design="within_trip_sequential_holdout",
+        evaluation_design=evaluation_design,
         profiles=tuple(profiles),
         positive_user_ids=frozenset(positive_ids),
         promotion=promotion,
@@ -254,7 +496,6 @@ def _booking_case(
 @dataclass(frozen=True, slots=True)
 class _AirbnbUser:
     user_id: str
-    country_destination: str
     age_group: str
     gender: str
     affiliate_channel: str
@@ -279,6 +520,7 @@ def load_airbnb_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     users_path = source_dir / "train_users_2.csv.zip"
     sessions_path = source_dir / "sessions.csv.zip"
@@ -313,7 +555,6 @@ def load_airbnb_dataset(
         key=stable_score,
     )[: config.profile_pool_limit]
     profiles: list[RawEventUserSignalRecord] = []
-    positive_ids: set[str] = set()
     for user_id in selected_user_ids:
         user = users[user_id]
         signal = signals[user_id]
@@ -335,12 +576,21 @@ def load_airbnb_dataset(
                 else (),
             )
         )
-        if user.country_destination and user.country_destination != "NDF":
-            positive_ids.add(external_user_id)
     if len(profiles) < config.min_scenario_users:
         raise ExternalBacktestError(
             "Airbnb session sampling produced too few observable users"
         )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    outcomes = _read_airbnb_outcomes(
+        users_path,
+        selected_user_ids=set(selected_user_ids),
+    )
+    positive_ids = {
+        f"airbnb-user-{user_id}"
+        for user_id, country_destination in outcomes.items()
+        if country_destination and country_destination != "NDF"
+    }
     scenario_id = "airbnb-search-active-booking"
     promotion = _promotion(
         dataset_id="airbnb",
@@ -411,6 +661,11 @@ def load_airbnb_dataset(
             source_file_descriptor(path, include_checksum=config.include_checksum)
             for path in (users_path, sessions_path)
         ),
+        evaluation_role=config.evaluation_role,
+        prediction_error_comparability_reason=(
+            "Airbnb static first-booking label has no matching observation window "
+            "for the Expedia model target"
+        ),
         notes=(
             "세션 행에 절대 이벤트 시각이 없어 temporal backtest로 해석하지 않습니다.",
             "booking_request/booking_response/partner_callback은 결과 누수를 줄이기 위해 관찰 feature에서 제외합니다.",
@@ -432,17 +687,30 @@ def _read_airbnb_users(
             user_id = _nonempty(row.get("id"))
             if not user_id:
                 continue
-            if stable_bucket(user_id, config.sample_modulo) != config.sample_remainder:
+            if not config.includes_subject(user_id):
                 continue
             user = _AirbnbUser(
                 user_id=user_id,
-                country_destination=_nonempty(row.get("country_destination")),
                 age_group=_age_group(_nonempty(row.get("age"))),
                 gender=_normalized_gender(_nonempty(row.get("gender"))),
                 affiliate_channel=_nonempty(row.get("affiliate_channel")),
             )
             sampler.add(user_id, user)
     return {user.user_id: user for user in sampler.values()}
+
+
+def _read_airbnb_outcomes(
+    path: Path,
+    *,
+    selected_user_ids: set[str],
+) -> dict[str, str]:
+    outcomes: dict[str, str] = {}
+    with _zipped_dict_reader(path, "train_users_2.csv") as reader:
+        for row in reader:
+            user_id = _nonempty(row.get("id"))
+            if user_id in selected_user_ids:
+                outcomes[user_id] = _nonempty(row.get("country_destination"))
+    return outcomes
 
 
 @dataclass(slots=True)
@@ -460,6 +728,7 @@ def load_synerise_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     try:
         import pyarrow.dataset as arrow_dataset
@@ -500,7 +769,6 @@ def load_synerise_dataset(
         selected_client_ids=selected_client_id_set,
         config=config,
         observation_start=observation_start,
-        outcome_end=outcome_end,
         arrow_dataset=arrow_dataset,
     )
     for event_kind in ("add", "remove", "buy"):
@@ -511,7 +779,6 @@ def load_synerise_dataset(
             selected_client_ids=selected_client_id_set,
             config=config,
             observation_start=observation_start,
-            outcome_end=outcome_end,
             arrow_dataset=arrow_dataset,
         )
     selected_client_ids = [
@@ -519,17 +786,14 @@ def load_synerise_dataset(
         for client_id in selected_client_ids
         if signals[client_id].event_count > 0
     ]
-    relevant_skus = {
+    observed_skus = {
         sku
         for client_id in selected_client_ids
-        for sku in (
-            set(signals[client_id].sku_counts)
-            | signals[client_id].future_buy_skus
-        )
+        for sku in signals[client_id].sku_counts
     }
     sku_properties = _load_synerise_properties(
         paths["properties"],
-        relevant_skus=relevant_skus,
+        relevant_skus=observed_skus,
         parquet=parquet,
     )
     category_users: Counter[str] = Counter()
@@ -544,6 +808,33 @@ def load_synerise_dataset(
         category_users,
         limit=config.max_scenarios,
         min_users=config.min_scenario_users,
+    )
+    if not target_categories:
+        raise ExternalBacktestError(
+            "Synerise observation window produced no eligible target categories"
+        )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    _scan_synerise_future_buys(
+        paths["buy"],
+        signals=signals,
+        selected_client_ids=selected_client_id_set,
+        config=config,
+        outcome_end=outcome_end,
+        arrow_dataset=arrow_dataset,
+    )
+    future_skus = {
+        sku
+        for client_id in selected_client_ids
+        for sku in signals[client_id].future_buy_skus
+        if sku not in sku_properties
+    }
+    sku_properties.update(
+        _load_synerise_properties(
+            paths["properties"],
+            relevant_skus=future_skus,
+            parquet=parquet,
+        )
     )
     cases = tuple(
         _synerise_case(
@@ -605,6 +896,11 @@ def load_synerise_dataset(
             source_file_descriptor(path, include_checksum=config.include_checksum)
             for path in paths.values()
         ),
+        evaluation_role=config.evaluation_role,
+        prediction_error_comparability_reason=(
+            "Synerise retail category purchase is a cross-domain proxy, not an "
+            "Expedia future hotel booking target"
+        ),
         notes=(
             f"관찰 구간은 {observation_start.isoformat()}부터 {config.cutoff.isoformat()} 직전까지입니다.",
             f"결과 구간은 {config.cutoff.isoformat()}부터 {outcome_end.isoformat()} 직전까지입니다.",
@@ -638,7 +934,7 @@ def _select_synerise_clients(
         )
         for batch in scanner.to_batches():
             for client_id in batch.column(0).to_pylist():
-                if client_id % config.sample_modulo != config.sample_remainder:
+                if not config.includes_subject(str(client_id)):
                     continue
                 sampler.add(str(client_id), int(client_id))
     clients = sampler.values()
@@ -655,14 +951,13 @@ def _scan_synerise_events(
     selected_client_ids: set[int],
     config: ExternalAdapterConfig,
     observation_start: datetime,
-    outcome_end: datetime,
     arrow_dataset: Any,
 ) -> None:
-    columns = ["client_id", "timestamp"]
+    columns = ["client_id"]
     if event_kind != "search":
         columns.append("sku")
     start_text = observation_start.strftime("%Y-%m-%d %H:%M:%S")
-    end_text = outcome_end.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
     scanner = arrow_dataset.dataset(path, format="parquet").scanner(
         columns=columns,
         filter=(arrow_dataset.field("timestamp") >= start_text)
@@ -670,33 +965,57 @@ def _scan_synerise_events(
         batch_size=131_072,
         use_threads=True,
     )
-    cutoff_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
     for batch in scanner.to_batches():
         values = batch.to_pydict()
         skus = values.get("sku", [None] * len(values["client_id"]))
-        for client_id, timestamp, sku in zip(
+        for client_id, sku in zip(
             values["client_id"],
-            values["timestamp"],
             skus,
             strict=True,
         ):
             if client_id not in selected_client_ids:
                 continue
             signal = signals[client_id]
-            if timestamp < cutoff_text:
-                signal.event_count += 1
-                if event_kind == "search":
-                    signal.search_count += 1
-                elif event_kind == "add":
-                    signal.add_count += 1
-                elif event_kind == "remove":
-                    signal.remove_count += 1
-                elif event_kind == "buy":
-                    signal.buy_count += 1
-                if sku is not None:
-                    signal.sku_counts[int(sku)] += 1
-            elif event_kind == "buy" and sku is not None:
-                signal.future_buy_skus.add(int(sku))
+            signal.event_count += 1
+            if event_kind == "search":
+                signal.search_count += 1
+            elif event_kind == "add":
+                signal.add_count += 1
+            elif event_kind == "remove":
+                signal.remove_count += 1
+            elif event_kind == "buy":
+                signal.buy_count += 1
+            if sku is not None:
+                signal.sku_counts[int(sku)] += 1
+
+
+def _scan_synerise_future_buys(
+    path: Path,
+    *,
+    signals: dict[int, _SyneriseSignals],
+    selected_client_ids: set[int],
+    config: ExternalAdapterConfig,
+    outcome_end: datetime,
+    arrow_dataset: Any,
+) -> None:
+    cutoff_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    outcome_end_text = outcome_end.strftime("%Y-%m-%d %H:%M:%S")
+    scanner = arrow_dataset.dataset(path, format="parquet").scanner(
+        columns=["client_id", "sku"],
+        filter=(arrow_dataset.field("timestamp") >= cutoff_text)
+        & (arrow_dataset.field("timestamp") < outcome_end_text),
+        batch_size=131_072,
+        use_threads=True,
+    )
+    for batch in scanner.to_batches():
+        values = batch.to_pydict()
+        for client_id, sku in zip(
+            values["client_id"],
+            values["sku"],
+            strict=True,
+        ):
+            if client_id in selected_client_ids and sku is not None:
+                signals[client_id].future_buy_skus.add(int(sku))
 
 
 def _load_synerise_properties(
