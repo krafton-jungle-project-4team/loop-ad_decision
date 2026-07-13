@@ -207,6 +207,8 @@ class PromotionRunRecord:
     loop_count: int
     status: str
     goal_snapshot_json: Mapping[str, Any]
+    segment_scope_json: Sequence[str] = ()
+    segment_scope_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,8 @@ class PromotionRunWrite:
     loop_count: int
     status: str
     goal_snapshot_json: Mapping[str, Any]
+    segment_scope_json: Sequence[str] = ()
+    segment_scope_fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -241,6 +245,8 @@ class AdExperimentRecord:
     goal_metric: str
     goal_target_value: Decimal
     goal_basis: str
+    parent_ad_experiment_id: str | None = None
+    source_evaluation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,8 @@ class AdExperimentWrite:
     goal_metric: str
     goal_target_value: Decimal
     goal_basis: str
+    parent_ad_experiment_id: str | None = None
+    source_evaluation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -602,6 +610,12 @@ class NextLoopPreparationWriter(Protocol):
     ) -> NextLoopPreparationRecord | None:
         ...
 
+    def get_by_id_for_update(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        ...
+
     def get_next_attempt_no(self, source_promotion_run_id: str) -> int:
         ...
 
@@ -916,9 +930,11 @@ class PromotionRunRepository:
                 generation_id,
                 loop_count,
                 status,
-                goal_snapshot_json
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 run.promotion_run_id,
@@ -930,6 +946,8 @@ class PromotionRunRepository:
                 run.loop_count,
                 run.status,
                 run.goal_snapshot_json,
+                run.segment_scope_json,
+                run.segment_scope_fingerprint,
             ),
         )
 
@@ -945,7 +963,9 @@ class PromotionRunRepository:
                 generation_id,
                 loop_count,
                 status,
-                goal_snapshot_json
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
             FROM promotion_runs
             WHERE promotion_run_id = %s
             """,
@@ -999,6 +1019,8 @@ class AdExperimentRepository:
                 segment_name,
                 content_id,
                 content_option_id,
+                parent_ad_experiment_id,
+                source_evaluation_id,
                 channel,
                 loop_count,
                 status,
@@ -1030,6 +1052,8 @@ class AdExperimentRepository:
                     segment_name,
                     content_id,
                     content_option_id,
+                    parent_ad_experiment_id,
+                    source_evaluation_id,
                     channel,
                     loop_count,
                     status,
@@ -1037,7 +1061,10 @@ class AdExperimentRepository:
                     goal_target_value,
                     goal_basis
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
+                )
                 """,
                 (
                     experiment.ad_experiment_id,
@@ -1051,6 +1078,8 @@ class AdExperimentRepository:
                     experiment.segment_name,
                     experiment.content_id,
                     experiment.content_option_id,
+                    experiment.parent_ad_experiment_id,
+                    experiment.source_evaluation_id,
                     experiment.channel,
                     experiment.loop_count,
                     experiment.status,
@@ -1075,6 +1104,8 @@ class AdExperimentRepository:
                 segment_name,
                 content_id,
                 content_option_id,
+                parent_ad_experiment_id,
+                source_evaluation_id,
                 channel,
                 loop_count,
                 status,
@@ -1807,6 +1838,37 @@ class NextLoopPreparationRepository:
                 updated_at
             FROM next_loop_preparations
             WHERE next_loop_preparation_id = %s
+            """,
+            (next_loop_preparation_id,),
+        )
+        return _next_loop_preparation_record_or_none(row)
+
+    def get_by_id_for_update(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        _require_non_blank_string(
+            next_loop_preparation_id,
+            field_name="next_loop_preparation_id",
+        )
+        row = self._db.fetchone(
+            """
+            SELECT
+                next_loop_preparation_id,
+                source_promotion_run_id,
+                analysis_id,
+                generation_id,
+                attempt_no,
+                failed_segment_ids_json,
+                failed_ad_experiment_ids_json,
+                source_evaluation_ids_json,
+                status,
+                activated_promotion_run_id,
+                created_at,
+                updated_at
+            FROM next_loop_preparations
+            WHERE next_loop_preparation_id = %s
+            FOR UPDATE
             """,
             (next_loop_preparation_id,),
         )

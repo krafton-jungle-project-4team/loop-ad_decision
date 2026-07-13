@@ -227,6 +227,41 @@ def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
     assert connection.close_count == 1
 
 
+def test_run_api_rejects_preparation_activation_behind_default_off_flag(
+    monkeypatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={
+            "analysis_id": "analysis_banner_002",
+            "generation_id": "generation_banner_002",
+            "loop_count": 2,
+            "next_loop_preparation_id": "prep_banner_002",
+        },
+    )
+
+    assert response.status_code == 409
+    connection = connections[0]
+    assert connection.executed == []
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+
+
 def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
     monkeypatch,
 ) -> None:
@@ -255,6 +290,9 @@ def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
     assert connection.close_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert not any("insert into ad_experiments" in query for query in executed_sql)
 
 
 class FakeRunService:
