@@ -3,10 +3,12 @@ from __future__ import annotations
 from decimal import Decimal
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 from psycopg import errors
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.decision.repositories import PromotionRunWrite
 from app.decision.router import get_promotion_run_service
 from app.decision.schemas import (
     AdExperimentCreateResponse,
@@ -17,6 +19,7 @@ from app.decision.schemas import (
 )
 from app.decision.service import (
     PromotionNotFoundError,
+    PromotionRunService,
     RunConflictError,
     RunValidationError,
     normalize_explicit_segment_ids,
@@ -337,6 +340,81 @@ def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
     assert not any("insert into ad_experiments" in query for query in executed_sql)
 
 
+@pytest.mark.parametrize("fail_on_mark_activation", [False, True])
+def test_run_api_keeps_run_insert_and_preparation_activation_in_one_transaction(
+    monkeypatch,
+    fail_on_mark_activation: bool,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(
+            raise_on_mark_activation=fail_on_mark_activation,
+        )
+        connections.append(connection)
+        return connection
+
+    def write_run_then_activate(
+        self: PromotionRunService,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+    ) -> RunCreateResponse:
+        run = PromotionRunWrite(
+            promotion_run_id="prun_transaction_loop_2",
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion_id,
+            analysis_id="analysis_banner_002",
+            generation_id="generation_banner_002",
+            loop_count=2,
+            status=PromotionRunStatus.PLANNED.value,
+            goal_snapshot_json={},
+            segment_scope_json=("seg_family_trip",),
+            segment_scope_fingerprint="a" * 64,
+        )
+        assert self._promotion_run_repository.insert_if_absent(run)
+        self._next_loop_preparation_repository.mark_activated(
+            next_loop_preparation_id="prep_banner_002",
+            activated_promotion_run_id=run.promotion_run_id,
+        )
+        return FakeRunService().create_run(
+            promotion_id=promotion_id,
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(PromotionRunService, "create_run", write_run_then_activate)
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={},
+    )
+
+    connection = connections[0]
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert any(
+        "update next_loop_preparations" in query
+        and "set status = 'activated'" in query
+        for query in executed_sql
+    )
+    if fail_on_mark_activation:
+        assert response.status_code == 500
+        assert connection.commit_count == 0
+        assert connection.rollback_count == 1
+    else:
+        assert response.status_code == 200
+        assert connection.commit_count == 1
+        assert connection.rollback_count == 0
+    assert connection.close_count == 1
+
+
 class FakeRunService:
     def __init__(self, exc: Exception | None = None) -> None:
         self.exc = exc
@@ -415,6 +493,12 @@ class RecordingCursor:
         self._last_query = query
         self._connection.executed.append((query, params))
         if (
+            self._connection.raise_on_mark_activation
+            and "update next_loop_preparations" in compact_sql(query)
+            and "set status = 'activated'" in compact_sql(query)
+        ):
+            raise RuntimeError("mark_activated failed after run insert")
+        if (
             self._connection.raise_unique_on_insert
             and "insert into promotion_runs" in compact_sql(query)
         ):
@@ -452,12 +536,14 @@ class RecordingConnection:
         analysis_row: dict[str, object] | None | object = DEFAULT_ROW,
         run_exists: bool = False,
         raise_unique_on_insert: bool = False,
+        raise_on_mark_activation: bool = False,
     ) -> None:
         self.analysis_row = (
             analysis_row_ok() if analysis_row is DEFAULT_ROW else analysis_row
         )
         self.run_exists = run_exists
         self.raise_unique_on_insert = raise_unique_on_insert
+        self.raise_on_mark_activation = raise_on_mark_activation
         self.executed: list[tuple[str, Any]] = []
         self.row_factories: list[object] = []
         self.commit_count = 0
