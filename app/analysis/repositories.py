@@ -780,11 +780,13 @@ class UserBehaviorVectorRepository:
         season_months: Sequence[int] = (),
         limit: int = 1000,
     ) -> list[RawEventUserSignalRecord]:
-        cleaned_destination_terms = tuple(
+        # clickhouse-connect serializes Array(String) parameters from lists.
+        # Tuples are rendered as SQL tuples and fail at runtime for this placeholder.
+        cleaned_destination_terms = [
             str(term).strip().lower()
             for term in destination_terms
             if str(term).strip()
-        )
+        ]
         result = self._client.query(
             """
             WITH
