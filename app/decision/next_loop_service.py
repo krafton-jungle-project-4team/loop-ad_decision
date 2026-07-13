@@ -9,6 +9,7 @@ from app.analysis.service import (
     PromotionAnalysisService,
     PromotionNotFoundError as AnalysisPromotionNotFoundError,
     SegmentSelectionError,
+    TargetSegmentStatus,
 )
 from app.decision.repositories import (
     AdExperimentRecord,
@@ -98,6 +99,7 @@ class NextLoopAnalysisGateway(Protocol):
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
+        target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
         ...
 
@@ -168,6 +170,7 @@ class UnavailableNextLoopAnalysisGateway:
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
+        target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
         _ = (
             project_id,
@@ -178,6 +181,7 @@ class UnavailableNextLoopAnalysisGateway:
             source_promotion_run_id,
             source_failed_ad_experiment_ids,
             operator_instruction,
+            target_status,
         )
         raise NextLoopValidationError(
             "next-loop analysis integration is not configured; Owner 1 "
@@ -262,6 +266,7 @@ class ServiceNextLoopAnalysisGateway:
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
+        target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
         try:
             result = self._analysis_service.analyze_focus(
@@ -274,7 +279,8 @@ class ServiceNextLoopAnalysisGateway:
                     source_promotion_run_id=source_promotion_run_id,
                     source_failed_ad_experiment_ids=source_failed_ad_experiment_ids,
                     operator_instruction=operator_instruction,
-                )
+                ),
+                target_status=target_status,
             )
         except (AnalysisPromotionNotFoundError, SegmentSelectionError) as exc:
             raise NextLoopValidationError(str(exc)) from exc
@@ -496,6 +502,7 @@ class NextLoopService:
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             operator_instruction=request.operator_instruction,
+            target_status="approved",
         )
         log.assign_context({"analysisId": analysis_result.analysis_id})
         log.info("next_loop_analysis_created", {"analysis": analysis_result})
@@ -652,6 +659,7 @@ class NextLoopService:
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             operator_instruction=request.operator_instruction,
+            target_status="planned",
         )
         _validate_gateway_segments(
             label="analysis",

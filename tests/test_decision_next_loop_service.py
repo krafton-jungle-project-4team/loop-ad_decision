@@ -72,6 +72,7 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
             "prun_banner_001_loop_1",
             ("adexp_luxury_001",),
             "Emphasize breakfast benefits.",
+            "approved",
         )
     ]
     assert repos.run_creator.calls == [
@@ -453,6 +454,7 @@ def test_manual_next_loop_stores_multi_candidate_preparation_without_run() -> No
     )
     assert inserted.attempt_no == 1
     assert inserted.next_loop_preparation_id.startswith("nlprep_")
+    assert repos.analysis_gateway.calls[0][-1] == "planned"
     assert repos.generation_gateway.manual_calls[0][6] == 1
 
 
@@ -1278,7 +1280,17 @@ class FakeAnalysisGateway:
     def __init__(self, target_segment_ids: list[str] | None = None) -> None:
         self.target_segment_ids = target_segment_ids or ["seg_luxury"]
         self.calls: list[
-            tuple[str, str, str, tuple[str, ...], int, str, tuple[str, ...], str | None]
+            tuple[
+                str,
+                str,
+                str,
+                tuple[str, ...],
+                int,
+                str,
+                tuple[str, ...],
+                str | None,
+                str,
+            ]
         ] = []
 
     def start_analysis(
@@ -1292,6 +1304,7 @@ class FakeAnalysisGateway:
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
         operator_instruction: str | None,
+        target_status: str,
     ) -> NextLoopAnalysisResult:
         self.calls.append(
             (
@@ -1303,6 +1316,7 @@ class FakeAnalysisGateway:
                 source_promotion_run_id,
                 tuple(source_failed_ad_experiment_ids),
                 operator_instruction,
+                target_status,
             )
         )
         return NextLoopAnalysisResult(
