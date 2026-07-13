@@ -56,6 +56,9 @@ from offline_evaluation.external_final_test import (  # noqa: E402
 from offline_evaluation.git_state import (  # noqa: E402
     inspect_clean_git_identity,
 )
+from offline_evaluation.external_manifest_registry import (  # noqa: E402
+    ExternalManifestRegistry,
+)
 from offline_evaluation.sealed_execution import (  # noqa: E402
     STATUS_RESULT_STAGED,
     mark_execution_failure,
@@ -75,6 +78,7 @@ DEFAULT_SOURCE_DIRS = {
     "synerise": Path("artifacts/external-datasets/synerise_dataset"),
 }
 DATASET_IDS = tuple(DEFAULT_SOURCE_DIRS)
+DEFAULT_PUBLIC_MANIFEST_DIR = Path("evaluation_manifests/external")
 
 
 def main() -> int:
@@ -85,6 +89,10 @@ def main() -> int:
             return run_development_diagnostic(args)
         if args.command == "seal-final-test":
             return seal_final_test(args)
+        if args.command == "register-final-test":
+            return register_final_test(args)
+        if args.command == "list-final-tests":
+            return list_final_tests(args)
         if args.command == "run-final-test":
             return execute_final_test(args)
         raise ValueError(f"unsupported command: {args.command}")
@@ -354,6 +362,43 @@ def execute_final_test(args: argparse.Namespace) -> int:
     return 0
 
 
+@log_context_scope
+def register_final_test(args: argparse.Namespace) -> int:
+    manifest, destination = ExternalManifestRegistry(args.registry_dir).register(
+        args.manifest
+    )
+    log.assign_context(
+        {"manifestId": manifest.manifest_id, "datasetId": manifest.dataset_id}
+    )
+    log.info(
+        "external_final_test_manifest_registered",
+        {"manifestPath": destination, "codeCommit": manifest.code_commit},
+    )
+    print(f"manifest_id={manifest.manifest_id}")
+    print(f"manifest_path={destination}")
+    return 0
+
+
+@log_context_scope
+def list_final_tests(args: argparse.Namespace) -> int:
+    manifests = ExternalManifestRegistry(args.registry_dir).list()
+    for manifest in manifests:
+        print(
+            "\t".join(
+                (
+                    manifest.manifest_id,
+                    manifest.dataset_id,
+                    manifest.code_commit,
+                )
+            )
+        )
+    log.info(
+        "external_final_test_manifests_listed",
+        {"manifestCount": len(manifests), "registryDir": args.registry_dir},
+    )
+    return 0
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -409,6 +454,27 @@ def parse_args() -> argparse.Namespace:
             "Resume the same execution after a pre-outcome or publication "
             "failure. The ID must match the execution journal."
         ),
+    )
+
+    register = subparsers.add_parser(
+        "register-final-test",
+        help="Copy one sealed manifest into the public Git registry.",
+    )
+    register.add_argument("--manifest", type=Path, required=True)
+    register.add_argument(
+        "--registry-dir",
+        type=Path,
+        default=DEFAULT_PUBLIC_MANIFEST_DIR,
+    )
+
+    list_manifests = subparsers.add_parser(
+        "list-final-tests",
+        help="List sealed manifests published in this Git clone.",
+    )
+    list_manifests.add_argument(
+        "--registry-dir",
+        type=Path,
+        default=DEFAULT_PUBLIC_MANIFEST_DIR,
     )
     return parser.parse_args()
 
