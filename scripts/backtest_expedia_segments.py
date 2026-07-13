@@ -22,7 +22,6 @@ import argparse
 from datetime import UTC, date, datetime
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -67,6 +66,9 @@ from app.logging import (  # noqa: E402
     log,
     log_context_scope,
     now_ms,
+)
+from offline_evaluation.git_state import (  # noqa: E402
+    inspect_clean_git_identity,
 )
 from offline_evaluation.sealed_execution import (  # noqa: E402
     STATUS_RESULT_STAGED,
@@ -254,7 +256,7 @@ def seal_final_test(
     *,
     started_at: float,
 ) -> int:
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = sealing_git_identity()
     config = backtest_config(args)
     development_cutoffs = monthly_cutoffs(
         args.development_start_cutoff,
@@ -342,7 +344,7 @@ def execute_final_test(
             "final test confirmation does not match the sealed manifest; "
             f"use {manifest.required_confirmation!r} only after code freeze"
         )
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = execution_git_identity()
     model_path = args.model_path.expanduser().resolve()
     model = load_segment_performance_model(model_path)
     stats = repository.source_stats()
@@ -741,41 +743,17 @@ def unit_interval(value: str) -> float:
     return parsed
 
 
-def frozen_git_identity() -> tuple[str, str]:
-    branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
-    if branch != "dev":
-        raise ValueError(
-            "sealed final test must be created and executed from the dev branch"
-        )
-    tracked_status = _git_output(
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
+def sealing_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(
+        REPOSITORY_ROOT,
+        required_branch="dev",
     )
-    if tracked_status:
-        raise ValueError(
-            "sealed final test requires a clean tracked working tree"
-        )
-    return (
-        _git_output("rev-parse", "HEAD"),
-        _git_output("rev-parse", "HEAD^{tree}"),
-    )
+    return identity.commit, identity.tree
 
 
-def _git_output(*args: str) -> str:
-    try:
-        completed = subprocess.run(
-            ("git", *args),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            f"failed to inspect frozen git state: {' '.join(args)}"
-        ) from exc
-    return completed.stdout.strip()
+def execution_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(REPOSITORY_ROOT)
+    return identity.commit, identity.tree
 
 
 def _logging_settings(connection: dict[str, str]) -> Settings:

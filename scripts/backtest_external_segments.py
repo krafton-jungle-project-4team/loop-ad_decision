@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +52,9 @@ from offline_evaluation.external_final_test import (  # noqa: E402
     verify_external_sealed_final_test_runtime,
     write_external_sealed_final_test_artifacts,
     write_external_sealed_final_test_manifest,
+)
+from offline_evaluation.git_state import (  # noqa: E402
+    inspect_clean_git_identity,
 )
 from offline_evaluation.sealed_execution import (  # noqa: E402
     STATUS_RESULT_STAGED,
@@ -201,7 +203,7 @@ def seal_final_test(args: argparse.Namespace) -> int:
     source_dir = args.source_dir or DEFAULT_SOURCE_DIRS[dataset_id]
     model_path = _model_path(args.model_path)
     predictor = build_segment_performance_predictor(model_path)
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = sealing_git_identity()
     adapter_config = _final_adapter_config(args)
     backtest_config = ExternalBacktestConfig(
         max_suggested_segments=args.max_segments,
@@ -262,7 +264,7 @@ def execute_final_test(args: argparse.Namespace) -> int:
     source_dir = args.source_dir or DEFAULT_SOURCE_DIRS[manifest.dataset_id]
     model_path = _model_path(args.model_path)
     predictor = build_segment_performance_predictor(model_path)
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = execution_git_identity()
     output_dir = args.output_dir or _default_final_output_dir(manifest)
     log.assign_context(
         {
@@ -546,41 +548,17 @@ def parse_datetime(value: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def frozen_git_identity() -> tuple[str, str]:
-    branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
-    if branch != "dev":
-        raise ValueError(
-            "external sealed final test must be created and executed from dev"
-        )
-    tracked_status = _git_output(
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
+def sealing_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(
+        REPOSITORY_ROOT,
+        required_branch="dev",
     )
-    if tracked_status:
-        raise ValueError(
-            "external sealed final test requires a clean tracked working tree"
-        )
-    return (
-        _git_output("rev-parse", "HEAD"),
-        _git_output("rev-parse", "HEAD^{tree}"),
-    )
+    return identity.commit, identity.tree
 
 
-def _git_output(*args: str) -> str:
-    try:
-        completed = subprocess.run(
-            ("git", *args),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            f"failed to inspect frozen git state: {' '.join(args)}"
-        ) from exc
-    return completed.stdout.strip()
+def execution_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(REPOSITORY_ROOT)
+    return identity.commit, identity.tree
 
 
 def _model_path(value: Path | None) -> Path:
