@@ -1529,6 +1529,8 @@ def test_next_loop_preparation_repository_gets_active_by_source_run() -> None:
     assert "from next_loop_preparations" in sql
     assert "where source_promotion_run_id = %s" in sql
     assert "and status = 'awaiting_content_approval'" in sql
+    assert "order by attempt_no desc" in sql
+    assert "limit 1 for update" in sql
     assert call.params == ("run_email_a1",)
 
 

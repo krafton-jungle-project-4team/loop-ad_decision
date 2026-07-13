@@ -275,6 +275,23 @@ def test_content_candidate_repository_lists_by_generation() -> None:
     assert result == rows
     query, params = cursor.executed[0]
     assert "FROM content_candidates" in query
+    assert "ORDER BY segment_id, content_option_id, content_id" in query
+    assert "FOR UPDATE" not in query
+    assert params == {"generation_id": "generation_banner_001"}
+
+
+def test_content_candidate_repository_locks_entire_generation_in_stable_order() -> None:
+    rows = [{"content_id": "content_banner_001"}]
+    cursor = FakeCursor(fetchall_result=rows)
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.list_by_generation_for_update("generation_banner_001")
+
+    assert result == rows
+    query, params = cursor.executed[0]
+    assert "FROM content_candidates" in query
+    assert "ORDER BY segment_id, content_option_id, content_id" in query
+    assert "FOR UPDATE" in query
     assert params == {"generation_id": "generation_banner_001"}
 
 
