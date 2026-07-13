@@ -379,10 +379,115 @@ def test_manual_next_loop_api_persists_preparation_and_returns_pending_candidate
     assert any("pg_advisory_xact_lock" in query for query in executed_sql)
     assert not any("insert into promotion_runs" in query for query in executed_sql)
     assert not any("insert into ad_experiments" in query for query in executed_sql)
+    assert not any("user_segment_assignments" in query for query in executed_sql)
     evaluation_sql = next(
         query for query in executed_sql if "from promotion_evaluations" in query
     )
+    assert "ad_experiment_id is not null" in evaluation_sql
     assert "created_at desc, evaluation_id desc" in evaluation_sql
+    assert ad_experiment_row()["status"] == "running"
+
+
+def test_manual_next_loop_api_preserves_ranked_segment_id_from_evaluation_to_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ranked_segment_id = "seg_ai_hotel_affinity_rank_03"
+    connection = RecordingConnection(segment_id=ranked_segment_id)
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": [ranked_segment_id],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["segment_ids"] == [ranked_segment_id]
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["failed_segment_ids_json"] == [
+        ranked_segment_id
+    ]
+    assert connection.active_preparation_row["source_evaluation_ids_json"] == [
+        "eval_luxury_001"
+    ]
+    assert {
+        str(row["segment_id"]) for row in connection.content_candidate_rows
+    } == {ranked_segment_id}
+    assert all(
+        row["generation_id"] == body["next_generation_id"]
+        for row in connection.content_candidate_rows
+    )
+    assert ad_experiment_row(ranked_segment_id)["status"] == "running"
+
+
+def test_manual_next_loop_api_rejects_insufficient_data_then_accepts_reevaluation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection(
+        promotion_evaluation_rows=[
+            promotion_evaluation_row(
+                evaluation_id="eval_luxury_insufficient",
+                status="insufficient_data",
+            )
+        ]
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+    payload = {
+        "failed_segment_ids": ["seg_luxury"],
+        "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        "content_approval_mode": "manual",
+    }
+
+    insufficient = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+
+    assert insufficient.status_code == 422
+    assert "only goal_not_met" in insufficient.json()["detail"]
+    assert connection.active_preparation_row is None
+    assert connection.content_candidate_rows == []
+
+    connection.promotion_evaluation_rows = [
+        promotion_evaluation_row(evaluation_id="eval_luxury_goal_not_met")
+    ]
+    reevaluated = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+
+    assert reevaluated.status_code == 200, reevaluated.text
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["source_evaluation_ids_json"] == [
+        "eval_luxury_goal_not_met"
+    ]
+    assert ad_experiment_row()["status"] == "running"
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert not any("update ad_experiments" in query for query in executed_sql)
 
 
 def test_manual_next_loop_api_reuses_canonical_preparation(
@@ -442,6 +547,107 @@ def test_manual_next_loop_api_reuses_canonical_preparation(
     assert connection.rollback_count == 0
 
 
+def test_manual_next_loop_api_reuses_generation_when_rejected_candidate_has_drafts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+    payload = {
+        "failed_segment_ids": ["seg_luxury"],
+        "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        "content_approval_mode": "manual",
+    }
+
+    first = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    rejected_content_id = first.json()["pending_content_ids"][0]
+    next(
+        row
+        for row in connection.content_candidate_rows
+        if row["content_id"] == rejected_content_id
+    )["status"] = "rejected"
+
+    retry = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["next_loop_preparation_id"] == first.json()[
+        "next_loop_preparation_id"
+    ]
+    assert retry.json()["next_generation_id"] == first.json()["next_generation_id"]
+    assert rejected_content_id not in retry.json()["pending_content_ids"]
+    assert len(retry.json()["pending_content_ids"]) == 2
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["attempt_no"] == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert sum("insert into generation_runs" in query for query in executed_sql) == 1
+    assert sum("insert into content_candidates" in query for query in executed_sql) == 3
+    assert sum("insert into next_loop_preparations" in query for query in executed_sql) == 1
+
+
+def test_manual_next_loop_api_rejects_retry_after_source_evaluation_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+    payload = {
+        "failed_segment_ids": ["seg_luxury"],
+        "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        "content_approval_mode": "manual",
+    }
+
+    first = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    connection.promotion_evaluation_rows = [
+        promotion_evaluation_row(evaluation_id="eval_luxury_newer")
+    ]
+
+    stale_retry = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json=payload,
+    )
+
+    assert stale_retry.status_code == 409
+    assert stale_retry.json()["detail"] == (
+        "active next-loop preparation has a different intent"
+    )
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["source_evaluation_ids_json"] == [
+        "eval_luxury_001"
+    ]
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert sum("insert into generation_runs" in query for query in executed_sql) == 1
+    assert sum("insert into next_loop_preparations" in query for query in executed_sql) == 1
+
+
 def test_manual_next_loop_api_rolls_back_generation_on_candidate_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -483,6 +689,7 @@ def test_manual_next_loop_api_regenerates_exhausted_candidates_as_attempt_two(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = manual_regeneration_connection()
+    attempt_one_candidates = [dict(row) for row in connection.content_candidate_rows]
     monkeypatch.setattr(
         "app.decision.router.create_postgres_connection",
         lambda _settings: connection,
@@ -512,6 +719,23 @@ def test_manual_next_loop_api_regenerates_exhausted_candidates_as_attempt_two(
     )
     assert len(body["pending_content_ids"]) == 3
     assert all("attempt_2" in content_id for content_id in body["pending_content_ids"])
+    attempt_two_candidates = [
+        row
+        for row in connection.content_candidate_rows
+        if row["generation_id"] == body["next_generation_id"]
+    ]
+    assert len(attempt_two_candidates) == 3
+    assert {
+        str(row["content_id"]) for row in attempt_one_candidates
+    }.isdisjoint(
+        str(row["content_id"]) for row in attempt_two_candidates
+    )
+    assert {
+        str(row["content_option_id"]) for row in attempt_one_candidates
+    }.isdisjoint(
+        str(row["content_option_id"]) for row in attempt_two_candidates
+    )
+    assert all(row in connection.content_candidate_rows for row in attempt_one_candidates)
     assert [row["status"] for row in connection.rejected_preparation_rows] == [
         "rejected"
     ]
@@ -1127,7 +1351,7 @@ class RecordingCursor:
         if "from ad_experiments" in sql:
             return [ad_experiment_row(self._connection.segment_id)]
         if "from promotion_evaluations" in sql:
-            return [promotion_evaluation_row(self._connection.segment_id)]
+            return self._connection.promotion_evaluation_rows
         if "from segment_definitions" in sql:
             return [segment_definition_row(self._connection.segment_id)]
         if "from promotion_target_segments" in sql:
@@ -1167,6 +1391,7 @@ class RecordingConnection:
         segment_id: str = "seg_luxury",
         active_preparation_row: dict[str, object] | None = None,
         next_attempt_no: int = 1,
+        promotion_evaluation_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self.segment_id = segment_id
         self.promotion_run_row = (
@@ -1185,6 +1410,11 @@ class RecordingConnection:
         self.segment_id = segment_id
         self.active_preparation_row = active_preparation_row
         self.next_attempt_no = next_attempt_no
+        self.promotion_evaluation_rows = (
+            promotion_evaluation_rows
+            if promotion_evaluation_rows is not None
+            else [promotion_evaluation_row(segment_id)]
+        )
         self.content_candidate_rows: list[dict[str, object]] = []
         self.rejected_preparation_rows: list[dict[str, object]] = []
         self.preparation_before_rejection: dict[str, object] | None = None
@@ -1295,16 +1525,22 @@ def ad_experiment_row(segment_id: str = "seg_luxury") -> dict[str, object]:
         "content_option_id": "option_luxury_001",
         "channel": "onsite_banner",
         "loop_count": 1,
-        "status": "goal_not_met",
+        "status": "running",
         "goal_metric": "booking_conversion_rate",
         "goal_target_value": Decimal("0.300000"),
         "goal_basis": "all_segments",
     }
 
 
-def promotion_evaluation_row(segment_id: str = "seg_luxury") -> dict[str, object]:
+def promotion_evaluation_row(
+    segment_id: str = "seg_luxury",
+    *,
+    evaluation_id: str = "eval_luxury_001",
+    status: str = "goal_not_met",
+) -> dict[str, object]:
+    is_goal_not_met = status == "goal_not_met"
     return {
-        "evaluation_id": "eval_luxury_001",
+        "evaluation_id": evaluation_id,
         "project_id": "hotel-client-a",
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
@@ -1320,10 +1556,10 @@ def promotion_evaluation_row(segment_id: str = "seg_luxury") -> dict[str, object
         "denominator_count": 10,
         "sample_size": 10,
         "basis": "all_segments",
-        "status": "goal_not_met",
+        "status": status,
         "feedback": None,
-        "next_loop_required": True,
-        "result_json": {"status_reason": "goal_not_met"},
+        "next_loop_required": is_goal_not_met,
+        "result_json": {"status_reason": status},
     }
 
 
