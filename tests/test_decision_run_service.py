@@ -1432,24 +1432,13 @@ def test_run_service_rejects_fallback_in_explicit_scope_without_writes() -> None
     assert repos.ad_experiments.inserted_batches == []
 
 
-def test_run_service_rejects_explicit_scope_when_feature_flag_is_off() -> None:
-    service, repos = make_service(partial_segment_scope_enabled=False)
+def test_run_service_rejects_preparation_activation_when_manual_switch_is_off() -> None:
+    service, repos = make_service()
 
-    with pytest.raises(RunConflictError, match="scope is disabled"):
-        service.create_run(
-            promotion_id="promo_banner_001",
-            request=RunCreateRequest(segment_ids=["seg_family_trip"]),
-        )
-
-    assert repos.promotions.calls == []
-    assert repos.runs.inserted == []
-    assert repos.ad_experiments.inserted_batches == []
-
-
-def test_run_service_rejects_preparation_activation_when_feature_flag_is_off() -> None:
-    service, repos = make_service(partial_segment_scope_enabled=False)
-
-    with pytest.raises(RunConflictError, match="scope is disabled"):
+    with pytest.raises(
+        RunConflictError,
+        match="manual next-loop preparation activation is disabled",
+    ):
         service.create_run(
             promotion_id="promo_banner_001",
             request=RunCreateRequest(next_loop_preparation_id="nlprep_001"),
@@ -1842,7 +1831,6 @@ def make_service(
     latest_generation: GenerationRunRecord | None | object = DEFAULT_LATEST,
     target_segments: list[PromotionTargetSegmentRecord] | None = None,
     candidates: list[ContentCandidateRecord] | None = None,
-    partial_segment_scope_enabled: bool = True,
     promotion_runs: list[PromotionRunRecord] | None = None,
     ad_experiments: list[AdExperimentRecord] | None = None,
     evaluations: list[PromotionEvaluationRecord] | None = None,
@@ -1874,7 +1862,6 @@ def make_service(
             promotion_evaluation_repository=repos.evaluations,
             next_loop_preparation_repository=repos.preparations,
             manual_activation_enabled=manual_activation_enabled,
-            partial_segment_scope_enabled=partial_segment_scope_enabled,
         ),
         repos,
     )
