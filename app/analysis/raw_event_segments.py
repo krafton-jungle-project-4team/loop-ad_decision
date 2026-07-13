@@ -30,10 +30,10 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v4"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v5"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
-RAW_EVENT_CANDIDATE_USER_LIMIT = 160
+AUDIENCE_SELECTION_POLICY_VERSION = "dec.segment-audience-selection.v1"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 MAX_RANK_USER_OVERLAP = 0.70
 RANK_RATE_TIE_TOLERANCE = 0.001
@@ -928,10 +928,11 @@ def _candidate_from_profiles(
             profile.user_id,
         ),
     )
-    selected_profiles = ordered_profiles[:RAW_EVENT_CANDIDATE_USER_LIMIT]
-    candidate_user_ids = tuple(profile.user_id for profile in selected_profiles)
+    # Keep every matching user until a selection ratio is calibrated by backtest.
+    candidate_profiles = ordered_profiles
+    candidate_user_ids = tuple(profile.user_id for profile in candidate_profiles)
     signal_metrics = _signal_metrics(
-        selected_profiles,
+        candidate_profiles,
         matching_profile_count=matching_profile_count,
     )
     type_labels = CANDIDATE_TYPE_LABELS[candidate_type]
@@ -944,12 +945,12 @@ def _candidate_from_profiles(
         matched_condition_keys=matched_condition_keys,
     )
     sample_reliability = _sample_reliability(
-        sample_size=len(selected_profiles),
+        sample_size=len(candidate_profiles),
         min_sample_size=min_sample_size,
     )
     performance_features = _performance_features(
         candidate_type=candidate_type,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         signal_metrics=signal_metrics,
         baseline=baseline,
         promotion_condition_match=promotion_condition_match,
@@ -958,7 +959,7 @@ def _candidate_from_profiles(
     )
     predicted_goal_rate, prediction_metadata = _expected_goal_performance(
         promotion=promotion,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         baseline=baseline,
         performance_features=performance_features,
         performance_predictor=performance_predictor,
@@ -984,7 +985,7 @@ def _candidate_from_profiles(
         predicted_goal_rate=predicted_goal_rate,
         expected_goal_performance=predicted_goal_rate,
         behavior_lift_vs_baseline=_behavior_lift(
-            profiles=selected_profiles,
+            profiles=candidate_profiles,
             baseline=baseline,
             candidate_type=candidate_type,
         ),
@@ -1185,15 +1186,34 @@ def _segment_definition_from_candidate(
         candidate.signal_metrics.get("matching_profile_count", candidate.sample_size)
         or candidate.sample_size
     )
+    matching_user_ratio = _safe_rate(
+        matching_user_count,
+        total_eligible_user_count,
+    )
+    selection_ratio_within_matching = _safe_rate(
+        candidate.sample_size,
+        matching_user_count,
+    )
     audience = {
         "total_eligible_user_count": total_eligible_user_count,
         "matching_user_count": matching_user_count,
         "selected_user_count": candidate.sample_size,
         "selected_user_ratio": round(float(sample_ratio), 6),
-        "selection_limited": matching_user_count > candidate.sample_size,
-        "selection_basis": "behavior_signal_strength",
-        "selection_limit": RAW_EVENT_CANDIDATE_USER_LIMIT,
-        "selected_user_role": "analysis_seed",
+        "matching_user_ratio": round(matching_user_ratio, 6),
+        "selection_ratio_within_matching": round(
+            selection_ratio_within_matching,
+            6,
+        ),
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": AUDIENCE_SELECTION_POLICY_VERSION,
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
     }
     performance_estimate = _performance_estimate(
         promotion=promotion,
@@ -1303,12 +1323,10 @@ def _candidate_audience_summary(
         f"분석 대상 {total_eligible_user_count}명 중 "
         f"조건 일치 {matching_user_count}명"
     )
-    if matching_user_count > candidate.sample_size:
-        return (
-            f"{summary} · 행동 신호 상위 {candidate.sample_size}명을 "
-            "예측 표본으로 사용"
-        )
-    return f"{summary} · {float(sample_ratio) * 100:g}%"
+    return (
+        f"{summary} · 조건 일치자 전체를 추천 대상으로 사용 "
+        f"({float(sample_ratio) * 100:g}%)"
+    )
 
 
 def _intent_system_instruction() -> str:
