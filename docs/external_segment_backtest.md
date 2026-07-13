@@ -102,7 +102,9 @@ confirmation=RUN_EXTERNAL_FINAL_<manifest-id-prefix>
 
 ## 3. 봉인 결과 한 번만 열기
 
-아직 최종 결과를 보고 싶지 않다면 이 명령은 실행하지 않는다. `run-final-test`는 결과 label을 실제로 읽기 직전에 실행 마커를 생성하며, 같은 manifest의 두 번째 실행은 차단한다.
+아직 최종 결과를 보고 싶지 않다면 이 명령은 실행하지 않는다. `run-final-test`는
+manifest별 실행 ID와 상태를 `*.execution-started.json` 저널에 기록한다. 같은 manifest로
+새 평가를 시작하는 것은 차단하며, 장애 복구는 기존 실행 ID로만 가능하다.
 
 ```bash
 .venv/bin/python scripts/backtest_external_segments.py run-final-test \
@@ -110,7 +112,25 @@ confirmation=RUN_EXTERNAL_FINAL_<manifest-id-prefix>
   --confirm RUN_EXTERNAL_FINAL_<manifest-id-prefix>
 ```
 
-확인 토큰, 원본 checksum, 모델, Git commit 또는 tree가 봉인 시점과 다르면 실행하지 않는다. 실행 마커가 생성된 뒤 실패해도 결과 집합이 개봉된 것으로 간주하므로 같은 manifest를 재사용하지 않는다.
+확인 토큰, 원본 checksum, 모델, Git commit 또는 tree가 봉인 시점과 다르면 실행하지
+않는다. 실패 시 재시도 가능 여부는 outcome 개봉 시점을 기준으로 나뉜다.
+
+- `reserved`, `retryable_pre_outcome_failure`: outcome을 읽기 전의 파일·환경 오류다. 저널의
+  `execution_id`를 `--resume-execution-id`로 전달하면 같은 실행을 재개할 수 있다.
+- `outcomes_opened`, `failed_after_outcomes`: 정답 label을 읽은 뒤 계산이 실패한 상태다.
+  다시 계산하면 최종 시험을 반복하게 되므로 재실행을 차단한다.
+- `result_staged`: 계산과 산출물 기록은 끝났지만 최종 디렉터리 공개가 실패한 상태다.
+  같은 실행 ID로 재개하면 label을 다시 읽거나 계산하지 않고 게시만 완료한다.
+- `completed`: 최종 평가가 완료된 상태로 다시 실행할 수 없다.
+
+재개 명령은 최초 명령에 실행 ID만 추가한다.
+
+```bash
+.venv/bin/python scripts/backtest_external_segments.py run-final-test \
+  --manifest artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json \
+  --confirm RUN_EXTERNAL_FINAL_<manifest-id-prefix> \
+  --resume-execution-id <execution_id>
+```
 
 ## 산출물
 

@@ -207,22 +207,36 @@ manifest에는 다음 값이 고정된다.
 ### 4.3 코드 동결 후 단 한 번 실행
 
 manifest 생성 후 코드, 모델, 원천 데이터 중 하나라도 달라지면 실행을 거부한다. 아래
-명령은 확인 토큰이 일치할 때만 실행 시작 marker를 먼저 생성한 뒤 미래 예약 결과를
-조회한다.
+명령은 확인 토큰이 일치할 때 manifest별 실행 ID와 상태 저널을 먼저 생성한 뒤 미래 예약
+결과를 조회한다.
 
 ```bash
 .venv/bin/python scripts/backtest_expedia_segments.py run-final-test \
   --confirm RUN_FINAL_TEST_<seal-command-output>
 ```
 
-실행이 시작된 manifest에는 `*.execution-started.json` marker가 남는다. 실행이 실패하거나
-결과가 기준에 미달해도 같은 manifest를 다시 실행할 수 없다. 결과를 확인한 뒤 코드를
-수정하면 새로운 라벨 데이터 없이는 다시 “최종 테스트”라고 부를 수 없다.
+실행이 시작된 manifest에는 `*.execution-started.json` 저널이 남는다. 재시도 가능 여부는
+미래 예약 outcome을 처음 조회한 시점을 기준으로 나뉜다.
+
+- outcome 조회 전 실패는 저널의 `execution_id`를 지정해 같은 실행으로 재시도할 수 있다.
+- outcome 조회 후 계산 실패는 최종 시험 반복을 막기 위해 재실행할 수 없다.
+- 계산 완료 후 결과 디렉터리 공개만 실패했다면 같은 실행 ID로 게시만 재개할 수 있다.
+- 완료된 실행과 다른 실행 ID를 이용한 재시도는 차단한다.
+
+재개할 때는 최초 실행 명령에 다음 옵션을 추가한다.
+
+```bash
+  --resume-execution-id <execution_id>
+```
+
+결과를 확인한 뒤 코드를 수정하면 새로운 라벨 데이터 없이는 다시 “최종 테스트”라고
+부를 수 없다. 즉 재시도 기능은 결과를 다시 계산하는 기능이 아니라, outcome을 읽기 전
+장애 또는 계산이 끝난 뒤 게시 장애를 복구하는 기능이다.
 
 생성되는 최종 산출물은 다음과 같다.
 
 ```text
-artifacts/expedia-segment-backtest/sealed-final-test-<timestamp>/
+artifacts/expedia-segment-backtest/sealed-final-<manifest-id-prefix>/
 ├── sealed_final_test_report.md
 ├── sealed_final_test_summary.json
 └── details/
