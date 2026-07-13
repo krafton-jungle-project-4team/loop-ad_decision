@@ -22,9 +22,11 @@ from offline_evaluation.external_backtest import (
     write_external_backtest_artifacts,
 )
 from offline_evaluation.external_datasets import (
+    EXTERNAL_SEALED_FINAL_ROLE,
     ExternalAdapterConfig,
     load_airbnb_dataset,
     load_booking_com_dataset,
+    load_booking_com_final_dataset,
     load_synerise_dataset,
 )
 
@@ -56,6 +58,10 @@ def test_external_backtest_uses_production_candidates_and_future_outcomes(
     assert all(result.outcome_name == "future_target_rate" for result in run.results)
     assert run.summary["scenario_count"] == 1
     assert run.summary["candidate_result_count"] == len(run.results)
+    assert run.summary["prediction_error_comparable"] is False
+    assert (
+        run.summary["mean_absolute_prediction_error_percentage_points"] is None
+    )
 
     manifest = ExternalDatasetManifest(
         dataset_id="fixture",
@@ -109,6 +115,54 @@ def test_booking_adapter_hides_last_trip_city_from_profiles(tmp_path: Path) -> N
     assert case.target_value == "10"
     assert bundle.manifest.evaluation_design == "within_trip_sequential_holdout"
     assert len(bundle.manifest.source_files) == 1
+
+
+def test_booking_official_final_adapter_excludes_placeholder_city(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "booking-final"
+    source_dir.mkdir()
+    _write_csv(
+        source_dir / "test_set.csv",
+        [
+            _booking_row("trip-1", "2016-01-01", "10"),
+            _booking_row("trip-1", "2016-01-02", "20"),
+            _booking_row("trip-1", "2016-01-03", "0"),
+            _booking_row("trip-2", "2016-01-01", "10"),
+            _booking_row("trip-2", "2016-01-02", "30"),
+            _booking_row("trip-2", "2016-01-03", "0"),
+        ],
+    )
+    _write_csv(
+        source_dir / "ground_truth.csv",
+        [
+            {"utrip_id": "trip-1", "city_id": "10", "hotel_country": "A"},
+            {"utrip_id": "trip-2", "city_id": "99", "hotel_country": "B"},
+        ],
+    )
+    config = ExternalAdapterConfig(
+        profile_pool_limit=10,
+        max_scenarios=1,
+        min_scenario_users=1,
+        sample_modulo=1,
+        sample_remainder=0,
+        sample_remainders=(0,),
+        evaluation_role=EXTERNAL_SEALED_FINAL_ROLE,
+        include_checksum=False,
+    )
+
+    bundle = load_booking_com_final_dataset(source_dir, config=config)
+
+    case = bundle.cases[0]
+    trip_one = next(
+        profile
+        for profile in case.profiles
+        if profile.user_id == "booking-final-trip-trip-1"
+    )
+    assert "0" not in trip_one.destination_values
+    assert "booking-final-trip-trip-1" in case.positive_user_ids
+    assert bundle.manifest.evaluation_role == EXTERNAL_SEALED_FINAL_ROLE
+    assert bundle.manifest.evaluation_design == "official_test_ground_truth_holdout"
 
 
 def test_airbnb_adapter_excludes_booking_actions_and_destination_label(
