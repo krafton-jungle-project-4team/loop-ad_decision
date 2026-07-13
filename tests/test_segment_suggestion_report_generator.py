@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -49,6 +50,55 @@ def test_openai_segment_report_rejects_technical_terms() -> None:
         forbidden not in str(report)
         for forbidden in ("벡터", "군집", "클러스터", "centroid", "유사도", "cosine")
     )
+
+
+def test_openai_segment_report_preserves_computed_rank_facts() -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        return {
+            "output_text": json.dumps(
+                {
+                    "title": "예약 관심 고객",
+                    "summary": "예약 행동이 확인된 고객입니다.",
+                    "promotion_interpretation": ["예약 전환이 목표입니다.", "혜택을 안내합니다."],
+                    "why_recommended": ["예약 시작 행동이 있습니다.", "숙소를 탐색했습니다."],
+                    "evidence": ["6명이 포함됐습니다.", "예약 시작 신호가 있습니다."],
+                    "difference_from_other_ranks": ["근거 없이 Rank 2보다 훨씬 좋습니다."],
+                    "action_hint": "예약 혜택을 안내하세요.",
+                    "caution": "첫 발송 결과를 확인하세요.",
+                    "confidence_label": "high",
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    base_input = _report_input()
+    computed_difference = "Rank 1보다 예상 예약 전환율은 2.0%p 낮지만, 예약 이탈 회수 전략입니다."
+    report_input = replace(
+        base_input,
+        display_copy={
+            **dict(base_input.display_copy),
+            "difference_summary": computed_difference,
+            "performance_estimate": {
+                "label": "예상 예약 전환율",
+                "formatted": "18.0%",
+                "confidence_label": "low",
+            },
+        },
+    )
+    generator = OpenAISegmentSuggestionReportGenerator(
+        api_key="test-key",
+        transport=transport,
+    )
+
+    report = generator.generate_report(report_input)
+
+    assert report["difference_from_other_ranks"][0] == computed_difference
+    assert report["confidence_label"] == "low"
 
 
 def _report_input() -> SegmentSuggestionReportInput:
