@@ -552,7 +552,7 @@ def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
     )
 
 
-def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:
+def test_raw_event_suggester_uses_all_matching_users_until_ratio_is_backtested() -> None:
     vector_reader = FakeUserBehaviorVectorRepository([])
     raw_reader = FakeRawEventSignalRepository(
         [
@@ -581,13 +581,31 @@ def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -
 
     assert len(segments) == 1
     segment = segments[0]
-    assert segment.sample_size == 160
+    assert segment.sample_size == 170
     assert segment.total_eligible_user_count == 170
     assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
     assert segment.profile_json["display_copy"]["audience_summary"] == (
-        "분석 대상 170명 중 조건 일치 170명 · 행동 신호 상위 160명을 "
-        "예측 표본으로 사용"
+        "분석 대상 170명 중 조건 일치 170명 · "
+        "조건 일치자 전체를 추천 대상으로 사용 (100%)"
     )
+    assert segment.profile_json["display_copy"]["audience"] == {
+        "total_eligible_user_count": 170,
+        "matching_user_count": 170,
+        "selected_user_count": 170,
+        "selected_user_ratio": 1.0,
+        "matching_user_ratio": 1.0,
+        "selection_ratio_within_matching": 1.0,
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v1",
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
+    }
 
 
 def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
@@ -757,10 +775,18 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
         "matching_user_count": 6,
         "selected_user_count": 6,
         "selected_user_ratio": 0.5,
+        "matching_user_ratio": 0.5,
+        "selection_ratio_within_matching": 1.0,
         "selection_limited": False,
-        "selection_basis": "behavior_signal_strength",
-        "selection_limit": 160,
-        "selected_user_role": "analysis_seed",
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v1",
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
     }
     assert display_copy["rank_comparison"]["reference_rank"] == 2
     assert display_copy["rank_comparison"]["direction"] == "higher"
