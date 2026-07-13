@@ -483,6 +483,30 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
     ]
 
 
+def test_service_can_approve_automatic_next_loop_focus_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+    )
+
+    result = service.analyze_focus(
+        NextLoopFocusAnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_failed_ad_experiment_ids=["adexp_near_checkin_001"],
+        ),
+        target_status="approved",
+    )
+
+    assert analysis_repository.saved.target_segments == result.target_segments
+    assert {segment.status for segment in result.target_segments} == {"approved"}
+
+
 def test_next_loop_analysis_id_separates_and_bounds_source_lineage() -> None:
     common = {
         "prefix": "analysis",

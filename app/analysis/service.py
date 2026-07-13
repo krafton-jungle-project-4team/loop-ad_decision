@@ -484,6 +484,8 @@ class PromotionAnalysisService:
     def analyze_focus(
         self,
         request: NextLoopFocusAnalysisRequest,
+        *,
+        target_status: TargetSegmentStatus = "planned",
     ) -> PromotionAnalysisResult:
         started_at = now_ms()
         log.assign_context(
@@ -513,7 +515,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=False,
             persist_target_segments=True,
             persist_segment_suggestions=False,
-            target_status="planned",
+            target_status=target_status,
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
