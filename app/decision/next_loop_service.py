@@ -45,6 +45,11 @@ from app.logging import duration_ms, log, log_context_scope, now_ms
 
 COMPLETED_STATUS = "completed"
 MANUAL_CONTENT_OPTION_COUNT = 3
+SELECTABLE_CANDIDATE_STATUSES = frozenset({"draft", "approved", "active"})
+EXHAUSTED_CANDIDATE_STATUSES = frozenset({"rejected", "archived"})
+KNOWN_CANDIDATE_STATUSES = (
+    SELECTABLE_CANDIDATE_STATUSES | EXHAUSTED_CANDIDATE_STATUSES
+)
 
 
 class NextLoopNotFoundError(Exception):
@@ -70,6 +75,15 @@ class NextLoopGenerationResult:
     generation_id: str
     generated_segment_ids: Sequence[str]
     status: str = COMPLETED_STATUS
+
+
+@dataclass(frozen=True)
+class GenerationCandidateSnapshot:
+    pending_content_ids: tuple[str, ...]
+    selectable_segment_ids: frozenset[str]
+    exhausted_segment_ids: frozenset[str]
+    content_ids: frozenset[str]
+    content_option_keys: frozenset[tuple[str, str]]
 
 
 class NextLoopAnalysisGateway(Protocol):
@@ -123,6 +137,12 @@ class NextLoopGenerationGateway(Protocol):
 
 class NextLoopContentCandidateReader(Protocol):
     def list_by_generation(self, generation_id: str) -> list[Mapping[str, Any]]:
+        ...
+
+    def list_by_generation_for_update(
+        self,
+        generation_id: str,
+    ) -> list[Mapping[str, Any]]:
         ...
 
 
@@ -666,12 +686,14 @@ class NextLoopService:
             expected_segment_ids=failed_segment_ids,
             actual_segment_ids=generation_result.generated_segment_ids,
         )
-        pending_content_ids = _validate_generation_candidates(
+        candidate_snapshot = _inspect_generation_candidates(
             candidates=self._content_candidate_repository.list_by_generation(
                 generation_result.generation_id
             ),
             generation_id=generation_result.generation_id,
             analysis_id=analysis_result.analysis_id,
+            project_id=previous_run.project_id,
+            campaign_id=previous_run.campaign_id,
             promotion_id=previous_run.promotion_id,
             expected_segment_ids=failed_segment_ids,
             require_draft_per_segment=True,
@@ -701,7 +723,7 @@ class NextLoopService:
             preparation=preparation,
             previous_run=previous_run,
             loop_count=next_loop_count,
-            pending_content_ids=pending_content_ids,
+            pending_content_ids=candidate_snapshot.pending_content_ids,
         )
 
     def _reuse_active_preparation(
@@ -715,6 +737,10 @@ class NextLoopService:
         source_evaluation_ids: Sequence[str],
         operator_instruction: str | None,
     ) -> NextLoopResponse:
+        if preparation.status != "awaiting_content_approval":
+            raise NextLoopConflictError(
+                "next-loop preparation is no longer awaiting content approval"
+            )
         if (
             set(preparation.failed_segment_ids_json) != set(failed_segment_ids)
             or set(preparation.failed_ad_experiment_ids_json)
@@ -737,33 +763,155 @@ class NextLoopService:
             raise NextLoopValidationError(
                 "active next-loop preparation generation context is invalid"
             )
+        expected_segment_ids = tuple(sorted(preparation.failed_segment_ids_json))
         if (
             generation.analysis_id != preparation.analysis_id
             or generation.promotion_id != previous_run.promotion_id
-            or int(next_loop_context.get("loop_count", 0)) != next_loop_count
+            or generation.project_id != previous_run.project_id
+            or generation.campaign_id != previous_run.campaign_id
+            or generation.status != COMPLETED_STATUS
+            or _context_positive_int(next_loop_context.get("loop_count"))
+            != next_loop_count
+            or _context_positive_int(next_loop_context.get("attempt_no"))
+            != preparation.attempt_no
             or str(next_loop_context.get("source_promotion_run_id", ""))
             != previous_run.promotion_run_id
-            or _normalize_instruction(generation.operator_instruction)
-            != _normalize_instruction(operator_instruction)
+            or str(next_loop_context.get("source_generation_id", ""))
+            != previous_run.generation_id
+            or _context_id_set(next_loop_context.get("focus_segment_ids"))
+            != frozenset(expected_segment_ids)
         ):
             raise NextLoopConflictError(
                 "active next-loop preparation has a different intent"
             )
-        pending_content_ids = _validate_generation_candidates(
-            candidates=self._content_candidate_repository.list_by_generation(
+        candidate_snapshot = _inspect_generation_candidates(
+            candidates=self._content_candidate_repository.list_by_generation_for_update(
                 preparation.generation_id
             ),
             generation_id=preparation.generation_id,
             analysis_id=preparation.analysis_id,
+            project_id=previous_run.project_id,
+            campaign_id=previous_run.campaign_id,
             promotion_id=previous_run.promotion_id,
-            expected_segment_ids=failed_segment_ids,
+            expected_segment_ids=expected_segment_ids,
             require_draft_per_segment=False,
         )
+        if not candidate_snapshot.exhausted_segment_ids:
+            if _normalize_instruction(generation.operator_instruction) != (
+                _normalize_instruction(operator_instruction)
+            ):
+                raise NextLoopConflictError(
+                    "active next-loop preparation has a different intent"
+                )
+            return _manual_preparation_response(
+                preparation=preparation,
+                previous_run=previous_run,
+                loop_count=next_loop_count,
+                pending_content_ids=candidate_snapshot.pending_content_ids,
+            )
+
+        effective_instruction = (
+            _normalize_instruction(operator_instruction)
+            or _normalize_instruction(generation.operator_instruction)
+        )
+        rejected = self._next_loop_preparation_repository.mark_rejected(
+            preparation.next_loop_preparation_id
+        )
+        if (
+            rejected is None
+            or rejected.next_loop_preparation_id
+            != preparation.next_loop_preparation_id
+            or rejected.status != "rejected"
+        ):
+            raise NextLoopConflictError(
+                "next-loop preparation changed while regeneration was requested"
+            )
+
+        attempt_no = self._next_loop_preparation_repository.get_next_attempt_no(
+            previous_run.promotion_run_id
+        )
+        if attempt_no != preparation.attempt_no + 1:
+            raise NextLoopConflictError(
+                "next-loop preparation attempt sequence is not continuous"
+            )
+
+        generation_result = self._generation_gateway.start_manual_generation(
+            project_id=previous_run.project_id,
+            campaign_id=previous_run.campaign_id,
+            promotion_id=previous_run.promotion_id,
+            analysis_id=preparation.analysis_id,
+            focus_segment_ids=expected_segment_ids,
+            loop_count=next_loop_count,
+            attempt_no=attempt_no,
+            source_promotion_run_id=previous_run.promotion_run_id,
+            source_generation_id=previous_run.generation_id,
+            operator_instruction=effective_instruction,
+        )
+        _validate_generation_completed(generation_result)
+        _validate_gateway_segments(
+            label="generation",
+            expected_segment_ids=expected_segment_ids,
+            actual_segment_ids=generation_result.generated_segment_ids,
+        )
+        if generation_result.generation_id == preparation.generation_id:
+            raise NextLoopValidationError(
+                "replacement generation must use a new generation_id"
+            )
+
+        replacement_snapshot = _inspect_generation_candidates(
+            candidates=self._content_candidate_repository.list_by_generation(
+                generation_result.generation_id
+            ),
+            generation_id=generation_result.generation_id,
+            analysis_id=preparation.analysis_id,
+            project_id=previous_run.project_id,
+            campaign_id=previous_run.campaign_id,
+            promotion_id=previous_run.promotion_id,
+            expected_segment_ids=expected_segment_ids,
+            require_draft_per_segment=True,
+        )
+        if candidate_snapshot.content_ids & replacement_snapshot.content_ids:
+            raise NextLoopValidationError(
+                "replacement generation must use new content_id values"
+            )
+        if (
+            candidate_snapshot.content_option_keys
+            & replacement_snapshot.content_option_keys
+        ):
+            raise NextLoopValidationError(
+                "replacement generation must use new content_option_id values"
+            )
+
+        preparation_write = NextLoopPreparationWrite(
+            next_loop_preparation_id=_next_loop_preparation_id(
+                previous_run.promotion_run_id,
+                attempt_no,
+            ),
+            source_promotion_run_id=previous_run.promotion_run_id,
+            analysis_id=preparation.analysis_id,
+            generation_id=generation_result.generation_id,
+            attempt_no=attempt_no,
+            failed_segment_ids_json=tuple(expected_segment_ids),
+            failed_ad_experiment_ids_json=tuple(
+                sorted(preparation.failed_ad_experiment_ids_json)
+            ),
+            source_evaluation_ids_json=tuple(
+                sorted(preparation.source_evaluation_ids_json)
+            ),
+        )
+        try:
+            replacement = self._next_loop_preparation_repository.insert(
+                preparation_write
+            )
+        except NextLoopPreparationConflictError as exc:
+            raise NextLoopConflictError(
+                "next-loop preparation already exists; retry the request"
+            ) from exc
         return _manual_preparation_response(
-            preparation=preparation,
+            preparation=replacement,
             previous_run=previous_run,
             loop_count=next_loop_count,
-            pending_content_ids=pending_content_ids,
+            pending_content_ids=replacement_snapshot.pending_content_ids,
         )
 
     def _get_previous_run(self, promotion_run_id: str) -> PromotionRunRecord:
@@ -886,15 +1034,17 @@ def _validate_failed_ids(
     return selected_sources
 
 
-def _validate_generation_candidates(
+def _inspect_generation_candidates(
     *,
     candidates: Sequence[Mapping[str, Any]],
     generation_id: str,
     analysis_id: str,
+    project_id: str,
+    campaign_id: str,
     promotion_id: str,
     expected_segment_ids: Sequence[str],
     require_draft_per_segment: bool,
-) -> list[str]:
+) -> GenerationCandidateSnapshot:
     if not candidates:
         raise NextLoopValidationError(
             "manual next-loop generation must create content candidates"
@@ -902,18 +1052,25 @@ def _validate_generation_candidates(
     expected = set(expected_segment_ids)
     covered: set[str] = set()
     draft_segments: set[str] = set()
+    selectable_segments: set[str] = set()
+    content_ids: set[str] = set()
+    content_option_keys: set[tuple[str, str]] = set()
     pending: list[tuple[str, str, str]] = []
     for candidate in candidates:
-        candidate_generation_id = str(candidate.get("generation_id", ""))
-        candidate_analysis_id = str(candidate.get("analysis_id", ""))
-        candidate_promotion_id = str(candidate.get("promotion_id", ""))
-        segment_id = str(candidate.get("segment_id", ""))
-        content_id = str(candidate.get("content_id", ""))
-        content_option_id = str(candidate.get("content_option_id", ""))
-        status = str(candidate.get("status", ""))
+        candidate_generation_id = _candidate_text(candidate, "generation_id")
+        candidate_analysis_id = _candidate_text(candidate, "analysis_id")
+        candidate_project_id = _candidate_text(candidate, "project_id")
+        candidate_campaign_id = _candidate_text(candidate, "campaign_id")
+        candidate_promotion_id = _candidate_text(candidate, "promotion_id")
+        segment_id = _candidate_text(candidate, "segment_id")
+        content_id = _candidate_text(candidate, "content_id")
+        content_option_id = _candidate_text(candidate, "content_option_id")
+        status = _candidate_text(candidate, "status")
         if (
             candidate_generation_id != generation_id
             or candidate_analysis_id != analysis_id
+            or candidate_project_id != project_id
+            or candidate_campaign_id != campaign_id
             or candidate_promotion_id != promotion_id
             or segment_id not in expected
             or not content_id
@@ -922,10 +1079,23 @@ def _validate_generation_candidates(
             raise NextLoopValidationError(
                 "manual next-loop content candidates do not match the generation"
             )
+        if status not in KNOWN_CANDIDATE_STATUSES:
+            raise NextLoopValidationError(
+                "manual next-loop content candidate status is invalid"
+            )
+        content_option_key = (segment_id, content_option_id)
+        if content_id in content_ids or content_option_key in content_option_keys:
+            raise NextLoopValidationError(
+                "manual next-loop content candidates contain duplicate ids"
+            )
+        content_ids.add(content_id)
+        content_option_keys.add(content_option_key)
         covered.add(segment_id)
         if status == "draft":
             draft_segments.add(segment_id)
             pending.append((segment_id, content_option_id, content_id))
+        if status in SELECTABLE_CANDIDATE_STATUSES:
+            selectable_segments.add(segment_id)
     if covered != expected:
         raise NextLoopValidationError(
             "manual next-loop content candidates must cover every failed segment"
@@ -934,7 +1104,43 @@ def _validate_generation_candidates(
         raise NextLoopValidationError(
             "manual next-loop generation must create draft content for every segment"
         )
-    return [content_id for _segment, _option, content_id in sorted(pending)]
+    return GenerationCandidateSnapshot(
+        pending_content_ids=tuple(
+            content_id for _segment, _option, content_id in sorted(pending)
+        ),
+        selectable_segment_ids=frozenset(selectable_segments),
+        exhausted_segment_ids=frozenset(expected - selectable_segments),
+        content_ids=frozenset(content_ids),
+        content_option_keys=frozenset(content_option_keys),
+    )
+
+
+def _candidate_text(candidate: Mapping[str, Any], field_name: str) -> str:
+    value = candidate.get(field_name)
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+def _context_positive_int(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 1 else None
+
+
+def _context_id_set(value: Any) -> frozenset[str] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    normalized = [str(item).strip() for item in value]
+    if any(not item for item in normalized) or len(set(normalized)) != len(
+        normalized
+    ):
+        return None
+    return frozenset(normalized)
 
 
 def _next_loop_preparation_id(source_promotion_run_id: str, attempt_no: int) -> str:
