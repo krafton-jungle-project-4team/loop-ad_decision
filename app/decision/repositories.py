@@ -1836,7 +1836,9 @@ class NextLoopPreparationRepository:
             FROM next_loop_preparations
             WHERE source_promotion_run_id = %s
               AND status = 'awaiting_content_approval'
+            ORDER BY attempt_no DESC
             LIMIT 1
+            FOR UPDATE
             """,
             (source_promotion_run_id,),
         )

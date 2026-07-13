@@ -609,7 +609,41 @@ class ContentCandidateRepository:
             updated_at
         FROM content_candidates
         WHERE generation_id = %(generation_id)s
-        ORDER BY segment_id, content_option_id
+        ORDER BY segment_id, content_option_id, content_id
+    """
+
+    SELECT_BY_GENERATION_FOR_UPDATE_SQL = """
+        SELECT
+            content_id,
+            content_option_id,
+            generation_id,
+            analysis_id,
+            project_id,
+            campaign_id,
+            promotion_id,
+            segment_id,
+            channel,
+            subject,
+            preheader,
+            title,
+            body,
+            cta,
+            message,
+            image_prompt,
+            image_url,
+            landing_url,
+            generation_prompt,
+            reason_summary,
+            data_evidence_json,
+            message_strategy,
+            metadata_json,
+            status,
+            created_at,
+            updated_at
+        FROM content_candidates
+        WHERE generation_id = %(generation_id)s
+        ORDER BY segment_id, content_option_id, content_id
+        FOR UPDATE
     """
 
     def __init__(self, connection: ConnectionProtocol):
@@ -659,6 +693,17 @@ class ContentCandidateRepository:
         with self._connection.cursor(row_factory=dict_row) as cursor:
             cursor.execute(
                 self.SELECT_BY_GENERATION_SQL,
+                {"generation_id": generation_id},
+            )
+            return cursor.fetchall()
+
+    def list_by_generation_for_update(
+        self,
+        generation_id: str,
+    ) -> list[dict[str, Any]]:
+        with self._connection.cursor(row_factory=dict_row) as cursor:
+            cursor.execute(
+                self.SELECT_BY_GENERATION_FOR_UPDATE_SQL,
                 {"generation_id": generation_id},
             )
             return cursor.fetchall()
