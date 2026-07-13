@@ -251,6 +251,7 @@ class NextLoopResponse(BaseModel):
     next_promotion_run_id: str | None = None
     promotion_id: str = Field(min_length=1)
     loop_count: int = Field(ge=1)
+    segment_ids: list[str]
     next_analysis_id: str | None = None
     next_generation_id: str | None = None
     pending_content_ids: list[str] = Field(default_factory=list)

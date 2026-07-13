@@ -55,6 +55,7 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
     assert response.previous_promotion_run_id == "prun_banner_001_loop_1"
     assert response.next_promotion_run_id == "prun_banner_001_loop_2"
     assert response.loop_count == 2
+    assert response.segment_ids == ["seg_luxury"]
     assert response.next_analysis_id == "analysis_next_001"
     assert response.next_generation_id == "generation_next_001"
     assert [experiment.segment_id for experiment in response.next_ad_experiments] == [
@@ -130,6 +131,7 @@ def test_next_loop_noops_when_failed_ids_are_empty() -> None:
 
     assert "status" not in response.model_dump()
     assert response.next_promotion_run_id is None
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert response.next_ad_experiments == []
     assert repos.analysis_gateway.calls == []
     assert repos.generation_gateway.calls == []
@@ -356,6 +358,7 @@ def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> N
 
     assert "status" not in response.model_dump()
     assert response.next_promotion_run_id == "prun_banner_001_loop_2"
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert {
         experiment.segment_id for experiment in response.next_ad_experiments
     } == {"seg_family_trip", "seg_luxury"}
@@ -470,6 +473,7 @@ def test_manual_next_loop_stores_multi_candidate_preparation_without_run() -> No
     assert response.status.value == "awaiting_content_approval"
     assert response.content_approval_required is True
     assert response.next_promotion_run_id is None
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert response.next_ad_experiments == []
     assert response.pending_content_ids == [
         "content_seg_family_trip_1",

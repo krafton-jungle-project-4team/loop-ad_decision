@@ -145,6 +145,7 @@ def test_manual_next_loop_contract_does_not_expose_forbidden_public_terms() -> N
             next_promotion_run_id=None,
             promotion_id="promo_banner_001",
             loop_count=2,
+            segment_ids=["seg_luxury"],
             next_analysis_id="analysis_banner_002",
             next_generation_id="generation_banner_002_attempt_1",
             pending_content_ids=["content_banner_002_option_1"],
@@ -193,9 +194,11 @@ def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
 def test_run_response_exposes_segment_scope_and_fallback_marker() -> None:
     run_schema = RunCreateResponse.model_json_schema()
     experiment_schema = AdExperimentCreateResponse.model_json_schema()
+    next_loop_schema = NextLoopResponse.model_json_schema()
 
     assert "segment_ids" in run_schema["required"]
     assert "is_fallback" in experiment_schema["required"]
+    assert "segment_ids" in next_loop_schema["required"]
 
 
 def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
