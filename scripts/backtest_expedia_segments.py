@@ -33,7 +33,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from app.analysis.expedia_backtest import (  # noqa: E402
+from offline_evaluation.expedia_backtest import (  # noqa: E402
     ClickHouseExpediaBacktestRepository,
     ExpediaBacktestConfig,
     ExpediaBacktestError,
@@ -44,7 +44,7 @@ from app.analysis.expedia_backtest import (  # noqa: E402
     write_backtest_artifacts,
     write_temporal_holdout_artifacts,
 )
-from app.analysis.expedia_final_test import (  # noqa: E402
+from offline_evaluation.expedia_final_test import (  # noqa: E402
     ExpediaFinalTestCriteria,
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,

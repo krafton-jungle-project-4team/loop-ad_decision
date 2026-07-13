@@ -36,3 +36,5 @@ and follow the shared Loop-Ad logging standard from the Dashboard API reference.
 
 - [Expedia 세그먼트 추천 백테스트](docs/expedia_segment_backtest.md): 과거 행동과
   미래 예약 라벨을 시간 분리해 AI 추천 후보, Rank, 예상 전환율을 검증한다.
+- [외부 데이터셋 세그먼트 추천 검증](docs/external_segment_backtest.md): Airbnb,
+  Booking.com, Synerise의 서로 다른 결과 계약으로 추천의 외부 일반화를 검증한다.
