@@ -37,6 +37,7 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
+    partial_promotion_run_scope_enabled: bool = False
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
     segment_performance_model_path: str | None = None
@@ -98,6 +99,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
+        partial_promotion_run_scope_enabled=_read_optional_bool(
+            source,
+            "LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED",
+        ),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
         segment_performance_model_path=_read_optional(
@@ -120,6 +125,17 @@ def _read_required(source: Mapping[str, str], name: str) -> str:
 def _read_optional(source: Mapping[str, str], name: str) -> str | None:
     value = str(source.get(name, "")).strip()
     return value or None
+
+
+def _read_optional_bool(source: Mapping[str, str], name: str) -> bool:
+    raw_value = str(source.get(name, "")).strip().lower()
+    if not raw_value:
+        return False
+    if raw_value == "true":
+        return True
+    if raw_value == "false":
+        return False
+    raise SettingsError(f"{name} must be either 'true' or 'false'")
 
 
 def _read_positive_int(source: Mapping[str, str], name: str) -> int:

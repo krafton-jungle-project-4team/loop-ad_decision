@@ -1169,6 +1169,8 @@ def promotion_run_record(
         goal_snapshot_json=goal_snapshot_json
         if goal_snapshot_json is not None
         else {"min_sample_size": min_sample_size},
+        segment_scope_json=["seg_family_trip"],
+        segment_scope_fingerprint="a" * 64,
     )
 
 

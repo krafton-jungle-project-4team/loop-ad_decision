@@ -1,23 +1,29 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from collections import defaultdict
 from decimal import Decimal
 from typing import Sequence
 
 from app.decision.repositories import (
+    AdExperimentRecord,
     AdExperimentWrite,
     AdExperimentWriter,
     ContentCandidateReader,
     ContentCandidateRecord,
     GenerationRunReader,
     GenerationRunRecord,
+    NextLoopPreparationConflictError,
+    NextLoopPreparationRecord,
+    NextLoopPreparationWriter,
     PromotionAnalysisReader,
     PromotionAnalysisRecord,
     PromotionReader,
     PromotionRecord,
     PromotionRunWrite,
+    PromotionRunRecord,
     PromotionRunWriter,
     PromotionTargetSegmentReader,
     PromotionTargetSegmentRecord,
@@ -46,6 +52,10 @@ class RunValidationError(Exception):
     pass
 
 
+class RunSegmentScopeValidationError(RunValidationError):
+    pass
+
+
 class RunConflictError(Exception):
     pass
 
@@ -61,6 +71,8 @@ class PromotionRunService:
         content_candidate_repository: ContentCandidateReader,
         promotion_run_repository: PromotionRunWriter,
         ad_experiment_repository: AdExperimentWriter,
+        next_loop_preparation_repository: NextLoopPreparationWriter | None = None,
+        partial_segment_scope_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_analysis_repository = promotion_analysis_repository
@@ -69,6 +81,8 @@ class PromotionRunService:
         self._content_candidate_repository = content_candidate_repository
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
+        self._next_loop_preparation_repository = next_loop_preparation_repository
+        self._partial_segment_scope_enabled = partial_segment_scope_enabled
 
     @log_context_scope
     def create_run(
@@ -80,6 +94,42 @@ class PromotionRunService:
         started_at = now_ms()
         log.assign_context({"promotionId": promotion_id})
         log.info("started", {"promotionId": promotion_id, "request": request})
+        requested_segment_ids = normalize_explicit_segment_ids(request.segment_ids)
+        if (
+            (
+                requested_segment_ids is not None
+                or request.next_loop_preparation_id is not None
+            )
+            and not self._partial_segment_scope_enabled
+        ):
+            raise RunConflictError(
+                "explicit segment scope is disabled until Dashboard scope lineage is ready"
+            )
+        preparation: NextLoopPreparationRecord | None = None
+        activation_run: PromotionRunRecord | None = None
+        analysis_id = request.analysis_id
+        generation_id = request.generation_id
+        loop_count = request.loop_count
+        if request.next_loop_preparation_id is not None:
+            preparation, requested_segment_ids, activation_run = (
+                self._resolve_activation_context(
+                    promotion_id=promotion_id,
+                    request=request,
+                    requested_segment_ids=requested_segment_ids,
+                )
+            )
+            analysis_id = preparation.analysis_id
+            generation_id = preparation.generation_id
+            source_run = self._promotion_run_repository.get_by_id(
+                preparation.source_promotion_run_id
+            )
+            if source_run is None:
+                raise RunValidationError(
+                    "next-loop preparation source promotion_run was not found"
+                )
+            loop_count = source_run.loop_count + 1
+            if activation_run is not None:
+                return self._reuse_existing_run(activation_run)
         promotion = self._get_promotion(promotion_id)
         log.assign_context(
             {
@@ -90,41 +140,76 @@ class PromotionRunService:
         log.info("promotion_loaded", {"promotion": promotion})
         analysis = self._select_analysis(
             promotion=promotion,
-            analysis_id=request.analysis_id,
+            analysis_id=analysis_id,
         )
         log.assign_context({"analysisId": analysis.analysis_id})
         log.info("promotion_analysis_loaded", {"analysis": analysis})
         generation = self._select_generation(
             promotion=promotion,
             analysis=analysis,
-            generation_id=request.generation_id,
+            generation_id=generation_id,
         )
         log.assign_context({"generationId": generation.generation_id})
         log.info("generation_run_loaded", {"generation": generation})
 
-        promotion_run_id = build_bounded_decision_id(
-            "prun",
-            promotion.promotion_id,
-            f"loop_{request.loop_count}",
+        snapshot_segment_ids = normalize_generation_segment_snapshot(
+            generation.input_json.get("target_segment_ids"),
+            required=requested_segment_ids is not None,
         )
-        if self._promotion_run_repository.exists_for_promotion_loop(
-            promotion_id=promotion.promotion_id,
-            loop_count=request.loop_count,
-        ):
-            log.warn("promotion_run_conflict", {"promotionId": promotion.promotion_id, "loopCount": request.loop_count})
-            raise RunConflictError(
-                "promotion_run already exists for promotion_id and loop_count"
-            )
+        if requested_segment_ids is None:
+            effective_segment_ids = snapshot_segment_ids
+        else:
+            if not set(requested_segment_ids).issubset(
+                set(snapshot_segment_ids or ())
+            ):
+                raise RunValidationError(
+                    "segment_ids must be a subset of the generation target_segment_ids snapshot"
+                )
+            effective_segment_ids = requested_segment_ids
 
         target_segments = self._load_target_segments(
             analysis,
             promotion,
-            segment_ids=request.segment_ids,
+            segment_ids=effective_segment_ids,
         )
-        self._validate_generation_segment_snapshot(
-            generation=generation,
-            requested_segment_ids=request.segment_ids,
+        segment_ids = tuple(
+            sorted({target_segment.segment_id for target_segment in target_segments})
         )
+        segment_scope_fingerprint = build_segment_scope_fingerprint(
+            segment_ids=segment_ids,
+        )
+        promotion_run_id = build_promotion_run_id(
+            project_id=promotion.project_id,
+            promotion_id=promotion.promotion_id,
+            analysis_id=analysis.analysis_id,
+            generation_id=generation.generation_id,
+            loop_count=loop_count,
+            segment_scope_fingerprint=segment_scope_fingerprint,
+        )
+        log.assign_context(
+            {
+                "segmentScopeFingerprint": segment_scope_fingerprint[:12],
+                "segmentScopeCount": len(segment_ids),
+            }
+        )
+        log.info("promotion_run_scope_resolved")
+        existing_run = self._promotion_run_repository.get_by_scope(
+            project_id=promotion.project_id,
+            promotion_id=promotion.promotion_id,
+            analysis_id=analysis.analysis_id,
+            generation_id=generation.generation_id,
+            segment_scope_fingerprint=segment_scope_fingerprint,
+            loop_count=loop_count,
+        )
+        if existing_run is not None:
+            response = self._reuse_existing_run(existing_run)
+            self._activate_preparation(preparation, existing_run.promotion_run_id)
+            log.info(
+                "completed",
+                {"response": response, "durationMs": duration_ms(started_at)},
+            )
+            return response
+
         log.info("target_segments_loaded", {"targetSegmentCount": len(target_segments)})
         content_by_segment = self._load_content_by_segment(generation.generation_id)
         log.info("content_candidates_loaded", {"segmentCount": len(content_by_segment)})
@@ -142,7 +227,9 @@ class PromotionRunService:
             analysis=analysis,
             generation=generation,
             promotion_run_id=promotion_run_id,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
+            segment_ids=segment_ids,
+            segment_scope_fingerprint=segment_scope_fingerprint,
         )
         ad_experiments = self._build_ad_experiments(
             promotion=promotion,
@@ -152,26 +239,221 @@ class PromotionRunService:
             target_segments=target_segments,
             selected_content=selected_content,
             content_by_segment=content_by_segment,
-            loop_count=request.loop_count,
+            loop_count=loop_count,
         )
         log.assign_context({"promotionRunId": run.promotion_run_id})
         log.info("promotion_run_prepared", {"promotionRun": run, "adExperimentCount": len(ad_experiments)})
 
-        for experiment in ad_experiments:
-            if self._ad_experiment_repository.exists_for_run_segment(
-                promotion_run_id=experiment.promotion_run_id,
-                segment_id=experiment.segment_id,
-            ):
-                log.warn("ad_experiment_conflict", {"promotionRunId": experiment.promotion_run_id, "segmentId": experiment.segment_id})
+        inserted = self._promotion_run_repository.insert_if_absent(run)
+        if not inserted:
+            concurrent_run = self._promotion_run_repository.get_by_scope(
+                project_id=run.project_id,
+                promotion_id=run.promotion_id,
+                analysis_id=run.analysis_id,
+                generation_id=run.generation_id,
+                segment_scope_fingerprint=run.segment_scope_fingerprint,
+                loop_count=run.loop_count,
+            )
+            if concurrent_run is None:
+                log.warn("promotion_run_id_collision")
                 raise RunConflictError(
-                    "ad_experiment already exists for promotion_run_id and segment_id"
+                    "promotion_run_id collided with a different segment scope"
+                )
+            response = self._reuse_existing_run(concurrent_run)
+            self._activate_preparation(
+                preparation,
+                concurrent_run.promotion_run_id,
+            )
+            log.info(
+                "completed",
+                {"response": response, "durationMs": duration_ms(started_at)},
+            )
+            return response
+
+        self._ad_experiment_repository.insert_many(ad_experiments)
+        self._activate_preparation(preparation, run.promotion_run_id)
+        log.info("promotion_run_created", {"promotionRun": run, "adExperiments": ad_experiments})
+        response = self._build_response(run, ad_experiments)
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
+
+    def _resolve_activation_context(
+        self,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+        requested_segment_ids: tuple[str, ...] | None,
+    ) -> tuple[
+        NextLoopPreparationRecord,
+        tuple[str, ...],
+        PromotionRunRecord | None,
+    ]:
+        repository = self._next_loop_preparation_repository
+        if repository is None or request.next_loop_preparation_id is None:
+            raise RunConflictError(
+                "next-loop preparation activation is not configured"
+            )
+        preparation = repository.get_by_id(request.next_loop_preparation_id)
+        if preparation is None:
+            raise RunValidationError("next-loop preparation was not found")
+        if preparation.status == "rejected":
+            raise RunConflictError("rejected next-loop preparation cannot be activated")
+
+        source_run = self._promotion_run_repository.get_by_id(
+            preparation.source_promotion_run_id
+        )
+        if source_run is None:
+            raise RunValidationError(
+                "next-loop preparation source promotion_run was not found"
+            )
+        if source_run.promotion_id != promotion_id:
+            raise RunValidationError(
+                "next-loop preparation must belong to the requested promotion"
+            )
+        preparation_segment_ids = normalize_explicit_segment_ids(
+            preparation.failed_segment_ids_json
+        )
+        if preparation_segment_ids is None:
+            raise RunValidationError("next-loop preparation segment scope is empty")
+        if not set(preparation_segment_ids).issubset(
+            set(source_run.segment_scope_json)
+        ):
+            raise RunValidationError(
+                "next-loop preparation scope must stay within its source promotion_run"
+            )
+        if (
+            requested_segment_ids is not None
+            and requested_segment_ids != preparation_segment_ids
+        ):
+            raise RunConflictError(
+                "segment_ids must match the next-loop preparation scope"
+            )
+        if request.analysis_id not in (None, preparation.analysis_id):
+            raise RunConflictError(
+                "analysis_id must match the next-loop preparation"
+            )
+        if request.generation_id not in (None, preparation.generation_id):
+            raise RunConflictError(
+                "generation_id must match the next-loop preparation"
+            )
+        expected_loop_count = source_run.loop_count + 1
+        if (
+            "loop_count" in request.model_fields_set
+            and request.loop_count != expected_loop_count
+        ):
+            raise RunConflictError(
+                "loop_count must follow the next-loop preparation source run"
+            )
+
+        activated_run: PromotionRunRecord | None = None
+        if preparation.status == "activated":
+            if preparation.activated_promotion_run_id is None:
+                raise RunConflictError(
+                    "activated next-loop preparation is missing its promotion_run"
+                )
+            activated_run = self._promotion_run_repository.get_by_id(
+                preparation.activated_promotion_run_id
+            )
+            if activated_run is None:
+                raise RunConflictError(
+                    "activated next-loop preparation promotion_run was not found"
+                )
+            expected_fingerprint = build_segment_scope_fingerprint(
+                segment_ids=preparation_segment_ids
+            )
+            if (
+                activated_run.promotion_id != promotion_id
+                or activated_run.analysis_id != preparation.analysis_id
+                or activated_run.generation_id != preparation.generation_id
+                or activated_run.loop_count != expected_loop_count
+                or activated_run.segment_scope_fingerprint != expected_fingerprint
+            ):
+                raise RunConflictError(
+                    "activated next-loop preparation promotion_run has a different scope"
                 )
 
-        self._promotion_run_repository.insert(run)
-        self._ad_experiment_repository.insert_many(ad_experiments)
-        log.info("promotion_run_created", {"promotionRun": run, "adExperiments": ad_experiments})
+        return preparation, preparation_segment_ids, activated_run
 
-        response = RunCreateResponse(
+    def _activate_preparation(
+        self,
+        preparation: NextLoopPreparationRecord | None,
+        promotion_run_id: str,
+    ) -> None:
+        if preparation is None or preparation.status == "activated":
+            return
+        repository = self._next_loop_preparation_repository
+        if repository is None:
+            raise RunConflictError(
+                "next-loop preparation activation is not configured"
+            )
+        try:
+            activated = repository.mark_activated(
+                next_loop_preparation_id=preparation.next_loop_preparation_id,
+                activated_promotion_run_id=promotion_run_id,
+            )
+        except NextLoopPreparationConflictError as exc:
+            raise RunConflictError(
+                "next-loop preparation activation conflicted"
+            ) from exc
+        if activated is not None:
+            return
+        current = repository.get_by_id(preparation.next_loop_preparation_id)
+        if (
+            current is None
+            or current.status != "activated"
+            or current.activated_promotion_run_id != promotion_run_id
+        ):
+            raise RunConflictError(
+                "next-loop preparation could not be activated"
+            )
+
+    def _reuse_existing_run(self, run: PromotionRunRecord) -> RunCreateResponse:
+        ad_experiments = self._ad_experiment_repository.list_by_run(
+            run.promotion_run_id
+        )
+        self._validate_existing_run_integrity(run, ad_experiments)
+        log.assign_context({"promotionRunId": run.promotion_run_id})
+        log.info("promotion_run_reused")
+        return self._build_response(run, ad_experiments)
+
+    def _validate_existing_run_integrity(
+        self,
+        run: PromotionRunRecord,
+        ad_experiments: Sequence[AdExperimentRecord],
+    ) -> None:
+        experiment_segment_ids = [
+            experiment.segment_id
+            for experiment in ad_experiments
+            if experiment.segment_id != FALLBACK_SEGMENT_ID
+        ]
+        fallback_count = sum(
+            experiment.segment_id == FALLBACK_SEGMENT_ID
+            for experiment in ad_experiments
+        )
+        if (
+            tuple(sorted(experiment_segment_ids))
+            != tuple(run.segment_scope_json)
+            or len(experiment_segment_ids) != len(set(experiment_segment_ids))
+            or fallback_count != 1
+        ):
+            log.warn(
+                "promotion_run_scope_corrupted",
+                {
+                    "storedSegmentCount": len(run.segment_scope_json),
+                    "experimentSegmentCount": len(experiment_segment_ids),
+                    "fallbackCount": fallback_count,
+                },
+            )
+            raise RunConflictError(
+                "stored promotion_run experiments do not match its segment scope"
+            )
+
+    def _build_response(
+        self,
+        run: PromotionRunWrite | PromotionRunRecord,
+        ad_experiments: Sequence[AdExperimentWrite | AdExperimentRecord],
+    ) -> RunCreateResponse:
+        return RunCreateResponse(
             promotion_run_id=run.promotion_run_id,
             project_id=run.project_id,
             campaign_id=run.campaign_id,
@@ -181,6 +463,7 @@ class PromotionRunService:
             loop_count=run.loop_count,
             status=PromotionRunStatus(run.status),
             goal_snapshot_json=dict(run.goal_snapshot_json),
+            segment_ids=list(run.segment_scope_json),
             ad_experiments=[
                 AdExperimentCreateResponse(
                     ad_experiment_id=experiment.ad_experiment_id,
@@ -191,12 +474,11 @@ class PromotionRunService:
                     channel=experiment.channel,
                     loop_count=experiment.loop_count,
                     status=AdExperimentStatus(experiment.status),
+                    is_fallback=experiment.segment_id == FALLBACK_SEGMENT_ID,
                 )
                 for experiment in ad_experiments
             ],
         )
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
-        return response
 
     def _get_promotion(self, promotion_id: str) -> PromotionRecord:
         promotion = self._promotion_repository.get_by_id(promotion_id)
@@ -283,17 +565,17 @@ class PromotionRunService:
         *,
         segment_ids: Sequence[str] | None,
     ) -> list[PromotionTargetSegmentRecord]:
-        if segment_ids is None:
-            target_segments = self._promotion_target_segment_repository.list_for_analysis(
+        target_segments = (
+            self._promotion_target_segment_repository.list_approved_for_analysis(
                 analysis.analysis_id,
+                segment_ids,
             )
-        else:
-            target_segments = (
-                self._promotion_target_segment_repository.list_approved_for_analysis(
-                    analysis.analysis_id,
-                    segment_ids,
-                )
-            )
+        )
+        target_segments = [
+            segment
+            for segment in target_segments
+            if segment.segment_id != FALLBACK_SEGMENT_ID
+        ]
         if not target_segments:
             log.warn("target_segments_empty", {"analysisId": analysis.analysis_id})
             if segment_ids is not None:
@@ -328,29 +610,6 @@ class PromotionRunService:
                 "segment_ids must match approved promotion_target_segments"
             )
         return target_segments
-
-    def _validate_generation_segment_snapshot(
-        self,
-        *,
-        generation: GenerationRunRecord,
-        requested_segment_ids: Sequence[str] | None,
-    ) -> None:
-        if requested_segment_ids is None:
-            return
-
-        snapshot = generation.input_json.get("target_segment_ids")
-        if (
-            not isinstance(snapshot, list)
-            or any(not isinstance(segment_id, str) or not segment_id for segment_id in snapshot)
-            or len(snapshot) != len(set(snapshot))
-        ):
-            raise RunValidationError(
-                "generation run must include a valid target_segment_ids snapshot"
-            )
-        if set(snapshot) != set(requested_segment_ids):
-            raise RunValidationError(
-                "segment_ids must match the generation target_segment_ids snapshot"
-            )
 
     def _load_content_by_segment(
         self,
@@ -434,6 +693,8 @@ class PromotionRunService:
         generation: GenerationRunRecord,
         promotion_run_id: str,
         loop_count: int,
+        segment_ids: Sequence[str],
+        segment_scope_fingerprint: str,
     ) -> PromotionRunWrite:
         return PromotionRunWrite(
             promotion_run_id=promotion_run_id,
@@ -450,6 +711,8 @@ class PromotionRunService:
                 generation=generation,
                 loop_count=loop_count,
             ),
+            segment_scope_json=tuple(segment_ids),
+            segment_scope_fingerprint=segment_scope_fingerprint,
         )
 
     def _build_ad_experiments(
@@ -515,6 +778,121 @@ def build_bounded_decision_id(prefix: str, *parts: str) -> str:
     max_slug_length = MAX_CONTRACT_ID_LENGTH - len(prefix) - len(digest) - 2
     slug = slug[:max_slug_length].rstrip("_") or "id"
     return f"{prefix}_{slug}_{digest}"
+
+
+def build_promotion_run_id(
+    *,
+    project_id: str,
+    promotion_id: str,
+    analysis_id: str,
+    generation_id: str,
+    loop_count: int,
+    segment_scope_fingerprint: str,
+) -> str:
+    if loop_count < 1:
+        raise ValueError("loop_count must be at least 1")
+    if re.fullmatch(r"[0-9a-f]{64}", segment_scope_fingerprint) is None:
+        raise ValueError(
+            "segment_scope_fingerprint must be a 64-character lowercase hex value"
+        )
+
+    prefix = "prun"
+    loop_slug = f"loop_{loop_count}"
+    scope_slug = segment_scope_fingerprint[:24]
+    identity_seed = "::".join(
+        (
+            project_id,
+            promotion_id,
+            analysis_id,
+            generation_id,
+            str(loop_count),
+            segment_scope_fingerprint,
+        )
+    )
+    identity_digest = hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:12]
+    promotion_slug = re.sub(r"[^a-zA-Z0-9]+", "_", promotion_id).strip("_").lower()
+    if not promotion_slug:
+        promotion_slug = "id"
+
+    max_promotion_slug_length = (
+        MAX_CONTRACT_ID_LENGTH
+        - len(prefix)
+        - len(loop_slug)
+        - len(scope_slug)
+        - len(identity_digest)
+        - 4
+    )
+    promotion_slug = (
+        promotion_slug[:max_promotion_slug_length].rstrip("_") or "id"
+    )
+    return f"{prefix}_{promotion_slug}_{loop_slug}_{scope_slug}_{identity_digest}"
+
+
+def build_segment_scope_fingerprint(
+    *,
+    segment_ids: Sequence[str],
+) -> str:
+    serialized = json.dumps(
+        sorted(
+            segment_id
+            for segment_id in set(segment_ids)
+            if segment_id != FALLBACK_SEGMENT_ID
+        ),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def normalize_explicit_segment_ids(
+    segment_ids: Sequence[str] | None,
+) -> tuple[str, ...] | None:
+    if segment_ids is None:
+        return None
+    normalized: set[str] = set()
+    for segment_id in segment_ids:
+        value = segment_id.strip()
+        if not value:
+            raise RunSegmentScopeValidationError(
+                "segment_ids must not contain blank values"
+            )
+        if value == FALLBACK_SEGMENT_ID:
+            raise RunSegmentScopeValidationError(
+                "segment_ids must not include the fallback segment"
+            )
+        normalized.add(value)
+    if not normalized:
+        raise RunSegmentScopeValidationError(
+            "segment_ids must contain at least one segment"
+        )
+    return tuple(sorted(normalized))
+
+
+def normalize_generation_segment_snapshot(
+    snapshot: object,
+    *,
+    required: bool,
+) -> tuple[str, ...] | None:
+    if snapshot is None and not required:
+        return None
+    if not isinstance(snapshot, list):
+        raise RunValidationError(
+            "generation run must include a valid target_segment_ids snapshot"
+        )
+    normalized: set[str] = set()
+    for segment_id in snapshot:
+        if not isinstance(segment_id, str) or not segment_id.strip():
+            raise RunValidationError(
+                "generation run must include a valid target_segment_ids snapshot"
+            )
+        value = segment_id.strip()
+        if value != FALLBACK_SEGMENT_ID:
+            normalized.add(value)
+    if not normalized:
+        raise RunValidationError(
+            "generation run must include a valid target_segment_ids snapshot"
+        )
+    return tuple(sorted(normalized))
 
 
 def _build_goal_snapshot(

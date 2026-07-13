@@ -438,6 +438,8 @@ def promotion_run_record(
             "goal_basis": GoalBasis.ALL_SEGMENTS.value,
             "min_sample_size": 10,
         },
+        segment_scope_json=["seg_family_trip", "seg_luxury"],
+        segment_scope_fingerprint="a" * 64,
     )
 
 

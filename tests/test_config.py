@@ -61,3 +61,19 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.openai_content_model == "gpt-test"
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
     assert settings.segment_performance_model_path == "/models/segment.json"
+    assert settings.partial_promotion_run_scope_enabled is False
+
+
+def test_load_settings_parses_partial_promotion_run_scope_flag() -> None:
+    env = valid_env()
+    env["LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED"] = "true"
+
+    assert load_settings(env).partial_promotion_run_scope_enabled is True
+
+
+def test_load_settings_rejects_invalid_partial_promotion_run_scope_flag() -> None:
+    env = valid_env()
+    env["LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED"] = "enabled"
+
+    with pytest.raises(SettingsError, match="must be either 'true' or 'false'"):
+        load_settings(env)

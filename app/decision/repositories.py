@@ -207,6 +207,8 @@ class PromotionRunRecord:
     loop_count: int
     status: str
     goal_snapshot_json: Mapping[str, Any]
+    segment_scope_json: Sequence[str]
+    segment_scope_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -220,6 +222,8 @@ class PromotionRunWrite:
     loop_count: int
     status: str
     goal_snapshot_json: Mapping[str, Any]
+    segment_scope_json: Sequence[str]
+    segment_scope_fingerprint: str
 
 
 @dataclass(frozen=True)
@@ -425,7 +429,7 @@ class PromotionTargetSegmentReader(Protocol):
     def list_approved_for_analysis(
         self,
         analysis_id: str,
-        segment_ids: Sequence[str],
+        segment_ids: Sequence[str] | None = None,
     ) -> list[PromotionTargetSegmentRecord]:
         ...
 
@@ -459,13 +463,22 @@ class ContentCandidateReader(Protocol):
 
 
 class PromotionRunWriter(Protocol):
-    def insert(self, run: PromotionRunWrite) -> None:
+    def insert_if_absent(self, run: PromotionRunWrite) -> bool:
         ...
 
     def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
         ...
 
-    def exists_for_promotion_loop(self, *, promotion_id: str, loop_count: int) -> bool:
+    def get_by_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> PromotionRunRecord | None:
         ...
 
     def update_status(self, *, promotion_run_id: str, status: str) -> None:
@@ -764,10 +777,15 @@ class PromotionTargetSegmentRepository:
     def list_approved_for_analysis(
         self,
         analysis_id: str,
-        segment_ids: Sequence[str],
+        segment_ids: Sequence[str] | None = None,
     ) -> list[PromotionTargetSegmentRecord]:
+        segment_filter = ""
+        params: Sequence[Any] = (analysis_id,)
+        if segment_ids is not None:
+            segment_filter = "AND segment_id = ANY(%s)"
+            params = (analysis_id, list(segment_ids))
         rows = self._db.fetchall(
-            """
+            f"""
             SELECT
                 analysis_id,
                 project_id,
@@ -786,10 +804,10 @@ class PromotionTargetSegmentRepository:
             FROM promotion_target_segments
             WHERE analysis_id = %s
               AND status = 'approved'
-              AND segment_id = ANY(%s)
+              {segment_filter}
             ORDER BY id ASC
             """,
-            (analysis_id, list(segment_ids)),
+            params,
         )
         return [PromotionTargetSegmentRecord(**row) for row in rows]
 
@@ -904,8 +922,8 @@ class PromotionRunRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
 
-    def insert(self, run: PromotionRunWrite) -> None:
-        self._db.execute(
+    def insert_if_absent(self, run: PromotionRunWrite) -> bool:
+        row = self._db.fetchone(
             """
             INSERT INTO promotion_runs (
                 promotion_run_id,
@@ -916,9 +934,13 @@ class PromotionRunRepository:
                 generation_id,
                 loop_count,
                 status,
-                goal_snapshot_json
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
+            RETURNING promotion_run_id
             """,
             (
                 run.promotion_run_id,
@@ -930,8 +952,11 @@ class PromotionRunRepository:
                 run.loop_count,
                 run.status,
                 run.goal_snapshot_json,
+                Jsonb(list(run.segment_scope_json)),
+                run.segment_scope_fingerprint,
             ),
         )
+        return row is not None
 
     def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
         row = self._db.fetchone(
@@ -945,7 +970,9 @@ class PromotionRunRepository:
                 generation_id,
                 loop_count,
                 status,
-                goal_snapshot_json
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
             FROM promotion_runs
             WHERE promotion_run_id = %s
             """,
@@ -955,18 +982,51 @@ class PromotionRunRepository:
             return None
         return PromotionRunRecord(**row)
 
-    def exists_for_promotion_loop(self, *, promotion_id: str, loop_count: int) -> bool:
+    def get_by_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> PromotionRunRecord | None:
         row = self._db.fetchone(
             """
-            SELECT 1
+            SELECT
+                promotion_run_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                analysis_id,
+                generation_id,
+                loop_count,
+                status,
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
             FROM promotion_runs
-            WHERE promotion_id = %s
+            WHERE project_id = %s
+              AND promotion_id = %s
+              AND analysis_id = %s
+              AND generation_id = %s
+              AND segment_scope_fingerprint = %s
               AND loop_count = %s
             LIMIT 1
             """,
-            (promotion_id, loop_count),
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                generation_id,
+                segment_scope_fingerprint,
+                loop_count,
+            ),
         )
-        return row is not None
+        if row is None:
+            return None
+        return PromotionRunRecord(**row)
 
     def update_status(self, *, promotion_run_id: str, status: str) -> None:
         self._db.execute(

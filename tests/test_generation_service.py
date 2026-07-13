@@ -26,6 +26,7 @@ from app.generation.service import (
     GenerationInputUnavailable,
     GenerationService,
     NextLoopFocusGenerationRequest,
+    _next_loop_generation_id,
 )
 
 
@@ -450,7 +451,9 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         )
     )
 
-    assert result.generation_id == "generation_banner_001_loop_2"
+    assert result.generation_id == (
+        "generation_banner_001_loop_2_1d7b63967183"
+    )
     assert result.generated_segment_ids == ["seg_near_checkin"]
     assert result.status == "completed"
     assert len(generation_run_repository.saved) == 1
@@ -474,8 +477,32 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         candidate.status for candidate in content_candidate_repository.saved
     } == {"approved"}
     candidate = content_candidate_repository.saved[0]
-    assert candidate.content_id == "content_banner_near_checkin_loop_2_001"
-    assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
+    assert candidate.content_id == (
+        "content_banner_near_checkin_loop_2_1d7b63967183_001"
+    )
+    assert candidate.content_option_id == (
+        "banner_near_checkin_loop_2_1d7b63967183_option_001"
+    )
+
+
+def test_next_loop_generation_id_separates_and_bounds_source_lineage() -> None:
+    common = {
+        "promotion_id": "promo_" + ("long_hotel_promotion_" * 10),
+        "loop_count": 2,
+    }
+
+    first = _next_loop_generation_id(
+        **common,
+        source_promotion_run_id="prun_scope_a",
+    )
+    second = _next_loop_generation_id(
+        **common,
+        source_promotion_run_id="prun_scope_b",
+    )
+
+    assert first != second
+    assert len(first) <= 100
+    assert len(second) <= 100
 
 
 def test_generation_service_generates_attempt_aware_multi_draft_focus_candidates() -> None:
@@ -512,7 +539,9 @@ def test_generation_service_generates_attempt_aware_multi_draft_focus_candidates
         )
     )
 
-    assert result.generation_id == "generation_banner_001_loop_2_attempt_1"
+    assert result.generation_id == (
+        "generation_banner_001_loop_2_1d7b63967183_attempt_1"
+    )
     assert result.generated_segment_ids == ["seg_near_checkin"]
     assert len(content_candidate_repository.saved) == 3
     assert {
@@ -521,9 +550,9 @@ def test_generation_service_generates_attempt_aware_multi_draft_focus_candidates
     assert {
         candidate.content_id for candidate in content_candidate_repository.saved
     } == {
-        "content_banner_near_checkin_loop_2_attempt_1_001",
-        "content_banner_near_checkin_loop_2_attempt_1_002",
-        "content_banner_near_checkin_loop_2_attempt_1_003",
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_001",
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_002",
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_003",
     }
     generation_run = generation_run_repository.saved[0]
     assert generation_run.content_option_count == 3
@@ -570,11 +599,11 @@ def test_generation_service_bounds_long_next_loop_content_identifiers() -> None:
     candidate = content_candidate_repository.saved[0]
     assert candidate.content_id == (
         "content_email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
-        "target_destination_affi_6c87bac404eb7fd3_001"
+        "target_destination_affi_f1e2c89951c932fa_001"
     )
     assert candidate.content_option_id == (
         "email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
-        "target_destination_affi_6c87bac404eb7fd3_option_001"
+        "target_destination_affi_f1e2c89951c932fa_option_001"
     )
     assert len(candidate.content_id) == 100
     assert len(candidate.content_option_id) == 99

@@ -13,10 +13,12 @@ from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.decision.schemas import (
+    AdExperimentCreateResponse,
     NextLoopPreparationStatus,
     NextLoopRequest,
     NextLoopResponse,
     RunCreateRequest,
+    RunCreateResponse,
 )
 from app.generation.artifacts import render_banner_html
 from app.generation.router import get_generation_service
@@ -186,6 +188,14 @@ def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
         "activated",
         "rejected",
     }
+
+
+def test_run_response_exposes_segment_scope_and_fallback_marker() -> None:
+    run_schema = RunCreateResponse.model_json_schema()
+    experiment_schema = AdExperimentCreateResponse.model_json_schema()
+
+    assert "segment_ids" in run_schema["required"]
+    assert "is_fallback" in experiment_schema["required"]
 
 
 def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
