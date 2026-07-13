@@ -467,6 +467,18 @@ class ContentCandidateReader(Protocol):
 
 
 class PromotionRunWriter(Protocol):
+    def lock_activation_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> None:
+        ...
+
     def insert_if_absent(self, run: PromotionRunWrite) -> bool:
         ...
 
@@ -931,6 +943,43 @@ class ContentCandidateRepository:
 class PromotionRunRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
+
+    def lock_activation_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> None:
+        identity_parts = (
+            _require_non_blank_string(project_id, field_name="project_id"),
+            _require_non_blank_string(promotion_id, field_name="promotion_id"),
+            _require_non_blank_string(analysis_id, field_name="analysis_id"),
+            _require_non_blank_string(generation_id, field_name="generation_id"),
+            _require_non_blank_string(
+                segment_scope_fingerprint,
+                field_name="segment_scope_fingerprint",
+            ),
+        )
+        if loop_count < 1:
+            raise ValueError("loop_count must be at least 1")
+        identity_key = json.dumps(
+            [*identity_parts, loop_count],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._db.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtext('promotion-run-activation-v1'),
+                hashtext(%s)
+            )
+            """,
+            (identity_key,),
+        )
 
     def insert_if_absent(self, run: PromotionRunWrite) -> bool:
         row = self._db.fetchone(
@@ -2100,7 +2149,13 @@ class NextLoopPreparationRepository:
                 (activated_promotion_run_id, next_loop_preparation_id),
             )
         except errors.UniqueViolation as exc:
-            raise _next_loop_preparation_conflict(exc) from exc
+            conflict = _next_loop_preparation_conflict(exc)
+            if (
+                conflict.constraint_name
+                == "uq_next_loop_preparations_activated_run"
+            ):
+                raise conflict from exc
+            raise
         return _next_loop_preparation_record_or_none(row)
 
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -483,6 +484,52 @@ def test_promotion_run_repository_gets_exact_segment_scope() -> None:
         "a" * 64,
         1,
     )
+
+
+def test_promotion_run_repository_locks_full_activation_identity() -> None:
+    db = FakePostgresExecutor()
+    repo = PromotionRunRepository(db)
+
+    repo.lock_activation_scope(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_002",
+        generation_id="generation_banner_002",
+        segment_scope_fingerprint="b" * 64,
+        loop_count=2,
+    )
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "execute"
+    assert "pg_advisory_xact_lock" in sql
+    assert "promotion-run-activation-v1" in sql
+    assert json.loads(call.params[0]) == [
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_002",
+        "generation_banner_002",
+        "b" * 64,
+        2,
+    ]
+
+
+def test_promotion_run_activation_lock_distinguishes_same_promotion_loop_scopes(
+) -> None:
+    db = FakePostgresExecutor()
+    repo = PromotionRunRepository(db)
+
+    for fingerprint in ("a" * 64, "b" * 64):
+        repo.lock_activation_scope(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_002",
+            generation_id="generation_banner_002",
+            segment_scope_fingerprint=fingerprint,
+            loop_count=2,
+        )
+
+    assert db.calls[0].params != db.calls[1].params
 
 
 def test_promotion_run_repository_reads_segment_scope_contract() -> None:
@@ -1939,6 +1986,24 @@ def test_next_loop_preparation_activation_maps_activated_run_unique_conflict(
 
     assert exc_info.value.constraint_name == constraint_name
     assert constraint_name in str(exc_info.value)
+
+
+def test_next_loop_preparation_activation_preserves_unknown_unique_violation(
+) -> None:
+    constraint_name = "unexpected_next_loop_unique"
+    db = FakePostgresExecutor(
+        fetchone_exception=UniqueViolationWithConstraint(constraint_name)
+    )
+    repo = NextLoopPreparationRepository(db)
+
+    with pytest.raises(errors.UniqueViolation) as exc_info:
+        repo.mark_activated(
+            next_loop_preparation_id="prep_email_next_loop_01",
+            activated_promotion_run_id="run_email_a2",
+        )
+
+    assert not isinstance(exc_info.value, NextLoopPreparationConflictError)
+    assert exc_info.value.diag.constraint_name == constraint_name
 
 
 def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:

@@ -11,6 +11,7 @@ from app.decision.repositories import (
     AdExperimentWrite,
     ContentCandidateRecord,
     GenerationRunRecord,
+    NextLoopPreparationConflictError,
     NextLoopPreparationRecord,
     PromotionAnalysisRecord,
     PromotionEvaluationRecord,
@@ -60,6 +61,7 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
     assert response.analysis_id == "analysis_banner_001"
     assert response.generation_id == "generation_banner_001"
     assert response.status == PromotionRunStatus.PLANNED
+    assert repos.runs.activation_lock_calls == []
     assert len(repos.runs.inserted) == 1
     assert repos.runs.inserted[0].goal_snapshot_json == {
         "source": "promotions",
@@ -932,6 +934,18 @@ def test_preparation_activation_persists_segment_lineage_and_nullable_fallback()
     assert repos.preparations.activated_calls == [
         ("prep_loop_2", response.promotion_run_id)
     ]
+    assert repos.runs.activation_lock_calls == [
+        (
+            "hotel-client-a",
+            "promo_banner_001",
+            "analysis_banner_loop_2",
+            "generation_banner_loop_2",
+            build_segment_scope_fingerprint(
+                ["seg_family_trip", "seg_mobile_user"]
+            ),
+            2,
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1133,6 +1147,7 @@ def test_activated_preparation_retry_returns_canonical_before_candidate_or_evalu
     assert repos.contents.calls == []
     assert repos.evaluations.list_calls == []
     assert repos.runs.inserted == []
+    assert repos.runs.activation_lock_calls == []
     assert repos.ad_experiments.inserted_batches == []
     assert repos.preparations.activated_calls == []
 
@@ -1156,6 +1171,128 @@ def test_activated_preparation_with_missing_canonical_run_is_conflict_without_wr
     assert repos.evaluations.list_calls == []
     assert repos.runs.inserted == []
     assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_response_loss_retry_returns_same_canonical_result(
+) -> None:
+    service, repos = make_preparation_activation_service()
+
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+    repos.ad_experiments.records.sort(key=lambda experiment: experiment.segment_id)
+    retry = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert retry == first
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", first.promotion_run_id)
+    ]
+    assert len(repos.runs.activation_lock_calls) == 1
+
+
+def test_preparation_activation_recovers_complete_unlinked_canonical_run() -> None:
+    canonical_run = canonical_promotion_run_record()
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=canonical_ad_experiments(canonical_run),
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.promotion_run_id == canonical_run.promotion_run_id
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", canonical_run.promotion_run_id)
+    ]
+
+
+def test_preparation_activation_rejects_incomplete_unlinked_canonical_run() -> None:
+    canonical_run = canonical_promotion_run_record()
+    incomplete_experiments = canonical_ad_experiments(canonical_run)[:-1]
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=incomplete_experiments,
+    )
+
+    with pytest.raises(RunConflictError, match="do not match its segment scope"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+def test_preparation_activation_maps_foreign_preparation_canonical_conflict(
+) -> None:
+    canonical_run = canonical_promotion_run_record()
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=canonical_ad_experiments(canonical_run),
+    )
+
+    def reject_foreign_preparation(**_kwargs: str) -> None:
+        raise NextLoopPreparationConflictError(
+            "uq_next_loop_preparations_activated_run"
+        )
+
+    repos.preparations.mark_activated = (  # type: ignore[method-assign]
+        reject_foreign_preparation
+    )
+
+    with pytest.raises(
+        RunConflictError,
+        match="already activated by another next-loop preparation",
+    ):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_allows_same_promotion_loop_different_identity(
+) -> None:
+    foreign_run = replace(
+        canonical_promotion_run_record(),
+        promotion_run_id="prun_foreign_scope_loop_2",
+        analysis_id="analysis_foreign_loop_2",
+        generation_id="generation_foreign_loop_2",
+        segment_scope_json=("seg_foreign",),
+        segment_scope_fingerprint=build_segment_scope_fingerprint(
+            ["seg_foreign"]
+        ),
+    )
+    service, repos = make_preparation_activation_service(
+        canonical_run=foreign_run,
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.promotion_run_id != foreign_run.promotion_run_id
+    assert len(repos.runs.inserted) == 1
+    assert repos.runs.inserted[0].loop_count == foreign_run.loop_count
+    assert (
+        repos.runs.inserted[0].segment_scope_fingerprint
+        != foreign_run.segment_scope_fingerprint
+    )
 
 
 def test_bounded_decision_id_is_stable_and_under_contract_length() -> None:
@@ -1449,8 +1586,32 @@ class FakePromotionRunRepository:
         records: list[PromotionRunRecord] | None = None,
     ) -> None:
         self.get_calls: list[str] = []
+        self.activation_lock_calls: list[
+            tuple[str, str, str, str, str, int]
+        ] = []
         self.inserted: list[PromotionRunWrite] = []
         self.records = list(records or [])
+
+    def lock_activation_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> None:
+        self.activation_lock_calls.append(
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                generation_id,
+                segment_scope_fingerprint,
+                loop_count,
+            )
+        )
 
     def insert_if_absent(self, run: PromotionRunWrite) -> bool:
         if self.get_by_scope(

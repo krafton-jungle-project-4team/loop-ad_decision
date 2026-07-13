@@ -289,7 +289,8 @@ class PromotionRunService:
             )
         except NextLoopPreparationConflictError as exc:
             raise RunConflictError(
-                "next-loop preparation activation conflicted"
+                "canonical promotion run is already activated by another "
+                "next-loop preparation"
             ) from exc
         if activated is not None:
             return
@@ -351,6 +352,17 @@ class PromotionRunService:
         run: PromotionRunWrite | PromotionRunRecord,
         ad_experiments: Sequence[AdExperimentWrite | AdExperimentRecord],
     ) -> RunCreateResponse:
+        segment_order = {
+            segment_id: index
+            for index, segment_id in enumerate(run.segment_scope_json)
+        }
+        ordered_experiments = sorted(
+            ad_experiments,
+            key=lambda experiment: (
+                segment_order.get(experiment.segment_id, len(segment_order)),
+                experiment.segment_id,
+            ),
+        )
         return RunCreateResponse(
             promotion_run_id=run.promotion_run_id,
             project_id=run.project_id,
@@ -374,7 +386,7 @@ class PromotionRunService:
                     status=AdExperimentStatus(experiment.status),
                     is_fallback=experiment.segment_id == FALLBACK_SEGMENT_ID,
                 )
-                for experiment in ad_experiments
+                for experiment in ordered_experiments
             ],
         )
 
@@ -440,6 +452,17 @@ class PromotionRunService:
         if normalized_preparation_scope is None:
             raise RunValidationError("next-loop preparation segment scope is empty")
         expected_segment_ids = list(normalized_preparation_scope)
+        segment_scope_fingerprint = build_segment_scope_fingerprint(
+            segment_ids=expected_segment_ids
+        )
+        self._promotion_run_repository.lock_activation_scope(
+            project_id=promotion.project_id,
+            promotion_id=promotion.promotion_id,
+            analysis_id=analysis.analysis_id,
+            generation_id=generation.generation_id,
+            segment_scope_fingerprint=segment_scope_fingerprint,
+            loop_count=request.loop_count,
+        )
         target_segments = self._load_target_segments(
             analysis,
             promotion,
@@ -469,9 +492,6 @@ class PromotionRunService:
             promotion=promotion,
         )
 
-        segment_scope_fingerprint = build_segment_scope_fingerprint(
-            segment_ids=expected_segment_ids
-        )
         promotion_run_id = build_promotion_run_id(
             project_id=promotion.project_id,
             promotion_id=promotion.promotion_id,
