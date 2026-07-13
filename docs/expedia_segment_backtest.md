@@ -227,9 +227,10 @@ cd ../loop-ad-expedia-final
 실행이 시작된 manifest에는 `*.execution-started.json` 저널이 남는다. 재시도 가능 여부는
 미래 예약 outcome을 처음 조회한 시점을 기준으로 나뉜다.
 
-이 저널은 해당 filesystem에서 한 manifest의 중복 실행을 막는 로컬 계약이다. 저장소를
-다시 clone한 외부 사용자의 계정별 실행 횟수까지 통제하지는 않는다. 계정별 1회 제한은
-원본 outcome을 보유한 hosted evaluator와 공용 실행권 저장소에서 별도로 적용해야 한다.
+이 저널은 해당 filesystem에서 한 manifest의 중복 실행을 막는 로컬 계약이다. 원본과
+실행 환경을 평가자가 직접 보유하는 현재 구조에서는 저장소 재복제나 저널 삭제까지 막을 수
+없다. 따라서 “한 번”은 한 clone의 한 manifest당 한 번이라는 검증 절차이며, GitHub
+계정별 실행 제한을 보장하지 않는다.
 
 - outcome 조회 전 실패는 저널의 `execution_id`를 지정해 같은 실행으로 재시도할 수 있다.
 - outcome 조회 후 계산 실패는 최종 시험 반복을 막기 위해 재실행할 수 없다.

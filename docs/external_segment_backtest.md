@@ -22,7 +22,9 @@ Parquet 기반 Synerise adapter는 개발 의존성의 `pyarrow`를 사용한다
 python -m pip install -e '.[dev]'
 ```
 
-원본 데이터는 다음 기본 경로에 둔다. `artifacts/`는 Git에서 제외된다.
+원본 데이터는 각 평가자가 공식 배포처에서 직접 내려받아 다음 기본 경로에 둔다.
+원본 파일은 이 저장소나 별도 공용 저장소에서 제공하지 않으며, `artifacts/`는 Git에서
+제외된다.
 
 ```text
 artifacts/external-datasets/
@@ -102,33 +104,57 @@ manifest=artifacts/external-segment-backtest/sealed/booking-com-final.manifest.j
 confirmation=RUN_EXTERNAL_FINAL_<manifest-id-prefix>
 ```
 
+봉인 manifest는 원본 데이터가 아니라 파일명·크기·SHA-256, 모델, 코드, 평가 기준을
+담은 작은 공개 계약서다. 팀에서 최종 manifest를 확정하면 다음 명령으로 Git 레지스트리에
+복사하고 JSON 파일만 커밋한다. 원본 데이터와 outcome 파일은 커밋하지 않는다.
+
+```bash
+.venv/bin/python scripts/backtest_external_segments.py register-final-test \
+  --manifest artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json
+
+git add evaluation_manifests/external
+git commit -m "test: 외부 최종 평가 manifest 등록"
+```
+
+clone 사용자는 등록된 manifest ID, 데이터셋, 봉인 commit을 다음 명령으로 확인할 수 있다.
+
+```bash
+.venv/bin/python scripts/backtest_external_segments.py list-final-tests
+```
+
 ## 3. 봉인 결과 한 번만 열기
 
 아직 최종 결과를 보고 싶지 않다면 이 명령은 실행하지 않는다. `run-final-test`는
 manifest별 실행 ID와 상태를 `*.execution-started.json` 저널에 기록한다. 같은 manifest로
 새 평가를 시작하는 것은 차단하며, 장애 복구는 기존 실행 ID로만 가능하다.
 
-봉인 이후 `dev`에 새 commit이 쌓였다면 manifest의 `code_commit`으로 별도 worktree를
-만들어 실행한다.
+clone 사용자는 원본 데이터셋을 직접 내려받은 뒤, 봉인 이후 `dev`에 새 commit이 쌓였다면
+manifest의 `code_commit`으로 별도 worktree를 만들어 실행한다. manifest는 registry가
+있는 원래 clone의 절대 경로를 사용한다.
 
 ```bash
 git worktree add ../loop-ad-external-final <manifest-code-commit>
 cd ../loop-ad-external-final
+
+MANIFEST=/absolute/path/to/original-clone/evaluation_manifests/external/<manifest-id>.json
+SOURCE_DIR=/absolute/path/to/downloaded-dataset
 ```
 
 ```bash
 .venv/bin/python scripts/backtest_external_segments.py run-final-test \
-  --manifest artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json \
+  --manifest "$MANIFEST" \
+  --source-dir "$SOURCE_DIR" \
   --confirm RUN_EXTERNAL_FINAL_<manifest-id-prefix>
 ```
 
 확인 토큰, 원본 checksum, 모델, Git commit 또는 tree가 봉인 시점과 다르면 실행하지
 않는다. 실패 시 재시도 가능 여부는 outcome 개봉 시점을 기준으로 나뉜다.
 
-`*.execution-started.json`은 해당 filesystem에서 manifest 중복 실행을 막는다. 외부
-사용자가 저장소를 새로 clone하거나 로컬 저널을 삭제하는 행동까지 신뢰성 있게 막을 수는
-없다. GitHub 사용자별 1회 실행은 outcome을 외부에 배포하지 않는 hosted evaluator에서
-공용 실행권을 원자적으로 선점하는 별도 경계로 구현해야 한다.
+`*.execution-started.json`은 해당 clone에서 manifest 중복 실행을 막는다. manifest가 Git
+레지스트리에 있으면 저널도 그 파일 옆에 생성되며 `.gitignore`로 제외된다. 원본과 실행
+환경을 평가자가 소유하므로 새 clone 생성, 저널 삭제, 코드 수정까지 막는 중앙 통제는 하지
+않는다. 따라서 이 구조의 “한 번”은 **한 clone의 한 manifest당 한 번**이라는 재현성
+규칙이지 GitHub 계정별 보안 제한이 아니다.
 
 - `reserved`, `retryable_pre_outcome_failure`: outcome을 읽기 전의 파일·환경 오류다. 저널의
   `execution_id`를 `--resume-execution-id`로 전달하면 같은 실행을 재개할 수 있다.
@@ -142,7 +168,8 @@ cd ../loop-ad-external-final
 
 ```bash
 .venv/bin/python scripts/backtest_external_segments.py run-final-test \
-  --manifest artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json \
+  --manifest "$MANIFEST" \
+  --source-dir "$SOURCE_DIR" \
   --confirm RUN_EXTERNAL_FINAL_<manifest-id-prefix> \
   --resume-execution-id <execution_id>
 ```
