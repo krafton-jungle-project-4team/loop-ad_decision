@@ -27,6 +27,12 @@ from app.main import create_app
 
 
 README_PATH = Path(__file__).resolve().parents[1] / "README.md"
+RUN_RESPONSE_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "contracts"
+    / "decision-promotion-run-response.v1.json"
+)
 
 
 TERM_ARM_ID = "arm" + "_id"
@@ -199,6 +205,27 @@ def test_run_response_exposes_segment_scope_and_fallback_marker() -> None:
     assert "segment_ids" in run_schema["required"]
     assert "is_fallback" in experiment_schema["required"]
     assert "segment_ids" in next_loop_schema["required"]
+
+
+def test_dashboard_run_response_fixture_matches_public_contract() -> None:
+    response = RunCreateResponse.model_validate_json(
+        RUN_RESPONSE_FIXTURE_PATH.read_text(encoding="utf-8")
+    )
+    non_fallback_segment_ids = {
+        experiment.segment_id
+        for experiment in response.ad_experiments
+        if not experiment.is_fallback
+    }
+    fallback_experiments = [
+        experiment
+        for experiment in response.ad_experiments
+        if experiment.is_fallback
+    ]
+
+    assert response.segment_ids == ["segment-a", "segment-b"]
+    assert non_fallback_segment_ids == set(response.segment_ids)
+    assert len(fallback_experiments) == 1
+    assert fallback_experiments[0].segment_id == "seg_existing_all"
 
 
 def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
