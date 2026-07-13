@@ -27,6 +27,7 @@ from app.analysis.segment_performance import (
     write_segment_performance_model,
 )
 from app.logging import duration_ms, log, log_context_scope, now_ms
+from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
 
 
 EXPEDIA_TRAIN_COLUMNS = (
@@ -877,19 +878,19 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
     calibration_rank_one = [
         result for result in calibration_results if result.rank == 1
     ]
-    rank_one_is_best = 0
-    for scenario_results in evaluable_grouped.values():
-        rank_one_result = next(
-            (result for result in scenario_results if result.rank == 1),
-            None,
-        )
-        if rank_one_result is None:
-            continue
-        best_actual = max(
-            result.actual_contextual_conversion_rate for result in scenario_results
-        )
-        if rank_one_result.actual_contextual_conversion_rate >= best_actual:
-            rank_one_is_best += 1
+    rank_quality = summarize_rank_quality(
+        [
+            [
+                RankedOutcome(
+                    rank=result.rank,
+                    actual_rate=result.actual_contextual_conversion_rate,
+                    baseline_rate=result.baseline_contextual_conversion_rate,
+                )
+                for result in scenario_results
+            ]
+            for scenario_results in grouped.values()
+        ]
+    )
     by_candidate_type: dict[str, dict[str, Any]] = {}
     for candidate_type in sorted(
         {result.candidate_type for result in evaluable_results}
@@ -969,17 +970,7 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             * 100.0
             for result in calibration_results
         ),
-        "rank_one_beats_baseline_rate": _safe_rate(
-            sum(
-                result.actual_contextual_conversion_rate
-                > result.baseline_contextual_conversion_rate
-                for result in rank_one
-            ),
-            len(rank_one),
-        ),
-        "rank_one_is_best_rate": _safe_rate(
-            rank_one_is_best, len(evaluable_grouped)
-        ),
+        **rank_quality,
         "by_candidate_type": by_candidate_type,
     }
 
@@ -1402,9 +1393,17 @@ def _markdown_report(
         "- 전체 기준 목적지 무관 예약률: "
         f"{_format_percent(metrics['rank_one_mean_baseline_any_conversion_rate'])}",
         "- Rank 1이 기준선을 이긴 비율: "
-        f"{_format_percent(metrics['rank_one_beats_baseline_rate'])}",
-        "- Rank 1이 실제 최고 후보였던 비율: "
-        f"{_format_percent(metrics['rank_one_is_best_rate'])}",
+        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
+        "- Rank 1이 엄격하게 실제 최고 후보였던 비율: "
+        f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
+        "- Rank 2가 기준선을 이긴 비율: "
+        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
+        "- Rank 3이 기준선을 이긴 비율: "
+        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
+        "- 후보 쌍 순서 적중률: "
+        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
+        "- 후보 쌍 동률 비율: "
+        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
         "- 예상값 평균 절대 오차: "
         f"{metrics['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
         "",
@@ -1461,10 +1460,12 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 2014년 개발 검증 결과",
             "",
             f"- 평가 시나리오: {validation['scenario_count']}개",
-            "- Rank 1이 실제 최고 후보였던 비율: "
-            f"{_format_percent(validation['rank_one_is_best_rate'])}",
+            "- Rank 1이 엄격하게 실제 최고 후보였던 비율: "
+            f"{_format_optional_percent(validation['rank_one_is_best_rate'])}",
+            "- 후보 쌍 순서 적중률: "
+            f"{_format_optional_percent(validation['pairwise_rank_accuracy'])}",
             "- Rank 1이 기준선을 이긴 비율: "
-            f"{_format_percent(validation['rank_one_beats_baseline_rate'])}",
+            f"{_format_optional_percent(validation['rank_one_beats_baseline_rate'])}",
             "- Rank 1 평균 절대 오차: "
             f"{validation['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
             f"- Rank 1 Brier score: {validation['rank_one_brier_score']:.6f}",
@@ -1477,8 +1478,8 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 학습 구간 참고 지표",
             "",
             f"- 학습 시나리오: {training['scenario_count']}개",
-            "- 학습 Rank 1 실제 최고 후보 비율: "
-            f"{_format_percent(training['rank_one_is_best_rate'])}",
+            "- 학습 Rank 1 엄격한 실제 최고 후보 비율: "
+            f"{_format_optional_percent(training['rank_one_is_best_rate'])}",
             "",
             "## 해석 주의사항",
             "",
@@ -1589,3 +1590,9 @@ def _brier_score(results: Sequence[ExpediaBacktestResult]) -> float:
 
 def _format_percent(value: float) -> str:
     return f"{value * 100.0:.2f}%"
+
+
+def _format_optional_percent(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return _format_percent(value)
