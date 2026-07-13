@@ -318,7 +318,16 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 - `all_candidate_mean_absolute_error_percentage_points`: 예상값과 실제값의 평균 절대 오차
 - `all_candidate_brier_score`: 사용자별 확률 예측 오차. 0에 가까울수록 좋다.
 - `rank_one_beats_baseline_rate`: Rank 1이 전체 분석 대상의 목적지 예약률을 이긴 비율
-- `rank_one_is_best_rate`: Rank 1이 노출된 후보 중 실제 최고 예약률이었던 비율
+- `rank_one_is_best_rate`: Rank 1 예약률이 다른 모든 후보보다 엄격하게 높았던 비율. 동률은 승리로 세지 않는다.
+- `rank_one_tied_best_rate`: Rank 1이 실제 최고 예약률로 다른 후보와 동률이었던 비율
+- `rank_two_beats_baseline_rate`, `rank_three_beats_baseline_rate`: Rank 2·3도 전체 사용자 기준 예약률을 이긴 비율
+- `pairwise_rank_accuracy`: 동률이 아닌 후보 쌍에서 앞 Rank의 실제 예약률이 더 높았던 비율
+- `pairwise_rank_tie_rate`: 실제 예약률이 같아 순서의 옳고 그름을 판단할 수 없었던 후보 쌍 비율
+- `three_rank_scenario_count`: Rank 1·2·3을 모두 생성해 Top 3 전체를 비교할 수 있었던 시나리오 수
+
+봉인 최종 테스트는 관측 outcome과 Rank 2·3 후보가 부족하면 `FAIL` 대신 `INCONCLUSIVE`로 기록한다. 충분한 근거가 있을 때만 예상값 보정, Top 3 유용성, 전체 순위 정확성을 함께 사용해 `PASS` 또는 `FAIL`을 결정한다.
+
+이 기준은 `expedia.sealed-final-test.v2` manifest에 사전 등록된다. 아직 결과를 열지 않은 v1 manifest가 있다면 새 코드와 모델을 동결한 뒤 v2 manifest를 다시 생성해야 한다.
 
 ## 시간 누수 방지
 
