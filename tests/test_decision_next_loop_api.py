@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+import os
+import threading
+import time
 from typing import Any
+import uuid
 
+import psycopg
 import pytest
 from fastapi.testclient import TestClient
 from psycopg import errors
+from psycopg import sql
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.decision.next_loop_service import (
@@ -14,7 +20,15 @@ from app.decision.next_loop_service import (
     NextLoopNotFoundError,
     NextLoopValidationError,
 )
-from app.decision.router import get_next_loop_service
+from app.decision.repositories import (
+    NextLoopPreparationRepository,
+    NextLoopPreparationWrite,
+    PsycopgPostgresExecutor,
+)
+from app.decision.router import (
+    SerializedNextLoopPreparationRepository,
+    get_next_loop_service,
+)
 from app.decision.schemas import (
     AdExperimentCreateResponse,
     AdExperimentStatus,
@@ -26,6 +40,7 @@ from app.decision.schemas import (
     PromotionRunStatus,
 )
 from app.main import create_app
+from app.generation.repositories import ContentCandidateRepository
 
 
 DEFAULT_ROW = object()
@@ -403,6 +418,21 @@ def test_manual_next_loop_api_reuses_canonical_preparation(
     assert sum("insert into generation_runs" in query for query in executed_sql) == 1
     assert sum("insert into content_candidates" in query for query in executed_sql) == 3
     assert sum("pg_advisory_xact_lock" in query for query in executed_sql) == 2
+    preparation_lock_indices = [
+        index
+        for index, query in enumerate(executed_sql)
+        if "from next_loop_preparations" in query and "for update" in query
+    ]
+    candidate_lock_indices = [
+        index
+        for index, query in enumerate(executed_sql)
+        if "from content_candidates" in query and "for update" in query
+    ]
+    assert preparation_lock_indices
+    assert candidate_lock_indices
+    assert preparation_lock_indices[-1] < candidate_lock_indices[-1]
+    candidate_lock_sql = executed_sql[candidate_lock_indices[-1]]
+    assert "order by segment_id, content_option_id, content_id" in candidate_lock_sql
     assert connection.commit_count == 2
     assert connection.rollback_count == 0
 
@@ -442,6 +472,119 @@ def test_manual_next_loop_api_rolls_back_generation_on_candidate_failure(
     assert not any("insert into next_loop_preparations" in query for query in executed_sql)
     assert not any("insert into promotion_runs" in query for query in executed_sql)
     assert not any("insert into ad_experiments" in query for query in executed_sql)
+
+
+def test_manual_next_loop_api_regenerates_exhausted_candidates_as_attempt_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = manual_regeneration_connection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["next_analysis_id"] == "analysis_banner_001_loop_2_1d7b63967183"
+    assert body["next_generation_id"].endswith(
+        "_loop_2_1d7b63967183_attempt_2"
+    )
+    assert len(body["pending_content_ids"]) == 3
+    assert all("attempt_2" in content_id for content_id in body["pending_content_ids"])
+    assert [row["status"] for row in connection.rejected_preparation_rows] == [
+        "rejected"
+    ]
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["attempt_no"] == 2
+    assert connection.active_preparation_row["status"] == (
+        "awaiting_content_approval"
+    )
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    preparation_lock = next(
+        index
+        for index, query in enumerate(executed_sql)
+        if "from next_loop_preparations" in query and "for update" in query
+    )
+    candidate_lock = next(
+        index
+        for index, query in enumerate(executed_sql)
+        if "from content_candidates" in query and "for update" in query
+    )
+    reject_update = next(
+        index
+        for index, query in enumerate(executed_sql)
+        if "update next_loop_preparations" in query
+        and "status = 'rejected'" in query
+    )
+    assert preparation_lock < candidate_lock < reject_update
+    assert not any("insert into promotion_analyses" in query for query in executed_sql)
+    assert sum("insert into generation_runs" in query for query in executed_sql) == 1
+    assert sum("insert into content_candidates" in query for query in executed_sql) == 3
+    assert sum("insert into next_loop_preparations" in query for query in executed_sql) == 1
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+
+
+def test_manual_next_loop_api_rolls_back_rejection_and_attempt_two_rows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = manual_regeneration_connection(
+        raise_unique_on_content_candidate_insert=True,
+    )
+    old_candidate_ids = {
+        str(candidate["content_id"])
+        for candidate in connection.content_candidate_rows
+    }
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    app.state.manual_next_loop_enabled = True
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+            "content_approval_mode": "manual",
+        },
+    )
+
+    assert response.status_code == 409
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.active_preparation_row is not None
+    assert connection.active_preparation_row["attempt_no"] == 1
+    assert connection.active_preparation_row["status"] == (
+        "awaiting_content_approval"
+    )
+    assert {
+        str(candidate["content_id"])
+        for candidate in connection.content_candidate_rows
+    } == old_candidate_ids
+    assert connection.rolled_back_inserts == ["generation_runs"]
 
 
 def test_next_loop_service_wires_s3_artifact_publisher_outside_test_env(
@@ -939,6 +1082,19 @@ class RecordingCursor:
             row = next_loop_preparation_insert_row(self._last_params)
             self._connection.active_preparation_row = row
             return row
+        if "update next_loop_preparations" in sql and "status = 'rejected'" in sql:
+            active = self._connection.active_preparation_row
+            if active is None or active["status"] != "awaiting_content_approval":
+                return None
+            self._connection.preparation_before_rejection = dict(active)
+            rejected = {
+                **active,
+                "status": "rejected",
+                "updated_at": datetime.now(UTC),
+            }
+            self._connection.rejected_preparation_rows.append(rejected)
+            self._connection.active_preparation_row = None
+            return rejected
         if "select coalesce(max(attempt_no), 0) + 1" in sql:
             return {"next_attempt_no": self._connection.next_attempt_no}
         if "from next_loop_preparations" in sql:
@@ -974,13 +1130,22 @@ class RecordingCursor:
             return [target_segment_row(self._connection.segment_id)]
         if "from content_candidates" in sql:
             if self._connection.content_candidate_rows:
+                generation_id = None
+                if isinstance(self._last_params, dict):
+                    generation_id = self._last_params.get("generation_id")
+                candidate_rows = [
+                    candidate
+                    for candidate in self._connection.content_candidate_rows
+                    if generation_id is None
+                    or candidate["generation_id"] == generation_id
+                ]
                 if "status in ('approved', 'active')" in sql:
                     return [
                         decision_content_candidate_row(candidate)
-                        for candidate in self._connection.content_candidate_rows
+                        for candidate in candidate_rows
                         if candidate["status"] in {"approved", "active"}
                     ]
-                return list(self._connection.content_candidate_rows)
+                return candidate_rows
             return [approved_content_candidate_row(self._connection.segment_id)]
         return []
 
@@ -1015,6 +1180,9 @@ class RecordingConnection:
         self.active_preparation_row = active_preparation_row
         self.next_attempt_no = next_attempt_no
         self.content_candidate_rows: list[dict[str, object]] = []
+        self.rejected_preparation_rows: list[dict[str, object]] = []
+        self.preparation_before_rejection: dict[str, object] | None = None
+        self.committed_content_candidate_count = 0
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
@@ -1030,11 +1198,17 @@ class RecordingConnection:
         self.commit_count += 1
         self.committed_inserts.extend(self.pending_inserts)
         self.pending_inserts.clear()
+        self.committed_content_candidate_count = len(self.content_candidate_rows)
+        self.preparation_before_rejection = None
 
     def rollback(self) -> None:
         self.rollback_count += 1
         self.rolled_back_inserts.extend(self.pending_inserts)
         self.pending_inserts.clear()
+        del self.content_candidate_rows[self.committed_content_candidate_count :]
+        if self.preparation_before_rejection is not None:
+            self.active_preparation_row = self.preparation_before_rejection
+            self.preparation_before_rejection = None
 
     def close(self) -> None:
         self.close_count += 1
@@ -1243,6 +1417,8 @@ def generation_run_row(
                 "loop_count": 2,
                 "source_promotion_run_id": "prun_banner_001_loop_1",
                 "source_generation_id": "generation_banner_001",
+                "focus_segment_ids": [segment_id],
+                "attempt_no": 1,
             }
         },
         "output_json": {},
@@ -1339,6 +1515,100 @@ def decision_content_candidate_row(
     }
 
 
+def manual_regeneration_connection(
+    *,
+    raise_unique_on_content_candidate_insert: bool = False,
+) -> RecordingConnection:
+    generation_id = "generation_banner_001_loop_2_1d7b63967183_attempt_1"
+    analysis_id = "analysis_banner_001_loop_2_1d7b63967183"
+    connection = RecordingConnection(
+        active_preparation_row=manual_preparation_row(
+            generation_id=generation_id,
+            analysis_id=analysis_id,
+        ),
+        next_attempt_no=2,
+        raise_unique_on_content_candidate_insert=(
+            raise_unique_on_content_candidate_insert
+        ),
+    )
+    connection.content_candidate_rows = [
+        manual_candidate_row(
+            generation_id=generation_id,
+            analysis_id=analysis_id,
+            option_index=option_index,
+            status="rejected",
+        )
+        for option_index in range(1, 4)
+    ]
+    connection.committed_content_candidate_count = len(
+        connection.content_candidate_rows
+    )
+    return connection
+
+
+def manual_preparation_row(
+    *,
+    generation_id: str,
+    analysis_id: str,
+) -> dict[str, object]:
+    now = datetime.now(UTC)
+    return {
+        "next_loop_preparation_id": "nlprep_existing_attempt_1",
+        "source_promotion_run_id": "prun_banner_001_loop_1",
+        "analysis_id": analysis_id,
+        "generation_id": generation_id,
+        "attempt_no": 1,
+        "failed_segment_ids_json": ["seg_luxury"],
+        "failed_ad_experiment_ids_json": ["adexp_luxury_001"],
+        "source_evaluation_ids_json": ["eval_luxury_001"],
+        "status": "awaiting_content_approval",
+        "activated_promotion_run_id": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+def manual_candidate_row(
+    *,
+    generation_id: str,
+    analysis_id: str,
+    option_index: int,
+    status: str,
+) -> dict[str, object]:
+    generation_slug = generation_id.removeprefix("generation_banner_001_")
+    content_slug = f"luxury_{generation_slug}"
+    return {
+        "content_id": f"content_banner_{content_slug}_{option_index:03d}",
+        "content_option_id": (
+            f"banner_{content_slug}_option_{option_index:03d}"
+        ),
+        "generation_id": generation_id,
+        "analysis_id": analysis_id,
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "segment_id": "seg_luxury",
+        "channel": "onsite_banner",
+        "subject": None,
+        "preheader": None,
+        "title": "Summer hotel stay",
+        "body": "Book your summer hotel stay.",
+        "cta": "Book now",
+        "message": None,
+        "image_prompt": "A summer hotel",
+        "image_url": None,
+        "landing_url": "https://demo-stay.example.com/summer",
+        "generation_prompt": "Generate a hotel banner.",
+        "reason_summary": "Uses the failed hotel segment.",
+        "data_evidence_json": {},
+        "message_strategy": "Highlight hotel booking benefits.",
+        "metadata_json": {},
+        "status": status,
+        "created_at": None,
+        "updated_at": None,
+    }
+
+
 def next_loop_preparation_insert_row(params: Any) -> dict[str, object]:
     values = tuple(params or ())
     now = datetime.now(UTC)
@@ -1417,3 +1687,458 @@ def user_behavior_vector_rows() -> list[dict[str, object]]:
             "source": "batch_profile",
         }
     ]
+
+
+@pytest.fixture
+def next_loop_postgres_schema() -> tuple[str, str]:
+    dsn = os.getenv("LOOPAD_TEST_POSTGRES_DSN")
+    if not dsn:
+        pytest.skip("LOOPAD_TEST_POSTGRES_DSN is required for PostgreSQL locking tests")
+    schema_name = f"test_next_loop_{uuid.uuid4().hex}"
+    admin = psycopg.connect(dsn, autocommit=True)
+    try:
+        admin.execute(
+            sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema_name))
+        )
+        admin.execute(
+            sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+        )
+        admin.execute(
+            """
+            CREATE TABLE next_loop_preparations (
+                next_loop_preparation_id text PRIMARY KEY,
+                source_promotion_run_id text NOT NULL,
+                analysis_id text NOT NULL,
+                generation_id text NOT NULL,
+                attempt_no integer NOT NULL CHECK (attempt_no >= 1),
+                failed_segment_ids_json jsonb NOT NULL,
+                failed_ad_experiment_ids_json jsonb NOT NULL,
+                source_evaluation_ids_json jsonb NOT NULL,
+                status text NOT NULL CHECK (
+                    status IN (
+                        'awaiting_content_approval',
+                        'rejected',
+                        'activated'
+                    )
+                ),
+                activated_promotion_run_id text,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (source_promotion_run_id, attempt_no)
+            )
+            """
+        )
+        admin.execute(
+            """
+            CREATE UNIQUE INDEX uq_next_loop_preparations_active_source
+            ON next_loop_preparations (source_promotion_run_id)
+            WHERE status = 'awaiting_content_approval'
+            """
+        )
+        admin.execute(
+            """
+            CREATE TABLE content_candidates (
+                content_id text PRIMARY KEY,
+                content_option_id text NOT NULL,
+                generation_id text NOT NULL,
+                analysis_id text NOT NULL,
+                project_id text NOT NULL,
+                campaign_id text NOT NULL,
+                promotion_id text NOT NULL,
+                segment_id text NOT NULL,
+                channel text NOT NULL,
+                subject text,
+                preheader text,
+                title text,
+                body text,
+                cta text,
+                message text,
+                image_prompt text,
+                image_url text,
+                landing_url text,
+                generation_prompt text,
+                reason_summary text,
+                data_evidence_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                message_strategy text,
+                metadata_json jsonb NOT NULL DEFAULT '{}'::jsonb,
+                status text NOT NULL,
+                created_at timestamptz NOT NULL DEFAULT now(),
+                updated_at timestamptz NOT NULL DEFAULT now(),
+                UNIQUE (generation_id, segment_id, content_option_id)
+            )
+            """
+        )
+        admin.execute(
+            """
+            INSERT INTO next_loop_preparations (
+                next_loop_preparation_id,
+                source_promotion_run_id,
+                analysis_id,
+                generation_id,
+                attempt_no,
+                failed_segment_ids_json,
+                failed_ad_experiment_ids_json,
+                source_evaluation_ids_json,
+                status
+            )
+            VALUES (
+                'prep_attempt_1',
+                'run_source_1',
+                'analysis_next_1',
+                'generation_attempt_1',
+                1,
+                '["seg_luxury"]'::jsonb,
+                '["adexp_luxury_1"]'::jsonb,
+                '["eval_luxury_1"]'::jsonb,
+                'awaiting_content_approval'
+            )
+            """
+        )
+        for option_index in range(1, 3):
+            _insert_postgres_candidate(
+                admin,
+                generation_id="generation_attempt_1",
+                option_index=option_index,
+                status="rejected",
+            )
+        yield dsn, schema_name
+    finally:
+        admin.execute(
+            sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(
+                sql.Identifier(schema_name)
+            )
+        )
+        admin.close()
+
+
+def test_postgres_dashboard_approve_lock_blocks_regenerate_until_commit(
+    next_loop_postgres_schema: tuple[str, str],
+) -> None:
+    dsn, schema_name = next_loop_postgres_schema
+    dashboard_connection = _open_postgres_test_connection(dsn, schema_name)
+    decision_connection = _open_postgres_test_connection(dsn, schema_name)
+    completed = threading.Event()
+    result: dict[str, object] = {}
+    failures: list[BaseException] = []
+    try:
+        dashboard_preparations = NextLoopPreparationRepository(
+            PsycopgPostgresExecutor(dashboard_connection)
+        )
+        dashboard_candidates = ContentCandidateRepository(dashboard_connection)
+        assert dashboard_preparations.get_active_by_source_run("run_source_1")
+        assert dashboard_candidates.list_by_generation_for_update(
+            "generation_attempt_1"
+        )
+        dashboard_connection.execute(
+            """
+            UPDATE content_candidates
+            SET status = 'approved'
+            WHERE content_id = 'content_generation_attempt_1_1'
+            """
+        )
+
+        def regenerate_reader() -> None:
+            try:
+                preparations = SerializedNextLoopPreparationRepository(
+                    PsycopgPostgresExecutor(decision_connection)
+                )
+                candidates = ContentCandidateRepository(decision_connection)
+                active = preparations.get_active_by_source_run("run_source_1")
+                result["active"] = active
+                result["candidates"] = candidates.list_by_generation_for_update(
+                    "generation_attempt_1"
+                )
+                decision_connection.commit()
+            except BaseException as exc:  # pragma: no cover - diagnostic path
+                failures.append(exc)
+                decision_connection.rollback()
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=regenerate_reader)
+        worker.start()
+        assert not completed.wait(0.25)
+        dashboard_connection.commit()
+        assert completed.wait(5)
+        worker.join(timeout=1)
+
+        assert failures == []
+        assert result["active"] is not None
+        statuses = {
+            str(candidate["status"])
+            for candidate in result["candidates"]  # type: ignore[union-attr]
+        }
+        assert statuses == {"approved", "rejected"}
+    finally:
+        dashboard_connection.rollback()
+        decision_connection.rollback()
+        dashboard_connection.close()
+        decision_connection.close()
+
+
+def test_postgres_regenerate_lock_blocks_dashboard_reject_until_commit(
+    next_loop_postgres_schema: tuple[str, str],
+) -> None:
+    dsn, schema_name = next_loop_postgres_schema
+    decision_connection = _open_postgres_test_connection(dsn, schema_name)
+    dashboard_connection = _open_postgres_test_connection(dsn, schema_name)
+    completed = threading.Event()
+    result: dict[str, object] = {}
+    failures: list[BaseException] = []
+    try:
+        preparations = SerializedNextLoopPreparationRepository(
+            PsycopgPostgresExecutor(decision_connection)
+        )
+        candidates = ContentCandidateRepository(decision_connection)
+        active = preparations.get_active_by_source_run("run_source_1")
+        assert active is not None
+        assert candidates.list_by_generation_for_update(active.generation_id)
+
+        def dashboard_reject_reader() -> None:
+            try:
+                row = dashboard_connection.execute(
+                    """
+                    SELECT status
+                    FROM next_loop_preparations
+                    WHERE next_loop_preparation_id = 'prep_attempt_1'
+                    FOR UPDATE
+                    """
+                ).fetchone()
+                result["status"] = None if row is None else row[0]
+                dashboard_connection.commit()
+            except BaseException as exc:  # pragma: no cover - diagnostic path
+                failures.append(exc)
+                dashboard_connection.rollback()
+            finally:
+                completed.set()
+
+        worker = threading.Thread(target=dashboard_reject_reader)
+        worker.start()
+        assert not completed.wait(0.25)
+        rejected = preparations.mark_rejected(active.next_loop_preparation_id)
+        assert rejected is not None
+        assert rejected.status == "rejected"
+        decision_connection.commit()
+        assert completed.wait(5)
+        worker.join(timeout=1)
+
+        assert failures == []
+        assert result["status"] == "rejected"
+    finally:
+        decision_connection.rollback()
+        dashboard_connection.rollback()
+        decision_connection.close()
+        dashboard_connection.close()
+
+
+def test_postgres_concurrent_regenerate_creates_only_one_attempt_two(
+    next_loop_postgres_schema: tuple[str, str],
+) -> None:
+    dsn, schema_name = next_loop_postgres_schema
+    barrier = threading.Barrier(2)
+    results: list[str] = []
+    failures: list[BaseException] = []
+
+    def regenerate() -> None:
+        connection = _open_postgres_test_connection(dsn, schema_name)
+        try:
+            preparations = SerializedNextLoopPreparationRepository(
+                PsycopgPostgresExecutor(connection)
+            )
+            candidates = ContentCandidateRepository(connection)
+            barrier.wait(timeout=5)
+            active = preparations.get_active_by_source_run("run_source_1")
+            assert active is not None
+            rows = candidates.list_by_generation_for_update(active.generation_id)
+            if active.attempt_no == 2:
+                assert {str(row["status"]) for row in rows} == {"draft"}
+                results.append("reused")
+                connection.commit()
+                return
+
+            assert active.attempt_no == 1
+            assert {str(row["status"]) for row in rows} == {"rejected"}
+            rejected = preparations.mark_rejected(active.next_loop_preparation_id)
+            assert rejected is not None
+            assert preparations.get_next_attempt_no("run_source_1") == 2
+            time.sleep(0.1)
+            preparations.insert(
+                NextLoopPreparationWrite(
+                    next_loop_preparation_id="prep_attempt_2",
+                    source_promotion_run_id="run_source_1",
+                    analysis_id="analysis_next_1",
+                    generation_id="generation_attempt_2",
+                    attempt_no=2,
+                    failed_segment_ids_json=("seg_luxury",),
+                    failed_ad_experiment_ids_json=("adexp_luxury_1",),
+                    source_evaluation_ids_json=("eval_luxury_1",),
+                )
+            )
+            _insert_postgres_candidate(
+                connection,
+                generation_id="generation_attempt_2",
+                option_index=1,
+                status="draft",
+            )
+            results.append("created")
+            connection.commit()
+        except BaseException as exc:  # pragma: no cover - diagnostic path
+            failures.append(exc)
+            connection.rollback()
+        finally:
+            connection.close()
+
+    workers = [threading.Thread(target=regenerate) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=8)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert failures == []
+    assert sorted(results) == ["created", "reused"]
+    observer = _open_postgres_test_connection(dsn, schema_name)
+    try:
+        rows = observer.execute(
+            """
+            SELECT attempt_no, status
+            FROM next_loop_preparations
+            WHERE source_promotion_run_id = 'run_source_1'
+            ORDER BY attempt_no
+            """
+        ).fetchall()
+        assert rows == [(1, "rejected"), (2, "awaiting_content_approval")]
+    finally:
+        observer.rollback()
+        observer.close()
+
+
+def test_postgres_regeneration_failure_rolls_back_rejection_and_attempt_two(
+    next_loop_postgres_schema: tuple[str, str],
+) -> None:
+    dsn, schema_name = next_loop_postgres_schema
+    connection = _open_postgres_test_connection(dsn, schema_name)
+    try:
+        preparations = SerializedNextLoopPreparationRepository(
+            PsycopgPostgresExecutor(connection)
+        )
+        candidates = ContentCandidateRepository(connection)
+        active = preparations.get_active_by_source_run("run_source_1")
+        assert active is not None
+        assert candidates.list_by_generation_for_update(active.generation_id)
+        assert preparations.mark_rejected(active.next_loop_preparation_id)
+        preparations.insert(
+            NextLoopPreparationWrite(
+                next_loop_preparation_id="prep_attempt_2",
+                source_promotion_run_id="run_source_1",
+                analysis_id="analysis_next_1",
+                generation_id="generation_attempt_2",
+                attempt_no=2,
+                failed_segment_ids_json=("seg_luxury",),
+                failed_ad_experiment_ids_json=("adexp_luxury_1",),
+                source_evaluation_ids_json=("eval_luxury_1",),
+            )
+        )
+        _insert_postgres_candidate(
+            connection,
+            generation_id="generation_attempt_2",
+            option_index=1,
+            status="draft",
+        )
+        connection.rollback()
+    finally:
+        connection.close()
+
+    observer = _open_postgres_test_connection(dsn, schema_name)
+    try:
+        preparations = observer.execute(
+            """
+            SELECT attempt_no, status
+            FROM next_loop_preparations
+            WHERE source_promotion_run_id = 'run_source_1'
+            ORDER BY attempt_no
+            """
+        ).fetchall()
+        attempt_two_candidates = observer.execute(
+            """
+            SELECT count(*)
+            FROM content_candidates
+            WHERE generation_id = 'generation_attempt_2'
+            """
+        ).fetchone()
+        assert preparations == [(1, "awaiting_content_approval")]
+        assert attempt_two_candidates == (0,)
+    finally:
+        observer.rollback()
+        observer.close()
+
+
+def _open_postgres_test_connection(
+    dsn: str,
+    schema_name: str,
+) -> psycopg.Connection[Any]:
+    connection = psycopg.connect(dsn, autocommit=False)
+    connection.execute(
+        sql.SQL("SET search_path TO {}").format(sql.Identifier(schema_name))
+    )
+    connection.commit()
+    return connection
+
+
+def _insert_postgres_candidate(
+    connection: Any,
+    *,
+    generation_id: str,
+    option_index: int,
+    status: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO content_candidates (
+            content_id,
+            content_option_id,
+            generation_id,
+            analysis_id,
+            project_id,
+            campaign_id,
+            promotion_id,
+            segment_id,
+            channel,
+            title,
+            body,
+            cta,
+            landing_url,
+            generation_prompt,
+            reason_summary,
+            data_evidence_json,
+            message_strategy,
+            metadata_json,
+            status
+        )
+        VALUES (
+            %s, %s, %s,
+            'analysis_next_1',
+            'hotel-client-a',
+            'campaign-summer',
+            'promotion-banner',
+            'seg_luxury',
+            'onsite_banner',
+            'Summer hotel stay',
+            'Book a summer hotel stay.',
+            'Book now',
+            'https://hotel.example.com/summer',
+            'Generate a hotel banner.',
+            'Uses the failed hotel segment.',
+            '{}'::jsonb,
+            'Highlight hotel booking benefits.',
+            '{}'::jsonb,
+            %s
+        )
+        """,
+        (
+            f"content_{generation_id}_{option_index}",
+            f"option_{generation_id}_{option_index}",
+            generation_id,
+            status,
+        ),
+    )

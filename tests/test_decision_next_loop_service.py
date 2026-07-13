@@ -30,6 +30,7 @@ from app.decision.schemas import (
     AdExperimentStatus,
     Channel,
     ContentApprovalMode,
+    NextLoopPreparationStatus,
     NextLoopRequest,
     PromotionEvaluationStatus,
     PromotionRunStatus,
@@ -518,6 +519,389 @@ def test_manual_next_loop_reuses_active_preparation_for_same_set_intent() -> Non
     assert repos.analysis_gateway.calls == []
     assert repos.generation_gateway.manual_calls == []
     assert repos.run_creator.calls == []
+    assert repos.candidates.calls == [
+        ("list_for_update", "generation_next_001")
+    ]
+
+
+def test_manual_next_loop_reuses_rejected_and_remaining_draft_candidates() -> None:
+    candidates = manual_candidates(["seg_luxury"])
+    candidates[0]["status"] = "rejected"
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        generation=generation_record(),
+        candidates=candidates,
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    response = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=manual_request(),
+    )
+
+    assert response.next_loop_preparation_id == "nlprep_existing_001"
+    assert response.next_generation_id == "generation_next_001"
+    assert response.pending_content_ids == ["content_seg_luxury_2"]
+    assert repos.preparations.inserted == []
+    assert repos.generation_gateway.manual_calls == []
+    assert repos.candidates.calls == [
+        ("list_for_update", "generation_next_001")
+    ]
+
+
+def test_manual_next_loop_keeps_approved_active_only_for_activation() -> None:
+    candidates = manual_candidates(["seg_luxury"])
+    candidates[0]["status"] = "approved"
+    candidates[1]["status"] = "active"
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        generation=generation_record(),
+        candidates=candidates,
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    response = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=manual_request(),
+    )
+
+    assert response.next_loop_preparation_id == "nlprep_existing_001"
+    assert response.pending_content_ids == []
+    assert response.status is NextLoopPreparationStatus.AWAITING_CONTENT_APPROVAL
+    assert repos.preparations.inserted == []
+    assert repos.generation_gateway.manual_calls == []
+
+
+@pytest.mark.parametrize(
+    ("operator_instruction", "expected_instruction"),
+    [
+        (None, "Emphasize breakfast"),
+        ("   ", "Emphasize breakfast"),
+        ("  Emphasize   spa access  ", "Emphasize spa access"),
+    ],
+)
+def test_manual_next_loop_regenerates_full_scope_when_one_segment_is_exhausted(
+    operator_instruction: str | None,
+    expected_instruction: str,
+) -> None:
+    old_candidates = manual_candidates(["seg_family_trip", "seg_luxury"])
+    for candidate in old_candidates:
+        if candidate["segment_id"] == "seg_luxury":
+            candidate["status"] = "rejected"
+    old_candidates[0]["status"] = "approved"
+    replacement_candidates = manual_candidates(
+        ["seg_family_trip", "seg_luxury"],
+        generation_id="generation_next_002",
+        id_suffix="_attempt_2",
+    )
+    repos = FakeNextLoopRepos(
+        evaluations=[
+            evaluation_record(
+                ad_experiment_id="adexp_family_trip_001",
+                segment_id="seg_family_trip",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+        ],
+        active_preparation=preparation_record(
+            segment_ids=("seg_family_trip", "seg_luxury"),
+            ad_experiment_ids=(
+                "adexp_family_trip_001",
+                "adexp_luxury_001",
+            ),
+            evaluation_ids=(
+                "eval_adexp_family_trip_001",
+                "eval_adexp_luxury_001",
+            ),
+        ),
+        next_attempt_no=2,
+        generation=generation_record(
+            operator_instruction="  Emphasize   breakfast ",
+            segment_ids=("seg_family_trip", "seg_luxury"),
+        ),
+        generation_gateway=FakeGenerationGateway(
+            generated_segment_ids=["seg_family_trip", "seg_luxury"]
+        ),
+        candidates=[*old_candidates, *replacement_candidates],
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    response = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=NextLoopRequest(
+            failed_segment_ids=["seg_luxury", "seg_family_trip"],
+            failed_ad_experiment_ids=[
+                "adexp_luxury_001",
+                "adexp_family_trip_001",
+            ],
+            operator_instruction=operator_instruction,
+            content_approval_mode=ContentApprovalMode.MANUAL,
+        ),
+    )
+
+    assert response.next_analysis_id == "analysis_next_001"
+    assert response.next_generation_id == "generation_next_002"
+    assert response.pending_content_ids == [
+        "content_seg_family_trip_attempt_2_1",
+        "content_seg_family_trip_attempt_2_2",
+        "content_seg_luxury_attempt_2_1",
+        "content_seg_luxury_attempt_2_2",
+    ]
+    assert repos.analysis_gateway.calls == []
+    assert repos.generation_gateway.manual_calls == [
+        (
+            "hotel-client-a",
+            "camp_summer_2026",
+            "promo_banner_001",
+            "analysis_next_001",
+            ("seg_family_trip", "seg_luxury"),
+            2,
+            2,
+            "prun_banner_001_loop_1",
+            "generation_banner_001",
+            expected_instruction,
+        )
+    ]
+    assert [record.status for record in repos.preparations.history] == [
+        "rejected",
+        "awaiting_content_approval",
+    ]
+    assert repos.preparations.history[0].generation_id == "generation_next_001"
+    assert repos.preparations.history[1].generation_id == "generation_next_002"
+    assert repos.preparations.history[1].attempt_no == 2
+    assert repos.preparations.history[1].failed_segment_ids_json == (
+        "seg_family_trip",
+        "seg_luxury",
+    )
+
+
+def test_manual_next_loop_retry_after_regeneration_reuses_attempt_two() -> None:
+    old_candidates = manual_candidates(["seg_luxury"])
+    for candidate in old_candidates:
+        candidate["status"] = "rejected"
+    replacement_candidates = manual_candidates(
+        ["seg_luxury"],
+        generation_id="generation_next_002",
+        id_suffix="_attempt_2",
+    )
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        next_attempt_no=2,
+        generation=generation_record(operator_instruction="Breakfast"),
+        candidates=[*old_candidates, *replacement_candidates],
+    )
+    service = make_service(repos, manual_enabled=True)
+    request = NextLoopRequest(
+        failed_segment_ids=["seg_luxury"],
+        failed_ad_experiment_ids=["adexp_luxury_001"],
+        operator_instruction="Breakfast",
+        content_approval_mode=ContentApprovalMode.MANUAL,
+    )
+
+    first = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=request,
+    )
+    repos.generation_runs.generation = generation_record(
+        operator_instruction="Breakfast",
+        generation_id="generation_next_002",
+        attempt_no=2,
+    )
+    second = service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=request,
+    )
+
+    assert second == first
+    assert first.next_generation_id == "generation_next_002"
+    assert len(repos.generation_gateway.manual_calls) == 1
+    assert len(repos.preparations.inserted) == 1
+
+
+def test_manual_next_loop_rejects_non_continuous_replacement_attempt() -> None:
+    candidates = manual_candidates(["seg_luxury"])
+    for candidate in candidates:
+        candidate["status"] = "rejected"
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        next_attempt_no=3,
+        generation=generation_record(),
+        candidates=candidates,
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopConflictError, match="not continuous"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.generation_gateway.manual_calls == []
+
+
+def test_manual_next_loop_rejects_reused_replacement_candidate_ids() -> None:
+    old_candidates = manual_candidates(["seg_luxury"])
+    for candidate in old_candidates:
+        candidate["status"] = "rejected"
+    replacement_candidates = manual_candidates(
+        ["seg_luxury"],
+        generation_id="generation_next_002",
+    )
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        next_attempt_no=2,
+        generation=generation_record(),
+        candidates=[*old_candidates, *replacement_candidates],
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="new content_id"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.inserted == []
+
+
+def test_manual_next_loop_rejects_reused_replacement_generation_id() -> None:
+    candidates = manual_candidates(["seg_luxury"])
+    for candidate in candidates:
+        candidate["status"] = "rejected"
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        next_attempt_no=2,
+        generation=generation_record(),
+        generation_gateway=FakeGenerationGateway(
+            manual_generation_id="generation_next_001"
+        ),
+        candidates=candidates,
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="new generation_id"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.inserted == []
+
+
+def test_manual_next_loop_rejects_reused_replacement_content_option_ids() -> None:
+    old_candidates = manual_candidates(["seg_luxury"])
+    for candidate in old_candidates:
+        candidate["status"] = "rejected"
+    replacement_candidates = manual_candidates(
+        ["seg_luxury"],
+        generation_id="generation_next_002",
+        id_suffix="_attempt_2",
+    )
+    for option_index, candidate in enumerate(replacement_candidates, start=1):
+        candidate["content_option_id"] = f"option_{option_index}"
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        next_attempt_no=2,
+        generation=generation_record(),
+        candidates=[*old_candidates, *replacement_candidates],
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="new content_option_id"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.inserted == []
+
+
+@pytest.mark.parametrize("status", ["queued", "unknown"])
+def test_manual_next_loop_rejects_unknown_candidate_status(status: str) -> None:
+    candidates = manual_candidates(["seg_luxury"])
+    candidates[0]["status"] = status
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(),
+        generation=generation_record(),
+        candidates=candidates,
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="status is invalid"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.inserted == []
+
+
+def test_manual_next_loop_rejects_missing_expected_segment_candidates() -> None:
+    repos = FakeNextLoopRepos(
+        evaluations=[
+            evaluation_record(
+                ad_experiment_id="adexp_family_trip_001",
+                segment_id="seg_family_trip",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+        ],
+        active_preparation=preparation_record(
+            segment_ids=("seg_family_trip", "seg_luxury"),
+            ad_experiment_ids=(
+                "adexp_family_trip_001",
+                "adexp_luxury_001",
+            ),
+            evaluation_ids=(
+                "eval_adexp_family_trip_001",
+                "eval_adexp_luxury_001",
+            ),
+        ),
+        generation=generation_record(
+            segment_ids=("seg_family_trip", "seg_luxury")
+        ),
+        candidates=manual_candidates(["seg_family_trip"]),
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="cover every failed segment"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=NextLoopRequest(
+                failed_segment_ids=["seg_family_trip", "seg_luxury"],
+                failed_ad_experiment_ids=[
+                    "adexp_family_trip_001",
+                    "adexp_luxury_001",
+                ],
+                content_approval_mode=ContentApprovalMode.MANUAL,
+            ),
+        )
+
+    assert repos.preparations.inserted == []
+
+
+def test_manual_next_loop_never_reuses_rejected_preparation() -> None:
+    repos = FakeNextLoopRepos(
+        active_preparation=preparation_record(status="rejected"),
+        generation=generation_record(),
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopConflictError, match="no longer awaiting"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.candidates.calls == []
 
 
 def test_manual_next_loop_rejects_active_preparation_with_different_intent() -> None:
@@ -830,6 +1214,9 @@ class FakeNextLoopPreparationRepository:
         self.next_attempt_no = next_attempt_no
         self.calls: list[tuple[str, str]] = []
         self.inserted: list[NextLoopPreparationWrite] = []
+        self.history: list[NextLoopPreparationRecord] = (
+            [active] if active is not None else []
+        )
 
     def get_active_by_source_run(
         self,
@@ -859,13 +1246,31 @@ class FakeNextLoopPreparationRepository:
             created_at=datetime.now(UTC),
             updated_at=datetime.now(UTC),
         )
+        self.history.append(self.active)
         return self.active
 
     def get_by_id(self, _next_loop_preparation_id: str) -> None:
         return None
 
-    def mark_rejected(self, _next_loop_preparation_id: str) -> None:
-        return None
+    def mark_rejected(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        self.calls.append(("mark_rejected", next_loop_preparation_id))
+        if (
+            self.active is None
+            or self.active.next_loop_preparation_id != next_loop_preparation_id
+            or self.active.status != "awaiting_content_approval"
+        ):
+            return None
+        rejected = replace(
+            self.active,
+            status="rejected",
+            updated_at=datetime.now(UTC),
+        )
+        self.history[-1] = rejected
+        self.active = None
+        return rejected
 
     def mark_activated(self, **_kwargs: str) -> None:
         return None
@@ -884,10 +1289,20 @@ class FakeGenerationRunRepository:
 class FakeContentCandidateRepository:
     def __init__(self, candidates: list[dict[str, Any]]) -> None:
         self.candidates = candidates
-        self.calls: list[str] = []
+        self.calls: list[tuple[str, str]] = []
 
     def list_by_generation(self, generation_id: str) -> list[dict[str, Any]]:
-        self.calls.append(generation_id)
+        self.calls.append(("list", generation_id))
+        return self._for_generation(generation_id)
+
+    def list_by_generation_for_update(
+        self,
+        generation_id: str,
+    ) -> list[dict[str, Any]]:
+        self.calls.append(("list_for_update", generation_id))
+        return self._for_generation(generation_id)
+
+    def _for_generation(self, generation_id: str) -> list[dict[str, Any]]:
         return [
             candidate
             for candidate in self.candidates
@@ -938,9 +1353,11 @@ class FakeGenerationGateway:
         generated_segment_ids: list[str] | None = None,
         *,
         status: str = "completed",
+        manual_generation_id: str | None = None,
     ) -> None:
         self.generated_segment_ids = generated_segment_ids or ["seg_luxury"]
         self.status = status
+        self.manual_generation_id = manual_generation_id
         self.calls: list[
             tuple[str, str, str, str, tuple[str, ...], int, str, str, str | None]
         ] = []
@@ -1007,7 +1424,10 @@ class FakeGenerationGateway:
             )
         )
         return NextLoopGenerationResult(
-            generation_id="generation_next_001",
+            generation_id=(
+                self.manual_generation_id
+                or f"generation_next_{attempt_no:03d}"
+            ),
             generated_segment_ids=self.generated_segment_ids,
             status=self.status,
         )
@@ -1203,18 +1623,26 @@ def manual_request() -> NextLoopRequest:
     )
 
 
-def preparation_record() -> NextLoopPreparationRecord:
+def preparation_record(
+    *,
+    generation_id: str = "generation_next_001",
+    attempt_no: int = 1,
+    segment_ids: Sequence[str] = ("seg_luxury",),
+    ad_experiment_ids: Sequence[str] = ("adexp_luxury_001",),
+    evaluation_ids: Sequence[str] = ("eval_adexp_luxury_001",),
+    status: str = "awaiting_content_approval",
+) -> NextLoopPreparationRecord:
     now = datetime.now(UTC)
     return NextLoopPreparationRecord(
         next_loop_preparation_id="nlprep_existing_001",
         source_promotion_run_id="prun_banner_001_loop_1",
         analysis_id="analysis_next_001",
-        generation_id="generation_next_001",
-        attempt_no=1,
-        failed_segment_ids_json=("seg_luxury",),
-        failed_ad_experiment_ids_json=("adexp_luxury_001",),
-        source_evaluation_ids_json=("eval_adexp_luxury_001",),
-        status="awaiting_content_approval",
+        generation_id=generation_id,
+        attempt_no=attempt_no,
+        failed_segment_ids_json=tuple(segment_ids),
+        failed_ad_experiment_ids_json=tuple(ad_experiment_ids),
+        source_evaluation_ids_json=tuple(evaluation_ids),
+        status=status,
         activated_promotion_run_id=None,
         created_at=now,
         updated_at=now,
@@ -1224,10 +1652,14 @@ def preparation_record() -> NextLoopPreparationRecord:
 def generation_record(
     *,
     operator_instruction: str | None = None,
+    generation_id: str = "generation_next_001",
+    analysis_id: str = "analysis_next_001",
+    segment_ids: Sequence[str] = ("seg_luxury",),
+    attempt_no: int = 1,
 ) -> GenerationRunRecord:
     return GenerationRunRecord(
-        generation_id="generation_next_001",
-        analysis_id="analysis_next_001",
+        generation_id=generation_id,
+        analysis_id=analysis_id,
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
@@ -1238,6 +1670,8 @@ def generation_record(
                 "loop_count": 2,
                 "source_promotion_run_id": "prun_banner_001_loop_1",
                 "source_generation_id": "generation_banner_001",
+                "focus_segment_ids": list(segment_ids),
+                "attempt_no": attempt_no,
             }
         },
         output_json={},
@@ -1246,13 +1680,21 @@ def generation_record(
     )
 
 
-def manual_candidates(segment_ids: Sequence[str]) -> list[dict[str, Any]]:
+def manual_candidates(
+    segment_ids: Sequence[str],
+    *,
+    generation_id: str = "generation_next_001",
+    analysis_id: str = "analysis_next_001",
+    id_suffix: str = "",
+) -> list[dict[str, Any]]:
     return [
         {
-            "content_id": f"content_{segment_id}_{option}",
-            "content_option_id": f"option_{option}",
-            "generation_id": "generation_next_001",
-            "analysis_id": "analysis_next_001",
+            "content_id": f"content_{segment_id}{id_suffix}_{option}",
+            "content_option_id": f"option{id_suffix}_{option}",
+            "generation_id": generation_id,
+            "analysis_id": analysis_id,
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
             "promotion_id": "promo_banner_001",
             "segment_id": segment_id,
             "status": "draft",
