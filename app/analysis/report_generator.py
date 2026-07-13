@@ -198,6 +198,13 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
     evidence = report_input.target_segment.data_evidence_json
     signal_chips = display_copy.get("signal_chips", [])
     performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
+    prediction_adjustment = _mapping_value(
+        performance_estimate.get("prediction_adjustment")
+    )
+    prior_user_count = prediction_adjustment.get("prior_user_count")
+    small_sample_criterion = (
+        f"{prior_user_count}명 미만" if prior_user_count else "별도 기준 없음"
+    )
     rank_comparison = _mapping_value(display_copy.get("rank_comparison"))
     return "\n".join(
         [
@@ -216,6 +223,8 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             f"- 예상 목표 성과: {performance_estimate.get('label', '-')} {performance_estimate.get('formatted', '-')}",
             f"- 예상 기준: {performance_estimate.get('window_label', performance_estimate.get('basis_label', '-'))}",
             f"- 예측 신뢰도: {performance_estimate.get('confidence_label', '-')}",
+            f"- 예측 신뢰도 근거: {performance_estimate.get('confidence_reason', '-')}",
+            f"- 소표본 판단 기준: {small_sample_criterion}",
             f"- Rank 비교 사실: {rank_comparison.get('summary', display_copy.get('difference_summary', '-'))}",
             "",
             "JSON 필드 설명:",
@@ -226,7 +235,7 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             "- evidence: 판단 근거 2~3개",
             "- difference_from_other_ranks: 다른 Rank와 비교했을 때의 차이 1~2개",
             "- action_hint: 이 프로모션에서 어떻게 활용하면 좋은지",
-            "- caution: 표본 수, 해석 주의점, 다음 액션 중 하나",
+            "- caution: 제공된 예측 신뢰도 근거만 사용하고 표본 크기를 임의로 평가하지 말 것",
             "- confidence_label: high, medium, low 중 하나",
         ],
     )
@@ -320,7 +329,7 @@ def _sanitize_report(
         or fallback["difference_from_other_ranks"],
         "action_hint": _safe_text(report.get("action_hint"))
         or fallback["action_hint"],
-        "caution": _safe_text(report.get("caution")) or fallback["caution"],
+        "caution": _verified_caution(report_input),
         "confidence_label": computed_confidence
         or _confidence_label(report.get("confidence_label"))
         or fallback["confidence_label"],
@@ -381,10 +390,7 @@ def _fallback_report(
         ],
         "action_hint": str(display_copy.get("action_hint", "")).strip()
         or "이 고객군을 우선 타겟으로 테스트해보는 것이 좋습니다.",
-        "caution": _caution_text(
-            sample_size=int(evidence.get("sample_size", 0) or 0),
-            min_sample_size=report_input.promotion.min_sample_size,
-        ),
+        "caution": _verified_caution(report_input),
         "confidence_label": performance_confidence or _fallback_confidence_label(
             sample_size=int(evidence.get("sample_size", 0) or 0),
             min_sample_size=report_input.promotion.min_sample_size,
@@ -424,6 +430,33 @@ def _caution_text(*, sample_size: int, min_sample_size: int) -> str:
     if sample_size < min_sample_size:
         return "표본이 적어 첫 실험 결과를 빠르게 확인한 뒤 다음 타겟을 조정하는 것이 좋습니다."
     return "첫 발송 후 랜딩과 예약 시작 지표를 함께 확인하면 다음 액션을 더 잘 정할 수 있습니다."
+
+
+def _verified_caution(report_input: SegmentSuggestionReportInput) -> str:
+    performance_estimate = _mapping_value(
+        report_input.display_copy.get("performance_estimate")
+    )
+    confidence_reason = _safe_text(
+        performance_estimate.get("confidence_reason")
+    )
+    confidence_label = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
+    if confidence_reason:
+        if confidence_label == "low":
+            return (
+                f"{confidence_reason} 예상값은 참고 지표로 사용하고 첫 발송 결과를 "
+                "확인하세요."
+            )
+        return (
+            f"{confidence_reason} 첫 발송 후 실제 전환 지표와 함께 확인하세요."
+        )
+
+    evidence = report_input.target_segment.data_evidence_json
+    return _caution_text(
+        sample_size=int(evidence.get("sample_size", 0) or 0),
+        min_sample_size=report_input.promotion.min_sample_size,
+    )
 
 
 def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str:

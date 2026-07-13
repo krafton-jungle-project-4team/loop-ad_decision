@@ -1191,6 +1191,9 @@ def _segment_definition_from_candidate(
         "selected_user_count": candidate.sample_size,
         "selected_user_ratio": round(float(sample_ratio), 6),
         "selection_limited": matching_user_count > candidate.sample_size,
+        "selection_basis": "behavior_signal_strength",
+        "selection_limit": RAW_EVENT_CANDIDATE_USER_LIMIT,
+        "selected_user_role": "analysis_seed",
     }
     performance_estimate = _performance_estimate(
         promotion=promotion,
@@ -1301,7 +1304,10 @@ def _candidate_audience_summary(
         f"조건 일치 {matching_user_count}명"
     )
     if matching_user_count > candidate.sample_size:
-        return f"{summary} · 상위 {candidate.sample_size}명 사용"
+        return (
+            f"{summary} · 행동 신호 상위 {candidate.sample_size}명을 "
+            "예측 표본으로 사용"
+        )
     return f"{summary} · {float(sample_ratio) * 100:g}%"
 
 
@@ -2043,6 +2049,13 @@ def _performance_confidence(
         ood_feature_count = int(
             adjustment.get("out_of_distribution_feature_count", 0) or 0
         )
+        influential_ood_feature_count = int(
+            adjustment.get(
+                "influential_out_of_distribution_feature_count",
+                0,
+            )
+            or 0
+        )
         is_small_sample = prior_user_count > 0 and sample_size < prior_user_count
         if policy_version and is_small_sample and ood_feature_count > 0:
             return (
@@ -2057,9 +2070,16 @@ def _performance_confidence(
                 "보수적으로 추정했습니다.",
             )
         if policy_version and ood_feature_count > 0:
+            if influential_ood_feature_count > 0:
+                return (
+                    "medium",
+                    "표본은 충분하지만 예측에 영향을 주는 일부 행동 신호가 "
+                    "학습 범위를 벗어나 분포 제한을 적용했습니다.",
+                )
             return (
-                "low",
-                "일부 행동 신호가 학습 범위를 벗어나 분포 제한을 적용했습니다.",
+                "medium",
+                "표본은 충분하며 학습 범위 밖의 보조 신호는 "
+                "예측값에 직접 반영하지 않았습니다.",
             )
     if calibration_status == "calibrated":
         if candidate.sample_reliability >= 0.75:
