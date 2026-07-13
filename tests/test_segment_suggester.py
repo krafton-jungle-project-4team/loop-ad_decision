@@ -585,7 +585,8 @@ def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -
     assert segment.total_eligible_user_count == 170
     assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
     assert segment.profile_json["display_copy"]["audience_summary"] == (
-        "분석 대상 170명 중 조건 일치 170명 · 상위 160명 사용"
+        "분석 대상 170명 중 조건 일치 170명 · 행동 신호 상위 160명을 "
+        "예측 표본으로 사용"
     )
 
 
@@ -757,6 +758,9 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
         "selected_user_count": 6,
         "selected_user_ratio": 0.5,
         "selection_limited": False,
+        "selection_basis": "behavior_signal_strength",
+        "selection_limit": 160,
+        "selected_user_role": "analysis_seed",
     }
     assert display_copy["rank_comparison"]["reference_rank"] == 2
     assert display_copy["rank_comparison"]["direction"] == "higher"
@@ -875,6 +879,42 @@ def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> N
     assert estimate["value"] == adjustment["adjusted_value"]
     assert estimate["value"] < 0.2
     assert estimate["confidence_label"] == "low"
+
+
+def test_calibrated_prediction_uses_medium_confidence_for_adequate_ood_sample() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(160)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    responsive_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "promotion_responsive"
+    )
+    estimate = responsive_segment.profile_json["performance_estimate"]
+    assert estimate["prediction_adjustment"]["candidate_sample_size"] == 160
+    assert estimate["confidence_label"] == "medium"
+    assert "표본은 충분" in estimate["confidence_reason"]
 
 
 def test_raw_event_suggester_requests_vector_window_signals() -> None:
