@@ -54,6 +54,15 @@ from offline_evaluation.external_final_test import (  # noqa: E402
     write_external_sealed_final_test_artifacts,
     write_external_sealed_final_test_manifest,
 )
+from offline_evaluation.sealed_execution import (  # noqa: E402
+    STATUS_RESULT_STAGED,
+    mark_execution_failure,
+    mark_outcomes_opened,
+    mark_result_staged,
+    prepare_staging_output,
+    publish_staged_result,
+    sealed_execution_attempt,
+)
 
 
 DEFAULT_SOURCE_DIRS = {
@@ -255,10 +264,6 @@ def execute_final_test(args: argparse.Namespace) -> int:
     predictor = build_segment_performance_predictor(model_path)
     code_commit, code_tree = frozen_git_identity()
     output_dir = args.output_dir or _default_final_output_dir(manifest)
-    if output_dir.exists():
-        raise ExternalBacktestError(
-            "external final output already exists; choose a new empty path"
-        )
     log.assign_context(
         {
             "datasetId": manifest.dataset_id,
@@ -283,22 +288,51 @@ def execute_final_test(args: argparse.Namespace) -> int:
         code_commit=code_commit,
         code_tree=code_tree,
     )
-    marker_path = reserve_external_sealed_final_test_execution(
+    execution = reserve_external_sealed_final_test_execution(
         args.manifest,
         manifest,
         code_commit=code_commit,
-    )
-    result = run_external_sealed_final_test(
-        manifest=manifest,
-        source_dir=source_dir,
-        performance_predictor=predictor,
-    )
-    artifacts = write_external_sealed_final_test_artifacts(
-        result,
-        manifest=manifest,
         output_dir=output_dir,
-        model_metadata=predictor.metadata(),
+        resume_execution_id=args.resume_execution_id,
     )
+    log.assign_context({"executionId": execution.execution_id})
+    with sealed_execution_attempt(execution):
+        if execution.status == STATUS_RESULT_STAGED:
+            completed = publish_staged_result(execution)
+            log.info(
+                "sealed_result_publication_resumed",
+                {
+                    "outputDir": completed.output_dir,
+                    "executionJournalPath": completed.journal_path,
+                },
+            )
+            return 0
+        staging_dir = prepare_staging_output(execution)
+        try:
+            result = run_external_sealed_final_test(
+                manifest=manifest,
+                source_dir=source_dir,
+                performance_predictor=predictor,
+                on_outcomes_opened=lambda: mark_outcomes_opened(execution),
+            )
+            write_external_sealed_final_test_artifacts(
+                result,
+                manifest=manifest,
+                output_dir=staging_dir,
+                model_metadata=predictor.metadata(),
+            )
+            mark_result_staged(execution)
+            completed = publish_staged_result(execution)
+        except Exception as exc:
+            failed = mark_execution_failure(execution, exc)
+            log.info(
+                "sealed_execution_state_updated",
+                {
+                    "executionStatus": failed.status,
+                    "executionJournalPath": failed.journal_path,
+                },
+            )
+            raise
     log.info(
         "completed",
         {
@@ -306,9 +340,11 @@ def execute_final_test(args: argparse.Namespace) -> int:
             "manifestId": manifest.manifest_id,
             "passed": result.passed,
             "candidateResultCount": len(result.run.results),
-            "executionMarkerPath": marker_path,
-            "summaryPath": artifacts["summary"],
-            "reportPath": artifacts["report"],
+            "executionJournalPath": completed.journal_path,
+            "summaryPath": completed.output_dir
+            / "sealed_final_test_summary.json",
+            "reportPath": completed.output_dir
+            / "sealed_final_test_report.md",
             "durationMs": duration_ms(started_at),
         },
     )
@@ -364,6 +400,13 @@ def parse_args() -> argparse.Namespace:
     final.add_argument("--source-dir", type=Path)
     final.add_argument("--model-path", type=Path)
     final.add_argument("--output-dir", type=Path)
+    final.add_argument(
+        "--resume-execution-id",
+        help=(
+            "Resume the same execution after a pre-outcome or publication "
+            "failure. The ID must match the execution journal."
+        ),
+    )
     return parser.parse_args()
 
 

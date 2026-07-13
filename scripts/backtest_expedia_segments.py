@@ -46,6 +46,7 @@ from offline_evaluation.expedia_backtest import (  # noqa: E402
 )
 from offline_evaluation.expedia_final_test import (  # noqa: E402
     ExpediaFinalTestCriteria,
+    ExpediaSealedFinalTestManifest,
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,
     reserve_sealed_final_test_execution,
@@ -66,6 +67,15 @@ from app.logging import (  # noqa: E402
     log,
     log_context_scope,
     now_ms,
+)
+from offline_evaluation.sealed_execution import (  # noqa: E402
+    STATUS_RESULT_STAGED,
+    mark_execution_failure,
+    mark_outcomes_opened,
+    mark_result_staged,
+    prepare_staging_output,
+    publish_staged_result,
+    sealed_execution_attempt,
 )
 
 
@@ -359,28 +369,52 @@ def execute_final_test(
         lookback_days=config.lookback_days,
         outcome_days=config.outcome_days,
     )
-    output_dir = args.output_dir or default_output_dir("sealed-final-test")
-    if output_dir.exists():
-        raise ExpediaBacktestError(
-            "sealed final test output already exists; choose a new empty path "
-            "before opening outcomes"
-        )
-    marker_path = reserve_sealed_final_test_execution(
+    output_dir = args.output_dir or default_final_test_output_dir(manifest)
+    execution = reserve_sealed_final_test_execution(
         args.manifest,
         manifest,
         code_commit=code_commit,
-    )
-    result = run_sealed_final_test(
-        repository,
-        manifest=manifest,
-        model=model,
-    )
-    artifacts = write_sealed_final_test_artifacts(
-        result,
-        manifest=manifest,
         output_dir=output_dir,
-        source_stats=stats,
+        resume_execution_id=args.resume_execution_id,
     )
+    log.assign_context({"executionId": execution.execution_id})
+    with sealed_execution_attempt(execution):
+        if execution.status == STATUS_RESULT_STAGED:
+            completed = publish_staged_result(execution)
+            log.info(
+                "sealed_result_publication_resumed",
+                {
+                    "outputDir": completed.output_dir,
+                    "executionJournalPath": completed.journal_path,
+                },
+            )
+            return 0
+        staging_dir = prepare_staging_output(execution)
+        try:
+            result = run_sealed_final_test(
+                repository,
+                manifest=manifest,
+                model=model,
+                on_outcomes_opened=lambda: mark_outcomes_opened(execution),
+            )
+            write_sealed_final_test_artifacts(
+                result,
+                manifest=manifest,
+                output_dir=staging_dir,
+                source_stats=stats,
+            )
+            mark_result_staged(execution)
+            completed = publish_staged_result(execution)
+        except Exception as exc:
+            failed = mark_execution_failure(execution, exc)
+            log.info(
+                "sealed_execution_state_updated",
+                {
+                    "executionStatus": failed.status,
+                    "executionJournalPath": failed.journal_path,
+                },
+            )
+            raise
     log.info(
         "sealed_final_test_completed",
         {
@@ -388,10 +422,12 @@ def execute_final_test(
             "passed": result.passed,
             "scenarioResultCount": len(result.run.results),
             "skippedScenarioCount": len(result.run.skipped_scenarios),
-            "executionMarkerPath": marker_path,
-            "outputDir": output_dir,
-            "reportPath": artifacts["report"],
-            "summaryPath": artifacts["summary"],
+            "executionJournalPath": completed.journal_path,
+            "outputDir": completed.output_dir,
+            "reportPath": completed.output_dir
+            / "sealed_final_test_report.md",
+            "summaryPath": completed.output_dir
+            / "sealed_final_test_summary.json",
         },
     )
     log.info(
@@ -563,6 +599,13 @@ def parse_args() -> argparse.Namespace:
     final_test.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     final_test.add_argument("--confirm", required=True)
     final_test.add_argument("--output-dir", type=Path, default=None)
+    final_test.add_argument(
+        "--resume-execution-id",
+        help=(
+            "Resume the same execution after a pre-outcome or publication "
+            "failure. The ID must match the execution journal."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -649,6 +692,16 @@ def resolve_cutoffs(args: argparse.Namespace) -> list[datetime]:
 def default_output_dir(command: str) -> Path:
     run_at = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
     return Path("artifacts") / "expedia-segment-backtest" / f"{command}-{run_at}"
+
+
+def default_final_test_output_dir(
+    manifest: ExpediaSealedFinalTestManifest,
+) -> Path:
+    return (
+        Path("artifacts")
+        / "expedia-segment-backtest"
+        / f"sealed-final-{manifest.manifest_id[:12]}"
+    )
 
 
 def parse_date(value: str) -> date:

@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from app.analysis.segment_performance import SegmentPerformancePredictor
 from offline_evaluation.external_backtest import (
@@ -22,6 +22,11 @@ from offline_evaluation.external_datasets import (
     ExternalAdapterConfig,
     external_source_paths,
     load_external_dataset,
+)
+from offline_evaluation.sealed_execution import (
+    SealedExecution,
+    SealedExecutionError,
+    reserve_sealed_execution,
 )
 
 
@@ -342,26 +347,20 @@ def reserve_external_sealed_final_test_execution(
     manifest: ExternalSealedFinalTestManifest,
     *,
     code_commit: str,
-) -> Path:
-    marker_path = manifest_path.with_name(
-        f"{manifest_path.stem}.execution-started.json"
-    )
-    marker_payload = {
-        "manifest_id": manifest.manifest_id,
-        "manifest_integrity_sha256": manifest.integrity_sha256,
-        "code_commit": code_commit,
-        "started_at": datetime.now(UTC).isoformat(),
-        "status": "started_outcomes_unsealed",
-    }
+    output_dir: Path,
+    resume_execution_id: str | None = None,
+) -> SealedExecution:
     try:
-        with marker_path.open("x", encoding="utf-8") as destination:
-            json.dump(marker_payload, destination, ensure_ascii=False, indent=2)
-            destination.write("\n")
-    except FileExistsError as exc:
-        raise ExternalBacktestError(
-            "external sealed final test was already started; its outcomes are exposed"
-        ) from exc
-    return marker_path
+        return reserve_sealed_execution(
+            manifest_path,
+            manifest_id=manifest.manifest_id,
+            manifest_integrity_sha256=manifest.integrity_sha256,
+            code_commit=code_commit,
+            output_dir=output_dir,
+            resume_execution_id=resume_execution_id,
+        )
+    except SealedExecutionError as exc:
+        raise ExternalBacktestError(str(exc)) from exc
 
 
 def run_external_sealed_final_test(
@@ -369,6 +368,7 @@ def run_external_sealed_final_test(
     manifest: ExternalSealedFinalTestManifest,
     source_dir: Path,
     performance_predictor: SegmentPerformancePredictor,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalSealedFinalTestResult:
     adapter_config = _adapter_config_from_payload(manifest.adapter_config)
     backtest_config = ExternalBacktestConfig(**dict(manifest.backtest_config))
@@ -376,6 +376,7 @@ def run_external_sealed_final_test(
         manifest.dataset_id,
         source_dir,
         config=adapter_config,
+        on_outcomes_opened=on_outcomes_opened,
     )
     run = run_external_backtest(
         bundle.cases,

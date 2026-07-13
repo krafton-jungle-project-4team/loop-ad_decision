@@ -6,11 +6,11 @@ import io
 import itertools
 import zipfile
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable, Iterator, Mapping, Sequence, TypeVar
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence, TypeVar
 
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
@@ -94,6 +94,7 @@ def load_external_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     loaders = {
         "airbnb": load_airbnb_dataset,
@@ -108,7 +109,11 @@ def load_external_dataset(
         loader = loaders[dataset_id]
     except KeyError as exc:
         raise ValueError(f"unsupported external dataset: {dataset_id}") from exc
-    return loader(source_dir, config=config)
+    return loader(
+        source_dir,
+        config=config,
+        on_outcomes_opened=on_outcomes_opened,
+    )
 
 
 def external_source_paths(
@@ -156,7 +161,9 @@ def load_booking_com_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
+    del on_outcomes_opened
     train_path = source_dir / "train_set.csv"
     sampler: _BoundedStableSample[_BookingTrip] = _BoundedStableSample(
         config.profile_pool_limit
@@ -241,16 +248,16 @@ def load_booking_com_final_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     if config.evaluation_role != EXTERNAL_SEALED_FINAL_ROLE:
         raise ValueError("Booking.com official test requires the sealed final role")
     test_path = source_dir / "test_set.csv"
     ground_truth_path = source_dir / "ground_truth.csv"
-    ground_truth = _read_booking_ground_truth(ground_truth_path)
     sampler: _BoundedStableSample[_BookingTrip] = _BoundedStableSample(
         config.profile_pool_limit
     )
-    for trip in _iter_booking_final_trips(test_path, ground_truth=ground_truth):
+    for trip in _iter_booking_final_observations(test_path):
         if not config.includes_subject(trip.trip_id):
             continue
         sampler.add(trip.trip_id, trip)
@@ -270,6 +277,22 @@ def load_booking_com_final_dataset(
         limit=config.max_scenarios,
         min_users=config.min_scenario_users,
     )
+    if not target_cities:
+        raise ExternalBacktestError(
+            "Booking.com official test produced no eligible target cities"
+        )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    ground_truth = _read_booking_ground_truth(ground_truth_path)
+    trips = [
+        replace(trip, outcome=ground_truth[trip.trip_id])
+        for trip in trips
+        if trip.trip_id in ground_truth
+    ]
+    if not trips:
+        raise ExternalBacktestError(
+            "Booking.com ground truth contains no sampled trip outcomes"
+        )
     cases = tuple(
         _booking_case(
             target_city=target_city,
@@ -372,11 +395,7 @@ def _read_booking_ground_truth(path: Path) -> dict[str, Mapping[str, str]]:
     return outcomes
 
 
-def _iter_booking_final_trips(
-    path: Path,
-    *,
-    ground_truth: Mapping[str, Mapping[str, str]],
-) -> Iterator[_BookingTrip]:
+def _iter_booking_final_observations(path: Path) -> Iterator[_BookingTrip]:
     if not path.is_file():
         raise ExternalBacktestError(f"Booking.com test_set.csv not found: {path}")
     with path.open(encoding="utf-8", newline="") as source:
@@ -385,9 +404,6 @@ def _iter_booking_final_trips(
         if not required.issubset(reader.fieldnames or ()):
             raise ExternalBacktestError("Booking.com test_set.csv schema is invalid")
         for trip_id, rows in itertools.groupby(reader, key=lambda row: row["utrip_id"]):
-            outcome = ground_truth.get(trip_id)
-            if outcome is None:
-                continue
             observation = tuple(
                 sorted(
                     (
@@ -403,7 +419,7 @@ def _iter_booking_final_trips(
             yield _BookingTrip(
                 trip_id=trip_id,
                 observation=observation,
-                outcome=outcome,
+                outcome={},
             )
 
 
@@ -480,7 +496,6 @@ def _booking_case(
 @dataclass(frozen=True, slots=True)
 class _AirbnbUser:
     user_id: str
-    country_destination: str
     age_group: str
     gender: str
     affiliate_channel: str
@@ -505,6 +520,7 @@ def load_airbnb_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     users_path = source_dir / "train_users_2.csv.zip"
     sessions_path = source_dir / "sessions.csv.zip"
@@ -539,7 +555,6 @@ def load_airbnb_dataset(
         key=stable_score,
     )[: config.profile_pool_limit]
     profiles: list[RawEventUserSignalRecord] = []
-    positive_ids: set[str] = set()
     for user_id in selected_user_ids:
         user = users[user_id]
         signal = signals[user_id]
@@ -561,12 +576,21 @@ def load_airbnb_dataset(
                 else (),
             )
         )
-        if user.country_destination and user.country_destination != "NDF":
-            positive_ids.add(external_user_id)
     if len(profiles) < config.min_scenario_users:
         raise ExternalBacktestError(
             "Airbnb session sampling produced too few observable users"
         )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    outcomes = _read_airbnb_outcomes(
+        users_path,
+        selected_user_ids=set(selected_user_ids),
+    )
+    positive_ids = {
+        f"airbnb-user-{user_id}"
+        for user_id, country_destination in outcomes.items()
+        if country_destination and country_destination != "NDF"
+    }
     scenario_id = "airbnb-search-active-booking"
     promotion = _promotion(
         dataset_id="airbnb",
@@ -667,13 +691,26 @@ def _read_airbnb_users(
                 continue
             user = _AirbnbUser(
                 user_id=user_id,
-                country_destination=_nonempty(row.get("country_destination")),
                 age_group=_age_group(_nonempty(row.get("age"))),
                 gender=_normalized_gender(_nonempty(row.get("gender"))),
                 affiliate_channel=_nonempty(row.get("affiliate_channel")),
             )
             sampler.add(user_id, user)
     return {user.user_id: user for user in sampler.values()}
+
+
+def _read_airbnb_outcomes(
+    path: Path,
+    *,
+    selected_user_ids: set[str],
+) -> dict[str, str]:
+    outcomes: dict[str, str] = {}
+    with _zipped_dict_reader(path, "train_users_2.csv") as reader:
+        for row in reader:
+            user_id = _nonempty(row.get("id"))
+            if user_id in selected_user_ids:
+                outcomes[user_id] = _nonempty(row.get("country_destination"))
+    return outcomes
 
 
 @dataclass(slots=True)
@@ -691,6 +728,7 @@ def load_synerise_dataset(
     source_dir: Path,
     *,
     config: ExternalAdapterConfig,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalDatasetBundle:
     try:
         import pyarrow.dataset as arrow_dataset
@@ -731,7 +769,6 @@ def load_synerise_dataset(
         selected_client_ids=selected_client_id_set,
         config=config,
         observation_start=observation_start,
-        outcome_end=outcome_end,
         arrow_dataset=arrow_dataset,
     )
     for event_kind in ("add", "remove", "buy"):
@@ -742,7 +779,6 @@ def load_synerise_dataset(
             selected_client_ids=selected_client_id_set,
             config=config,
             observation_start=observation_start,
-            outcome_end=outcome_end,
             arrow_dataset=arrow_dataset,
         )
     selected_client_ids = [
@@ -750,17 +786,14 @@ def load_synerise_dataset(
         for client_id in selected_client_ids
         if signals[client_id].event_count > 0
     ]
-    relevant_skus = {
+    observed_skus = {
         sku
         for client_id in selected_client_ids
-        for sku in (
-            set(signals[client_id].sku_counts)
-            | signals[client_id].future_buy_skus
-        )
+        for sku in signals[client_id].sku_counts
     }
     sku_properties = _load_synerise_properties(
         paths["properties"],
-        relevant_skus=relevant_skus,
+        relevant_skus=observed_skus,
         parquet=parquet,
     )
     category_users: Counter[str] = Counter()
@@ -775,6 +808,33 @@ def load_synerise_dataset(
         category_users,
         limit=config.max_scenarios,
         min_users=config.min_scenario_users,
+    )
+    if not target_categories:
+        raise ExternalBacktestError(
+            "Synerise observation window produced no eligible target categories"
+        )
+    if on_outcomes_opened is not None:
+        on_outcomes_opened()
+    _scan_synerise_future_buys(
+        paths["buy"],
+        signals=signals,
+        selected_client_ids=selected_client_id_set,
+        config=config,
+        outcome_end=outcome_end,
+        arrow_dataset=arrow_dataset,
+    )
+    future_skus = {
+        sku
+        for client_id in selected_client_ids
+        for sku in signals[client_id].future_buy_skus
+        if sku not in sku_properties
+    }
+    sku_properties.update(
+        _load_synerise_properties(
+            paths["properties"],
+            relevant_skus=future_skus,
+            parquet=parquet,
+        )
     )
     cases = tuple(
         _synerise_case(
@@ -891,14 +951,13 @@ def _scan_synerise_events(
     selected_client_ids: set[int],
     config: ExternalAdapterConfig,
     observation_start: datetime,
-    outcome_end: datetime,
     arrow_dataset: Any,
 ) -> None:
-    columns = ["client_id", "timestamp"]
+    columns = ["client_id"]
     if event_kind != "search":
         columns.append("sku")
     start_text = observation_start.strftime("%Y-%m-%d %H:%M:%S")
-    end_text = outcome_end.strftime("%Y-%m-%d %H:%M:%S")
+    end_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
     scanner = arrow_dataset.dataset(path, format="parquet").scanner(
         columns=columns,
         filter=(arrow_dataset.field("timestamp") >= start_text)
@@ -906,33 +965,57 @@ def _scan_synerise_events(
         batch_size=131_072,
         use_threads=True,
     )
-    cutoff_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
     for batch in scanner.to_batches():
         values = batch.to_pydict()
         skus = values.get("sku", [None] * len(values["client_id"]))
-        for client_id, timestamp, sku in zip(
+        for client_id, sku in zip(
             values["client_id"],
-            values["timestamp"],
             skus,
             strict=True,
         ):
             if client_id not in selected_client_ids:
                 continue
             signal = signals[client_id]
-            if timestamp < cutoff_text:
-                signal.event_count += 1
-                if event_kind == "search":
-                    signal.search_count += 1
-                elif event_kind == "add":
-                    signal.add_count += 1
-                elif event_kind == "remove":
-                    signal.remove_count += 1
-                elif event_kind == "buy":
-                    signal.buy_count += 1
-                if sku is not None:
-                    signal.sku_counts[int(sku)] += 1
-            elif event_kind == "buy" and sku is not None:
-                signal.future_buy_skus.add(int(sku))
+            signal.event_count += 1
+            if event_kind == "search":
+                signal.search_count += 1
+            elif event_kind == "add":
+                signal.add_count += 1
+            elif event_kind == "remove":
+                signal.remove_count += 1
+            elif event_kind == "buy":
+                signal.buy_count += 1
+            if sku is not None:
+                signal.sku_counts[int(sku)] += 1
+
+
+def _scan_synerise_future_buys(
+    path: Path,
+    *,
+    signals: dict[int, _SyneriseSignals],
+    selected_client_ids: set[int],
+    config: ExternalAdapterConfig,
+    outcome_end: datetime,
+    arrow_dataset: Any,
+) -> None:
+    cutoff_text = config.cutoff.strftime("%Y-%m-%d %H:%M:%S")
+    outcome_end_text = outcome_end.strftime("%Y-%m-%d %H:%M:%S")
+    scanner = arrow_dataset.dataset(path, format="parquet").scanner(
+        columns=["client_id", "sku"],
+        filter=(arrow_dataset.field("timestamp") >= cutoff_text)
+        & (arrow_dataset.field("timestamp") < outcome_end_text),
+        batch_size=131_072,
+        use_threads=True,
+    )
+    for batch in scanner.to_batches():
+        values = batch.to_pydict()
+        for client_id, sku in zip(
+            values["client_id"],
+            values["sku"],
+            strict=True,
+        ):
+            if client_id in selected_client_ids and sku is not None:
+                signals[client_id].future_buy_skus.add(int(sku))
 
 
 def _load_synerise_properties(

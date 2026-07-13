@@ -9,7 +9,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.analysis.raw_event_segments import (
     PromotionIntent,
@@ -541,6 +541,7 @@ class ExpediaSegmentBacktestService:
         *,
         fixed_scenarios: Mapping[datetime, Sequence[ExpediaBacktestScenario]]
         | None = None,
+        on_outcomes_opened: Callable[[], None] | None = None,
     ) -> ExpediaBacktestRun:
         started_at = now_ms()
         log.info(
@@ -555,6 +556,7 @@ class ExpediaSegmentBacktestService:
         )
         results: list[ExpediaBacktestResult] = []
         skipped: list[ExpediaBacktestSkippedScenario] = []
+        outcomes_opened = False
         for cutoff in cutoffs:
             normalized_cutoff = _as_utc_datetime(cutoff)
             if normalized_cutoff is None:
@@ -640,6 +642,10 @@ class ExpediaSegmentBacktestService:
                     )
                     continue
                 eligible_user_ids = tuple(profile.user_id for profile in profiles)
+                if not outcomes_opened:
+                    if on_outcomes_opened is not None:
+                        on_outcomes_opened()
+                    outcomes_opened = True
                 future_users = self._repository.future_booking_users(
                     scenario=scenario,
                     outcome_end=outcome_end,
@@ -677,6 +683,8 @@ class ExpediaSegmentBacktestService:
     def run_scenarios(
         self,
         scenarios: Sequence[ExpediaBacktestScenario],
+        *,
+        on_outcomes_opened: Callable[[], None] | None = None,
     ) -> ExpediaBacktestRun:
         scenarios_by_cutoff: dict[datetime, list[ExpediaBacktestScenario]] = (
             defaultdict(list)
@@ -691,6 +699,7 @@ class ExpediaSegmentBacktestService:
         return self.run(
             sorted(scenarios_by_cutoff),
             fixed_scenarios=scenarios_by_cutoff,
+            on_outcomes_opened=on_outcomes_opened,
         )
 
 

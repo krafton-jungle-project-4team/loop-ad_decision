@@ -5,8 +5,9 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
+from app.analysis.segment_performance import LogisticSegmentPerformanceModel
 from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
@@ -18,7 +19,11 @@ from offline_evaluation.expedia_backtest import (
     summarize_backtest,
     write_backtest_artifacts,
 )
-from app.analysis.segment_performance import LogisticSegmentPerformanceModel
+from offline_evaluation.sealed_execution import (
+    SealedExecution,
+    SealedExecutionError,
+    reserve_sealed_execution,
+)
 
 
 SEALED_FINAL_TEST_VERSION = "expedia.sealed-final-test.v1"
@@ -303,27 +308,20 @@ def reserve_sealed_final_test_execution(
     manifest: ExpediaSealedFinalTestManifest,
     *,
     code_commit: str,
-) -> Path:
-    marker_path = manifest_path.with_name(
-        f"{manifest_path.stem}.execution-started.json"
-    )
-    marker_payload = {
-        "manifest_id": manifest.manifest_id,
-        "manifest_integrity_sha256": manifest.integrity_sha256,
-        "code_commit": code_commit,
-        "started_at": datetime.now(UTC).isoformat(),
-        "status": "started_outcomes_unsealed",
-    }
+    output_dir: Path,
+    resume_execution_id: str | None = None,
+) -> SealedExecution:
     try:
-        with marker_path.open("x", encoding="utf-8") as destination:
-            json.dump(marker_payload, destination, ensure_ascii=False, indent=2)
-            destination.write("\n")
-    except FileExistsError as exc:
-        raise ExpediaBacktestError(
-            "sealed final test was already started; create a new manifest instead "
-            "of reusing the exposed test set"
-        ) from exc
-    return marker_path
+        return reserve_sealed_execution(
+            manifest_path,
+            manifest_id=manifest.manifest_id,
+            manifest_integrity_sha256=manifest.integrity_sha256,
+            code_commit=code_commit,
+            output_dir=output_dir,
+            resume_execution_id=resume_execution_id,
+        )
+    except SealedExecutionError as exc:
+        raise ExpediaBacktestError(str(exc)) from exc
 
 
 def run_sealed_final_test(
@@ -331,6 +329,7 @@ def run_sealed_final_test(
     *,
     manifest: ExpediaSealedFinalTestManifest,
     model: LogisticSegmentPerformanceModel,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExpediaSealedFinalTestResult:
     scenarios = _manifest_scenarios(manifest)
     config = _config_from_payload(manifest.config)
@@ -338,7 +337,10 @@ def run_sealed_final_test(
         repository,
         config=config,
         performance_predictor=model,
-    ).run_scenarios(scenarios)
+    ).run_scenarios(
+        scenarios,
+        on_outcomes_opened=on_outcomes_opened,
+    )
     metrics = dict(summarize_backtest(run))
     training_rate = float(
         model.training_metadata.get(
