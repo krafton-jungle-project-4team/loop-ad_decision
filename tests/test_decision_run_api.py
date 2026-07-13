@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
 from typing import Any
 
@@ -8,6 +9,7 @@ from fastapi.testclient import TestClient
 from psycopg import errors
 
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import PromotionRunWrite
 from app.decision.router import get_promotion_run_service
 from app.decision.schemas import (
@@ -25,6 +27,13 @@ from app.decision.service import (
     normalize_explicit_segment_ids,
 )
 from app.main import create_app
+from tests.test_decision_run_service import (
+    activation_candidates,
+    activation_request,
+    content_candidate_record,
+    make_preparation_activation_service,
+    make_service,
+)
 
 
 DEFAULT_ROW = object()
@@ -305,6 +314,126 @@ def test_run_api_rejects_preparation_activation_behind_default_off_flag(
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
     assert connection.close_count == 1
+
+
+def test_run_api_activates_dashboard_approval_fixture_with_lineage_and_retry() -> None:
+    candidates = activation_candidates() + [
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_family_trip",
+            content_id="content_family_draft",
+            status="draft",
+        ),
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_mobile_user",
+            content_id="content_mobile_rejected",
+            status="rejected",
+        ),
+    ]
+    service, repos = make_preparation_activation_service(candidates=candidates)
+    client = make_client(service)
+    payload = activation_request().model_dump(mode="json", exclude_none=True)
+
+    first = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json=payload,
+    )
+    retry = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json=payload,
+    )
+
+    assert first.status_code == 200, first.text
+    assert retry.status_code == 200, retry.text
+    assert retry.json() == first.json()
+    assert first.json()["segment_ids"] == ["seg_family_trip", "seg_mobile_user"]
+    assert [
+        experiment["is_fallback"] for experiment in first.json()["ad_experiments"]
+    ] == [False, False, True]
+    lineage = {
+        experiment.segment_id: (
+            experiment.parent_ad_experiment_id,
+            experiment.source_evaluation_id,
+        )
+        for experiment in repos.ad_experiments.inserted_batches[0]
+    }
+    assert lineage == {
+        "seg_family_trip": ("adexp_source_family", "eval_source_family"),
+        "seg_mobile_user": ("adexp_source_mobile", "eval_source_mobile"),
+        FALLBACK_SEGMENT_ID: (None, None),
+    }
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", first.json()["promotion_run_id"])
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["zero", "partial", "duplicate", "cross-generation"],
+)
+def test_run_api_rejects_incomplete_or_cross_generation_dashboard_approval(
+    case: str,
+) -> None:
+    candidates = activation_candidates()
+    if case == "zero":
+        candidates = []
+    elif case == "partial":
+        candidates = candidates[:1]
+    elif case == "duplicate":
+        candidates.append(
+            content_candidate_record(
+                analysis_id="analysis_banner_loop_2",
+                generation_id="generation_banner_loop_2",
+                segment_id="seg_family_trip",
+                content_id="content_family_duplicate",
+            )
+        )
+    else:
+        candidates = [
+            replace(candidate, generation_id="generation_other")
+            for candidate in candidates
+        ]
+    service, repos = make_preparation_activation_service(candidates=candidates)
+    client = make_client(service)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json=activation_request().model_dump(mode="json", exclude_none=True),
+    )
+
+    assert response.status_code == 422
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+def test_run_api_keeps_legacy_single_candidate_and_nullable_lineage() -> None:
+    service, repos = make_service()
+    client = make_client(service)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["segment_ids"] == ["seg_family_trip"]
+    experiments = repos.ad_experiments.inserted_batches[0]
+    assert [experiment.segment_id for experiment in experiments] == [
+        "seg_family_trip",
+        FALLBACK_SEGMENT_ID,
+    ]
+    assert all(
+        experiment.parent_ad_experiment_id is None
+        and experiment.source_evaluation_id is None
+        for experiment in experiments
+    )
+    assert repos.preparations.activated_calls == []
 
 
 def test_run_api_maps_unique_integrity_error_to_conflict_and_rolls_back(
