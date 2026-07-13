@@ -23,6 +23,13 @@ from offline_evaluation.external_datasets import (
     external_source_paths,
     load_external_dataset,
 )
+from offline_evaluation.rank_quality import (
+    CRITERION_EVIDENCE,
+    CRITERION_QUALITY,
+    VERDICT_PASSED,
+    criterion_result,
+    determine_final_verdict,
+)
 from offline_evaluation.sealed_execution import (
     SealedExecution,
     SealedExecutionError,
@@ -30,7 +37,7 @@ from offline_evaluation.sealed_execution import (
 )
 
 
-EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v1"
+EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v2"
 EXTERNAL_COHORT_MODULO = 5
 EXTERNAL_DEVELOPMENT_REMAINDERS = (0, 1, 2, 3)
 EXTERNAL_FINAL_REMAINDERS = (4,)
@@ -45,22 +52,49 @@ SYNERISE_FINAL_CUTOFF = datetime(2022, 11, 10, tzinfo=UTC)
 class ExternalFinalTestCriteria:
     rank_one_beats_baseline_rate_min: float = 0.50
     mean_rank_one_lift_percentage_points_min: float = 0.0
-    scenario_with_observed_outcome_count_min: int = 1
-    rank_comparable_scenario_count_min: int = 1
+    rank_one_is_best_rate_min: float = 0.50
+    rank_two_beats_baseline_rate_min: float = 0.50
+    mean_rank_two_lift_percentage_points_min: float = 0.0
+    rank_three_beats_baseline_rate_min: float = 0.50
+    mean_rank_three_lift_percentage_points_min: float = 0.0
+    pairwise_rank_accuracy_min: float = 0.55
+    scenario_with_observed_outcome_count_min: int = 3
+    rank_comparable_scenario_count_min: int = 3
+    rank_comparable_scenario_rate_min: float = 0.80
+    rank_two_result_count_min: int = 3
+    rank_three_result_count_min: int = 3
+    three_rank_scenario_count_min: int = 3
+    pairwise_rank_comparison_count_min: int = 6
+    pairwise_rank_tie_rate_max: float = 0.50
     candidate_type_count_min: int = 2
     mean_non_first_rank_overlap_max: float = 0.90
+    maximum_non_first_rank_overlap_max: float = 0.95
 
     def __post_init__(self) -> None:
-        if not 0 <= self.rank_one_beats_baseline_rate_min <= 1:
-            raise ValueError("rank one baseline criterion must be between 0 and 1")
-        if self.scenario_with_observed_outcome_count_min <= 0:
-            raise ValueError("observed outcome criterion must be positive")
-        if self.rank_comparable_scenario_count_min <= 0:
-            raise ValueError("rank comparable scenario criterion must be positive")
-        if self.candidate_type_count_min <= 0:
-            raise ValueError("candidate type criterion must be positive")
-        if not 0 <= self.mean_non_first_rank_overlap_max <= 1:
-            raise ValueError("overlap criterion must be between 0 and 1")
+        rates = (
+            self.rank_one_beats_baseline_rate_min,
+            self.rank_one_is_best_rate_min,
+            self.rank_two_beats_baseline_rate_min,
+            self.rank_three_beats_baseline_rate_min,
+            self.pairwise_rank_accuracy_min,
+            self.rank_comparable_scenario_rate_min,
+            self.pairwise_rank_tie_rate_max,
+            self.mean_non_first_rank_overlap_max,
+            self.maximum_non_first_rank_overlap_max,
+        )
+        if any(not 0 <= value <= 1 for value in rates):
+            raise ValueError("external final rate criteria must be between 0 and 1")
+        counts = (
+            self.scenario_with_observed_outcome_count_min,
+            self.rank_comparable_scenario_count_min,
+            self.rank_two_result_count_min,
+            self.rank_three_result_count_min,
+            self.three_rank_scenario_count_min,
+            self.pairwise_rank_comparison_count_min,
+            self.candidate_type_count_min,
+        )
+        if any(value <= 0 for value in counts):
+            raise ValueError("external final count criteria must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +142,7 @@ class ExternalSealedFinalTestResult:
     run: ExternalBacktestRun
     dataset_manifest: ExternalDatasetManifest
     criteria_results: Mapping[str, Any]
+    verdict: str
     passed: bool
 
 
@@ -217,8 +252,13 @@ def build_external_sealed_final_test_manifest(
         "primary_metrics": [
             "rank_one_beats_baseline_rate",
             "mean_rank_one_lift_percentage_points",
-            "rank_one_is_best_rate_when_comparable",
-            "candidate_overlap",
+            "rank_one_is_best_rate",
+            "rank_two_beats_baseline_rate",
+            "rank_three_beats_baseline_rate",
+            "pairwise_rank_accuracy",
+            "pairwise_rank_tie_rate",
+            "candidate_type_count",
+            "mean_non_first_rank_overlap",
         ],
     }
     criteria_payload = asdict(criteria or ExternalFinalTestCriteria())
@@ -391,13 +431,13 @@ def run_external_sealed_final_test(
         run.summary,
         manifest.acceptance_criteria,
     )
+    verdict = determine_final_verdict(criteria_results)
     return ExternalSealedFinalTestResult(
         run=run,
         dataset_manifest=bundle.manifest,
         criteria_results=criteria_results,
-        passed=all(
-            bool(result.get("passed")) for result in criteria_results.values()
-        ),
+        verdict=verdict,
+        passed=verdict == VERDICT_PASSED,
     )
 
 
@@ -427,6 +467,7 @@ def write_external_sealed_final_test_artifacts(
         "manifest_integrity_sha256": manifest.integrity_sha256,
         "dataset_id": manifest.dataset_id,
         "scope": "one_time_sealed_external_evaluation",
+        "verdict": result.verdict,
         "passed": result.passed,
         "metrics": dict(result.run.summary),
         "criteria_results": dict(result.criteria_results),
@@ -470,48 +511,121 @@ def _evaluate_criteria(
     metrics: Mapping[str, Any],
     criteria: Mapping[str, Any],
 ) -> dict[str, Any]:
-    checks = {
-        "rank_one_beats_baseline_rate": (
-            float(metrics.get("rank_one_beats_baseline_rate", 0.0) or 0.0),
-            ">=",
-            float(criteria["rank_one_beats_baseline_rate_min"]),
-        ),
-        "mean_rank_one_lift_percentage_points": (
-            float(
-                metrics.get("mean_rank_one_lift_percentage_points", 0.0) or 0.0
-            ),
-            ">=",
-            float(criteria["mean_rank_one_lift_percentage_points_min"]),
-        ),
-        "scenario_with_observed_outcome_count": (
-            int(metrics.get("scenario_with_observed_outcome_count", 0) or 0),
+    return {
+        "scenario_with_observed_outcome_count": criterion_result(
+            _int_metric(metrics, "scenario_with_observed_outcome_count"),
             ">=",
             int(criteria["scenario_with_observed_outcome_count_min"]),
+            category=CRITERION_EVIDENCE,
         ),
-        "rank_comparable_scenario_count": (
-            int(metrics.get("rank_comparable_scenario_count", 0) or 0),
+        "rank_comparable_scenario_count": criterion_result(
+            _int_metric(metrics, "rank_comparable_scenario_count"),
             ">=",
             int(criteria["rank_comparable_scenario_count_min"]),
+            category=CRITERION_EVIDENCE,
         ),
-        "candidate_type_count": (
-            int(metrics.get("candidate_type_count", 0) or 0),
+        "rank_comparable_scenario_rate": criterion_result(
+            _float_metric(metrics, "rank_comparable_scenario_rate"),
+            ">=",
+            float(criteria["rank_comparable_scenario_rate_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "rank_two_result_count": criterion_result(
+            _int_metric(metrics, "rank_two_result_count"),
+            ">=",
+            int(criteria["rank_two_result_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "rank_three_result_count": criterion_result(
+            _int_metric(metrics, "rank_three_result_count"),
+            ">=",
+            int(criteria["rank_three_result_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "three_rank_scenario_count": criterion_result(
+            _int_metric(metrics, "three_rank_scenario_count"),
+            ">=",
+            int(criteria["three_rank_scenario_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "pairwise_rank_comparison_count": criterion_result(
+            _int_metric(metrics, "pairwise_rank_comparison_count"),
+            ">=",
+            int(criteria["pairwise_rank_comparison_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "pairwise_rank_tie_rate": criterion_result(
+            _float_metric(metrics, "pairwise_rank_tie_rate"),
+            "<=",
+            float(criteria["pairwise_rank_tie_rate_max"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "rank_one_beats_baseline_rate": criterion_result(
+            _float_metric(metrics, "rank_one_beats_baseline_rate"),
+            ">=",
+            float(criteria["rank_one_beats_baseline_rate_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "mean_rank_one_lift_percentage_points": criterion_result(
+            _float_metric(metrics, "mean_rank_one_lift_percentage_points"),
+            ">=",
+            float(criteria["mean_rank_one_lift_percentage_points_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "rank_one_is_best_rate": criterion_result(
+            _float_metric(metrics, "rank_one_is_best_rate"),
+            ">=",
+            float(criteria["rank_one_is_best_rate_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "rank_two_beats_baseline_rate": criterion_result(
+            _float_metric(metrics, "rank_two_beats_baseline_rate"),
+            ">=",
+            float(criteria["rank_two_beats_baseline_rate_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "mean_rank_two_lift_percentage_points": criterion_result(
+            _float_metric(metrics, "mean_rank_two_lift_percentage_points"),
+            ">=",
+            float(criteria["mean_rank_two_lift_percentage_points_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "rank_three_beats_baseline_rate": criterion_result(
+            _float_metric(metrics, "rank_three_beats_baseline_rate"),
+            ">=",
+            float(criteria["rank_three_beats_baseline_rate_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "mean_rank_three_lift_percentage_points": criterion_result(
+            _float_metric(metrics, "mean_rank_three_lift_percentage_points"),
+            ">=",
+            float(criteria["mean_rank_three_lift_percentage_points_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "pairwise_rank_accuracy": criterion_result(
+            _float_metric(metrics, "pairwise_rank_accuracy"),
+            ">=",
+            float(criteria["pairwise_rank_accuracy_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "candidate_type_count": criterion_result(
+            _int_metric(metrics, "candidate_type_count"),
             ">=",
             int(criteria["candidate_type_count_min"]),
+            category=CRITERION_QUALITY,
         ),
-        "mean_non_first_rank_overlap": (
-            float(metrics.get("mean_non_first_rank_overlap", 0.0) or 0.0),
+        "mean_non_first_rank_overlap": criterion_result(
+            _float_metric(metrics, "mean_non_first_rank_overlap"),
             "<=",
             float(criteria["mean_non_first_rank_overlap_max"]),
+            category=CRITERION_QUALITY,
         ),
-    }
-    return {
-        name: {
-            "actual": actual,
-            "operator": operator,
-            "threshold": threshold,
-            "passed": actual >= threshold if operator == ">=" else actual <= threshold,
-        }
-        for name, (actual, operator, threshold) in checks.items()
+        "maximum_non_first_rank_overlap": criterion_result(
+            _float_metric(metrics, "maximum_non_first_rank_overlap"),
+            "<=",
+            float(criteria["maximum_non_first_rank_overlap_max"]),
+            category=CRITERION_QUALITY,
+        ),
     }
 
 
@@ -545,15 +659,29 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
         f"# {summary['dataset_id']} 외부 봉인 최종 평가",
         "",
         f"- Manifest ID: `{summary['manifest_id']}`",
-        f"- 최종 판정: {'PASS' if summary['passed'] else 'FAIL'}",
+        f"- 최종 판정: {_verdict_label(str(summary['verdict']))}",
         "- 외부 outcome으로 모델을 학습하거나 보정하지 않음",
         "",
         "## 핵심 지표",
         "",
         "- Rank 1 baseline 초과 비율: "
-        f"{float(metrics['rank_one_beats_baseline_rate']) * 100:.2f}%",
+        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
         "- Rank 1 평균 lift: "
-        f"{float(metrics['mean_rank_one_lift_percentage_points']):.2f}%p",
+        f"{_format_optional_percentage_points(metrics['mean_rank_one_lift_percentage_points'])}",
+        "- Rank 2 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
+        "- Rank 3 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
+        "- Rank 1 엄격한 실제 최고 비율: "
+        f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
+        "- 후보 쌍 순서 적중률: "
+        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
+        "- 후보 쌍 동률 비율: "
+        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
+        "- 비교 가능한 시나리오: "
+        f"{metrics['rank_comparable_scenario_count']}개",
+        "- Rank 1·2·3이 모두 생성된 시나리오: "
+        f"{metrics['three_rank_scenario_count']}개",
         "- 비교 가능한 예상값 오차: N/A",
         "",
         "## 사전 등록 기준",
@@ -562,8 +690,9 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
     for name, criterion in summary["criteria_results"].items():
         status = "PASS" if criterion["passed"] else "FAIL"
         lines.append(
-            f"- {name}: {criterion['actual']} {criterion['operator']} "
-            f"{criterion['threshold']} · {status}"
+            f"- [{criterion['category']}] {name}: "
+            f"{_format_criterion_value(criterion['actual'])} "
+            f"{criterion['operator']} {criterion['threshold']} · {status}"
         )
     lines.extend(
         [
@@ -578,6 +707,39 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def _float_metric(metrics: Mapping[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    return float(value) if value is not None else None
+
+
+def _int_metric(metrics: Mapping[str, Any], key: str) -> int:
+    return int(metrics.get(key, 0) or 0)
+
+
+def _verdict_label(verdict: str) -> str:
+    return {
+        "passed": "PASS",
+        "failed": "FAIL",
+        "inconclusive": "INCONCLUSIVE (근거 부족)",
+    }.get(verdict, verdict.upper())
+
+
+def _format_optional_percent(value: Any) -> str:
+    return "N/A" if value is None else f"{float(value) * 100:.2f}%"
+
+
+def _format_optional_percentage_points(value: Any) -> str:
+    return "N/A" if value is None else f"{float(value):.2f}%p"
+
+
+def _format_criterion_value(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
 
 
 def _mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:

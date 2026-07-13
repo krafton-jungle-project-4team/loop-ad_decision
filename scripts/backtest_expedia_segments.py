@@ -419,6 +419,7 @@ def execute_final_test(
         "sealed_final_test_completed",
         {
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "scenarioResultCount": len(result.run.results),
             "skippedScenarioCount": len(result.run.skipped_scenarios),
@@ -435,6 +436,7 @@ def execute_final_test(
         {
             "mode": args.command,
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "durationMs": duration_ms(started_at),
         },

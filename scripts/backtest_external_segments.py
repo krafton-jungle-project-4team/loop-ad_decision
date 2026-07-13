@@ -338,6 +338,7 @@ def execute_final_test(args: argparse.Namespace) -> int:
         {
             "datasetId": manifest.dataset_id,
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "candidateResultCount": len(result.run.results),
             "executionJournalPath": completed.journal_path,

@@ -213,7 +213,10 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
     assert "all_candidate_brier_skill_score" in result.metrics
     summary = json.loads(artifacts["summary"].read_text(encoding="utf-8"))
     assert summary["manifest_id"] == manifest.manifest_id
-    assert len(summary["criteria_results"]) == 5
+    assert summary["verdict"] == "inconclusive"
+    assert summary["passed"] is False
+    assert "pairwise_rank_accuracy" in summary["criteria_results"]
+    assert "rank_three_beats_baseline_rate" in summary["criteria_results"]
     assert "새로운 연도" in artifacts["report"].read_text(encoding="utf-8")
 
 

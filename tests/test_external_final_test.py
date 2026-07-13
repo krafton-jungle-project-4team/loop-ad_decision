@@ -172,6 +172,8 @@ def test_external_final_run_uses_official_booking_ground_truth_and_writes_result
     assert result.run.results
     assert outcome_events == ["opened"]
     assert result.dataset_manifest.evaluation_role == EXTERNAL_SEALED_FINAL_ROLE
+    assert result.verdict == "inconclusive"
+    assert result.passed is False
     assert result.run.summary["prediction_error_comparable"] is False
     assert (
         result.run.summary["mean_absolute_prediction_error_percentage_points"]
