@@ -1,0 +1,53 @@
+{
+  "promotion_run_id": "run-1",
+  "project_id": "project-1",
+  "campaign_id": "campaign-1",
+  "promotion_id": "promotion-1",
+  "analysis_id": "analysis-1",
+  "generation_id": "generation-1",
+  "loop_count": 2,
+  "status": "planned",
+  "goal_snapshot_json": {
+    "goal_metric": "booking_conversion_rate",
+    "goal_target_value": "0.03"
+  },
+  "segment_ids": [
+    "segment-a",
+    "segment-b"
+  ],
+  "ad_experiments": [
+    {
+      "ad_experiment_id": "adexp-a",
+      "segment_id": "segment-a",
+      "segment_name": "Segment A",
+      "content_id": "content-a",
+      "content_option_id": "option-a",
+      "channel": "email",
+      "loop_count": 2,
+      "status": "planned",
+      "is_fallback": false
+    },
+    {
+      "ad_experiment_id": "adexp-b",
+      "segment_id": "segment-b",
+      "segment_name": "Segment B",
+      "content_id": "content-b",
+      "content_option_id": "option-b",
+      "channel": "email",
+      "loop_count": 2,
+      "status": "planned",
+      "is_fallback": false
+    },
+    {
+      "ad_experiment_id": "adexp-fallback",
+      "segment_id": "seg_existing_all",
+      "segment_name": "Existing users fallback",
+      "content_id": "content-fallback",
+      "content_option_id": "option-fallback",
+      "channel": "email",
+      "loop_count": 2,
+      "status": "planned",
+      "is_fallback": true
+    }
+  ]
+}

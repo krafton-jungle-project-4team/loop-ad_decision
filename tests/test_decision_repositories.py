@@ -7,6 +7,7 @@ from typing import Any, Mapping, Sequence
 
 import pytest
 from psycopg import errors
+from psycopg.types.json import Jsonb
 
 from app.decision.repositories import (
     AdExperimentRepository,
@@ -336,6 +337,19 @@ def test_target_segment_repository_lists_only_requested_approved_records() -> No
     assert call.params == ("analysis_banner_001", ["seg_family_trip"])
 
 
+def test_target_segment_repository_lists_all_approved_records_when_ids_omitted() -> None:
+    db = FakePostgresExecutor(fetchall_result=[])
+    repo = PromotionTargetSegmentRepository(db)
+
+    assert repo.list_approved_for_analysis("analysis_banner_001") == []
+
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "status = 'approved'" in sql
+    assert "segment_id = any" not in sql
+    assert call.params == ("analysis_banner_001",)
+
+
 def test_content_candidate_repository_lists_approved_or_active_with_segment_keys() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[
@@ -374,7 +388,7 @@ def test_content_candidate_repository_lists_approved_or_active_with_segment_keys
 
 
 def test_promotion_run_repository_inserts_all_required_fields() -> None:
-    db = FakePostgresExecutor()
+    db = FakePostgresExecutor(fetchone_result={"promotion_run_id": "prun_banner_001_loop_1"})
     repo = PromotionRunRepository(db)
     run = PromotionRunWrite(
         promotion_run_id="prun_banner_001_loop_1",
@@ -390,12 +404,15 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
         segment_scope_fingerprint="a" * 64,
     )
 
-    repo.insert(run)
+    inserted = repo.insert_if_absent(run)
 
+    assert inserted is True
     call = db.calls[0]
     sql = compact_sql(call.query)
-    assert call.operation == "execute"
+    assert call.operation == "fetchone"
     assert "insert into promotion_runs" in sql
+    assert "on conflict do nothing" in sql
+    assert "returning promotion_run_id" in sql
     assert "promotion_run_id" in sql
     assert "project_id" in sql
     assert "campaign_id" in sql
@@ -404,7 +421,7 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
     assert "goal_snapshot_json" in sql
     assert "segment_scope_json" in sql
     assert "segment_scope_fingerprint" in sql
-    assert call.params == (
+    assert call.params[:9] == (
         "prun_banner_001_loop_1",
         "hotel-client-a",
         "camp_summer_2026",
@@ -414,8 +431,57 @@ def test_promotion_run_repository_inserts_all_required_fields() -> None:
         1,
         PromotionRunStatus.PLANNED.value,
         {"metric": "booking_conversion_rate"},
-        ("seg_family_trip",),
+    )
+    assert isinstance(call.params[9], Jsonb)
+    assert call.params[9].obj == ["seg_family_trip"]
+    assert call.params[10] == "a" * 64
+
+
+def test_promotion_run_repository_gets_exact_segment_scope() -> None:
+    row = {
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "generation_id": "generation_banner_001",
+        "loop_count": 1,
+        "status": PromotionRunStatus.PLANNED.value,
+        "goal_snapshot_json": {"metric": "booking_conversion_rate"},
+        "segment_scope_json": ["seg_family_trip"],
+        "segment_scope_fingerprint": "a" * 64,
+    }
+    db = FakePostgresExecutor(fetchone_result=row)
+
+    repo = PromotionRunRepository(db)
+
+    run = repo.get_by_scope(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        segment_scope_fingerprint="a" * 64,
+        loop_count=1,
+    )
+
+    assert run is not None
+    assert run.segment_scope_json == ["seg_family_trip"]
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from promotion_runs" in sql
+    assert "where project_id = %s" in sql
+    assert "and promotion_id = %s" in sql
+    assert "and analysis_id = %s" in sql
+    assert "and generation_id = %s" in sql
+    assert "and segment_scope_fingerprint = %s" in sql
+    assert "and loop_count = %s" in sql
+    assert call.params == (
+        "hotel-client-a",
+        "promo_banner_001",
+        "analysis_banner_001",
+        "generation_banner_001",
         "a" * 64,
+        1,
     )
 
 
@@ -445,26 +511,6 @@ def test_promotion_run_repository_reads_segment_scope_contract() -> None:
     sql = compact_sql(db.calls[0].query)
     assert "segment_scope_json" in sql
     assert "segment_scope_fingerprint" in sql
-
-
-def test_promotion_run_uniqueness_check_uses_promotion_id_and_loop_count() -> None:
-    db = FakePostgresExecutor(fetchone_result={"exists": 1})
-    repo = PromotionRunRepository(db)
-
-    exists = repo.exists_for_promotion_loop(
-        promotion_id="promo_banner_001",
-        loop_count=1,
-    )
-
-    assert exists is True
-    call = db.calls[0]
-    sql = compact_sql(call.query)
-    assert "from promotion_runs" in sql
-    assert "where promotion_id = %s" in sql
-    assert "and loop_count = %s" in sql
-    assert "promotion_run_id" not in sql
-    assert "segment_id" not in sql
-    assert call.params == ("promo_banner_001", 1)
 
 
 def test_promotion_run_repository_updates_status() -> None:

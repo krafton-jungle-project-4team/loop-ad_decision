@@ -19,6 +19,7 @@ from app.decision.service import (
     PromotionNotFoundError,
     RunConflictError,
     RunValidationError,
+    normalize_explicit_segment_ids,
 )
 from app.main import create_app
 
@@ -63,7 +64,9 @@ def test_run_api_returns_created_run_response_shape() -> None:
     assert payload["generation_id"] == "generation_banner_001"
     assert payload["status"] == "planned"
     assert payload["goal_snapshot_json"]["goal_target_value"] == "0.030000"
+    assert payload["segment_ids"] == ["seg_family_trip"]
     assert payload["ad_experiments"][0]["ad_experiment_id"] == "adexp_fake"
+    assert payload["ad_experiments"][0]["is_fallback"] is False
     assert service.calls[0][0] == "promo_banner_001"
     assert service.calls[0][1].loop_count == 2
     assert service.calls[0][1].next_loop_preparation_id is None
@@ -137,16 +140,25 @@ def test_run_api_rejects_blank_next_loop_preparation_id() -> None:
     assert response.json()["detail"][0]["type"] == "string_too_short"
 
 
-def test_run_api_rejects_empty_duplicate_or_blank_segment_ids() -> None:
-    client = make_client(FakeRunService())
+def test_run_api_normalizes_duplicate_segment_ids_and_rejects_empty_or_blank() -> None:
+    service = NormalizingFakeRunService()
+    client = make_client(service)
 
-    for segment_ids in ([], ["seg_family_trip", "seg_family_trip"], ["   "]):
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={"segment_ids": [" seg_b ", "seg_a", "seg_a"]},
+    )
+
+    assert response.status_code == 200
+    assert service.calls[0][1].segment_ids == ["seg_a", "seg_b"]
+
+    for segment_ids in ([], ["   "], ["seg_family_trip", "   "]):
         response = client.post(
             "/decision/v1/promotions/promo_banner_001/runs",
             json={"segment_ids": segment_ids},
         )
 
-        assert response.status_code == 400
+        assert response.status_code == 422
 
 
 def test_run_api_maps_service_errors() -> None:
@@ -197,6 +209,36 @@ def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into promotion_runs" in query for query in executed_sql)
     assert any("insert into ad_experiments" in query for query in executed_sql)
+
+
+def test_run_api_flag_off_rejects_explicit_scope_before_repository_access(
+    monkeypatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection()
+        connections.append(connection)
+        return connection
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={"segment_ids": ["seg_family_trip"]},
+    )
+
+    assert response.status_code == 409
+    connection = connections[0]
+    assert connection.executed == []
+    assert connection.commit_count == 0
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
 
 
 def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
@@ -322,6 +364,7 @@ class FakeRunService:
                 "source": "promotions",
                 "goal_target_value": "0.030000",
             },
+            segment_ids=list(request.segment_ids or ["seg_family_trip"]),
             ad_experiments=[
                 AdExperimentCreateResponse(
                     ad_experiment_id="adexp_fake",
@@ -332,8 +375,28 @@ class FakeRunService:
                     channel=Channel.ONSITE_BANNER,
                     loop_count=request.loop_count,
                     status="planned",
+                    is_fallback=False,
                 )
             ],
+        )
+
+
+class NormalizingFakeRunService(FakeRunService):
+    def create_run(
+        self,
+        *,
+        promotion_id: str,
+        request: RunCreateRequest,
+    ) -> RunCreateResponse:
+        normalized = normalize_explicit_segment_ids(request.segment_ids)
+        normalized_request = request.model_copy(
+            update={
+                "segment_ids": list(normalized) if normalized is not None else None
+            }
+        )
+        return super().create_run(
+            promotion_id=promotion_id,
+            request=normalized_request,
         )
 
 
@@ -359,6 +422,8 @@ class RecordingCursor:
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
+        if "insert into promotion_runs" in sql:
+            return {"promotion_run_id": "prun_inserted"}
         if "from promotions" in sql:
             return promotion_row()
         if "from promotion_analyses" in sql:

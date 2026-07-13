@@ -22,6 +22,7 @@ from app.analysis.service import (
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
+    _bounded_next_loop_lineage_id,
 )
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
@@ -480,6 +481,27 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
                 candidate_user_ids=[],
             )
     ]
+
+
+def test_next_loop_analysis_id_separates_and_bounds_source_lineage() -> None:
+    common = {
+        "prefix": "analysis",
+        "promotion_id": "promo_" + ("long_hotel_promotion_" * 10),
+        "loop_count": 2,
+    }
+
+    first = _bounded_next_loop_lineage_id(
+        **common,
+        source_promotion_run_id="prun_scope_a",
+    )
+    second = _bounded_next_loop_lineage_id(
+        **common,
+        source_promotion_run_id="prun_scope_b",
+    )
+
+    assert first != second
+    assert len(first) <= 100
+    assert len(second) <= 100
 
 
 def test_service_analyzes_requested_segments_without_refreshing_suggestions() -> None:

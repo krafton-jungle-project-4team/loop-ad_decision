@@ -82,19 +82,13 @@ class RunCreateRequest(BaseModel):
 
     analysis_id: str | None = Field(default=None, min_length=1)
     generation_id: str | None = Field(default=None, min_length=1)
-    segment_ids: list[str] | None = Field(default=None, min_length=1)
+    segment_ids: list[str] | None = None
     loop_count: int = Field(default=1, ge=1)
     next_loop_preparation_id: str | None = Field(default=None, min_length=1)
 
     @field_validator("segment_ids")
     @classmethod
     def validate_segment_ids(cls, segment_ids: list[str] | None) -> list[str] | None:
-        if segment_ids is None:
-            return None
-        if any(not segment_id for segment_id in segment_ids):
-            raise ValueError("segment_ids must not contain blank values")
-        if len(segment_ids) != len(set(segment_ids)):
-            raise ValueError("segment_ids must not contain duplicates")
         return segment_ids
 
 
@@ -109,6 +103,7 @@ class AdExperimentCreateResponse(BaseModel):
     channel: Channel
     loop_count: int = Field(ge=1)
     status: AdExperimentStatus
+    is_fallback: bool
 
 
 class RunCreateResponse(BaseModel):
@@ -123,6 +118,7 @@ class RunCreateResponse(BaseModel):
     loop_count: int = Field(ge=1)
     status: PromotionRunStatus
     goal_snapshot_json: dict[str, Any]
+    segment_ids: list[str]
     ad_experiments: list[AdExperimentCreateResponse]
 
 
@@ -255,6 +251,7 @@ class NextLoopResponse(BaseModel):
     next_promotion_run_id: str | None = None
     promotion_id: str = Field(min_length=1)
     loop_count: int = Field(ge=1)
+    segment_ids: list[str]
     next_analysis_id: str | None = None
     next_generation_id: str | None = None
     pending_content_ids: list[str] = Field(default_factory=list)

@@ -363,6 +363,7 @@ class NextLoopService:
         generation_gateway: NextLoopGenerationGateway,
         run_creator: PromotionRunCreator,
         manual_prepare_enabled: bool = False,
+        partial_segment_scope_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_run_repository = promotion_run_repository
@@ -375,6 +376,7 @@ class NextLoopService:
         self._generation_gateway = generation_gateway
         self._run_creator = run_creator
         self._manual_prepare_enabled = manual_prepare_enabled
+        self._partial_segment_scope_enabled = partial_segment_scope_enabled
 
     @log_context_scope
     def create_next_loop(
@@ -387,6 +389,10 @@ class NextLoopService:
             if not self._manual_prepare_enabled:
                 raise NextLoopConflictError(
                     "manual next-loop preparation is disabled"
+                )
+            if not self._partial_segment_scope_enabled:
+                raise NextLoopConflictError(
+                    "partial segment scope is disabled until Dashboard scope lineage is ready"
                 )
             return self._prepare_manual_next_loop(
                 promotion_run_id=promotion_run_id,
@@ -417,9 +423,11 @@ class NextLoopService:
             }
         )
         log.info("promotion_run_loaded", {"promotionRun": previous_run})
-        failed_segment_ids = _deduplicate_or_raise(
-            request.failed_segment_ids,
-            "failed_segment_ids",
+        failed_segment_ids = sorted(
+            _deduplicate_or_raise(
+                request.failed_segment_ids,
+                "failed_segment_ids",
+            )
         )
         failed_ad_experiment_ids = _deduplicate_or_raise(
             request.failed_ad_experiment_ids,
@@ -431,6 +439,11 @@ class NextLoopService:
             log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
 
+        if not self._partial_segment_scope_enabled:
+            raise NextLoopConflictError(
+                "partial segment scope is disabled until Dashboard scope lineage is ready"
+            )
+
         promotion = self._promotion_repository.get_by_id(previous_run.promotion_id)
         if promotion is None:
             log.warn("promotion_not_found", {"promotionId": previous_run.promotion_id})
@@ -441,15 +454,6 @@ class NextLoopService:
         if next_loop_count > promotion.max_loop_count:
             log.warn("promotion_loop_limit_exceeded", {"loopCount": next_loop_count, "maxLoopCount": promotion.max_loop_count})
             raise NextLoopValidationError("promotion max_loop_count exceeded")
-        if self._promotion_run_repository.exists_for_promotion_loop(
-            promotion_id=previous_run.promotion_id,
-            loop_count=next_loop_count,
-        ):
-            log.warn("promotion_run_conflict", {"promotionId": previous_run.promotion_id, "loopCount": next_loop_count})
-            raise NextLoopConflictError(
-                "promotion_run already exists for next loop_count"
-            )
-
         experiments = self._ad_experiment_repository.list_by_run(
             previous_run.promotion_run_id,
         )
@@ -459,6 +463,10 @@ class NextLoopService:
                 "previous promotion_run must have ad experiments"
             )
         log.info("ad_experiments_loaded", {"adExperimentCount": len(experiments)})
+        if not set(failed_segment_ids).issubset(set(previous_run.segment_scope_json)):
+            raise NextLoopValidationError(
+                "failed_segment_ids must stay within the previous promotion_run scope"
+            )
         _validate_failed_ids(
             failed_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
@@ -513,6 +521,7 @@ class NextLoopService:
                 request=RunCreateRequest(
                     analysis_id=analysis_result.analysis_id,
                     generation_id=generation_result.generation_id,
+                    segment_ids=failed_segment_ids,
                     loop_count=next_loop_count,
                 ),
             )
@@ -538,6 +547,7 @@ class NextLoopService:
             next_promotion_run_id=run_result.promotion_run_id,
             promotion_id=run_result.promotion_id,
             loop_count=run_result.loop_count,
+            segment_ids=run_result.segment_ids,
             next_analysis_id=run_result.analysis_id,
             next_generation_id=run_result.generation_id,
             next_ad_experiments=run_result.ad_experiments,
@@ -567,6 +577,12 @@ class NextLoopService:
             )
 
         previous_run = self._get_previous_run(promotion_run_id)
+        if not set(failed_segment_ids).issubset(
+            set(previous_run.segment_scope_json)
+        ):
+            raise NextLoopValidationError(
+                "failed_segment_ids must stay within the previous promotion_run scope"
+            )
         promotion = self._promotion_repository.get_by_id(previous_run.promotion_id)
         if promotion is None:
             raise NextLoopValidationError(
@@ -575,14 +591,6 @@ class NextLoopService:
         next_loop_count = previous_run.loop_count + 1
         if next_loop_count > promotion.max_loop_count:
             raise NextLoopValidationError("promotion max_loop_count exceeded")
-        if self._promotion_run_repository.exists_for_promotion_loop(
-            promotion_id=previous_run.promotion_id,
-            loop_count=next_loop_count,
-        ):
-            raise NextLoopConflictError(
-                "promotion_run already exists for next loop_count"
-            )
-
         experiments = self._ad_experiment_repository.list_by_run(
             previous_run.promotion_run_id
         )
@@ -773,6 +781,7 @@ def _no_op_response(run: PromotionRunRecord) -> NextLoopResponse:
         next_promotion_run_id=None,
         promotion_id=run.promotion_id,
         loop_count=run.loop_count,
+        segment_ids=list(run.segment_scope_json),
         next_analysis_id=None,
         next_generation_id=None,
         next_ad_experiments=[],
@@ -959,6 +968,7 @@ def _manual_preparation_response(
         next_promotion_run_id=None,
         promotion_id=previous_run.promotion_id,
         loop_count=loop_count,
+        segment_ids=list(preparation.failed_segment_ids_json),
         next_analysis_id=preparation.analysis_id,
         next_generation_id=preparation.generation_id,
         pending_content_ids=list(pending_content_ids),

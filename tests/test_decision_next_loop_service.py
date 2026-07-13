@@ -55,6 +55,7 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
     assert response.previous_promotion_run_id == "prun_banner_001_loop_1"
     assert response.next_promotion_run_id == "prun_banner_001_loop_2"
     assert response.loop_count == 2
+    assert response.segment_ids == ["seg_luxury"]
     assert response.next_analysis_id == "analysis_next_001"
     assert response.next_generation_id == "generation_next_001"
     assert [experiment.segment_id for experiment in response.next_ad_experiments] == [
@@ -73,7 +74,13 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
         )
     ]
     assert repos.run_creator.calls == [
-        ("promo_banner_001", "analysis_next_001", "generation_next_001", 2)
+        (
+            "promo_banner_001",
+            "analysis_next_001",
+            "generation_next_001",
+            ("seg_luxury",),
+            2,
+        )
     ]
     assert repos.generation_gateway.calls == [
         (
@@ -124,9 +131,28 @@ def test_next_loop_noops_when_failed_ids_are_empty() -> None:
 
     assert "status" not in response.model_dump()
     assert response.next_promotion_run_id is None
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert response.next_ad_experiments == []
     assert repos.analysis_gateway.calls == []
     assert repos.generation_gateway.calls == []
+
+
+def test_next_loop_rejects_partial_scope_before_gateway_writes_when_flag_is_off() -> None:
+    repos = FakeNextLoopRepos()
+    service = make_service(repos, partial_segment_scope_enabled=False)
+
+    with pytest.raises(NextLoopConflictError, match="scope is disabled"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=NextLoopRequest(
+                failed_segment_ids=["seg_luxury"],
+                failed_ad_experiment_ids=["adexp_luxury_001"],
+            ),
+        )
+
+    assert repos.analysis_gateway.calls == []
+    assert repos.generation_gateway.calls == []
+    assert repos.run_creator.calls == []
 
 
 @pytest.mark.parametrize(
@@ -206,11 +232,13 @@ def test_next_loop_rejects_max_loop_count_exceeded() -> None:
         )
 
 
-def test_next_loop_rejects_existing_next_loop() -> None:
-    repos = FakeNextLoopRepos(existing_next_loop=True)
+def test_next_loop_rejects_failed_segment_outside_stored_run_scope() -> None:
+    repos = FakeNextLoopRepos(
+        run=promotion_run_record(segment_scope_json=["seg_family_trip"]),
+    )
     service = make_service(repos)
 
-    with pytest.raises(NextLoopConflictError, match="already exists"):
+    with pytest.raises(NextLoopValidationError, match="previous promotion_run scope"):
         service.create_next_loop(
             promotion_run_id="prun_banner_001_loop_1",
             request=NextLoopRequest(
@@ -330,6 +358,7 @@ def test_next_loop_prepares_focus_generation_for_multiple_failed_segments() -> N
 
     assert "status" not in response.model_dump()
     assert response.next_promotion_run_id == "prun_banner_001_loop_2"
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert {
         experiment.segment_id for experiment in response.next_ad_experiments
     } == {"seg_family_trip", "seg_luxury"}
@@ -354,6 +383,44 @@ def test_manual_next_loop_flag_off_rejects_before_manual_dependencies() -> None:
     service = make_service(repos)
 
     with pytest.raises(NextLoopConflictError, match="disabled"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.calls == []
+    assert repos.analysis_gateway.calls == []
+    assert repos.generation_gateway.manual_calls == []
+    assert repos.run_creator.calls == []
+
+
+def test_manual_next_loop_partial_scope_flag_off_rejects_before_dependencies() -> None:
+    repos = FakeNextLoopRepos()
+    service = make_service(
+        repos,
+        manual_enabled=True,
+        partial_segment_scope_enabled=False,
+    )
+
+    with pytest.raises(NextLoopConflictError, match="scope is disabled"):
+        service.create_next_loop(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=manual_request(),
+        )
+
+    assert repos.preparations.calls == []
+    assert repos.analysis_gateway.calls == []
+    assert repos.generation_gateway.manual_calls == []
+    assert repos.run_creator.calls == []
+
+
+def test_manual_next_loop_rejects_segment_outside_source_scope() -> None:
+    repos = FakeNextLoopRepos(
+        run=promotion_run_record(segment_scope_json=["seg_family_trip"]),
+    )
+    service = make_service(repos, manual_enabled=True)
+
+    with pytest.raises(NextLoopValidationError, match="previous promotion_run scope"):
         service.create_next_loop(
             promotion_run_id="prun_banner_001_loop_1",
             request=manual_request(),
@@ -406,6 +473,7 @@ def test_manual_next_loop_stores_multi_candidate_preparation_without_run() -> No
     assert response.status.value == "awaiting_content_approval"
     assert response.content_approval_required is True
     assert response.next_promotion_run_id is None
+    assert response.segment_ids == ["seg_family_trip", "seg_luxury"]
     assert response.next_ad_experiments == []
     assert response.pending_content_ids == [
         "content_seg_family_trip_1",
@@ -612,6 +680,7 @@ def make_service(
     repos: "FakeNextLoopRepos",
     *,
     manual_enabled: bool = False,
+    partial_segment_scope_enabled: bool = True,
 ) -> NextLoopService:
     return NextLoopService(
         promotion_repository=repos.promotions,
@@ -625,6 +694,7 @@ def make_service(
         generation_gateway=repos.generation_gateway,
         run_creator=repos.run_creator,
         manual_prepare_enabled=manual_enabled,
+        partial_segment_scope_enabled=partial_segment_scope_enabled,
     )
 
 
@@ -636,7 +706,6 @@ class FakeNextLoopRepos:
         promotion: PromotionRecord | None = None,
         experiments: list[AdExperimentRecord] | None = None,
         evaluations: list[PromotionEvaluationRecord] | None = None,
-        existing_next_loop: bool = False,
         analysis_gateway: "FakeAnalysisGateway" | None = None,
         generation_gateway: "FakeGenerationGateway" | None = None,
         run_creator: "FakeRunCreator" | None = None,
@@ -648,7 +717,6 @@ class FakeNextLoopRepos:
         self.promotions = FakePromotionRepository(promotion or promotion_record())
         self.runs = FakePromotionRunRepository(
             run if run is not None else promotion_run_record(),
-            existing_next_loop=existing_next_loop,
         )
         self.experiments = FakeAdExperimentRepository(
             experiments if experiments is not None else default_experiments()
@@ -685,22 +753,15 @@ class FakePromotionRunRepository:
     def __init__(
         self,
         run: PromotionRunRecord | None,
-        *,
-        existing_next_loop: bool = False,
     ) -> None:
         self.run = run
-        self.existing_next_loop = existing_next_loop
 
     def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
         if self.run is None or self.run.promotion_run_id != promotion_run_id:
             return None
         return self.run
 
-    def exists_for_promotion_loop(self, *, promotion_id: str, loop_count: int) -> bool:
-        _ = promotion_id, loop_count
-        return self.existing_next_loop
-
-    def insert(self, _run: object) -> None:
+    def insert_if_absent(self, _run: object) -> bool:
         raise AssertionError("insert should be called through run creator")
 
     def update_status(self, *, promotion_run_id: str, status: str) -> None:
@@ -959,7 +1020,9 @@ class FakeGenerationGateway:
 class FakeRunCreator:
     def __init__(self, created_segment_ids: list[str] | None = None) -> None:
         self.created_segment_ids = created_segment_ids or ["seg_luxury"]
-        self.calls: list[tuple[str, str | None, str | None, int]] = []
+        self.calls: list[
+            tuple[str, str | None, str | None, tuple[str, ...], int]
+        ] = []
 
     def create_run(
         self,
@@ -972,6 +1035,7 @@ class FakeRunCreator:
                 promotion_id,
                 request.analysis_id,
                 request.generation_id,
+                tuple(request.segment_ids or []),
                 request.loop_count,
             )
         )
@@ -990,6 +1054,7 @@ class FakeRunCreator:
                 "goal_basis": "all_segments",
                 "min_sample_size": 10,
             },
+            segment_ids=list(request.segment_ids or []),
             ad_experiments=[
                 AdExperimentCreateResponse(
                     ad_experiment_id=f"adexp_{segment_id}_loop_{request.loop_count}",
@@ -1000,6 +1065,7 @@ class FakeRunCreator:
                     channel=Channel.ONSITE_BANNER,
                     loop_count=request.loop_count,
                     status=AdExperimentStatus.PLANNED,
+                    is_fallback=segment_id == FALLBACK_SEGMENT_ID,
                 )
                 for segment_id in self.created_segment_ids
             ],
@@ -1020,7 +1086,11 @@ def promotion_record(*, max_loop_count: int = 3) -> PromotionRecord:
     )
 
 
-def promotion_run_record(*, loop_count: int = 1) -> PromotionRunRecord:
+def promotion_run_record(
+    *,
+    loop_count: int = 1,
+    segment_scope_json: list[str] | None = None,
+) -> PromotionRunRecord:
     return PromotionRunRecord(
         promotion_run_id=f"prun_banner_001_loop_{loop_count}",
         project_id="hotel-client-a",
@@ -1036,6 +1106,12 @@ def promotion_run_record(*, loop_count: int = 1) -> PromotionRunRecord:
             "goal_basis": "all_segments",
             "min_sample_size": 10,
         },
+        segment_scope_json=(
+            segment_scope_json
+            if segment_scope_json is not None
+            else ["seg_family_trip", "seg_luxury"]
+        ),
+        segment_scope_fingerprint="a" * 64,
     )
 
 

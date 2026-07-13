@@ -482,6 +482,8 @@ def promotion_run_row() -> dict[str, object]:
         "loop_count": 1,
         "status": "planned",
         "goal_snapshot_json": {"min_sample_size": 1},
+        "segment_scope_json": ["seg_family_trip"],
+        "segment_scope_fingerprint": "a" * 64,
     }
 
 

@@ -327,6 +327,8 @@ def default_promotion_run_row() -> dict[str, object]:
             "goal_target_value": "0.300000",
             "min_sample_size": 10,
         },
+        "segment_scope_json": ["seg_family_trip"],
+        "segment_scope_fingerprint": "a" * 64,
     }
 
 

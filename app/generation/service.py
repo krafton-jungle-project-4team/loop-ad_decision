@@ -264,10 +264,11 @@ class GenerationService:
             content_option_count=request.content_option_count,
             operator_instruction=request.operator_instruction,
         )
-        generation_id = _generation_id_from_promotion(
-            request.promotion_id,
+        generation_id = _next_loop_generation_id(
+            promotion_id=request.promotion_id,
             loop_count=request.loop_count,
             attempt_no=request.attempt_no,
+            source_promotion_run_id=request.source_promotion_run_id,
         )
         log.assign_context({"generationId": generation_id})
         prompt_inputs = self._build_focus_prompt_inputs(
@@ -678,6 +679,27 @@ def _generation_id_from_promotion(
     return generation_id
 
 
+def _next_loop_generation_id(
+    *,
+    promotion_id: str,
+    loop_count: int,
+    source_promotion_run_id: str,
+    attempt_no: int | None = None,
+) -> str:
+    promotion_slug = promotion_id.removeprefix("promo_")
+    safe_slug = re.sub(r"[^a-zA-Z0-9_]+", "_", promotion_slug).strip("_")
+    lineage_digest = hashlib.sha256(
+        source_promotion_run_id.encode("utf-8")
+    ).hexdigest()[:12]
+    suffix = f"_loop_{loop_count}_{lineage_digest}"
+    if attempt_no is not None:
+        suffix = f"{suffix}_attempt_{attempt_no}"
+    prefix = "generation"
+    max_slug_length = MAX_CONTENT_IDENTIFIER_LENGTH - len(prefix) - len(suffix) - 1
+    safe_slug = safe_slug[:max_slug_length].rstrip("_") or "content"
+    return f"{prefix}_{safe_slug}{suffix}"
+
+
 def _general_generation_attempt_slug(
     *,
     generation_id: str,
@@ -689,7 +711,7 @@ def _general_generation_attempt_slug(
         return None
     attempt_slug = generation_id.removeprefix(prefix)
     if re.fullmatch(
-        r"(?:run_[2-9][0-9]*|loop_[2-9][0-9]*(?:_attempt_[1-9][0-9]*)?)",
+        r"(?:run_[2-9][0-9]*|loop_[2-9][0-9]*(?:(?:_[0-9a-f]{12})?(?:_attempt_[1-9][0-9]*)?)?)",
         attempt_slug,
     ):
         return attempt_slug
