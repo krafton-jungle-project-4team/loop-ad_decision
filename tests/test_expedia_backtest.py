@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.expedia_backtest import (
+from offline_evaluation.expedia_backtest import (
     ClickHouseExpediaBacktestRepository,
     EXPEDIA_TRAIN_COLUMNS,
     ExpediaBacktestConfig,

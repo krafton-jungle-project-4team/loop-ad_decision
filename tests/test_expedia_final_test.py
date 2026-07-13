@@ -5,14 +5,14 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.analysis.expedia_backtest import (
+from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
     ExpediaBacktestScenario,
     ExpediaFutureBookingUsers,
     ExpediaSourceStats,
 )
-from app.analysis.expedia_final_test import (
+from offline_evaluation.expedia_final_test import (
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,
     reserve_sealed_final_test_execution,

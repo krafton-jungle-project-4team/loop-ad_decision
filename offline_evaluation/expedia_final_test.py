@@ -7,7 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from app.analysis.expedia_backtest import (
+from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
     ExpediaBacktestRepository,

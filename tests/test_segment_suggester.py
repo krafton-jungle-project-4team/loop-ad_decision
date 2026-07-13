@@ -342,11 +342,13 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
                 "target_repeat_1",
                 hotel_search_count=4,
                 destination_match_count=3,
+                destination_values=("제주 제주",),
             ),
             raw_signal(
                 "target_repeat_2",
                 hotel_search_count=3,
                 destination_match_count=2,
+                destination_values=("jeju 제주 제주",),
             ),
             raw_signal(
                 "general_1",
