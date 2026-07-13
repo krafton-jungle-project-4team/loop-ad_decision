@@ -36,6 +36,9 @@ requests return 409 before any lifecycle writes. Enable it only after the Data
 Source Contract expand/backfill/finalize rollout and the Dashboard exact
 scope/lineage reader are deployed.
 
+Dashboard integration requirements and the versioned response fixture are in
+[`docs/dashboard-segment-experiment-integration-fix-spec.md`](docs/dashboard-segment-experiment-integration-fix-spec.md).
+
 Automatic next-loop analysis and generation IDs include a bounded digest of the
 source promotion run. Different source scopes can therefore advance to the same
 loop count without colliding in their upstream lifecycle rows or generated
