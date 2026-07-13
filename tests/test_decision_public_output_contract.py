@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -12,6 +13,7 @@ from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
 from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.decision.router import _manual_next_loop_enabled
 from app.decision.schemas import (
     AdExperimentCreateResponse,
     NextLoopPreparationStatus,
@@ -190,11 +192,77 @@ def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
         "next_loop_preparation_id",
         "pending_content_ids",
     } <= response_schema["properties"].keys()
+    assert {
+        "status",
+        "content_approval_required",
+        "next_loop_preparation_id",
+        "pending_content_ids",
+    }.isdisjoint(response_schema.get("required", []))
     assert set(preparation_status_schema["enum"]) == {
         "awaiting_content_approval",
         "activated",
         "rejected",
     }
+
+
+def test_automatic_next_loop_serialization_keeps_legacy_wire_shape() -> None:
+    response = NextLoopResponse(
+        previous_promotion_run_id="prun_banner_001_loop_1",
+        next_promotion_run_id="prun_banner_001_loop_2",
+        promotion_id="promo_banner_001",
+        loop_count=2,
+        segment_ids=["seg_luxury"],
+        next_analysis_id="analysis_banner_002",
+        next_generation_id="generation_banner_002",
+        next_ad_experiments=[],
+    )
+
+    assert set(response.model_dump(mode="json")) == {
+        "previous_promotion_run_id",
+        "next_promotion_run_id",
+        "promotion_id",
+        "loop_count",
+        "segment_ids",
+        "next_analysis_id",
+        "next_generation_id",
+        "next_ad_experiments",
+    }
+
+
+def test_manual_next_loop_switch_is_off_until_explicitly_enabled() -> None:
+    app = create_app(settings=load_settings(valid_env()))
+    request = SimpleNamespace(app=app)
+
+    assert _manual_next_loop_enabled(request) is False
+
+    app.state.manual_next_loop_enabled = True
+    assert _manual_next_loop_enabled(request) is True
+
+
+def test_decision_routes_exclude_dashboard_reads_and_hot_paths() -> None:
+    app = create_app(settings=load_settings(valid_env()))
+    routes = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+
+    assert not {
+        path
+        for method, path in routes
+        if method == "GET" and path.startswith("/decision/v1")
+    }
+    assert ("POST", "/decision/v1/segments/query-preview") not in routes
+    assert ("POST", "/decision/v1/segments") not in routes
+    assert not {path for _method, path in routes if "/chatkit/" in path}
+    assert (
+        "POST",
+        "/decision/v1/promotion-runs/{promotion_run_id}/segment-match",
+    ) not in routes
+    assert (
+        "GET",
+        "/decision/v1/promotion-runs/{promotion_run_id}/active-contents",
+    ) not in routes
 
 
 def test_run_response_exposes_segment_scope_and_fallback_marker() -> None:
