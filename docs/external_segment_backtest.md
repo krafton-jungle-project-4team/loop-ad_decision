@@ -1,8 +1,20 @@
 # 외부 데이터셋 세그먼트 추천 검증
 
-이 도구는 Decision API가 사용하는 `generate_raw_event_segment_definitions`를 외부 데이터의 관찰 신호로 실행하고, 감춰 둔 실제 결과에서 후보별 성과를 측정한다. 데이터셋마다 관측 가능한 사실이 다르므로 결과를 하나의 종합 점수로 합치지 않는다.
+이 도구는 운영에서 사용하는 세그먼트 후보 생성·랭킹 로직을 외부 데이터의 관찰 신호로 실행하고, 감춰 둔 실제 결과에서 후보별 성과를 측정한다.
 
-## 설치
+외부 데이터는 Expedia 기반 예상 예약률 모델을 학습하거나 보정하는 데 사용하지 않는다. 외부 결과는 추천 후보가 다른 데이터에서도 baseline보다 좋은 사용자를 선별하는지, Rank가 의미 있게 구분되는지 진단하는 용도다.
+
+## 데이터 분할 원칙
+
+| 데이터 | 반복 가능한 개발 진단 | 한 번만 여는 봉인 평가 |
+| --- | --- | --- |
+| Booking.com | `train_set.csv`에서 여행별 마지막 도시를 숨김 | 공식 `test_set.csv + ground_truth.csv` |
+| Airbnb | 사용자 ID 해시 `mod 5`의 remainder `0,1,2,3` | 사용자 ID 해시 `mod 5`의 remainder `4` |
+| Synerise | remainder `0,1,2,3`, cutoff `2022-09-29`, `2022-10-13` | remainder `4`, cutoff `2022-11-10` |
+
+Airbnb는 절대 행동 시각이 없으므로 정적 label 기반 사용자 holdout이다. Synerise는 숙박이 아닌 리테일 데이터이므로 후보 생성·랭킹 구조의 교차 도메인 진단일 뿐 숙박 성능의 직접 근거가 아니다.
+
+## 설치와 원본 경로
 
 Parquet 기반 Synerise adapter는 개발 의존성의 `pyarrow`를 사용한다.
 
@@ -19,79 +31,119 @@ artifacts/external-datasets/
 └── synerise_dataset/
 ```
 
-## 실행
+## 1. 개발 진단
+
+개발 중에는 `development`만 반복 실행한다. 이 결과를 보고 일반적인 추천 규칙을 개선할 수 있으므로 최종 성능 수치가 아니라 개발 진단 데이터로 취급한다.
 
 ### Booking.com
 
 ```bash
-.venv/bin/python scripts/backtest_external_segments.py booking-com \
+.venv/bin/python scripts/backtest_external_segments.py development booking-com \
   --profile-pool-limit 1000 \
-  --max-scenarios 3 \
-  --sample-modulo 1
+  --max-scenarios 3
 ```
 
-`train_set.csv`에서 여행별 마지막 예약 도시를 outcome으로 숨기고 이전 도시만 profile로 만든다. 시나리오 목적지는 이전 도시 이력에서만 선택한다. 기본 validation은 `test_set.csv`와 `ground_truth.csv`를 읽지 않는다.
-
-이 결과는 다음 도시 정합성과 목적지 반복 관심을 검증한다. 검색 후 예약 전환율이나 미예약 사용자의 반응은 검증하지 못한다.
+`train_set.csv`의 각 여행에서 마지막 도시를 outcome으로 숨기고 이전 도시만 profile로 만든다. 공식 `test_set.csv`와 `ground_truth.csv`는 읽지 않는다.
 
 ### Airbnb
 
 ```bash
-.venv/bin/python scripts/backtest_external_segments.py airbnb \
-  --profile-pool-limit 1000 \
-  --sample-modulo 1
+.venv/bin/python scripts/backtest_external_segments.py development airbnb \
+  --profile-pool-limit 1000
 ```
 
-`sessions.csv.zip`의 검색·클릭·조회 행동으로 profile을 만들고 `country_destination != NDF`를 관측된 첫 예약 outcome으로 사용한다. 결과와 가까운 `booking_request`, `booking_response`, `partner_callback`은 feature에서 제외하고 목적지 label은 profile에 넣지 않는다.
-
-세션 행에 절대 시각이 없으므로 이 결과는 시간 기반 미래 전환율이 아니라 정적 outcome holdout이다.
+검색·클릭·상세 탐색 행동으로 profile을 만들고 `country_destination != NDF`를 관측된 첫 예약 label로 사용한다. 결과와 가까운 booking action과 목적지 label은 feature에서 제외한다.
 
 ### Synerise
 
 ```bash
-.venv/bin/python scripts/backtest_external_segments.py synerise \
+.venv/bin/python scripts/backtest_external_segments.py development synerise \
   --profile-pool-limit 1000 \
   --max-scenarios 3 \
-  --cutoff 2022-11-10T00:00:00Z \
   --lookback-days 90 \
-  --outcome-days 28 \
-  --sample-modulo 1
+  --outcome-days 28
 ```
 
-cutoff 이전의 검색·장바구니 추가·제거·구매만 profile에 사용하고 cutoff 이후 target category 구매를 outcome으로 사용한다. 시나리오 category도 관찰 구간에서만 선택한다.
+기본 실행은 두 development cutoff를 각각 평가한다. cutoff 이전 검색·장바구니 추가·제거·구매만 profile에 사용하고, cutoff 이후 target category 구매를 outcome으로 사용한다.
 
-운영 repository가 최근 활동 사용자부터 profile pool을 구성하는 동작에 맞춰, cutoff 이전 최근 14일 내 활동한 사용자 중에서 결정적으로 표본을 선택한 뒤 해당 사용자의 전체 lookback 이력을 집계한다.
+빠른 smoke test에서 전체 사용자를 쓰려면 `--sample-modulo 1`을 지정할 수 있다. 비교 가능한 기록에는 원본 checksum을 남기며 `--skip-checksum`은 로컬 smoke test에서만 사용한다.
 
-`page_visit`는 약 2억 건이지만 URL과 SKU의 관계가 제공되지 않아 상품 상세 조회로 변환하지 않는다. Synerise 결과는 퍼널 후보 생성과 Rank 구조를 검증하는 교차 도메인 자료이며 숙박 성능과 합산하지 않는다.
+## 2. 외부 최종 평가 봉인
+
+추천 로직과 예상 예약률 모델 수정이 끝난 뒤 PR을 `dev`에 병합한다. 봉인과 최종 실행은 모두 깨끗한 `dev`의 동일 commit에서만 허용된다.
+
+```bash
+git switch dev
+git pull --ff-only origin dev
+
+.venv/bin/python scripts/backtest_external_segments.py seal-final-test booking-com
+.venv/bin/python scripts/backtest_external_segments.py seal-final-test airbnb
+.venv/bin/python scripts/backtest_external_segments.py seal-final-test synerise
+```
+
+봉인 명령은 다음을 manifest에 고정한다.
+
+- 원본 파일 크기와 SHA-256
+- Expedia에서 학습한 모델 파일과 metadata
+- Git commit과 tree
+- profile 크기, 후보 수, 최소 표본 등 실행 설정
+- development/final 사용자·시간 분할
+- 외부 outcome과 모델 정답의 비교 가능성 계약
+- 결과를 보기 전에 정한 통과 기준
+
+봉인 과정은 outcome 파일의 checksum만 계산하며 outcome을 이용해 시나리오나 후보를 고르지 않는다. 기존 manifest는 덮어쓰지 않는다.
+
+명령이 성공하면 다음 두 값이 출력된다.
+
+```text
+manifest=artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json
+confirmation=RUN_EXTERNAL_FINAL_<manifest-id-prefix>
+```
+
+## 3. 봉인 결과 한 번만 열기
+
+아직 최종 결과를 보고 싶지 않다면 이 명령은 실행하지 않는다. `run-final-test`는 결과 label을 실제로 읽기 직전에 실행 마커를 생성하며, 같은 manifest의 두 번째 실행은 차단한다.
+
+```bash
+.venv/bin/python scripts/backtest_external_segments.py run-final-test \
+  --manifest artifacts/external-segment-backtest/sealed/booking-com-final.manifest.json \
+  --confirm RUN_EXTERNAL_FINAL_<manifest-id-prefix>
+```
+
+확인 토큰, 원본 checksum, 모델, Git commit 또는 tree가 봉인 시점과 다르면 실행하지 않는다. 실행 마커가 생성된 뒤 실패해도 결과 집합이 개봉된 것으로 간주하므로 같은 manifest를 재사용하지 않는다.
 
 ## 산출물
 
-기본 출력 경로는 `artifacts/external-segment-backtest/<dataset>/validation-<timestamp>`다.
+개발 진단은 기본적으로 아래 경로에 생성된다.
 
 ```text
-dataset_manifest.json  원본 파일 checksum과 신호별 direct/derived/proxy 계약
-results.csv            Rank별 예상값, 실제값, baseline, lift, 후보 중복도
-summary.json           데이터 계약, 모델 metadata, 집계 지표
-report.md              사람이 읽는 결과와 검증 불가능한 주장
+artifacts/external-segment-backtest/<dataset>/development-<timestamp>/
+├── dataset_manifest.json
+├── results.csv
+├── summary.json
+├── report.md
+└── development_diagnostic_summary.json
 ```
 
-`--skip-checksum`은 빠른 smoke test에서만 사용한다. 비교 가능한 검증 기록에는 원본 checksum을 남긴다.
+Synerise처럼 cutoff가 여러 개면 cutoff별 하위 디렉터리가 생긴다. 봉인 최종 평가는 manifest ID가 포함된 별도 디렉터리에 기록하며 덮어쓸 수 없다.
 
 ## 지표 해석
 
 - `rank_one_beats_baseline_rate`: Rank 1의 실제 outcome rate가 전체 profile baseline보다 높은 시나리오 비율
-- `rank_one_is_best_rate`: 실제 양성 outcome이 있고 후보가 두 개 이상인 시나리오에서 Rank 1이 최고였던 비율
+- `rank_one_is_best_rate`: 실제 양성 outcome이 있고 후보가 둘 이상인 시나리오에서 Rank 1이 최고였던 비율
 - `mean_rank_one_lift_percentage_points`: Rank 1 실제 outcome rate와 baseline의 평균 차이
-- `mean_absolute_prediction_error_percentage_points`: 표시한 예상값과 데이터셋 실제 outcome rate의 평균 절대 차이. outcome 계약이 다른 데이터셋에서는 calibration을 증명하는 값으로 해석하지 않는다.
-- `mean_non_first_rank_overlap`: Rank 2 이후 후보와 앞선 후보 간 최대 사용자 Jaccard overlap의 평균
+- `rank_comparable_scenario_count`: 후보가 둘 이상이고 실제 양성이 있어 Rank 순서를 비교할 수 있는 시나리오 수
+- `mean_non_first_rank_overlap`: Rank 2 이후 후보와 앞선 후보 간 최대 사용자 Jaccard overlap 평균
+- `mean_absolute_prediction_error_percentage_points`: 외부 outcome의 정답 정의가 Expedia 모델과 달라 기본적으로 `N/A`
 
-Booking.com이나 Airbnb처럼 후보가 하나뿐이면 Rank 순서의 정확성은 검증되지 않으며 `rank_one_is_best_rate`는 `N/A`다.
+Booking.com의 다음 도시, Airbnb의 정적 첫 예약, Synerise의 리테일 구매를 Expedia의 향후 목적지 일치 예약률과 직접 비교하면 안 된다. 따라서 외부 봉인 평가의 통과 기준에는 예상값 MAE를 넣지 않고, baseline lift·Rank 비교 가능성·후보 다양성·중복도를 사용한다.
 
 ## 검증 원칙
 
 1. 외부 데이터의 사용자 ID를 Expedia 사용자와 연결하지 않는다.
 2. 존재하지 않는 검색·광고 노출·할인·예약 label을 생성하지 않는다.
 3. proxy 변환은 manifest에 원본 필드와 한계를 남긴다.
-4. 시나리오 선택과 profile 생성에는 outcome 구간을 사용하지 않는다.
-5. 데이터셋별 outcome 의미가 다르므로 성과를 평균내지 않는다.
-6. 이 검증은 관측 데이터 기반 적합성 검증이며 광고의 인과적 증분 효과를 증명하지 않는다.
+4. 시나리오 선택과 profile 생성에는 outcome을 사용하지 않는다.
+5. 데이터셋별 outcome 의미가 다르므로 결과를 하나의 평균 점수로 합치지 않는다.
+6. 외부 결과를 모델 fitting이나 calibration 입력으로 사용하지 않는다.
+7. 이 검증은 관측 데이터 기반 선별력 평가이며 광고의 인과적 증분 효과를 증명하지 않는다.
