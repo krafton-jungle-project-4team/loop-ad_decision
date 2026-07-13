@@ -623,8 +623,59 @@ def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
         "vector_dim": 64,
         "vector_version": "v2",
         "vector_source": "raw_events",
+        "destination_terms": (),
         "limit": 250,
     }
+
+
+def test_raw_event_signals_count_matching_destination_events_before_deduplication() -> None:
+    client = FakeClickHouseClient(
+        rows=[
+            {
+                "project_id": "hotel-client-a",
+                "user_id": "repeat-jeju-user",
+                "event_count": 2,
+                "hotel_search_count": 2,
+                "hotel_click_count": 0,
+                "hotel_detail_view_count": 0,
+                "promotion_impression_count": 0,
+                "promotion_click_count": 0,
+                "campaign_redirect_click_count": 0,
+                "campaign_landing_count": 0,
+                "booking_start_count": 0,
+                "booking_complete_count": 0,
+                "booking_cancel_count": 0,
+                "deal_event_count": 0,
+                "free_cancellation_count": 0,
+                "breakfast_included_count": 0,
+                "price_event_count": 0,
+                "avg_price": 0.0,
+                "destination_values": ["제주 제주"],
+                "checkin_dates": [],
+                "hotel_market_values": [],
+                "hotel_cluster_values": [],
+                "age_group_values": [],
+                "gender_values": [],
+                "preferred_category_values": [],
+                "destination_match_count": 2,
+            }
+        ]
+    )
+    repo = UserBehaviorVectorRepository(client)
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        destination_terms=(" JeJu ", "제주"),
+    )
+
+    assert records[0].destination_values == ("제주 제주",)
+    assert records[0].destination_match_count == 2
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "countif( arrayexists(" in sql
+    assert "positioncaseinsensitiveutf8(" in sql
+    assert "{destination_terms:array(string)}" in sql
+    assert call.params["destination_terms"] == ("jeju", "제주")
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:
