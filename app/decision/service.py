@@ -77,7 +77,6 @@ class PromotionRunService:
         promotion_evaluation_repository: PromotionEvaluationWriter,
         next_loop_preparation_repository: NextLoopPreparationWriter,
         manual_activation_enabled: bool = False,
-        partial_segment_scope_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_analysis_repository = promotion_analysis_repository
@@ -89,7 +88,6 @@ class PromotionRunService:
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._next_loop_preparation_repository = next_loop_preparation_repository
         self._manual_activation_enabled = manual_activation_enabled
-        self._partial_segment_scope_enabled = partial_segment_scope_enabled
 
     @log_context_scope
     def create_run(
@@ -102,16 +100,6 @@ class PromotionRunService:
         log.assign_context({"promotionId": promotion_id})
         log.info("started", {"promotionId": promotion_id, "request": request})
         requested_segment_ids = normalize_explicit_segment_ids(request.segment_ids)
-        if (
-            (
-                requested_segment_ids is not None
-                or request.next_loop_preparation_id is not None
-            )
-            and not self._partial_segment_scope_enabled
-        ):
-            raise RunConflictError(
-                "explicit segment scope is disabled until Dashboard scope lineage is ready"
-            )
         analysis_id = request.analysis_id
         generation_id = request.generation_id
         loop_count = request.loop_count

@@ -8,10 +8,9 @@ Decision 연동 기준: PR #230 scope 멱등성과 `dev` PR #232 preparation lin
 
 대시보드의 run 생성 요청 JSON은 현재 정상이다. `segment_ids: [segmentId]`를 포함한 객체를 `JSON.stringify`하고 `Content-Type: application/json`으로 전송하고 있으므로, PostgreSQL의 `Token "("` JSONB 500을 대시보드 직렬화 코드로 고치면 안 된다.
 
-> **운영 확인:** 새 Dashboard가 `segment_ids`를 보내는데 Decision의
-> `LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED`가 `false`이면 Decision은
-> lifecycle write 전에 의도적으로 `409`를 반환한다. 이는 JSON 직렬화 오류가
-> 아니다. Dashboard와 Decision의 활성화 시점을 반드시 아래 운영 계약에 맞춘다.
+> **운영 확인:** 새 Dashboard와 Decision은 `segment_ids` 기반 부분 scope를
+> 항상 사용한다. 대상 DB에 segment scope finalize가 적용되지 않았다면 배포를
+> 진행하지 않는다. 이는 JSON 직렬화 오류와 별개의 배포 전제조건이다.
 
 대시보드에 실제로 필요한 수정은 Decision이 함께 생성하는 **fallback 광고 실험을 응답 파싱 과정에서 보존하고, fallback 배정이 발생했을 때 선택 세그먼트 실험과 함께 실행 상태로 전환하는 것**이다.
 
@@ -247,26 +246,11 @@ npm run typecheck
 
 두 명령이 모두 통과해야 한다.
 
-## 6. Feature flag 운영 계약
+## 6. 부분 scope 배포 계약
 
-`LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED`의 기본값은 `false`다. 환경 변수가 없거나 `false`인 상태를 부분 scope 기능이 활성화된 것으로 간주하면 안 된다.
-
-### 6.1 OFF 상태의 동작
-
-| 요청 | Decision 동작 | 운영 판정 |
-| --- | --- | --- |
-| `segment_ids`를 포함한 신규 run | lifecycle write 전에 `409` | 예상된 feature gate 차단이며 JSON 오류가 아님 |
-| failed-only 자동 next-loop | analysis/generation/run write 전에 `409` | 예상된 feature gate 차단 |
-| 수동 preparation 생성·활성화 | preparation/run write 전에 `409` | 예상된 feature gate 차단 |
-| `segment_ids`를 생략한 run 요청 | 전체 generation scope로 처리 | 하위 호환 동작이며 부분 scope 실행이 아님 |
-
-따라서 새 Dashboard를 먼저 배포해 모든 신규 요청에 `segment_ids`가 포함됐는데 Decision flag가 OFF이면, JSON 형식이 정상이어도 실행은 계속 `409`로 실패한다. 이 상태를 해결하기 위해 Dashboard의 JSON 직렬화를 다시 변경하지 않는다.
-
-flag 차단 응답은 주로 `explicit segment scope is disabled until Dashboard scope lineage is ready` 또는 `partial segment scope is disabled until Dashboard scope lineage is ready` 메시지를 가진다. 운영 로그와 응답에서 이 문구를 먼저 확인한다.
-
-### 6.2 ON 전 필수 게이트
-
-다음 조건이 모두 충족되기 전에는 dev와 production 어디에서도 flag를 켜지 않는다.
+Decision은 명시적 `segment_ids` run과 failed-only 자동 next-loop를 항상
+활성화한다. 다음 조건이 모두 충족되기 전에는 이 Decision 버전을 dev 또는
+production에 배포하지 않는다.
 
 1. Data Contract `expand → backfill → finalize`가 순서대로 완료됐다.
 2. 기존 `uq_promotion_runs_loop`가 제거되고 전체 composite unique가 적용됐다.
@@ -276,42 +260,42 @@ flag 차단 응답은 주로 `explicit segment scope is disabled until Dashboard
 6. Dashboard가 next-loop의 복수 scope와 동일 scope `200` 재사용을 처리한다.
 7. Dashboard/Advertisement 계약 테스트와 dispatch 멱등 재시도 테스트가 통과했다.
 
-`finalize` 전에 flag를 켜면 기존 `(promotion_id, loop_count)` unique 때문에 같은 loop의 다른 scope가 충돌할 수 있다. Dashboard가 `segment_ids`를 실수로 생략하면 Decision은 하위 호환 규칙에 따라 전체 generation scope run을 만들 수 있으므로, Dashboard 요청 스키마에서 누락을 차단해야 한다.
+`finalize` 전에 이 Decision 버전을 배포하면 기존 `(promotion_id, loop_count)`
+unique 때문에 같은 loop의 다른 scope가 충돌할 수 있다. Dashboard가
+`segment_ids`를 실수로 생략하면 Decision은 하위 호환 규칙에 따라 전체
+generation scope run을 만들 수 있으므로, Dashboard 요청 스키마에서 누락을
+차단해야 한다.
 
-### 6.3 ECS task 일관성
+### 6.1 ECS task 일관성
 
-같은 ECS service의 모든 task는 다음 두 값이 동일해야 한다.
+같은 ECS service의 모든 task는 동일한 Decision image/revision을 사용해야 한다.
+새 task가 모두 healthy가 되고 이전 task가 모두 종료됐는지 확인한 뒤 smoke
+test를 시작한다.
 
-- 배포된 Decision image/revision
-- `LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED`
-
-일부 task만 ON이면 같은 요청이 라우팅된 task에 따라 `200` 또는 `409`가 되는 간헐적 장애가 발생한다. rolling deployment 중에도 구·신 task의 flag를 다르게 두지 않으며, flag 변경은 service 전체에 새 task definition을 배포해 일괄 반영한다. 새 task가 모두 healthy가 되고 이전 task가 모두 종료됐는지 확인한 뒤 smoke test를 시작한다.
-
-### 6.4 활성화 순서
+### 6.2 배포 순서
 
 아래 순서를 바꾸지 않는다.
 
 ```text
 Data Contract expand
-→ Decision dual-write 배포, 모든 task flag OFF
 → 기존 run backfill 및 무결성 검증
 → finalize 및 composite unique 적용
 → Dashboard의 segment_ids·is_fallback 파싱 반영
-→ 모든 dev task에서 flag ON
+→ 동일한 Decision image/revision을 모든 dev task에 배포
 → dev smoke test
 → Dashboard/Advertisement 연동 및 dispatch 재시도 확인
-→ 운영 전체 task에서 flag 일괄 ON
+→ 운영 전체 task에 동일 revision 배포
 ```
 
-dev smoke test가 실패하면 일부 task만 OFF로 되돌리지 않는다. dev service 전체를 동일한 flag 값으로 복구하고, 실패한 gate를 수정한 뒤 처음부터 task 일관성을 다시 확인한다. 운영 ON은 dev 증빙과 Dashboard 담당자의 반영 확인이 모두 남은 뒤에만 진행한다.
+dev smoke test가 실패하면 dev service 전체를 이전 image/revision으로 복구하고,
+실패한 gate를 수정한 뒤 처음부터 task 일관성을 다시 확인한다. 운영 배포는 dev
+증빙과 Dashboard 담당자의 반영 확인이 모두 남은 뒤에만 진행한다.
 
-### 6.5 409·500 장애 분류
+### 6.3 409·500 장애 분류
 
 | 증상 | 우선 확인할 원인 | 조치 |
 | --- | --- | --- |
-| 신규 `segment_ids` 요청이 항상 `409` | Decision flag OFF | JSON을 수정하지 말고 배포 게이트와 전체 task flag 확인 |
-| 같은 요청이 `200`과 `409`를 오감 | ECS task별 flag/image 불일치 | service 전체 task definition과 running task 교체 상태 확인 |
-| ON 이후 같은 loop의 다른 scope가 충돌 | finalize 미적용 또는 기존 unique 잔존 | DB constraint metadata 확인, 운영 실행 중단 |
+| 같은 loop의 다른 scope가 충돌 | finalize 미적용 또는 기존 unique 잔존 | DB constraint metadata 확인, 운영 실행 중단 |
 | 기존 run 재사용만 `409` | scope·fingerprint·target/fallback 또는 preparation lineage 손상 | 해당 run 무결성 조사, 신규 run으로 조용히 우회하지 않음 |
 | `Token "("` JSONB `500` | 구버전 Decision image 또는 repository JSONB 변환 문제 | 8장의 런타임/코드 확인 절차 수행 |
 | 의도보다 많은 target 실험 생성 | Dashboard의 `segment_ids` 누락 | 요청 스키마와 실제 payload 로그 확인, 전체 scope run 실행 중단 |
@@ -322,7 +306,7 @@ Decision 서버는 다음 조건으로 새로 실행해야 한다.
 
 - PR #230과 최신 `dev`의 PR #232가 통합된 전달 커밋인지 확인한다.
 - Data Contract finalize와 Dashboard 계약 반영이 끝난 dev 환경인지 확인한다.
-- 모든 dev ECS task에 동일한 Decision image와 `LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED=true`가 적용됐는지 확인한다.
+- 모든 dev ECS task에 동일한 Decision image/revision이 적용됐는지 확인한다.
 - 기존 8081 프로세스 또는 컨테이너를 종료하고 이미지를 재빌드한 뒤 재시작한다.
 
 수용 기준:
@@ -336,7 +320,7 @@ Decision 서버는 다음 조건으로 새로 실행해야 한다.
 7. 선택하지 않은 다른 비-fallback 세그먼트 실험은 생성·시작되지 않는다.
 8. failed-only 자동 next-loop가 복수 실패 세그먼트로 생성된다.
 9. 수동 preparation 생성·활성화가 `409`로 차단되지 않는다.
-10. ECS 배포 상태에서 모든 running task가 동일한 task definition revision을 사용하고, 해당 revision의 flag가 `true`임을 확인한다.
+10. ECS 배포 상태에서 모든 running task가 동일한 task definition revision을 사용함을 확인한다.
 
 ## 8. JSON 500을 분리해서 판정하는 방법
 
@@ -380,7 +364,6 @@ docker ps --filter publish=8081 --format 'table {{.ID}}\t{{.Image}}\t{{.Ports}}\
 - API 계약 테스트, 실행 흐름 테스트, 전체 테스트, typecheck가 통과한다.
 - 최신 Decision 런타임을 사용한 로컬 통합 테스트에서 JSON 500이 재현되지 않는다.
 - dispatch 실패 후 같은 멱등 키 재시도와 접수·완료 작업의 미재발송이 검증된다.
-- 모든 dev ECS task의 Decision image와 flag 값이 동일하다.
-- `409`가 JSON 오류, feature gate 차단, 기존 run 무결성 실패 중 무엇인지 응답·로그 기준으로 분류할 수 있다.
-- 위 증빙 전에는 운영 `LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED`를 켜지 않는다.
-- 운영 ON은 전체 task에 일괄 적용하고, 일부 task만 다른 flag 값으로 남기지 않는다.
+- 모든 dev ECS task의 Decision image/revision이 동일하다.
+- `409`가 JSON 오류 또는 기존 run 무결성 실패 중 무엇인지 응답·로그 기준으로 분류할 수 있다.
+- 위 증빙 전에는 운영에 새 Decision revision을 배포하지 않는다.

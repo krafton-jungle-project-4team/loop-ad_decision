@@ -161,9 +161,6 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             promotion_evaluation_repository=PromotionEvaluationRepository(executor),
             next_loop_preparation_repository=NextLoopPreparationRepository(executor),
             manual_activation_enabled=_manual_next_loop_enabled(request),
-            partial_segment_scope_enabled=(
-                settings.partial_promotion_run_scope_enabled
-            ),
         )
         connection.commit()
     except Exception:
@@ -331,9 +328,6 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             promotion_evaluation_repository=promotion_evaluation_repository,
             next_loop_preparation_repository=next_loop_preparation_repository,
             manual_activation_enabled=_manual_next_loop_enabled(request),
-            partial_segment_scope_enabled=(
-                settings.partial_promotion_run_scope_enabled
-            ),
         )
         yield NextLoopService(
             promotion_repository=promotion_repository,
@@ -347,9 +341,6 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
             run_creator=run_creator,
             manual_prepare_enabled=_manual_next_loop_enabled(request),
-            partial_segment_scope_enabled=(
-                settings.partial_promotion_run_scope_enabled
-            ),
         )
         connection.commit()
     except Exception:

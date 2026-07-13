@@ -383,7 +383,6 @@ class NextLoopService:
         generation_gateway: NextLoopGenerationGateway,
         run_creator: PromotionRunCreator,
         manual_prepare_enabled: bool = False,
-        partial_segment_scope_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._promotion_run_repository = promotion_run_repository
@@ -396,7 +395,6 @@ class NextLoopService:
         self._generation_gateway = generation_gateway
         self._run_creator = run_creator
         self._manual_prepare_enabled = manual_prepare_enabled
-        self._partial_segment_scope_enabled = partial_segment_scope_enabled
 
     @log_context_scope
     def create_next_loop(
@@ -409,10 +407,6 @@ class NextLoopService:
             if not self._manual_prepare_enabled:
                 raise NextLoopConflictError(
                     "manual next-loop preparation is disabled"
-                )
-            if not self._partial_segment_scope_enabled:
-                raise NextLoopConflictError(
-                    "partial segment scope is disabled until Dashboard scope lineage is ready"
                 )
             return self._prepare_manual_next_loop(
                 promotion_run_id=promotion_run_id,
@@ -458,11 +452,6 @@ class NextLoopService:
             log.info("next_loop_skipped", {"reason": "no_failed_targets"})
             log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
             return response
-
-        if not self._partial_segment_scope_enabled:
-            raise NextLoopConflictError(
-                "partial segment scope is disabled until Dashboard scope lineage is ready"
-            )
 
         promotion = self._promotion_repository.get_by_id(previous_run.promotion_id)
         if promotion is None:

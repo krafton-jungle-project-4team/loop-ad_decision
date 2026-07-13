@@ -138,24 +138,6 @@ def test_next_loop_noops_when_failed_ids_are_empty() -> None:
     assert repos.generation_gateway.calls == []
 
 
-def test_next_loop_rejects_partial_scope_before_gateway_writes_when_flag_is_off() -> None:
-    repos = FakeNextLoopRepos()
-    service = make_service(repos, partial_segment_scope_enabled=False)
-
-    with pytest.raises(NextLoopConflictError, match="scope is disabled"):
-        service.create_next_loop(
-            promotion_run_id="prun_banner_001_loop_1",
-            request=NextLoopRequest(
-                failed_segment_ids=["seg_luxury"],
-                failed_ad_experiment_ids=["adexp_luxury_001"],
-            ),
-        )
-
-    assert repos.analysis_gateway.calls == []
-    assert repos.generation_gateway.calls == []
-    assert repos.run_creator.calls == []
-
-
 @pytest.mark.parametrize(
     "status",
     [
@@ -379,31 +361,11 @@ def test_next_loop_rejects_missing_previous_run() -> None:
         )
 
 
-def test_manual_next_loop_flag_off_rejects_before_manual_dependencies() -> None:
+def test_manual_next_loop_switch_off_rejects_before_manual_dependencies() -> None:
     repos = FakeNextLoopRepos()
     service = make_service(repos)
 
     with pytest.raises(NextLoopConflictError, match="disabled"):
-        service.create_next_loop(
-            promotion_run_id="prun_banner_001_loop_1",
-            request=manual_request(),
-        )
-
-    assert repos.preparations.calls == []
-    assert repos.analysis_gateway.calls == []
-    assert repos.generation_gateway.manual_calls == []
-    assert repos.run_creator.calls == []
-
-
-def test_manual_next_loop_partial_scope_flag_off_rejects_before_dependencies() -> None:
-    repos = FakeNextLoopRepos()
-    service = make_service(
-        repos,
-        manual_enabled=True,
-        partial_segment_scope_enabled=False,
-    )
-
-    with pytest.raises(NextLoopConflictError, match="scope is disabled"):
         service.create_next_loop(
             promotion_run_id="prun_banner_001_loop_1",
             request=manual_request(),
@@ -1064,7 +1026,6 @@ def make_service(
     repos: "FakeNextLoopRepos",
     *,
     manual_enabled: bool = False,
-    partial_segment_scope_enabled: bool = True,
 ) -> NextLoopService:
     return NextLoopService(
         promotion_repository=repos.promotions,
@@ -1078,7 +1039,6 @@ def make_service(
         generation_gateway=repos.generation_gateway,
         run_creator=repos.run_creator,
         manual_prepare_enabled=manual_enabled,
-        partial_segment_scope_enabled=partial_segment_scope_enabled,
     )
 
 

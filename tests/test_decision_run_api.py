@@ -214,7 +214,7 @@ def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:
     assert any("insert into ad_experiments" in query for query in executed_sql)
 
 
-def test_run_api_flag_off_rejects_explicit_scope_before_repository_access(
+def test_run_api_accepts_explicit_scope_without_runtime_gate(
     monkeypatch,
 ) -> None:
     connections: list[RecordingConnection] = []
@@ -236,11 +236,13 @@ def test_run_api_flag_off_rejects_explicit_scope_before_repository_access(
         json={"segment_ids": ["seg_family_trip"]},
     )
 
-    assert response.status_code == 409
+    assert response.status_code == 200
     connection = connections[0]
-    assert connection.executed == []
-    assert connection.commit_count == 0
-    assert connection.rollback_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert any("insert into ad_experiments" in query for query in executed_sql)
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
     assert connection.close_count == 1
 
 
@@ -272,7 +274,7 @@ def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
     assert connection.close_count == 1
 
 
-def test_run_api_rejects_preparation_activation_behind_default_off_flag(
+def test_run_api_rejects_preparation_activation_when_manual_switch_is_off(
     monkeypatch,
 ) -> None:
     connections: list[RecordingConnection] = []
@@ -606,7 +608,10 @@ def generation_row() -> dict[str, object]:
         "promotion_id": "promo_banner_001",
         "content_option_count": 1,
         "operator_instruction": None,
-        "input_json": {"analysis_id": "analysis_banner_001"},
+        "input_json": {
+            "analysis_id": "analysis_banner_001",
+            "target_segment_ids": ["seg_family_trip"],
+        },
         "output_json": {"content_count": 1},
         "generation_report_json": {"status": "completed"},
         "status": "completed",

@@ -30,11 +30,10 @@ fallback membership with `is_fallback`.
 array serialized as compact JSON. The remaining identity fields are enforced by
 the composite database constraint and a short digest in `promotion_run_id`.
 
-`LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED` is a strict boolean and defaults to
-`false`. While disabled, explicit run scopes and failed-only automatic next-loop
-requests return 409 before any lifecycle writes. Enable it only after the Data
-Source Contract expand/backfill/finalize rollout and the Dashboard exact
-scope/lineage reader are deployed.
+Explicit run scopes and failed-only automatic next-loop requests are always
+enabled. Deploy this Decision version only after the Data Source Contract
+expand/backfill/finalize rollout is complete and the Dashboard exact
+scope/lineage reader is deployed.
 
 Dashboard integration requirements and the versioned response fixture are in
 [`docs/dashboard-segment-experiment-integration-fix-spec.md`](docs/dashboard-segment-experiment-integration-fix-spec.md).

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
-import os
 import threading
 import time
 from typing import Any
@@ -67,7 +66,6 @@ def valid_env() -> dict[str, str]:
         {
             "LOOPAD_ENV": "test",
             "LOOPAD_SERVICE_ID": "decision-api",
-            "LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED": "true",
             "PORT": "8080",
             "LOOPAD_AURORA_PORT": "15432",
         }
@@ -303,7 +301,7 @@ def test_next_loop_api_wires_repositories_and_commits_noop(
     assert not any("next_loop_preparations" in query for query in executed_sql)
 
 
-def test_manual_next_loop_flag_off_rejects_before_any_sql(
+def test_manual_next_loop_switch_off_rejects_before_any_sql(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     connection = RecordingConnection()
@@ -697,47 +695,6 @@ def test_next_loop_api_maps_segment_vector_data_unavailable_to_validation_error(
     assert response.status_code == 422
     assert response.json()["detail"] == "segment vector data unavailable"
     connection = connections[0]
-    assert connection.commit_count == 0
-    assert connection.rollback_count == 1
-    assert connection.close_count == 1
-
-
-def test_next_loop_api_flag_off_rejects_before_lifecycle_writes(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    connections: list[RecordingConnection] = []
-
-    def fake_create_postgres_connection(_settings) -> RecordingConnection:
-        connection = RecordingConnection()
-        connections.append(connection)
-        return connection
-
-    monkeypatch.setattr(
-        "app.decision.router.create_postgres_connection",
-        fake_create_postgres_connection,
-    )
-    monkeypatch.setattr(
-        "app.decision.router.create_clickhouse_client",
-        lambda _settings: FakeClickHouseClient(),
-    )
-    env = valid_env()
-    env["LOOPAD_PARTIAL_PROMOTION_RUN_SCOPE_ENABLED"] = "false"
-    app = create_app(settings=load_settings(env))
-    client = TestClient(app)
-
-    response = client.post(
-        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
-        json={
-            "failed_segment_ids": ["seg_luxury"],
-            "failed_ad_experiment_ids": ["adexp_luxury_001"],
-        },
-    )
-
-    assert response.status_code == 409
-    connection = connections[0]
-    executed_sql = [compact_sql(query) for query, _params in connection.executed]
-    assert not any(query.startswith("insert ") for query in executed_sql)
-    assert not any(query.startswith("update ") for query in executed_sql)
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
     assert connection.close_count == 1
@@ -1696,10 +1653,10 @@ def user_behavior_vector_rows() -> list[dict[str, object]]:
 
 
 @pytest.fixture
-def next_loop_postgres_schema() -> tuple[str, str]:
-    dsn = os.getenv("LOOPAD_TEST_POSTGRES_DSN")
-    if not dsn:
-        pytest.skip("LOOPAD_TEST_POSTGRES_DSN is required for PostgreSQL locking tests")
+def next_loop_postgres_schema(
+    loopad_test_postgres_dsn: str,
+) -> tuple[str, str]:
+    dsn = loopad_test_postgres_dsn
     schema_name = f"test_next_loop_{uuid.uuid4().hex}"
     admin = psycopg.connect(dsn, autocommit=True)
     try:
