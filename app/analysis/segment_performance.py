@@ -8,6 +8,10 @@ from typing import Any, Mapping, Protocol, Sequence
 
 
 CONTEXTUAL_BOOKING_MODEL_VERSION = "dec.contextual-booking-calibration.v2"
+# Runtime candidates can be much smaller and narrower than calibration cohorts.
+PREDICTION_POLICY_VERSION = "dec.segment-performance-serving.v1"
+STANDARDIZED_FEATURE_LIMIT = 3.0
+PREDICTION_PRIOR_USER_COUNT = 30.0
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
@@ -146,6 +150,60 @@ class SegmentPerformanceFeatures:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentPerformancePrediction:
+    value: float
+    raw_model_value: float
+    distribution_guarded_value: float
+    training_baseline_rate: float | None
+    candidate_sample_size: int
+    sample_weight: float
+    prior_user_count: float
+    out_of_distribution_features: tuple[str, ...]
+    influential_out_of_distribution_features: tuple[str, ...]
+    max_abs_standardized_value: float
+    policy_version: str | None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "prediction_adjustment": {
+                "policy_version": self.policy_version,
+                "applied": self.policy_version is not None,
+                "raw_model_value": round(self.raw_model_value, 6),
+                "distribution_guarded_value": round(
+                    self.distribution_guarded_value,
+                    6,
+                ),
+                "adjusted_value": round(self.value, 6),
+                "training_baseline_rate": (
+                    round(self.training_baseline_rate, 6)
+                    if self.training_baseline_rate is not None
+                    else None
+                ),
+                "candidate_sample_size": self.candidate_sample_size,
+                "sample_weight": round(self.sample_weight, 6),
+                "prior_user_count": self.prior_user_count,
+                "out_of_distribution_feature_count": len(
+                    self.out_of_distribution_features
+                ),
+                "out_of_distribution_features": list(
+                    self.out_of_distribution_features
+                ),
+                "influential_out_of_distribution_feature_count": len(
+                    self.influential_out_of_distribution_features
+                ),
+                "influential_out_of_distribution_features": list(
+                    self.influential_out_of_distribution_features
+                ),
+                "max_abs_standardized_value": round(
+                    self.max_abs_standardized_value,
+                    6,
+                ),
+                "standardized_feature_limit": STANDARDIZED_FEATURE_LIMIT,
+            }
+        }
+
+
 class SegmentPerformancePredictor(Protocol):
     version: str
     method: str
@@ -206,6 +264,91 @@ class LogisticSegmentPerformanceModel:
             ) / self.feature_scales[index]
             linear += self.coefficients[index] * standardized
         return _sigmoid(linear)
+
+    def predict_with_diagnostics(
+        self,
+        features: SegmentPerformanceFeatures,
+        *,
+        sample_size: int,
+    ) -> SegmentPerformancePrediction:
+        raw_values = features.model_values()
+        raw_linear = self.intercept
+        guarded_linear = self.intercept
+        out_of_distribution_features: list[str] = []
+        influential_out_of_distribution_features: list[str] = []
+        max_abs_standardized_value = 0.0
+
+        for index, feature_name in enumerate(self.feature_names):
+            raw_value = raw_values.get(feature_name, 0.0)
+            standardized = (
+                raw_value - self.feature_means[index]
+            ) / self.feature_scales[index]
+            coefficient = self.coefficients[index]
+            raw_linear += coefficient * standardized
+            max_abs_standardized_value = max(
+                max_abs_standardized_value,
+                abs(standardized),
+            )
+            is_numeric_feature = feature_name in NUMERIC_FEATURE_NAMES
+            is_unseen_candidate_type = (
+                not is_numeric_feature
+                and raw_value == 1.0
+                and self.feature_means[index] <= 1e-9
+            )
+            if (
+                is_numeric_feature
+                and abs(standardized) > STANDARDIZED_FEATURE_LIMIT
+            ) or is_unseen_candidate_type:
+                out_of_distribution_features.append(feature_name)
+                if abs(coefficient) > 1e-12:
+                    influential_out_of_distribution_features.append(feature_name)
+            guarded_standardized = (
+                max(
+                    -STANDARDIZED_FEATURE_LIMIT,
+                    min(STANDARDIZED_FEATURE_LIMIT, standardized),
+                )
+                if is_numeric_feature
+                else standardized
+            )
+            guarded_linear += coefficient * guarded_standardized
+
+        raw_model_value = _sigmoid(raw_linear)
+        distribution_guarded_value = _sigmoid(guarded_linear)
+        baseline_rate = _optional_rate(
+            self.training_metadata.get(
+                "training_contextual_booking_observation_rate"
+            )
+        )
+        normalized_sample_size = max(int(sample_size), 0)
+        if baseline_rate is None:
+            sample_weight = 1.0
+            adjusted_value = distribution_guarded_value
+        else:
+            sample_weight = normalized_sample_size / (
+                normalized_sample_size + PREDICTION_PRIOR_USER_COUNT
+            )
+            adjusted_value = (
+                sample_weight * distribution_guarded_value
+                + (1.0 - sample_weight) * baseline_rate
+            )
+
+        return SegmentPerformancePrediction(
+            value=_clamp01(adjusted_value),
+            raw_model_value=raw_model_value,
+            distribution_guarded_value=distribution_guarded_value,
+            training_baseline_rate=baseline_rate,
+            candidate_sample_size=normalized_sample_size,
+            sample_weight=sample_weight,
+            prior_user_count=(
+                PREDICTION_PRIOR_USER_COUNT if baseline_rate is not None else 0.0
+            ),
+            out_of_distribution_features=tuple(out_of_distribution_features),
+            influential_out_of_distribution_features=tuple(
+                influential_out_of_distribution_features
+            ),
+            max_abs_standardized_value=max_abs_standardized_value,
+            policy_version=PREDICTION_POLICY_VERSION,
+        )
 
     def metadata(self) -> Mapping[str, Any]:
         return {
@@ -283,6 +426,34 @@ class ContextualBookingHeuristicPredictor:
             "method": self.method,
             "calibration_status": self.calibration_status,
         }
+
+
+def predict_segment_performance(
+    predictor: SegmentPerformancePredictor,
+    features: SegmentPerformanceFeatures,
+    *,
+    sample_size: int,
+) -> SegmentPerformancePrediction:
+    if isinstance(predictor, LogisticSegmentPerformanceModel):
+        return predictor.predict_with_diagnostics(
+            features,
+            sample_size=sample_size,
+        )
+
+    value = _clamp01(predictor.predict(features))
+    return SegmentPerformancePrediction(
+        value=value,
+        raw_model_value=value,
+        distribution_guarded_value=value,
+        training_baseline_rate=None,
+        candidate_sample_size=max(int(sample_size), 0),
+        sample_weight=1.0,
+        prior_user_count=0.0,
+        out_of_distribution_features=(),
+        influential_out_of_distribution_features=(),
+        max_abs_standardized_value=0.0,
+        policy_version=None,
+    )
 
 
 def fit_logistic_segment_performance_model(
@@ -441,3 +612,13 @@ def _logit(value: float) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _optional_rate(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        return None
+    return parsed
