@@ -329,6 +329,12 @@ class UserSegmentAssignmentInsertRecord:
 
 
 @dataclass(frozen=True)
+class UserSegmentAssignmentRunAggregateRecord:
+    assignment_count: int
+    fallback_count: int
+
+
+@dataclass(frozen=True)
 class PromotionEvaluationWrite:
     evaluation_id: str
     project_id: str
@@ -604,6 +610,12 @@ class UserSegmentAssignmentWriter(Protocol):
         self,
         assignments: Sequence[UserSegmentAssignmentWrite],
     ) -> list[UserSegmentAssignmentInsertRecord]:
+        ...
+
+    def summarize_run(
+        self,
+        promotion_run_id: str,
+    ) -> UserSegmentAssignmentRunAggregateRecord:
         ...
 
 
@@ -1501,6 +1513,27 @@ class UserSegmentAssignmentRepository:
         )
         return {str(row["user_id"]) for row in rows}
 
+    def summarize_run(
+        self,
+        promotion_run_id: str,
+    ) -> UserSegmentAssignmentRunAggregateRecord:
+        row = self._db.fetchone(
+            """
+            SELECT
+                COUNT(*) AS assignment_count,
+                COUNT(*) FILTER (WHERE fallback) AS fallback_count
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+            """,
+            (promotion_run_id,),
+        )
+        if row is None:
+            raise RuntimeError("assignment run aggregate query returned no row")
+        return UserSegmentAssignmentRunAggregateRecord(
+            assignment_count=int(row["assignment_count"]),
+            fallback_count=int(row["fallback_count"]),
+        )
+
     def insert_many(
         self,
         assignments: Sequence[UserSegmentAssignmentWrite],
@@ -1645,8 +1678,8 @@ class UserBehaviorVectorRepository:
         if not user_ids:
             return []
 
-        source_filter = (
-            "                  AND source = {source:String}\n"
+        latest_source_filter = (
+            "              AND tupleElement(latest_vector, 3) = {source:String}\n"
             if source is not None
             else ""
         )
@@ -1664,29 +1697,29 @@ class UserBehaviorVectorRepository:
             SELECT
                 project_id,
                 user_id,
-                argMax(vector_dim, updated_at) AS vector_dim,
-                argMax(vector_values, updated_at) AS vector_values,
+                tupleElement(latest_vector, 1) AS vector_dim,
+                tupleElement(latest_vector, 2) AS vector_values,
                 vector_version,
-                argMax(source, updated_at) AS source
+                tupleElement(latest_vector, 3) AS source
             FROM (
                 SELECT
                     project_id,
                     user_id,
-                    vector_dim,
-                    vector_values,
                     vector_version,
-                    source,
-                    updated_at
+                    argMax(
+                        tuple(vector_dim, vector_values, source),
+                        updated_at
+                    ) AS latest_vector
                 FROM user_behavior_vectors
                 WHERE project_id = {project_id:String}
                   AND vector_version = {vector_version:String}
-                  AND vector_dim = {vector_dim:UInt16}
-            """
-            + source_filter
-            + """
                   AND user_id IN {user_ids:Array(String)}
+                GROUP BY project_id, user_id, vector_version
             )
-            GROUP BY project_id, user_id, vector_version
+            WHERE tupleElement(latest_vector, 1) = {vector_dim:UInt16}
+            """
+            + latest_source_filter
+            + """
             ORDER BY user_id ASC
             """
         )
@@ -1705,8 +1738,8 @@ class UserBehaviorVectorRepository:
         source: str | None = None,
         after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        source_filter = (
-            "                  AND source = {source:String}\n"
+        latest_source_filter = (
+            "              AND tupleElement(latest_vector, 3) = {source:String}\n"
             if source is not None
             else ""
         )
@@ -1731,29 +1764,31 @@ class UserBehaviorVectorRepository:
             SELECT
                 project_id,
                 user_id,
-                argMax(vector_dim, updated_at) AS vector_dim,
-                argMax(vector_values, updated_at) AS vector_values,
+                tupleElement(latest_vector, 1) AS vector_dim,
+                tupleElement(latest_vector, 2) AS vector_values,
                 vector_version,
-                argMax(source, updated_at) AS source
+                tupleElement(latest_vector, 3) AS source
             FROM (
                 SELECT
                     project_id,
                     user_id,
-                    vector_dim,
-                    vector_values,
                     vector_version,
-                    source,
-                    updated_at
+                    argMax(
+                        tuple(vector_dim, vector_values, source),
+                        updated_at
+                    ) AS latest_vector
                 FROM user_behavior_vectors
                 WHERE project_id = {project_id:String}
                   AND vector_version = {vector_version:String}
-                  AND vector_dim = {vector_dim:UInt16}
             """
-            + source_filter
             + cursor_filter
             + """
+                GROUP BY project_id, user_id, vector_version
             )
-            GROUP BY project_id, user_id, vector_version
+            WHERE tupleElement(latest_vector, 1) = {vector_dim:UInt16}
+            """
+            + latest_source_filter
+            + """
             ORDER BY user_id ASC
             LIMIT {limit:UInt32}
             """

@@ -19,17 +19,20 @@ from app.decision.matcher import (
     SegmentVector,
     UserVector,
     invalid_user_vector_result,
+    normalize_values,
     parse_vector_values,
 )
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentReader,
     PromotionRunWriter,
+    PromotionRunRecord,
     SegmentVectorReader,
     SegmentVectorRecord,
     UserBehaviorVectorRecord,
     UserBehaviorVectorReader,
     UserSegmentAssignmentInsertRecord,
+    UserSegmentAssignmentRunAggregateRecord,
     UserSegmentAssignmentWrite,
     UserSegmentAssignmentWriter,
 )
@@ -56,7 +59,6 @@ FALLBACK_REASON_KEYS = (
 )
 SIMILARITY_BUCKET_KEYS = (
     "not_available",
-    "lt_0_00",
     "0_00_to_0_50",
     "0_50_to_0_65",
     "0_65_to_0_80",
@@ -74,13 +76,13 @@ class SegmentAssignmentValidationError(Exception):
 
 
 @dataclass(frozen=True)
-class _ExperimentSet:
+class AssignmentExperimentSet:
     non_fallback: list[AdExperimentRecord]
     fallback: AdExperimentRecord | None
 
 
 @dataclass(frozen=True)
-class _EffectiveAudienceScope:
+class AssignmentAudienceScope:
     effective_vector_version: str
     effective_limit: int | None
     source: str | None
@@ -88,11 +90,27 @@ class _EffectiveAudienceScope:
 
 
 @dataclass(frozen=True)
-class _BuildMatchResult:
+class AssignmentBuildInput:
+    run: PromotionRunRecord
+    audience_scope: AssignmentAudienceScope
+    experiments: AssignmentExperimentSet
+    segment_vectors: tuple[SegmentVector, ...]
+
+
+@dataclass(frozen=True)
+class AssignmentPageSelection:
+    eligible_users: tuple[UserVector, ...]
+    users_to_match: tuple[UserVector, ...]
+    skipped_existing_count: int
+
+
+@dataclass(frozen=True)
+class AssignmentPageMatchResult:
     matches: Mapping[str, MatchResult]
     ann_candidate_count: int
     exact_reranked_pair_count: int
     ann_underfilled_user_count: int
+    exact_rescue_user_count: int
     ann_query_user_count: int
 
     @property
@@ -115,14 +133,21 @@ class _BuildMatchResult:
         )
 
 
+@dataclass(frozen=True)
+class AssignmentPageWriteOutcome:
+    attempted_count: int
+    inserted_records: tuple[UserSegmentAssignmentInsertRecord, ...]
+
+
 @dataclass
-class _BuildDiagnostics:
+class AssignmentDiagnostics:
     page_count: int = 0
     processed_user_count: int = 0
     users_to_match_count: int = 0
     ann_candidate_count: int = 0
     exact_reranked_pair_count: int = 0
     ann_underfilled_user_count: int = 0
+    exact_rescue_user_count: int = 0
     ann_applied: bool = False
     assignment_count: int = 0
     insert_conflict_count: int = 0
@@ -148,10 +173,11 @@ class _BuildDiagnostics:
         self.users_to_match_count += users_to_match_count
         self.skipped_existing_count += skipped_existing_count
 
-    def accumulate_matching(self, result: _BuildMatchResult) -> None:
+    def accumulate_matching(self, result: AssignmentPageMatchResult) -> None:
         self.ann_candidate_count += result.ann_candidate_count
         self.exact_reranked_pair_count += result.exact_reranked_pair_count
         self.ann_underfilled_user_count += result.ann_underfilled_user_count
+        self.exact_rescue_user_count += result.exact_rescue_user_count
         self.ann_applied = self.ann_applied or result.ann_query_user_count > 0
 
     def accumulate_inserted(
@@ -205,7 +231,7 @@ class _BuildDiagnostics:
             )
 
 
-class SegmentAssignmentService:
+class AssignmentInputLoader:
     def __init__(
         self,
         *,
@@ -213,43 +239,29 @@ class SegmentAssignmentService:
         ad_experiment_repository: AdExperimentReader,
         segment_vector_repository: SegmentVectorReader,
         user_behavior_vector_repository: UserBehaviorVectorReader,
-        user_segment_assignment_repository: UserSegmentAssignmentWriter,
-        reranker: SegmentCandidateReranker,
+        page_size: int | None = None,
     ) -> None:
+        page_size = ASSIGNMENT_PAGE_SIZE if page_size is None else page_size
+        if page_size <= 0:
+            raise ValueError("assignment page_size must be positive")
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
         self._segment_vector_repository = segment_vector_repository
         self._user_behavior_vector_repository = user_behavior_vector_repository
-        self._user_segment_assignment_repository = user_segment_assignment_repository
-        self._reranker = reranker
+        self._page_size = page_size
 
-    @log_context_scope
-    def build_assignments(
+    def load(
         self,
         *,
         promotion_run_id: str,
         request: SegmentAssignmentBuildRequest,
-    ) -> SegmentAssignmentBuildResponse:
-        started_at = now_ms()
-        log.assign_context({"promotionRunId": promotion_run_id})
-        log.info("started", {"promotionRunId": promotion_run_id, "request": request})
+    ) -> AssignmentBuildInput:
         run = self._promotion_run_repository.get_by_id(promotion_run_id)
         if run is None:
             log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
             raise SegmentAssignmentRunNotFoundError(
                 f"promotion run not found: {promotion_run_id}"
             )
-        log.assign_context(
-            {
-                "projectId": run.project_id,
-                "campaignId": run.campaign_id,
-                "promotionId": run.promotion_id,
-                "analysisId": run.analysis_id,
-                "generationId": run.generation_id,
-            }
-        )
-        log.info("promotion_run_loaded", {"promotionRun": run})
-
         audience_scope = _build_effective_audience_scope(
             goal_snapshot_json=run.goal_snapshot_json,
             request=request,
@@ -263,8 +275,6 @@ class SegmentAssignmentService:
             raise SegmentAssignmentValidationError(
                 "at least one non-fallback ad experiment is required"
             )
-        log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
-
         segment_vectors = self._load_segment_vectors(
             project_id=run.project_id,
             promotion_id=run.promotion_id,
@@ -274,166 +284,131 @@ class SegmentAssignmentService:
             ],
             vector_version=audience_scope.effective_vector_version,
         )
-        log.info("segment_vectors_loaded", {"segmentVectorCount": len(segment_vectors)})
-        diagnostics = _BuildDiagnostics()
-        assigned_at = datetime.now(UTC)
-        for page_number, eligible_users in enumerate(
-            self._iter_eligible_user_pages(
-                project_id=run.project_id,
-                audience_scope=audience_scope,
-            ),
-            start=1,
-        ):
-            if not eligible_users:
-                continue
-            log.info(
-                "eligible_users_page_loaded",
-                {
-                    "pageNumber": page_number,
-                    "eligibleUserCount": len(eligible_users),
-                },
-            )
-            existing_user_ids = (
-                self._user_segment_assignment_repository.list_existing_user_ids(
-                    promotion_run_id=run.promotion_run_id,
-                    user_ids=[user.user_id for user in eligible_users],
-                )
-            )
-            users_to_match = [
-                user
-                for user in eligible_users
-                if user.user_id not in existing_user_ids
-            ]
-            diagnostics.accumulate_page(
-                processed_user_count=len(eligible_users),
-                users_to_match_count=len(users_to_match),
-                skipped_existing_count=len(existing_user_ids),
-            )
-            if existing_user_ids:
-                log.info(
-                    "existing_assignments_skipped",
-                    {
-                        "pageNumber": page_number,
-                        "userCount": len(existing_user_ids),
-                    },
-                )
+        return AssignmentBuildInput(
+            run=run,
+            audience_scope=audience_scope,
+            experiments=experiments,
+            segment_vectors=tuple(segment_vectors),
+        )
 
-            try:
-                build_result = self._build_match_results(
-                    project_id=run.project_id,
-                    promotion_id=run.promotion_id,
-                    analysis_id=run.analysis_id,
+    def iter_user_pages(
+        self,
+        build_input: AssignmentBuildInput,
+    ) -> Iterator[list[UserVector]]:
+        project_id = build_input.run.project_id
+        audience_scope = build_input.audience_scope
+        if audience_scope.user_ids is not None:
+            user_ids = sorted(set(audience_scope.user_ids))
+            if audience_scope.effective_limit is not None:
+                user_ids = user_ids[: audience_scope.effective_limit]
+
+            previous_user_id: str | None = None
+            for index in range(0, len(user_ids), self._page_size):
+                user_id_page = user_ids[index : index + self._page_size]
+                records = self._user_behavior_vector_repository.list_by_user_ids(
+                    project_id=project_id,
+                    user_ids=user_id_page,
                     vector_version=audience_scope.effective_vector_version,
-                    users=users_to_match,
-                    segment_vectors=segment_vectors,
+                    source=audience_scope.source,
                 )
-            except (SegmentMatchValidationError, ValueError) as exc:
-                log.warn("segment_matching_invalid", {"err": exc})
-                raise SegmentAssignmentValidationError(str(exc)) from exc
+                _validate_user_vector_page(
+                    records,
+                    after_user_id=previous_user_id,
+                )
+                if records:
+                    previous_user_id = records[-1].user_id
+                yield _user_vectors_from_records(records)
+            return
 
-            fallback_needed = build_result.fallback_count > 0
-            if fallback_needed and experiments.fallback is None:
+        after_user_id: str | None = None
+        remaining_limit = audience_scope.effective_limit
+        while remaining_limit is None or remaining_limit > 0:
+            page_size = (
+                self._page_size
+                if remaining_limit is None
+                else min(self._page_size, remaining_limit)
+            )
+            records = self._user_behavior_vector_repository.list_for_project(
+                project_id=project_id,
+                vector_version=audience_scope.effective_vector_version,
+                limit=page_size,
+                source=audience_scope.source,
+                after_user_id=after_user_id,
+            )
+            if not records:
+                return
+            if len(records) > page_size:
+                raise SegmentAssignmentValidationError(
+                    "eligible user page exceeded the requested page size"
+                )
+            _validate_user_vector_page(records, after_user_id=after_user_id)
+
+            yield _user_vectors_from_records(records)
+
+            page_count = len(records)
+            after_user_id = records[-1].user_id
+            if remaining_limit is not None:
+                remaining_limit -= page_count
+                if remaining_limit <= 0:
+                    return
+            if page_count < page_size:
+                return
+
+    def _load_segment_vectors(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+        vector_version: str,
+    ) -> list[SegmentVector]:
+        records = self._segment_vector_repository.list_for_run_segments(
+            project_id=project_id,
+            promotion_id=promotion_id,
+            analysis_id=analysis_id,
+            segment_ids=segment_ids,
+            vector_version=vector_version,
+        )
+        records_by_segment: dict[str, list[SegmentVectorRecord]] = defaultdict(list)
+        for record in records:
+            records_by_segment[record.segment_id].append(record)
+
+        segment_vectors: list[SegmentVector] = []
+        for segment_id in segment_ids:
+            segment_records = records_by_segment.get(segment_id, [])
+            if len(segment_records) != 1:
                 log.warn(
-                    "fallback_ad_experiment_missing",
+                    "segment_vector_invalid",
                     {
-                        "pageNumber": page_number,
-                        "fallbackCount": build_result.fallback_count,
+                        "segmentId": segment_id,
+                        "segmentVectorCount": len(segment_records),
                     },
                 )
                 raise SegmentAssignmentValidationError(
-                    "fallback ad experiment is required when fallback assignments exist"
+                    "each non-fallback segment must have exactly one segment vector: "
+                    f"{segment_id}"
                 )
-            log.info(
-                "segment_matches_created",
-                {
-                    "pageNumber": page_number,
-                    "matchCount": len(build_result.matches),
-                    "fallbackCount": build_result.fallback_count,
-                    "annCandidateCount": build_result.ann_candidate_count,
-                    "exactRerankedPairCount": build_result.exact_reranked_pair_count,
-                },
+            segment_vectors.append(
+                _validated_segment_vector_from_record(
+                    segment_records[0],
+                    require_embedding=True,
+                )
             )
+        return segment_vectors
 
-            assignments = _build_assignment_writes(
-                project_id=run.project_id,
-                promotion_run_id=run.promotion_run_id,
-                matches=build_result.matches,
-                experiments=experiments,
-                assigned_at=assigned_at,
-                expires_in_days=request.expires_in_days,
-            )
-            inserted_records = (
-                self._user_segment_assignment_repository.insert_many(assignments)
-            )
-            diagnostics.accumulate_matching(build_result)
-            diagnostics.accumulate_inserted(
-                attempted_count=len(assignments),
-                inserted_records=inserted_records,
-            )
-            log.info(
-                "segment_assignments_page_created",
-                {
-                    "pageNumber": page_number,
-                    "assignmentCount": len(inserted_records),
-                    "insertConflictCount": len(assignments) - len(inserted_records),
-                },
-            )
 
-        diagnostics.validate_totals()
-        assignment_mode = (
-            ASSIGNMENT_MODE_EXPLICIT_USER_IDS
-            if audience_scope.user_ids is not None
-            else ASSIGNMENT_MODE_LIVE_KEYSET
-        )
+class AssignmentPageMatcher:
+    def __init__(
+        self,
+        *,
+        segment_vector_repository: SegmentVectorReader,
+        reranker: SegmentCandidateReranker,
+    ) -> None:
+        self._segment_vector_repository = segment_vector_repository
+        self._reranker = reranker
 
-        response = SegmentAssignmentBuildResponse(
-            promotion_run_id=run.promotion_run_id,
-            matching_mode=MATCHING_MODE,
-            vector_version=audience_scope.effective_vector_version,
-            ann_candidate_limit=ANN_CANDIDATE_LIMIT,
-            ann_candidate_count=diagnostics.ann_candidate_count,
-            exact_reranked_pair_count=diagnostics.exact_reranked_pair_count,
-            page_count=diagnostics.page_count,
-            processed_user_count=diagnostics.processed_user_count,
-            assignment_count=diagnostics.assignment_count,
-            insert_conflict_count=diagnostics.insert_conflict_count,
-            segment_assignment_counts=diagnostics.segment_assignment_counts,
-            batch_has_fallback=diagnostics.fallback_count > 0,
-            fallback_count=diagnostics.fallback_count,
-            fallback_rate=diagnostics.fallback_rate,
-            fallback_reason_counts=diagnostics.fallback_reason_counts,
-            below_threshold_fallback_count=(
-                diagnostics.fallback_reason_counts[
-                    FALLBACK_REASON_BELOW_THRESHOLD
-                ]
-            ),
-            no_candidate_fallback_count=diagnostics.fallback_reason_counts[
-                FALLBACK_REASON_NO_CANDIDATE
-            ],
-            invalid_user_vector_fallback_count=(
-                diagnostics.fallback_reason_counts[
-                    FALLBACK_REASON_INVALID_USER_VECTOR
-                ]
-            ),
-            similarity_score_buckets=diagnostics.similarity_score_buckets,
-            ann_underfilled_user_count=diagnostics.ann_underfilled_user_count,
-            ann_applied=diagnostics.ann_applied,
-            ann_not_applied_reason=diagnostics.ann_not_applied_reason,
-            skipped_existing_count=diagnostics.skipped_existing_count,
-            insufficient_segment_count=0,
-            completion_scope="current_request",
-            assignment_mode=assignment_mode,
-            input_stability="not_snapshotted",
-            status="completed",
-        )
-        log.info(
-            "assignment_diagnostics",
-            {"diagnostics": response.model_dump(mode="json")},
-        )
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
-        return response
-
-    def _build_match_results(
+    def match_page(
         self,
         *,
         project_id: str,
@@ -442,19 +417,24 @@ class SegmentAssignmentService:
         vector_version: str,
         users: Sequence[UserVector],
         segment_vectors: Sequence[SegmentVector],
-    ) -> _BuildMatchResult:
+    ) -> AssignmentPageMatchResult:
         if not segment_vectors:
             log.warn("segment_vectors_empty", {"analysisId": analysis_id})
             raise SegmentMatchValidationError(
                 "at least one non-fallback segment vector is required"
             )
 
-        segment_vector_ids = [segment.segment_vector_id for segment in segment_vectors]
+        expected_segments_by_vector_id = {
+            segment.segment_vector_id: segment.segment_id
+            for segment in segment_vectors
+        }
+        segment_vector_ids = list(expected_segments_by_vector_id)
         expected_candidate_count = min(len(segment_vector_ids), ANN_CANDIDATE_LIMIT)
         matches: dict[str, MatchResult] = {}
         ann_candidate_count = 0
         exact_reranked_pair_count = 0
         ann_underfilled_user_count = 0
+        exact_rescue_user_count = 0
 
         normalized_users: list[tuple[str, list[float]]] = []
         for user in _deduplicate_users_by_id(users):
@@ -484,129 +464,377 @@ class SegmentAssignmentService:
             )
             for user_id, normalized_user_vector in user_chunk:
                 candidate_records = candidates_by_user.get(user_id, [])
-                candidate_count = len(candidate_records)
-                ann_candidate_count += candidate_count
-                exact_reranked_pair_count += candidate_count
-                if candidate_count < expected_candidate_count:
+                ann_candidate_count += len(candidate_records)
+                valid_candidates: list[SegmentVector] = []
+                seen_vector_ids: set[str] = set()
+                invalid_candidate_result = False
+                for record in candidate_records:
+                    expected_segment_id = expected_segments_by_vector_id.get(
+                        record.segment_vector_id
+                    )
+                    if (
+                        expected_segment_id is None
+                        or record.segment_id != expected_segment_id
+                        or record.segment_vector_id in seen_vector_ids
+                    ):
+                        invalid_candidate_result = True
+                        continue
+                    seen_vector_ids.add(record.segment_vector_id)
+                    try:
+                        valid_candidates.append(
+                            _validated_segment_vector_from_record(
+                                record,
+                                require_embedding=True,
+                            )
+                        )
+                    except (SegmentAssignmentValidationError, ValueError):
+                        invalid_candidate_result = True
+
+                candidate_count = len(valid_candidates)
+                is_underfilled = candidate_count < expected_candidate_count
+                requires_exact_rescue = (
+                    invalid_candidate_result
+                    or candidate_count != expected_candidate_count
+                )
+                if is_underfilled:
                     ann_underfilled_user_count += 1
+                if requires_exact_rescue:
+                    exact_rescue_user_count += 1
+                    rerank_candidates = segment_vectors
+                else:
+                    rerank_candidates = valid_candidates
+                exact_reranked_pair_count += len(rerank_candidates)
 
                 matches[user_id] = self._reranker.rerank(
                     normalized_user_vector=normalized_user_vector,
-                    candidates=[
-                        _segment_vector_from_record(record, require_embedding=True)
-                        for record in candidate_records
-                    ],
+                    candidates=rerank_candidates,
                 )
 
-        return _BuildMatchResult(
+        return AssignmentPageMatchResult(
             matches=matches,
             ann_candidate_count=ann_candidate_count,
             exact_reranked_pair_count=exact_reranked_pair_count,
             ann_underfilled_user_count=ann_underfilled_user_count,
+            exact_rescue_user_count=exact_rescue_user_count,
             ann_query_user_count=len(normalized_users),
         )
 
-    def _load_segment_vectors(
+
+class ExactAssignmentPageMatcher:
+    """Production-safe exact matcher for future build workers."""
+
+    def __init__(self, *, reranker: SegmentCandidateReranker) -> None:
+        self._reranker = reranker
+
+    def match_page(
         self,
         *,
         project_id: str,
         promotion_id: str,
         analysis_id: str,
-        segment_ids: Sequence[str],
         vector_version: str,
-    ) -> list[SegmentVector]:
-        records = self._segment_vector_repository.list_for_run_segments(
-            project_id=project_id,
-            promotion_id=promotion_id,
-            analysis_id=analysis_id,
-            segment_ids=segment_ids,
-            vector_version=vector_version,
-        )
-        records_by_segment: dict[str, list[SegmentVectorRecord]] = defaultdict(list)
-        for record in records:
-            records_by_segment[record.segment_id].append(record)
-
-        segment_vectors: list[SegmentVector] = []
-        for segment_id in segment_ids:
-            segment_records = records_by_segment.get(segment_id, [])
-            if len(segment_records) != 1:
-                log.warn("segment_vector_invalid", {"segmentId": segment_id, "segmentVectorCount": len(segment_records)})
-                raise SegmentAssignmentValidationError(
-                    "each non-fallback segment must have exactly one segment vector: "
-                    f"{segment_id}"
-                )
-            segment_vectors.append(
-                _segment_vector_from_record(
-                    segment_records[0],
-                    require_embedding=True,
-                )
+        users: Sequence[UserVector],
+        segment_vectors: Sequence[SegmentVector],
+    ) -> AssignmentPageMatchResult:
+        del project_id, promotion_id, vector_version
+        if not segment_vectors:
+            log.warn("segment_vectors_empty", {"analysisId": analysis_id})
+            raise SegmentMatchValidationError(
+                "at least one non-fallback segment vector is required"
             )
-        return segment_vectors
+        matches: dict[str, MatchResult] = {}
+        exact_reranked_pair_count = 0
+        for user in _deduplicate_users_by_id(users):
+            normalized_user_vector = self._reranker.normalize_user_vector(user)
+            if normalized_user_vector is None:
+                matches[user.user_id] = invalid_user_vector_result()
+                continue
+            exact_reranked_pair_count += len(segment_vectors)
+            matches[user.user_id] = self._reranker.rerank(
+                normalized_user_vector=normalized_user_vector,
+                candidates=segment_vectors,
+            )
+        return AssignmentPageMatchResult(
+            matches=matches,
+            ann_candidate_count=0,
+            exact_reranked_pair_count=exact_reranked_pair_count,
+            ann_underfilled_user_count=0,
+            exact_rescue_user_count=0,
+            ann_query_user_count=0,
+        )
 
-    def _iter_eligible_user_pages(
+
+class AssignmentResultWriter:
+    def __init__(
+        self,
+        *,
+        user_segment_assignment_repository: UserSegmentAssignmentWriter,
+    ) -> None:
+        self._repository = user_segment_assignment_repository
+
+    def select_unassigned(
+        self,
+        *,
+        promotion_run_id: str,
+        eligible_users: Sequence[UserVector],
+    ) -> AssignmentPageSelection:
+        existing_user_ids = self._repository.list_existing_user_ids(
+            promotion_run_id=promotion_run_id,
+            user_ids=[user.user_id for user in eligible_users],
+        )
+        users_to_match = tuple(
+            user
+            for user in eligible_users
+            if user.user_id not in existing_user_ids
+        )
+        return AssignmentPageSelection(
+            eligible_users=tuple(eligible_users),
+            users_to_match=users_to_match,
+            skipped_existing_count=len(existing_user_ids),
+        )
+
+    def write_page(
         self,
         *,
         project_id: str,
-        audience_scope: _EffectiveAudienceScope,
-    ) -> Iterator[list[UserVector]]:
-        if audience_scope.user_ids is not None:
-            user_ids = sorted(set(audience_scope.user_ids))
-            if audience_scope.effective_limit is not None:
-                user_ids = user_ids[: audience_scope.effective_limit]
+        promotion_run_id: str,
+        match_result: AssignmentPageMatchResult,
+        experiments: AssignmentExperimentSet,
+        assigned_at: datetime,
+        expires_in_days: int | None,
+        page_number: int,
+    ) -> AssignmentPageWriteOutcome:
+        if match_result.fallback_count > 0 and experiments.fallback is None:
+            log.warn(
+                "fallback_ad_experiment_missing",
+                {
+                    "pageNumber": page_number,
+                    "fallbackCount": match_result.fallback_count,
+                },
+            )
+            raise SegmentAssignmentValidationError(
+                "fallback ad experiment is required when fallback assignments exist"
+            )
+        assignments = _build_assignment_writes(
+            project_id=project_id,
+            promotion_run_id=promotion_run_id,
+            matches=match_result.matches,
+            experiments=experiments,
+            assigned_at=assigned_at,
+            expires_in_days=expires_in_days,
+        )
+        inserted_records = tuple(self._repository.insert_many(assignments))
+        return AssignmentPageWriteOutcome(
+            attempted_count=len(assignments),
+            inserted_records=inserted_records,
+        )
 
-            previous_user_id: str | None = None
-            for index in range(0, len(user_ids), ASSIGNMENT_PAGE_SIZE):
-                user_id_page = user_ids[index : index + ASSIGNMENT_PAGE_SIZE]
-                records = self._user_behavior_vector_repository.list_by_user_ids(
-                    project_id=project_id,
-                    user_ids=user_id_page,
+    def summarize_run(
+        self,
+        promotion_run_id: str,
+    ) -> UserSegmentAssignmentRunAggregateRecord:
+        return self._repository.summarize_run(promotion_run_id)
+
+
+class SegmentAssignmentService:
+    def __init__(
+        self,
+        *,
+        input_loader: AssignmentInputLoader,
+        page_matcher: AssignmentPageMatcher,
+        result_writer: AssignmentResultWriter,
+    ) -> None:
+        self._input_loader = input_loader
+        self._page_matcher = page_matcher
+        self._result_writer = result_writer
+
+    @log_context_scope
+    def build_assignments(
+        self,
+        *,
+        promotion_run_id: str,
+        request: SegmentAssignmentBuildRequest,
+    ) -> SegmentAssignmentBuildResponse:
+        started_at = now_ms()
+        log.assign_context({"promotionRunId": promotion_run_id})
+        log.info("started", {"promotionRunId": promotion_run_id, "request": request})
+        build_input = self._input_loader.load(
+            promotion_run_id=promotion_run_id,
+            request=request,
+        )
+        run = build_input.run
+        audience_scope = build_input.audience_scope
+        experiments = build_input.experiments
+        segment_vectors = build_input.segment_vectors
+        log.assign_context(
+            {
+                "projectId": run.project_id,
+                "campaignId": run.campaign_id,
+                "promotionId": run.promotion_id,
+                "analysisId": run.analysis_id,
+                "generationId": run.generation_id,
+            }
+        )
+        log.info("promotion_run_loaded", {"promotionRun": run})
+        log.info(
+            "ad_experiments_loaded",
+            {
+                "nonFallbackCount": len(experiments.non_fallback),
+                "hasFallback": experiments.fallback is not None,
+            },
+        )
+        log.info(
+            "segment_vectors_loaded",
+            {"segmentVectorCount": len(segment_vectors)},
+        )
+        diagnostics = AssignmentDiagnostics()
+        assigned_at = datetime.now(UTC)
+        for page_number, eligible_users in enumerate(
+            self._input_loader.iter_user_pages(build_input),
+            start=1,
+        ):
+            if not eligible_users:
+                continue
+            log.info(
+                "eligible_users_page_loaded",
+                {
+                    "pageNumber": page_number,
+                    "eligibleUserCount": len(eligible_users),
+                },
+            )
+            selection = self._result_writer.select_unassigned(
+                promotion_run_id=run.promotion_run_id,
+                eligible_users=eligible_users,
+            )
+            diagnostics.accumulate_page(
+                processed_user_count=len(selection.eligible_users),
+                users_to_match_count=len(selection.users_to_match),
+                skipped_existing_count=selection.skipped_existing_count,
+            )
+            if selection.skipped_existing_count:
+                log.info(
+                    "existing_assignments_skipped",
+                    {
+                        "pageNumber": page_number,
+                        "userCount": selection.skipped_existing_count,
+                    },
+                )
+
+            try:
+                match_result = self._page_matcher.match_page(
+                    project_id=run.project_id,
+                    promotion_id=run.promotion_id,
+                    analysis_id=run.analysis_id,
                     vector_version=audience_scope.effective_vector_version,
-                    source=audience_scope.source,
+                    users=selection.users_to_match,
+                    segment_vectors=segment_vectors,
                 )
-                _validate_user_vector_page(
-                    records,
-                    after_user_id=previous_user_id,
-                )
-                if records:
-                    previous_user_id = records[-1].user_id
-                yield _user_vectors_from_records(records)
-            return
+            except (SegmentMatchValidationError, ValueError) as exc:
+                log.warn("segment_matching_invalid", {"err": exc})
+                raise SegmentAssignmentValidationError(str(exc)) from exc
 
-        after_user_id: str | None = None
-        remaining_limit = audience_scope.effective_limit
-        while remaining_limit is None or remaining_limit > 0:
-            page_size = (
-                ASSIGNMENT_PAGE_SIZE
-                if remaining_limit is None
-                else min(ASSIGNMENT_PAGE_SIZE, remaining_limit)
+            log.info(
+                "segment_matches_created",
+                {
+                    "pageNumber": page_number,
+                    "matchCount": len(match_result.matches),
+                    "fallbackCount": match_result.fallback_count,
+                    "annCandidateCount": match_result.ann_candidate_count,
+                    "exactRerankedPairCount": (
+                        match_result.exact_reranked_pair_count
+                    ),
+                },
             )
-            records = self._user_behavior_vector_repository.list_for_project(
-                project_id=project_id,
-                vector_version=audience_scope.effective_vector_version,
-                limit=page_size,
-                source=audience_scope.source,
-                after_user_id=after_user_id,
+
+            write_outcome = self._result_writer.write_page(
+                project_id=run.project_id,
+                promotion_run_id=run.promotion_run_id,
+                match_result=match_result,
+                experiments=experiments,
+                assigned_at=assigned_at,
+                expires_in_days=request.expires_in_days,
+                page_number=page_number,
             )
-            if not records:
-                return
-            if len(records) > page_size:
-                raise SegmentAssignmentValidationError(
-                    "eligible user page exceeded the requested page size"
-                )
-            _validate_user_vector_page(records, after_user_id=after_user_id)
+            diagnostics.accumulate_matching(match_result)
+            diagnostics.accumulate_inserted(
+                attempted_count=write_outcome.attempted_count,
+                inserted_records=write_outcome.inserted_records,
+            )
+            log.info(
+                "segment_assignments_page_created",
+                {
+                    "pageNumber": page_number,
+                    "assignmentCount": len(write_outcome.inserted_records),
+                    "insertConflictCount": (
+                        write_outcome.attempted_count
+                        - len(write_outcome.inserted_records)
+                    ),
+                },
+            )
 
-            yield _user_vectors_from_records(records)
+        diagnostics.validate_totals()
+        run_aggregate = self._result_writer.summarize_run(run.promotion_run_id)
+        assignment_mode = (
+            ASSIGNMENT_MODE_EXPLICIT_USER_IDS
+            if audience_scope.user_ids is not None
+            else ASSIGNMENT_MODE_LIVE_KEYSET
+        )
 
-            page_count = len(records)
-            after_user_id = records[-1].user_id
-            if remaining_limit is not None:
-                remaining_limit -= page_count
-                if remaining_limit <= 0:
-                    return
-            if page_count < page_size:
-                return
+        response = SegmentAssignmentBuildResponse(
+            promotion_run_id=run.promotion_run_id,
+            matching_mode=MATCHING_MODE,
+            vector_version=audience_scope.effective_vector_version,
+            ann_candidate_limit=ANN_CANDIDATE_LIMIT,
+            ann_candidate_count=diagnostics.ann_candidate_count,
+            exact_reranked_pair_count=diagnostics.exact_reranked_pair_count,
+            page_count=diagnostics.page_count,
+            processed_user_count=diagnostics.processed_user_count,
+            assignment_count=diagnostics.assignment_count,
+            run_assignment_count=run_aggregate.assignment_count,
+            run_has_fallback=run_aggregate.fallback_count > 0,
+            run_fallback_count=run_aggregate.fallback_count,
+            insert_conflict_count=diagnostics.insert_conflict_count,
+            segment_assignment_counts=diagnostics.segment_assignment_counts,
+            batch_has_fallback=diagnostics.fallback_count > 0,
+            fallback_count=diagnostics.fallback_count,
+            fallback_rate=diagnostics.fallback_rate,
+            fallback_reason_counts=diagnostics.fallback_reason_counts,
+            below_threshold_fallback_count=(
+                diagnostics.fallback_reason_counts[
+                    FALLBACK_REASON_BELOW_THRESHOLD
+                ]
+            ),
+            no_candidate_fallback_count=diagnostics.fallback_reason_counts[
+                FALLBACK_REASON_NO_CANDIDATE
+            ],
+            invalid_user_vector_fallback_count=(
+                diagnostics.fallback_reason_counts[
+                    FALLBACK_REASON_INVALID_USER_VECTOR
+                ]
+            ),
+            similarity_score_buckets=diagnostics.similarity_score_buckets,
+            ann_underfilled_user_count=diagnostics.ann_underfilled_user_count,
+            exact_rescue_user_count=diagnostics.exact_rescue_user_count,
+            ann_applied=diagnostics.ann_applied,
+            ann_not_applied_reason=diagnostics.ann_not_applied_reason,
+            skipped_existing_count=diagnostics.skipped_existing_count,
+            insufficient_segment_count=0,
+            completion_scope="current_request",
+            assignment_mode=assignment_mode,
+            input_stability="not_snapshotted",
+            status="completed",
+        )
+        log.info(
+            "assignment_diagnostics",
+            {"diagnostics": response.model_dump(mode="json")},
+        )
+        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
 
-def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _ExperimentSet:
+
+def _split_experiments(
+    experiments: Sequence[AdExperimentRecord],
+) -> AssignmentExperimentSet:
     if not experiments:
         log.warn("ad_experiments_empty")
         raise SegmentAssignmentValidationError("ad experiments are required")
@@ -618,7 +846,7 @@ def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _Experiment
             fallback = experiment
         else:
             non_fallback.append(experiment)
-    return _ExperimentSet(non_fallback=non_fallback, fallback=fallback)
+    return AssignmentExperimentSet(non_fallback=non_fallback, fallback=fallback)
 
 
 def _deduplicate_users_by_id(users: Sequence[UserVector]) -> list[UserVector]:
@@ -672,7 +900,7 @@ def _build_effective_audience_scope(
     goal_snapshot_json: Mapping[str, Any],
     request: SegmentAssignmentBuildRequest,
     project_id: str,
-) -> _EffectiveAudienceScope:
+) -> AssignmentAudienceScope:
     del project_id  # promotion_run.project_id is the only allowed project context.
     raw_scope = goal_snapshot_json.get("audience_scope")
     if raw_scope is not None and not isinstance(raw_scope, Mapping):
@@ -683,7 +911,7 @@ def _build_effective_audience_scope(
     request_limit = request.eligible_user_limit
 
     if raw_scope is None:
-        return _EffectiveAudienceScope(
+        return AssignmentAudienceScope(
             effective_vector_version=request.vector_version or DEFAULT_VECTOR_VERSION,
             effective_limit=request_limit,
             source=None,
@@ -731,7 +959,7 @@ def _build_effective_audience_scope(
     else:
         effective_limit = request_limit
 
-    return _EffectiveAudienceScope(
+    return AssignmentAudienceScope(
         effective_vector_version=effective_vector_version,
         effective_limit=effective_limit,
         source=source,
@@ -837,7 +1065,7 @@ def _build_assignment_writes(
     project_id: str,
     promotion_run_id: str,
     matches: Mapping[str, MatchResult],
-    experiments: _ExperimentSet,
+    experiments: AssignmentExperimentSet,
     assigned_at: datetime,
     expires_in_days: int | None,
 ) -> list[UserSegmentAssignmentWrite]:
@@ -854,7 +1082,12 @@ def _build_assignment_writes(
     )
     assignments: list[UserSegmentAssignmentWrite] = []
     for user_id, result in matches.items():
-        experiment = experiments_by_segment[result.segment_id]
+        experiment = experiments_by_segment.get(result.segment_id)
+        if experiment is None:
+            raise SegmentAssignmentValidationError(
+                "match references a segment without an ad experiment: "
+                f"{result.segment_id}"
+            )
         assignments.append(
             UserSegmentAssignmentWrite(
                 project_id=project_id,
@@ -904,6 +1137,27 @@ def _segment_vector_from_record(
     )
 
 
+def _validated_segment_vector_from_record(
+    record: SegmentVectorRecord,
+    *,
+    require_embedding: bool,
+) -> SegmentVector:
+    segment_vector = _segment_vector_from_record(
+        record,
+        require_embedding=require_embedding,
+    )
+    try:
+        normalize_values(
+            segment_vector.embedding_values,
+            segment_vector.vector_dim,
+        )
+    except ValueError as exc:
+        raise SegmentAssignmentValidationError(
+            f"invalid segment embedding: {record.segment_id}"
+        ) from exc
+    return segment_vector
+
+
 def _fallback_reason_count(
     matches: Mapping[str, MatchResult],
     fallback_reason: str,
@@ -918,6 +1172,8 @@ def _fallback_reason_count(
 def _score_to_decimal(score: float | None) -> Decimal | None:
     if score is None:
         return None
+    # The persisted Data Contract is [0, 1], so negative raw cosine values are
+    # intentionally represented as 0.000000 before diagnostics are bucketed.
     clamped_score = min(1.0, max(0.0, float(score)))
     return Decimal(str(clamped_score)).quantize(
         Decimal("0.000001"),
@@ -928,8 +1184,6 @@ def _score_to_decimal(score: float | None) -> Decimal | None:
 def _similarity_score_bucket(score: Decimal | None) -> str:
     if score is None:
         return "not_available"
-    if score < Decimal("0.00"):
-        return "lt_0_00"
     if score < Decimal("0.50"):
         return "0_00_to_0_50"
     if score < Decimal("0.65"):

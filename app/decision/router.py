@@ -27,6 +27,9 @@ from app.analysis.vector_service import (
 )
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.decision.assignment_service import (
+    AssignmentInputLoader,
+    AssignmentPageMatcher,
+    AssignmentResultWriter,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
@@ -178,17 +181,28 @@ def get_segment_assignment_service(
     clickhouse_client = create_clickhouse_client(settings)
     executor = PsycopgPostgresExecutor(connection)
     try:
+        promotion_run_repository = PromotionRunRepository(executor)
+        ad_experiment_repository = AdExperimentRepository(executor)
+        segment_vector_repository = SegmentVectorRepository(executor)
+        user_segment_assignment_repository = UserSegmentAssignmentRepository(executor)
         yield SegmentAssignmentService(
-            promotion_run_repository=PromotionRunRepository(executor),
-            ad_experiment_repository=AdExperimentRepository(executor),
-            segment_vector_repository=SegmentVectorRepository(executor),
-            user_behavior_vector_repository=UserBehaviorVectorRepository(
-                clickhouse_client,
+            input_loader=AssignmentInputLoader(
+                promotion_run_repository=promotion_run_repository,
+                ad_experiment_repository=ad_experiment_repository,
+                segment_vector_repository=segment_vector_repository,
+                user_behavior_vector_repository=UserBehaviorVectorRepository(
+                    clickhouse_client,
+                ),
             ),
-            user_segment_assignment_repository=UserSegmentAssignmentRepository(
-                executor,
+            page_matcher=AssignmentPageMatcher(
+                segment_vector_repository=segment_vector_repository,
+                reranker=SegmentCandidateReranker(),
             ),
-            reranker=SegmentCandidateReranker(),
+            result_writer=AssignmentResultWriter(
+                user_segment_assignment_repository=(
+                    user_segment_assignment_repository
+                ),
+            ),
         )
         connection.commit()
     except Exception:
@@ -400,7 +414,8 @@ async def build_segment_assignments(
     promotion_run_id: str,
     request: Request,
     segment_assignment_service: SegmentAssignmentService = Depends(
-        get_segment_assignment_service
+        get_segment_assignment_service,
+        scope="function",
     ),
 ) -> SegmentAssignmentBuildResponse:
     build_request = await _parse_segment_assignment_build_request(request)
