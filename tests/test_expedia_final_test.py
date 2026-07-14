@@ -263,6 +263,14 @@ def model_fixture(tmp_path):
             "training_end_cutoff": "2013-12-01T00:00:00+00:00",
             "training_target": "future_contextual_booking_rate",
             "training_contextual_booking_observation_rate": 0.04,
+            "training_candidate_type_example_counts": {
+                "intent_matched": 12,
+                "target_destination_affinity": 12,
+                "funnel_recovery": 12,
+                "benefit_value_seeker": 12,
+                "promotion_responsive": 0,
+                "general_destination_explorer": 0,
+            },
         },
     )
     model_path = tmp_path / "model.json"
