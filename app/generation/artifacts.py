@@ -58,10 +58,12 @@ class StaticCreativeArtifactPublisher:
             channel=channel,
             content_values=content_values,
         )
+        content_sha256 = hashlib.sha256(html_body.encode("utf-8")).hexdigest()
         storage_key = html_artifact_key(
             base_prefix=self.base_prefix,
             content_id=content_id,
             creative_format=creative_format,
+            content_sha256=content_sha256,
         )
         artifact = html_artifact_metadata(
             creative_format=creative_format,
@@ -91,17 +93,14 @@ class S3CreativeArtifactPublisher:
         if creative_format == CreativeFormat.SMS_TEXT:
             return not_required_artifact(creative_format)
 
-        try:
-            stored = self.storage.store_html(
-                content_id=content_id,
-                creative_format=creative_format,
-                html_body=render_creative_html(
-                    channel=channel,
-                    content_values=content_values,
-                ),
-            )
-        except Exception as exc:
-            return failed_artifact(creative_format, error_code=safe_error_code(exc))
+        stored = self.storage.store_html(
+            content_id=content_id,
+            creative_format=creative_format,
+            html_body=render_creative_html(
+                channel=channel,
+                content_values=content_values,
+            ),
+        )
 
         return {
             "creative_format": creative_format.value,
@@ -301,11 +300,20 @@ def html_artifact_key(
     base_prefix: str,
     content_id: str,
     creative_format: CreativeFormat,
+    content_sha256: str,
 ) -> str:
     prefix = base_prefix.strip("/")
-    filename = f"{safe_asset_name(content_id)}.{creative_format.value}.html"
-    path = f"generated/{filename}"
+    digest = _validated_sha256(content_sha256)
+    filename = f"{digest}.{creative_format.value}.html"
+    path = f"generated/{safe_asset_name(content_id)}/{filename}"
     return f"{prefix}/{path}" if prefix else path
+
+
+def _validated_sha256(value: str) -> str:
+    digest = str(value).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("content_sha256 must be 64 lowercase hexadecimal characters")
+    return digest
 
 
 def html_artifact_metadata(

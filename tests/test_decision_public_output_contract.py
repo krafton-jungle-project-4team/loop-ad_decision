@@ -24,7 +24,11 @@ from app.decision.schemas import (
 )
 from app.generation.artifacts import render_banner_html
 from app.generation.router import get_generation_service
-from app.generation.service import GenerationService
+from app.generation.schemas import (
+    GenerationAcceptedResponse,
+    GenerationRequest,
+    GenerationStatus,
+)
 from app.main import create_app
 
 
@@ -94,7 +98,9 @@ def valid_env() -> dict[str, str]:
 def make_client() -> TestClient:
     app = create_app(settings=load_settings(valid_env()))
     app.dependency_overrides[get_analysis_service] = lambda: FakeAnalysisService()
-    app.dependency_overrides[get_generation_service] = lambda: GenerationService()
+    app.dependency_overrides[get_generation_service] = (
+        lambda: FakeGenerationSubmissionService()
+    )
     return TestClient(app)
 
 
@@ -380,6 +386,21 @@ class FakeAnalysisService:
         )
 
 
+class FakeGenerationSubmissionService:
+    def submit(
+        self,
+        request: GenerationRequest,
+        *,
+        idempotency_key: str,
+    ) -> GenerationAcceptedResponse:
+        assert idempotency_key == "public-output-contract-001"
+        return GenerationAcceptedResponse(
+            generation_id="generation_banner_001_receipt",
+            promotion_id=request.promotion_id,
+            status=GenerationStatus.REQUESTED,
+        )
+
+
 def public_payload_text(client: TestClient) -> str:
     payloads: list[Any] = []
     health_response = client.get("/health")
@@ -408,8 +429,16 @@ def public_payload_text(client: TestClient) -> str:
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "public-output-contract-001"},
     )
-    assert generation_response.status_code == 200
-    payloads.append(generation_response.json())
+    assert generation_response.status_code == 202
+    generation_receipt = generation_response.json()
+    assert generation_receipt == {
+        "generation_id": "generation_banner_001_receipt",
+        "promotion_id": "promo_banner_001",
+        "status": "requested",
+    }
+    assert "content_candidates" not in generation_receipt
+    payloads.append(generation_receipt)
 
     return json.dumps(payloads, ensure_ascii=False).lower()

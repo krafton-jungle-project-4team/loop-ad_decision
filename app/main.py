@@ -8,6 +8,10 @@ from fastapi import FastAPI
 
 from app.analysis.router import router as analysis_router
 from app.config import Settings, load_settings
+from app.db import (
+    create_generation_coordinator_connection,
+    create_postgres_connection,
+)
 from app.decision.router import (
     ad_experiment_router,
     promotion_run_router,
@@ -15,6 +19,8 @@ from app.decision.router import (
 )
 from app.dependencies import require_internal_key
 from app.generation.router import router as generation_router
+from app.generation.coordinator import GenerationCoordinator
+from app.generation.worker import GenerationJobProcessor
 from app.internal.router import router as internal_batch_router
 from app.logging import configure_logging, request_logging_middleware
 
@@ -22,8 +28,26 @@ from app.logging import configure_logging, request_logging_middleware
 def create_app(*, settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        configure_logging(_get_or_load_settings(app))
-        yield
+        resolved_settings = _get_or_load_settings(app)
+        configure_logging(resolved_settings)
+        coordinator: GenerationCoordinator | None = None
+        if resolved_settings.env != "test":
+            coordinator = GenerationCoordinator(
+                settings=resolved_settings,
+                connection_factory=create_generation_coordinator_connection,
+                processor_factory=lambda: GenerationJobProcessor(
+                    settings=resolved_settings,
+                    connection_factory=create_postgres_connection,
+                ),
+            )
+            app.state.generation_coordinator = coordinator
+            coordinator.start()
+        try:
+            yield
+        finally:
+            if coordinator is not None:
+                coordinator.shutdown()
+            app.state.generation_coordinator = None
 
     app = FastAPI(
         title="Loop-Ad Decision API",
@@ -31,6 +55,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.generation_coordinator = None
     if settings is not None:
         configure_logging(settings)
 
