@@ -22,6 +22,9 @@ from offline_evaluation.external_backtest import (
     stable_bucket,
     stable_score,
 )
+from offline_evaluation.external_evaluation_contract import (
+    external_evaluation_contract,
+)
 
 
 SYNERISE_SELECTION_RECENCY_DAYS = 14
@@ -190,6 +193,7 @@ def load_booking_com_dataset(
         _booking_case(target_city=target_city, trips=trips, config=config)
         for target_city in target_cities
     )
+    claim_contract = external_evaluation_contract("booking-com")
     manifest = ExternalDatasetManifest(
         dataset_id="booking-com",
         source_version="booking.multi-destination-trips.v1",
@@ -205,6 +209,7 @@ def load_booking_com_dataset(
             "검색 또는 호텔 상세 조회 이후의 예약 전환율",
             "미예약 사용자에 대한 예약 가능성",
             "프로모션 노출·클릭에 따른 증분 효과",
+            "서로 다른 전략 후보 2~3개의 다양성과 사용자 중복도",
         ),
         signal_mappings={
             "destination_values": {
@@ -230,6 +235,9 @@ def load_booking_com_dataset(
                 include_checksum=config.include_checksum,
             ),
         ),
+        supported_claim_ids=claim_contract.supported_claim_ids,
+        unsupported_claim_ids=claim_contract.unsupported_claim_ids,
+        verdict_scope=claim_contract.verdict_scope,
         evaluation_role=config.evaluation_role,
         prediction_error_comparability_reason=(
             "Booking.com next itinerary city is not the Expedia model's "
@@ -304,6 +312,7 @@ def load_booking_com_final_dataset(
         )
         for target_city in target_cities
     )
+    claim_contract = external_evaluation_contract("booking-com")
     manifest = ExternalDatasetManifest(
         dataset_id="booking-com",
         source_version="booking.multi-destination-trips.official-test.v1",
@@ -319,6 +328,7 @@ def load_booking_com_final_dataset(
             "검색 또는 호텔 상세 조회 이후의 예약 전환율",
             "프로모션 노출에 따른 증분 효과",
             "Expedia 예상 예약률의 보정 정확도",
+            "서로 다른 전략 후보 2~3개의 다양성과 사용자 중복도",
         ),
         signal_mappings={
             "destination_values": {
@@ -342,6 +352,9 @@ def load_booking_com_final_dataset(
             source_file_descriptor(path, include_checksum=config.include_checksum)
             for path in (test_path, ground_truth_path)
         ),
+        supported_claim_ids=claim_contract.supported_claim_ids,
+        unsupported_claim_ids=claim_contract.unsupported_claim_ids,
+        verdict_scope=claim_contract.verdict_scope,
         evaluation_role=config.evaluation_role,
         prediction_error_comparability_reason=(
             "Booking.com next itinerary city is not the Expedia model's "
@@ -624,6 +637,7 @@ def load_airbnb_dataset(
         promotion=promotion,
         intent=intent,
     )
+    claim_contract = external_evaluation_contract("airbnb")
     manifest = ExternalDatasetManifest(
         dataset_id="airbnb",
         source_version="airbnb.new-user-bookings.2015",
@@ -638,6 +652,7 @@ def load_airbnb_dataset(
             "행동 이후 특정 기간 안에 발생한 미래 예약 전환율",
             "특정 목적지 프로모션과 사용자 목적지 관심의 정합성",
             "프로모션 노출로 발생한 증분 전환",
+            "서로 다른 전략 후보 2~3개의 다양성과 사용자 중복도",
         ),
         signal_mappings={
             "hotel_search_count": {
@@ -661,6 +676,9 @@ def load_airbnb_dataset(
             source_file_descriptor(path, include_checksum=config.include_checksum)
             for path in (users_path, sessions_path)
         ),
+        supported_claim_ids=claim_contract.supported_claim_ids,
+        unsupported_claim_ids=claim_contract.unsupported_claim_ids,
+        verdict_scope=claim_contract.verdict_scope,
         evaluation_role=config.evaluation_role,
         prediction_error_comparability_reason=(
             "Airbnb static first-booking label has no matching observation window "
@@ -846,6 +864,7 @@ def load_synerise_dataset(
         )
         for category in target_categories
     )
+    claim_contract = external_evaluation_contract("synerise")
     manifest = ExternalDatasetManifest(
         dataset_id="synerise",
         source_version="synerise.recsys-2025.raw",
@@ -854,13 +873,14 @@ def load_synerise_dataset(
         supports_temporal_holdout=True,
         supported_claims=(
             "검색·장바구니·구매 이력으로 미래 구매 가능성이 높은 후보를 찾는 능력",
-            "퍼널 이탈형·가격 민감형·카테고리 반복 관심형 후보 묶음의 품질",
+            "생성 가능한 후보 유형별 미래 구매 사용자 포함 정도",
             "시간 분리된 미래 구매율과 예상값의 차이 및 baseline 대비 lift",
         ),
         unsupported_claims=(
             "숙박 목적지 또는 호텔에 대한 도메인 정합성",
             "실제 광고 노출로 발생한 증분 구매 효과",
             "page_visit URL을 특정 상품 상세 조회로 해석한 결과",
+            "서로 다른 전략 후보 2~3개의 다양성과 사용자 중복도",
         ),
         signal_mappings={
             "hotel_search_count": {
@@ -896,6 +916,9 @@ def load_synerise_dataset(
             source_file_descriptor(path, include_checksum=config.include_checksum)
             for path in paths.values()
         ),
+        supported_claim_ids=claim_contract.supported_claim_ids,
+        unsupported_claim_ids=claim_contract.unsupported_claim_ids,
+        verdict_scope=claim_contract.verdict_scope,
         evaluation_role=config.evaluation_role,
         prediction_error_comparability_reason=(
             "Synerise retail category purchase is a cross-domain proxy, not an "

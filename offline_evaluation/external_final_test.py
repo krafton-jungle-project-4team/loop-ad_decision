@@ -23,12 +23,19 @@ from offline_evaluation.external_datasets import (
     external_source_paths,
     load_external_dataset,
 )
+from offline_evaluation.external_evaluation_contract import (
+    EXTERNAL_EVALUATION_CONTRACT_VERSION,
+    ExternalFinalTestCriteria,
+    determine_external_evaluation_verdict,
+    evaluate_external_criteria,
+    external_evaluation_contract,
+    validate_external_evaluation_contract,
+)
 from offline_evaluation.rank_quality import (
     CRITERION_EVIDENCE,
     CRITERION_QUALITY,
     VERDICT_PASSED,
     criterion_result,
-    determine_final_verdict,
 )
 from offline_evaluation.sealed_execution import (
     SealedExecution,
@@ -37,7 +44,7 @@ from offline_evaluation.sealed_execution import (
 )
 
 
-EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v3"
+EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v4"
 EXTERNAL_COHORT_MODULO = 5
 EXTERNAL_DEVELOPMENT_REMAINDERS = (0, 1, 2, 3)
 EXTERNAL_FINAL_REMAINDERS = (4,)
@@ -46,42 +53,6 @@ SYNERISE_DEVELOPMENT_CUTOFFS = (
     datetime(2022, 10, 13, tzinfo=UTC),
 )
 SYNERISE_FINAL_CUTOFF = datetime(2022, 11, 10, tzinfo=UTC)
-
-
-@dataclass(frozen=True, slots=True)
-class ExternalFinalTestCriteria:
-    portfolio_candidate_beats_baseline_rate_min: float = 0.50
-    portfolio_scenario_any_candidate_beats_baseline_rate_min: float = 0.50
-    portfolio_scenario_all_candidates_beat_baseline_rate_min: float = 0.50
-    portfolio_mean_candidate_lift_percentage_points_min: float = 0.0
-    portfolio_mean_worst_candidate_lift_percentage_points_min: float = 0.0
-    scenario_with_observed_outcome_count_min: int = 3
-    portfolio_candidate_result_count_min: int = 9
-    portfolio_multi_candidate_scenario_count_min: int = 3
-    portfolio_three_candidate_scenario_count_min: int = 3
-    candidate_type_count_min: int = 2
-    mean_portfolio_candidate_overlap_max: float = 0.90
-    maximum_portfolio_candidate_overlap_max: float = 0.95
-
-    def __post_init__(self) -> None:
-        rates = (
-            self.portfolio_candidate_beats_baseline_rate_min,
-            self.portfolio_scenario_any_candidate_beats_baseline_rate_min,
-            self.portfolio_scenario_all_candidates_beat_baseline_rate_min,
-            self.mean_portfolio_candidate_overlap_max,
-            self.maximum_portfolio_candidate_overlap_max,
-        )
-        if any(not 0 <= value <= 1 for value in rates):
-            raise ValueError("external final rate criteria must be between 0 and 1")
-        counts = (
-            self.scenario_with_observed_outcome_count_min,
-            self.portfolio_candidate_result_count_min,
-            self.portfolio_multi_candidate_scenario_count_min,
-            self.portfolio_three_candidate_scenario_count_min,
-            self.candidate_type_count_min,
-        )
-        if any(value <= 0 for value in counts):
-            raise ValueError("external final count criteria must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +199,10 @@ def build_external_sealed_final_test_manifest(
     }
     adapter_payload = _adapter_config_payload(adapter_config)
     backtest_payload = asdict(backtest_config)
+    evaluation_contract = external_evaluation_contract(
+        dataset_id,
+        criteria=criteria,
+    )
     outcome_contract = {
         "prediction_error_comparable": (
             backtest_config.prediction_error_comparable
@@ -236,17 +211,20 @@ def build_external_sealed_final_test_manifest(
             backtest_config.prediction_error_comparability_reason
         ),
         "external_data_updates_model_parameters": False,
+        "verdict_scope": evaluation_contract.verdict_scope,
+        "supported_claim_ids": list(evaluation_contract.supported_claim_ids),
+        "unsupported_claim_ids": list(
+            evaluation_contract.unsupported_claim_ids
+        ),
         "primary_metrics": [
-            "portfolio_candidate_beats_baseline_rate",
-            "portfolio_scenario_any_candidate_beats_baseline_rate",
-            "portfolio_scenario_all_candidates_beat_baseline_rate",
-            "portfolio_mean_candidate_lift_percentage_points",
-            "portfolio_mean_worst_candidate_lift_percentage_points",
-            "candidate_type_count",
-            "mean_portfolio_candidate_overlap",
+            criterion_id
+            for criterion_id, criterion in (
+                evaluation_contract.acceptance_criteria.items()
+            )
+            if criterion.get("applicable") is True
         ],
     }
-    criteria_payload = asdict(criteria or ExternalFinalTestCriteria())
+    criteria_payload = evaluation_contract.to_json()
     base_payload: dict[str, Any] = {
         "version": EXTERNAL_SEALED_FINAL_TEST_VERSION,
         "dataset_id": dataset_id,
@@ -395,6 +373,13 @@ def run_external_sealed_final_test(
     performance_predictor: SegmentPerformancePredictor,
     on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExternalSealedFinalTestResult:
+    try:
+        validate_external_evaluation_contract(
+            manifest.acceptance_criteria,
+            dataset_id=manifest.dataset_id,
+        )
+    except ValueError as exc:
+        raise ExternalBacktestError(str(exc)) from exc
     adapter_config = _adapter_config_from_payload(manifest.adapter_config)
     backtest_config = ExternalBacktestConfig(**dict(manifest.backtest_config))
     bundle = load_external_dataset(
@@ -402,6 +387,10 @@ def run_external_sealed_final_test(
         source_dir,
         config=adapter_config,
         on_outcomes_opened=on_outcomes_opened,
+    )
+    _validate_runtime_claim_contract(
+        bundle.manifest,
+        manifest.acceptance_criteria,
     )
     run = run_external_backtest(
         bundle.cases,
@@ -416,7 +405,7 @@ def run_external_sealed_final_test(
         run.summary,
         manifest.acceptance_criteria,
     )
-    verdict = determine_final_verdict(criteria_results)
+    verdict = determine_external_evaluation_verdict(criteria_results)
     return ExternalSealedFinalTestResult(
         run=run,
         dataset_manifest=bundle.manifest,
@@ -457,9 +446,20 @@ def write_external_sealed_final_test_artifacts(
         "metrics": dict(result.run.summary),
         "criteria_results": dict(result.criteria_results),
         "outcome_contract": dict(manifest.outcome_contract),
+        "verdict_scope": manifest.outcome_contract.get("verdict_scope"),
         "limitations": [
             "External outcomes do not update the Expedia-trained model.",
             "External lift is observational and does not prove causal ad lift.",
+            (
+                "Cross-domain diagnostic verdict does not determine hospitality "
+                "product acceptance."
+                if manifest.outcome_contract.get("verdict_scope")
+                == "cross_domain_diagnostic_only"
+                else (
+                    "This result is supporting evidence, not the primary "
+                    "Expedia verdict."
+                )
+            ),
             "After inspection, this manifest must not be reused for tuning.",
         ],
     }
@@ -492,10 +492,44 @@ def _validate_final_adapter_config(
     external_partition_contract(dataset_id)
 
 
+def _validate_runtime_claim_contract(
+    dataset_manifest: ExternalDatasetManifest,
+    acceptance_contract: Mapping[str, Any],
+) -> None:
+    if acceptance_contract.get("version") != EXTERNAL_EVALUATION_CONTRACT_VERSION:
+        raise ExternalBacktestError(
+            "external sealed evaluation contract version changed after sealing"
+        )
+    if acceptance_contract.get("dataset_id") != dataset_manifest.dataset_id:
+        raise ExternalBacktestError(
+            "external sealed evaluation contract dataset does not match runtime"
+        )
+    supported_claim_ids = tuple(
+        str(value)
+        for value in acceptance_contract.get("supported_claim_ids", ())
+    )
+    unsupported_claim_ids = tuple(
+        str(value)
+        for value in acceptance_contract.get("unsupported_claim_ids", ())
+    )
+    if supported_claim_ids != dataset_manifest.supported_claim_ids or (
+        unsupported_claim_ids != dataset_manifest.unsupported_claim_ids
+    ):
+        raise ExternalBacktestError(
+            "external dataset claim support changed after sealing"
+        )
+    if acceptance_contract.get("verdict_scope") != dataset_manifest.verdict_scope:
+        raise ExternalBacktestError(
+            "external dataset verdict scope changed after sealing"
+        )
+
+
 def _evaluate_criteria(
     metrics: Mapping[str, Any],
     criteria: Mapping[str, Any],
 ) -> dict[str, Any]:
+    if criteria.get("version") == EXTERNAL_EVALUATION_CONTRACT_VERSION:
+        return evaluate_external_criteria(metrics, criteria)
     return {
         "scenario_with_observed_outcome_count": criterion_result(
             _int_metric(metrics, "scenario_with_observed_outcome_count"),
@@ -627,6 +661,7 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
         "",
         f"- Manifest ID: `{summary['manifest_id']}`",
         f"- 최종 판정: {_verdict_label(str(summary['verdict']))}",
+        f"- 판정 범위: `{summary['verdict_scope']}`",
         "- 외부 outcome으로 모델을 학습하거나 보정하지 않음",
         "",
         "## 핵심 지표",
@@ -653,11 +688,15 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
         "",
     ]
     for name, criterion in summary["criteria_results"].items():
-        status = "PASS" if criterion["passed"] else "FAIL"
+        if criterion.get("applicable") is False:
+            status = "N/A"
+        else:
+            status = "PASS" if criterion["passed"] else "FAIL"
         lines.append(
             f"- [{criterion['category']}] {name}: "
             f"{_format_criterion_value(criterion['actual'])} "
-            f"{criterion['operator']} {criterion['threshold']} · {status}"
+            f"{criterion['operator']} "
+            f"{_format_criterion_value(criterion['threshold'])} · {status}"
         )
     lines.extend(
         [

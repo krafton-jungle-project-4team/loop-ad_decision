@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from app.analysis.segment_performance import (
 )
 from offline_evaluation.external_backtest import (
     ExternalBacktestConfig,
+    ExternalBacktestError,
 )
 from offline_evaluation.external_datasets import (
     EXTERNAL_DEVELOPMENT_ROLE,
@@ -80,6 +82,14 @@ def test_sealing_hashes_booking_outcome_file_without_parsing_it(
         "training_candidate_type_example_counts"
     ]["promotion_responsive"] == 0
     assert manifest.outcome_contract["prediction_error_comparable"] is False
+    assert manifest.outcome_contract["supported_claim_ids"]
+    assert "candidate_type_count" not in manifest.outcome_contract[
+        "primary_metrics"
+    ]
+    assert manifest.acceptance_criteria["dataset_id"] == "booking-com"
+    assert manifest.acceptance_criteria["criteria"][
+        "portfolio_multi_candidate_scenario_count"
+    ]["applicable"] is False
     assert manifest.partition_contract["final"]["disjoint_from_development"] is True
 
 
@@ -195,6 +205,12 @@ def test_external_final_run_uses_official_booking_ground_truth_and_writes_result
     assert result.dataset_manifest.evaluation_role == EXTERNAL_SEALED_FINAL_ROLE
     assert result.verdict == "inconclusive"
     assert result.passed is False
+    assert result.criteria_results[
+        "portfolio_multi_candidate_scenario_count"
+    ]["applicable"] is False
+    assert result.criteria_results[
+        "scenario_with_observed_outcome_count"
+    ]["passed"] is False
     assert result.run.summary["prediction_error_comparable"] is False
     assert (
         result.run.summary["mean_absolute_prediction_error_percentage_points"]
@@ -202,6 +218,34 @@ def test_external_final_run_uses_official_booking_ground_truth_and_writes_result
     )
     assert artifacts["summary"].is_file()
     assert artifacts["report"].is_file()
+
+
+def test_external_final_rejects_changed_contract_before_opening_outcomes(
+    tmp_path: Path,
+) -> None:
+    source_dir = _booking_fixture(tmp_path)
+    model_path = _model_file(tmp_path)
+    manifest = _build_manifest(source_dir, model_path)
+    changed_contract = dict(manifest.acceptance_criteria)
+    changed_contract["supported_claim_ids"] = ["strategy_portfolio_diversity"]
+    changed_manifest = replace(
+        manifest,
+        acceptance_criteria=changed_contract,
+    )
+    outcome_events: list[str] = []
+
+    with pytest.raises(
+        ExternalBacktestError,
+        match="supported_claim_ids changed after sealing",
+    ):
+        run_external_sealed_final_test(
+            manifest=changed_manifest,
+            source_dir=source_dir,
+            performance_predictor=ContextualBookingHeuristicPredictor(),
+            on_outcomes_opened=lambda: outcome_events.append("opened"),
+        )
+
+    assert outcome_events == []
 
 
 def _build_manifest(

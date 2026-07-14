@@ -62,6 +62,11 @@ from offline_evaluation.external_final_test import (  # noqa: E402
     write_external_sealed_final_test_artifacts,
     write_external_sealed_final_test_manifest,
 )
+from offline_evaluation.external_evaluation_contract import (  # noqa: E402
+    determine_external_evaluation_verdict,
+    evaluate_external_criteria,
+    external_evaluation_contract,
+)
 from offline_evaluation.git_state import (  # noqa: E402
     inspect_clean_git_identity,
 )
@@ -124,6 +129,7 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
     source_dir = args.source_dir or DEFAULT_SOURCE_DIRS[dataset_id]
     output_dir = args.output_dir or _default_development_output_dir(dataset_id)
     predictor = build_segment_performance_predictor(args.model_path)
+    evaluation_contract = external_evaluation_contract(dataset_id).to_json()
     cutoffs = _development_cutoffs(args)
     base_config = _development_adapter_config(args)
     selection_config = _audience_selection_config(args)
@@ -191,10 +197,18 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
         evaluation_designs.append(bundle.manifest.evaluation_design)
         if diagnostic_manifest is None:
             diagnostic_manifest = bundle.manifest
+        criteria_results = evaluate_external_criteria(
+            run.summary,
+            evaluation_contract,
+        )
         entries.append(
             {
                 "cutoff": cutoff.isoformat(),
                 "metrics": dict(run.summary),
+                "criteria_results": criteria_results,
+                "verdict": determine_external_evaluation_verdict(
+                    criteria_results
+                ),
                 "summary_path": str(artifacts["summary"]),
                 "report_path": str(artifacts["report"]),
             }
@@ -232,6 +246,7 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
                 "repeatable": True,
                 "updates_model_parameters": False,
                 "accesses_sealed_final_partition": False,
+                "evaluation_contract": evaluation_contract,
                 "runs": entries,
                 "audience_selection": {
                     "assessment": dict(

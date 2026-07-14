@@ -40,7 +40,6 @@ def settings() -> Settings:
         clickhouse_password="secret",
         data_storage_bucket="loopad-test",
         genai_assets_base_prefix="genai",
-        brand_context_base_prefix="brand-context",
         openai_api_key="openai-test",
         gemini_api_key="gemini-test",
         genai_assets_public_base_url="https://assets.example.test",

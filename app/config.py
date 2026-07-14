@@ -8,7 +8,11 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
+BRAND_CONTEXT_BASE_PREFIX = "brand-context/"
+GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
+OPENAI_CONTENT_MODEL = "gpt-4o-mini"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
 GENERATION_WORKER_MAX_CONCURRENCY = 2
 GENERATION_POLL_INTERVAL_SECONDS = 1
 GENERATION_IDLE_POLL_INTERVAL_SECONDS = 30
@@ -46,12 +50,12 @@ class Settings:
     clickhouse_password: str
     data_storage_bucket: str
     genai_assets_base_prefix: str
-    brand_context_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
-    genai_assets_public_base_url: str
-    openai_content_model: str
-    gemini_image_model: str
+    brand_context_base_prefix: str = BRAND_CONTEXT_BASE_PREFIX
+    genai_assets_public_base_url: str = GENAI_ASSETS_PUBLIC_BASE_URL
+    openai_content_model: str = OPENAI_CONTENT_MODEL
+    gemini_image_model: str = GEMINI_IMAGE_MODEL
     generation_worker_max_concurrency: int = GENERATION_WORKER_MAX_CONCURRENCY
     generation_poll_interval_seconds: int = GENERATION_POLL_INTERVAL_SECONDS
     generation_idle_poll_interval_seconds: int = GENERATION_IDLE_POLL_INTERVAL_SECONDS
@@ -85,12 +89,8 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
-    "LOOPAD_BRAND_CONTEXT_BASE_PREFIX",
-    "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
     "LOOPAD_OPENAI_API_KEY",
-    "LOOPAD_OPENAI_CONTENT_MODEL",
     "LOOPAD_GEMINI_API_KEY",
-    "LOOPAD_GEMINI_IMAGE_MODEL",
 )
 
 
@@ -127,21 +127,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             source,
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
         ),
-        brand_context_base_prefix=_read_required(
-            source,
-            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX",
-        ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
-        genai_assets_public_base_url=_read_required(
-            source,
-            "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
-        ),
-        openai_content_model=_read_required(
-            source,
-            "LOOPAD_OPENAI_CONTENT_MODEL",
-        ),
-        gemini_image_model=_read_required(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
         segment_performance_model_path=_read_optional(
             source,
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
@@ -201,7 +188,7 @@ def _validate_generation_settings(settings: Settings) -> None:
         or source_prefix.startswith(f"{brand_prefix}/")
     ):
         raise SettingsError(
-            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX must not overlap the public "
+            "BRAND_CONTEXT_BASE_PREFIX must not overlap the public "
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX or GENAI_SOURCE_MANIFEST_PREFIX"
         )
     if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
