@@ -248,6 +248,9 @@ def test_submit_persists_requested_row_before_commit_and_wake() -> None:
     assert record.worker_id is None
     assert record.lease_token is None
     assert record.input_json["schema_version"] == "generation.request.v1"
+    assert record.input_json["target_segment_ids"] == [
+        "seg_repeat_hotel_no_booking"
+    ]
     assert len(record.request_fingerprint or "") == 64
 
 
@@ -432,6 +435,7 @@ def test_snapshot_roundtrip_is_sorted_and_fingerprint_is_deterministic() -> None
     assert [
         item["segment_id"] for item in reversed_snapshot["target_segments"]
     ] == ["seg_a", "seg_b"]
+    assert reversed_snapshot["target_segment_ids"] == ["seg_a", "seg_b"]
     assert generation_request_fingerprint(reversed_snapshot) == (
         generation_request_fingerprint(ordered_snapshot)
     )

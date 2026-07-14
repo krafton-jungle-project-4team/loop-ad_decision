@@ -5,7 +5,7 @@ import json
 import re
 from collections import defaultdict
 from decimal import Decimal
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from app.decision.repositories import (
     AdExperimentRecord,
@@ -141,6 +141,7 @@ class PromotionRunService:
 
         snapshot_segment_ids = normalize_generation_segment_snapshot(
             generation.input_json.get("target_segment_ids"),
+            target_segments_snapshot=generation.input_json.get("target_segments"),
             required=requested_segment_ids is not None,
         )
         if requested_segment_ids is None:
@@ -1010,19 +1011,12 @@ class PromotionRunService:
         if requested_segment_ids is None:
             return
 
-        snapshot = generation.input_json.get("target_segment_ids")
-        if (
-            not isinstance(snapshot, list)
-            or any(
-                not isinstance(segment_id, str) or not segment_id.strip()
-                for segment_id in snapshot
-            )
-            or len(snapshot) != len(set(snapshot))
-        ):
-            raise RunValidationError(
-                "generation run must include a valid target_segment_ids snapshot"
-            )
-        if set(snapshot) != set(requested_segment_ids):
+        snapshot = normalize_generation_segment_snapshot(
+            generation.input_json.get("target_segment_ids"),
+            target_segments_snapshot=generation.input_json.get("target_segments"),
+            required=True,
+        )
+        if set(snapshot or ()) != set(requested_segment_ids):
             raise RunValidationError(
                 "segment_ids must match the generation target_segment_ids snapshot"
             )
@@ -1313,8 +1307,13 @@ def normalize_explicit_segment_ids(
 def normalize_generation_segment_snapshot(
     snapshot: object,
     *,
+    target_segments_snapshot: object = None,
     required: bool,
 ) -> tuple[str, ...] | None:
+    if snapshot is None:
+        snapshot = _segment_ids_from_target_segments_snapshot(
+            target_segments_snapshot
+        )
     if snapshot is None and not required:
         return None
     if not isinstance(snapshot, list):
@@ -1335,6 +1334,32 @@ def normalize_generation_segment_snapshot(
             "generation run must include a valid target_segment_ids snapshot"
         )
     return tuple(sorted(normalized))
+
+
+def _segment_ids_from_target_segments_snapshot(
+    snapshot: object,
+) -> list[str] | None:
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, list) or not snapshot:
+        raise RunValidationError(
+            "generation run must include a valid target_segments snapshot"
+        )
+
+    segment_ids: list[str] = []
+    for target_segment in snapshot:
+        if not isinstance(target_segment, Mapping):
+            raise RunValidationError(
+                "generation run must include a valid target_segments snapshot"
+            )
+        segment_id = target_segment.get("segment_id")
+        if not isinstance(segment_id, str) or not segment_id.strip():
+            raise RunValidationError(
+                "generation run must include a valid target_segments snapshot"
+            )
+        segment_ids.append(segment_id)
+    return segment_ids
+
 
 def _build_goal_snapshot(
     *,
