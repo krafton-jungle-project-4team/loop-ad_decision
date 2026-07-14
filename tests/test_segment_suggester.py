@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 import pytest
 
+from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
     compile_raw_event_intent,
@@ -586,7 +587,7 @@ def test_raw_event_suggester_uses_all_matching_users_until_ratio_is_backtested()
     assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
     assert segment.profile_json["display_copy"]["audience_summary"] == (
         "분석 대상 170명 중 조건 일치 170명 · "
-        "조건 일치자 전체를 추천 대상으로 사용 (100%)"
+        "조건 일치자 전체를 추천 대상으로 사용"
     )
     assert segment.profile_json["display_copy"]["audience"] == {
         "total_eligible_user_count": 170,
@@ -600,12 +601,70 @@ def test_raw_event_suggester_uses_all_matching_users_until_ratio_is_backtested()
         "selection_limit": None,
         "selected_user_role": "recommended_audience",
         "selection_policy": {
-            "version": "dec.segment-audience-selection.v1",
+            "version": "dec.segment-audience-selection.v2",
             "method": "all_matching",
+            "configured_ratio": 1.0,
             "applied_ratio": 1.0,
             "calibration_status": "pending_backtest",
+            "artifact_hash": None,
+            "fallback_reason": "artifact_missing",
         },
     }
+
+
+def test_raw_event_suggester_applies_validated_ratio_to_behavior_order() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                f"hotel_user_{index:03d}",
+                hotel_search_count=index + 1,
+                hotel_detail_view_count=1,
+            )
+            for index in range(10)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        audience_selection_policy=fixed_ratio_audience_selection_policy(
+            goal_metric="booking_conversion_rate",
+            selected_ratio=0.4,
+            minimum_selected_user_count=2,
+            policy_version="test-selection-policy.v1",
+        ),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="호텔 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.rule_json["candidate_user_ids"] == [
+        "hotel_user_009",
+        "hotel_user_008",
+        "hotel_user_007",
+        "hotel_user_006",
+    ]
+    assert segment.sample_size == 4
+    audience = segment.profile_json["audience"]
+    assert audience["matching_user_count"] == 10
+    assert audience["selected_user_count"] == 4
+    assert audience["selection_ratio_within_matching"] == 0.4
+    assert audience["selection_limited"] is True
+    assert audience["selection_policy"]["method"] == (
+        "top_behavior_strength_ratio"
+    )
+    assert audience["selection_policy"]["configured_ratio"] == 0.4
+    assert segment.profile_json["signal_metrics"]["profile_count"] == 4
+    assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 10
 
 
 def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
@@ -782,10 +841,13 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
         "selection_limit": None,
         "selected_user_role": "recommended_audience",
         "selection_policy": {
-            "version": "dec.segment-audience-selection.v1",
+            "version": "dec.segment-audience-selection.v2",
             "method": "all_matching",
+            "configured_ratio": 1.0,
             "applied_ratio": 1.0,
             "calibration_status": "pending_backtest",
+            "artifact_hash": None,
+            "fallback_reason": "artifact_missing",
         },
     }
     assert display_copy["rank_comparison"]["reference_rank"] == 2

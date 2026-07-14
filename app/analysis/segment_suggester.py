@@ -8,6 +8,7 @@ from decimal import Decimal
 from typing import Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
+from app.analysis.audience_selection import AudienceSelectionPolicyProtocol
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -259,6 +260,7 @@ class VectorClusterSegmentSuggester:
         raw_event_signal_repository: RawEventUserSignalSampler | None = None,
         promotion_intent_extractor: PromotionIntentExtractor | None = None,
         performance_predictor: SegmentPerformancePredictor | None = None,
+        audience_selection_policy: AudienceSelectionPolicyProtocol | None = None,
         vector_pool_limit: int = DEFAULT_VECTOR_POOL_LIMIT,
         vector_sample_limit: int = DEFAULT_VECTOR_SAMPLE_LIMIT,
         max_suggested_segments: int = DEFAULT_MAX_SUGGESTED_SEGMENTS,
@@ -282,6 +284,7 @@ class VectorClusterSegmentSuggester:
         self._raw_event_signal_repository = raw_event_signal_repository
         self._promotion_intent_extractor = promotion_intent_extractor
         self._performance_predictor = performance_predictor
+        self._audience_selection_policy = audience_selection_policy
         self._vector_pool_limit = vector_pool_limit
         self._vector_sample_limit = vector_sample_limit
         self._max_suggested_segments = max_suggested_segments
@@ -418,6 +421,7 @@ class VectorClusterSegmentSuggester:
                 max_suggested_segments=self._max_suggested_segments,
                 min_sample_size=self._min_cluster_size,
                 performance_predictor=self._performance_predictor,
+                audience_selection_policy=self._audience_selection_policy,
             )
         except Exception as exc:
             log.warn(

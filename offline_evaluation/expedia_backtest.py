@@ -11,8 +11,10 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
+from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     PromotionIntent,
+    RawEventIntentCompilation,
     compile_raw_event_intent,
     generate_raw_event_segment_candidate_pool,
     generate_raw_event_segment_definitions,
@@ -27,6 +29,14 @@ from app.analysis.segment_performance import (
     write_segment_performance_model,
 )
 from app.logging import duration_ms, log, log_context_scope, now_ms
+from offline_evaluation.audience_selection import (
+    AUDIENCE_SELECTION_EVALUATION_VERSION,
+    AudienceSelectionEvaluationConfig,
+    AudienceSelectionOutcome,
+    AudienceSelectionPolicyEvaluation,
+    build_audience_selection_policy_evaluation,
+    write_audience_selection_evaluation_artifacts,
+)
 from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
 
 
@@ -228,6 +238,7 @@ class ExpediaBacktestSkippedScenario:
 class ExpediaBacktestRun:
     results: tuple[ExpediaBacktestResult, ...]
     skipped_scenarios: tuple[ExpediaBacktestSkippedScenario, ...]
+    audience_selection_outcomes: tuple[AudienceSelectionOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +246,7 @@ class ExpediaTemporalHoldoutRun:
     training_run: ExpediaBacktestRun
     holdout_run: ExpediaBacktestRun
     calibration_model: LogisticSegmentPerformanceModel
+    audience_selection_evaluation: AudienceSelectionPolicyEvaluation
 
 
 class ExpediaBacktestRepository(Protocol):
@@ -529,11 +541,17 @@ class ExpediaSegmentBacktestService:
         config: ExpediaBacktestConfig,
         performance_predictor: SegmentPerformancePredictor | None = None,
         calibration_candidate_pool: bool = False,
+        audience_selection_evaluation_config: (
+            AudienceSelectionEvaluationConfig | None
+        ) = None,
     ) -> None:
         self._repository = repository
         self._config = config
         self._performance_predictor = performance_predictor
         self._calibration_candidate_pool = calibration_candidate_pool
+        self._audience_selection_evaluation_config = (
+            audience_selection_evaluation_config
+        )
 
     @log_context_scope
     def run(
@@ -556,6 +574,7 @@ class ExpediaSegmentBacktestService:
             },
         )
         results: list[ExpediaBacktestResult] = []
+        audience_selection_outcomes: list[AudienceSelectionOutcome] = []
         skipped: list[ExpediaBacktestSkippedScenario] = []
         outcomes_opened = False
         for cutoff in cutoffs:
@@ -661,6 +680,37 @@ class ExpediaSegmentBacktestService:
                     segments=segments,
                 )
                 results.extend(scenario_results)
+                if (
+                    self._audience_selection_evaluation_config is not None
+                    and not self._calibration_candidate_pool
+                ):
+                    all_matching_pool = generate_raw_event_segment_candidate_pool(
+                        promotion=promotion,
+                        intent=intent,
+                        compilation=compilation,
+                        profiles=profiles,
+                        min_sample_size=self._config.min_sample_size,
+                        performance_predictor=self._performance_predictor,
+                    )
+                    audience_selection_outcomes.extend(
+                        _evaluate_audience_selection_ratios(
+                            scenario=scenario,
+                            eligible_user_ids=eligible_user_ids,
+                            future_users=future_users,
+                            promotion=promotion,
+                            intent=intent,
+                            compilation=compilation,
+                            profiles=profiles,
+                            all_matching_segments=segments,
+                            all_matching_pool=all_matching_pool,
+                            performance_predictor=self._performance_predictor,
+                            config=self._audience_selection_evaluation_config,
+                            max_suggested_segments=(
+                                self._config.max_suggested_segments
+                            ),
+                            min_sample_size=self._config.min_sample_size,
+                        )
+                    )
                 cutoff_result_count += len(scenario_results)
             log.info(
                 "backtest_cutoff_completed",
@@ -670,11 +720,18 @@ class ExpediaSegmentBacktestService:
                     "candidateResultCount": cutoff_result_count,
                 },
             )
-        response = ExpediaBacktestRun(tuple(results), tuple(skipped))
+        response = ExpediaBacktestRun(
+            tuple(results),
+            tuple(skipped),
+            tuple(audience_selection_outcomes),
+        )
         log.info(
             "completed",
             {
                 "candidateResultCount": len(response.results),
+                "audienceSelectionResultCount": len(
+                    response.audience_selection_outcomes
+                ),
                 "skippedScenarioCount": len(response.skipped_scenarios),
                 "durationMs": duration_ms(started_at),
             },
@@ -710,6 +767,7 @@ def run_temporal_holdout_backtest(
     config: ExpediaBacktestConfig,
     training_cutoffs: Sequence[datetime],
     holdout_cutoffs: Sequence[datetime],
+    audience_selection_config: AudienceSelectionEvaluationConfig | None = None,
 ) -> ExpediaTemporalHoldoutRun:
     if not training_cutoffs or not holdout_cutoffs:
         raise ValueError("training and validation cutoffs must not be empty")
@@ -754,20 +812,33 @@ def run_temporal_holdout_backtest(
             "candidate_training_scope": "all_eligible_candidate_types",
         },
     )
+    selection_config = (
+        audience_selection_config or AudienceSelectionEvaluationConfig()
+    )
     training_run = ExpediaSegmentBacktestService(
         repository,
         config=config,
         performance_predictor=model,
+        audience_selection_evaluation_config=selection_config,
     ).run(normalized_training)
     holdout_run = ExpediaSegmentBacktestService(
         repository,
         config=config,
         performance_predictor=model,
+        audience_selection_evaluation_config=selection_config,
     ).run(normalized_holdout)
+    audience_selection_evaluation = build_audience_selection_policy_evaluation(
+        development_outcomes=training_run.audience_selection_outcomes,
+        validation_outcomes=holdout_run.audience_selection_outcomes,
+        config=selection_config,
+        development_split=_cutoff_year_label(normalized_training),
+        validation_split=_cutoff_year_label(normalized_holdout),
+    )
     return ExpediaTemporalHoldoutRun(
         training_run=training_run,
         holdout_run=holdout_run,
         calibration_model=model,
+        audience_selection_evaluation=audience_selection_evaluation,
     )
 
 
@@ -1042,6 +1113,15 @@ def write_temporal_holdout_artifacts(
     )
     model_path = output_dir / "contextual_booking_calibration_v2.json"
     write_segment_performance_model(run.calibration_model, model_path)
+    audience_selection_paths = write_audience_selection_evaluation_artifacts(
+        run.audience_selection_evaluation,
+        development_outcomes=run.training_run.audience_selection_outcomes,
+        validation_outcomes=run.holdout_run.audience_selection_outcomes,
+        output_dir=output_dir / "audience-selection",
+    )
+    audience_selection_artifact = json.loads(
+        audience_selection_paths["policy"].read_text(encoding="utf-8")
+    )
     summary_path = output_dir / "temporal_validation_summary.json"
     summary = {
         "split": {
@@ -1054,6 +1134,7 @@ def write_temporal_holdout_artifacts(
         "model": run.calibration_model.to_json(),
         "training_metrics": summarize_backtest(run.training_run),
         "validation_metrics": summarize_backtest(run.holdout_run),
+        "audience_selection_policy": audience_selection_artifact,
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -1070,6 +1151,15 @@ def write_temporal_holdout_artifacts(
         "report": report_path,
         "training_results": training_paths["results"],
         "validation_results": validation_paths["results"],
+        "audience_selection_policy": audience_selection_paths["policy"],
+        "audience_selection_summary": audience_selection_paths["summary"],
+        "audience_selection_report": audience_selection_paths["report"],
+        "audience_selection_development_results": audience_selection_paths[
+            "development_results"
+        ],
+        "audience_selection_validation_results": audience_selection_paths[
+            "validation_results"
+        ],
     }
 
 
@@ -1160,6 +1250,126 @@ def _evaluate_segments(
             )
         )
     return results
+
+
+def _evaluate_audience_selection_ratios(
+    *,
+    scenario: ExpediaBacktestScenario,
+    eligible_user_ids: Sequence[str],
+    future_users: ExpediaFutureBookingUsers,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    all_matching_segments: Sequence[Any],
+    all_matching_pool: Sequence[Any],
+    performance_predictor: SegmentPerformancePredictor | None,
+    config: AudienceSelectionEvaluationConfig,
+    max_suggested_segments: int,
+    min_sample_size: int,
+) -> list[AudienceSelectionOutcome]:
+    matching_ids_by_type = {
+        str(segment.rule_json.get("candidate_type", "unknown")): tuple(
+            dict.fromkeys(segment.rule_json.get("candidate_user_ids", ()))
+        )
+        for segment in all_matching_pool
+    }
+    eligible = set(eligible_user_ids)
+    future_positive = set(future_users.contextual_booking_user_ids)
+    baseline_positive_count = len(eligible & future_positive)
+    baseline_rate = _safe_rate(baseline_positive_count, len(eligible))
+    outcomes: list[AudienceSelectionOutcome] = []
+    for ratio in config.ratios:
+        if ratio == 1.0:
+            ratio_segments = list(all_matching_segments)
+        else:
+            ratio_segments = generate_raw_event_segment_definitions(
+                promotion=promotion,
+                intent=intent,
+                compilation=compilation,
+                profiles=profiles,
+                max_suggested_segments=max_suggested_segments,
+                min_sample_size=min_sample_size,
+                performance_predictor=performance_predictor,
+                audience_selection_policy=fixed_ratio_audience_selection_policy(
+                    goal_metric=config.goal_metric,
+                    selected_ratio=ratio,
+                    minimum_selected_user_count=(
+                        config.minimum_selected_user_count
+                    ),
+                    policy_version=(
+                        f"{AUDIENCE_SELECTION_EVALUATION_VERSION}.{ratio:g}"
+                    ),
+                ),
+            )
+        for rank, segment in enumerate(ratio_segments, start=1):
+            candidate_type = str(
+                segment.rule_json.get("candidate_type", "unknown")
+            )
+            matching_ids = set(matching_ids_by_type.get(candidate_type, ()))
+            selected_ids = set(segment.rule_json.get("candidate_user_ids", ()))
+            matching_positive_count = len(matching_ids & future_positive)
+            selected_positive_count = len(selected_ids & future_positive)
+            matching_count = len(matching_ids)
+            selected_count = len(selected_ids)
+            actual_rate = _safe_rate(selected_positive_count, selected_count)
+            all_matching_rate = _safe_rate(
+                matching_positive_count,
+                matching_count,
+            )
+            audience = segment.profile_json.get("audience", {})
+            performance_estimate = segment.profile_json.get(
+                "performance_estimate",
+                {},
+            )
+            outcomes.append(
+                AudienceSelectionOutcome(
+                    cutoff=scenario.cutoff.isoformat(),
+                    scenario_id=scenario.scenario_id,
+                    selection_ratio=ratio,
+                    rank=rank,
+                    candidate_type=candidate_type,
+                    matching_user_count=matching_count,
+                    selected_user_count=selected_count,
+                    matching_positive_user_count=matching_positive_count,
+                    selected_positive_user_count=selected_positive_count,
+                    baseline_user_count=len(eligible),
+                    baseline_positive_user_count=baseline_positive_count,
+                    predicted_goal_rate=float(
+                        performance_estimate.get("value", 0.0) or 0.0
+                    ),
+                    actual_goal_rate=actual_rate,
+                    all_matching_goal_rate=all_matching_rate,
+                    baseline_goal_rate=baseline_rate,
+                    lift_vs_all_matching_percentage_points=(
+                        actual_rate - all_matching_rate
+                    )
+                    * 100.0,
+                    lift_vs_baseline_percentage_points=(
+                        actual_rate - baseline_rate
+                    )
+                    * 100.0,
+                    positive_capture_rate=(
+                        selected_positive_count / matching_positive_count
+                        if matching_positive_count > 0
+                        else None
+                    ),
+                    reach_within_matching=_safe_rate(
+                        selected_count,
+                        matching_count,
+                    ),
+                    policy_applied=bool(audience.get("selection_limited", False)),
+                    sample_stable=(
+                        selected_count >= config.minimum_selected_user_count
+                    ),
+                )
+            )
+    return outcomes
+
+
+def _cutoff_year_label(cutoffs: Sequence[datetime]) -> str:
+    years = sorted({cutoff.year for cutoff in cutoffs})
+    return ",".join(str(year) for year in years)
 
 
 def _promotion_for_scenario(

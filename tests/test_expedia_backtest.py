@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from app.analysis.audience_selection import load_audience_selection_policy
 from offline_evaluation.expedia_backtest import (
     ClickHouseExpediaBacktestRepository,
     EXPEDIA_TRAIN_COLUMNS,
@@ -297,6 +298,13 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
         result.prediction_method == "temporal_holdout_logistic_calibration"
         for result in temporal_run.holdout_run.results
     )
+    assert {
+        outcome.selection_ratio
+        for outcome in temporal_run.training_run.audience_selection_outcomes
+    } == {0.2, 0.4, 0.6, 0.8, 1.0}
+    assert temporal_run.audience_selection_evaluation.artifact["provenance"][
+        "final_test"
+    ] == "not_run"
     holdout_summary = summarize_backtest(temporal_run.holdout_run)
     assert holdout_summary["all_candidate_brier_score"] >= 0
 
@@ -334,6 +342,15 @@ def test_temporal_artifacts_label_2014_as_development_validation(
     assert "개발 검증" in report
     assert "최종 일반화 성능" in report
     assert (tmp_path / "development-validation-2014" / "results.csv").exists()
+    assert artifacts["audience_selection_policy"].exists()
+    assert artifacts["audience_selection_development_results"].exists()
+    assert artifacts["audience_selection_validation_results"].exists()
+    policy = load_audience_selection_policy(
+        artifacts["audience_selection_policy"]
+    )
+    assert policy.policy_version.startswith(
+        "expedia-booking-audience-selection."
+    )
 
 
 def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:
