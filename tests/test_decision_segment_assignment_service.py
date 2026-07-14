@@ -6,6 +6,9 @@ import pytest
 
 from app.decision.assignment_service import (
     ASSIGNMENT_PAGE_SIZE,
+    AssignmentInputLoader,
+    AssignmentPageMatcher,
+    AssignmentResultWriter,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
@@ -13,7 +16,6 @@ from app.decision.assignment_service import (
 from app.decision.matcher import (
     FALLBACK_REASON_BELOW_THRESHOLD,
     FALLBACK_REASON_INVALID_USER_VECTOR,
-    FALLBACK_REASON_NO_CANDIDATE,
     SegmentCandidateReranker,
 )
 from app.decision.repositories import (
@@ -22,6 +24,7 @@ from app.decision.repositories import (
     SegmentVectorRecord,
     UserBehaviorVectorRecord,
     UserSegmentAssignmentInsertRecord,
+    UserSegmentAssignmentRunAggregateRecord,
     UserSegmentAssignmentWrite,
 )
 from app.decision.schemas import (
@@ -64,6 +67,9 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     )
 
     assert response.assignment_count == 2
+    assert response.run_assignment_count == 2
+    assert response.run_has_fallback is True
+    assert response.run_fallback_count == 1
     assert response.page_count == 1
     assert response.processed_user_count == 2
     assert response.insert_conflict_count == 0
@@ -87,11 +93,11 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     assert response.no_candidate_fallback_count == 0
     assert response.invalid_user_vector_fallback_count == 0
     assert response.ann_underfilled_user_count == 0
+    assert response.exact_rescue_user_count == 0
     assert response.ann_applied is True
     assert response.ann_not_applied_reason is None
     assert response.similarity_score_buckets == {
         "not_available": 0,
-        "lt_0_00": 0,
         "0_00_to_0_50": 1,
         "0_50_to_0_65": 0,
         "0_65_to_0_80": 0,
@@ -143,7 +149,22 @@ def test_assignment_service_requires_fallback_experiment_before_writes() -> None
     assert repos.assignments.inserted == []
 
 
-def test_assignment_service_falls_back_for_no_ann_candidate() -> None:
+def test_assignment_service_clamps_negative_cosine_before_persisted_diagnostics() -> None:
+    service, repos = make_service(
+        user_vectors=[user_vector_record("user_opposite", vector(0, -1.0))]
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_opposite"]),
+    )
+
+    assert repos.assignments.inserted[0].similarity_score == Decimal("0.000000")
+    assert response.similarity_score_buckets["0_00_to_0_50"] == 1
+    assert "lt_0_00" not in response.similarity_score_buckets
+
+
+def test_assignment_service_exact_rescues_no_ann_candidate() -> None:
     service, repos = make_service(ann_candidates=[])
 
     response = service.build_assignments(
@@ -151,12 +172,42 @@ def test_assignment_service_falls_back_for_no_ann_candidate() -> None:
         request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
     )
 
-    assert response.fallback_count == 1
-    assert response.no_candidate_fallback_count == 1
-    assert response.fallback_reason_counts["no_candidate"] == 1
-    assert response.similarity_score_buckets["not_available"] == 1
+    assert response.fallback_count == 0
+    assert response.no_candidate_fallback_count == 0
+    assert response.fallback_reason_counts["no_candidate"] == 0
+    assert response.similarity_score_buckets["gte_0_90"] == 1
     assert response.ann_underfilled_user_count == 1
-    assert repos.assignments.inserted[0].fallback_reason == FALLBACK_REASON_NO_CANDIDATE
+    assert response.exact_rescue_user_count == 1
+    assert response.exact_reranked_pair_count == 1
+    assert repos.assignments.inserted[0].segment_id == "seg_family_trip"
+    assert repos.assignments.inserted[0].fallback is False
+
+
+def test_assignment_service_exact_rescue_uses_below_threshold_not_no_candidate() -> None:
+    service, repos = make_service(
+        ann_candidates=[],
+        user_vectors=[user_vector_record("user_below", vector(1))],
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(user_ids=["user_below"]),
+    )
+
+    assert response.ann_underfilled_user_count == 1
+    assert response.exact_rescue_user_count == 1
+    assert response.fallback_count == 1
+    assert response.below_threshold_fallback_count == 1
+    assert response.no_candidate_fallback_count == 0
+    assert response.fallback_reason_counts == {
+        "below_threshold": 1,
+        "no_candidate": 0,
+        "invalid_user_vector": 0,
+    }
+    assignment = repos.assignments.inserted[0]
+    assert assignment.fallback is True
+    assert assignment.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
+    assert assignment.segment_id == "seg_existing_all"
 
 
 def test_assignment_service_falls_back_for_invalid_user_vector() -> None:
@@ -172,6 +223,7 @@ def test_assignment_service_falls_back_for_invalid_user_vector() -> None:
     assert response.fallback_count == 1
     assert response.invalid_user_vector_fallback_count == 1
     assert response.ann_candidate_count == 0
+    assert response.exact_rescue_user_count == 0
     assert response.ann_applied is False
     assert response.ann_not_applied_reason == "no_valid_user_vectors"
     assert response.similarity_score_buckets["not_available"] == 1
@@ -290,7 +342,7 @@ def test_assignment_service_splits_valid_users_into_batch_chunks() -> None:
     assert len(repos.segment_vectors.ann_calls[1]["user_ids"]) == 1
 
 
-def test_assignment_service_falls_back_for_valid_users_without_candidates() -> None:
+def test_assignment_service_exact_rescues_valid_users_without_candidates() -> None:
     service, repos = make_service(
         user_vectors=[
             user_vector_record("user_family", vector(0)),
@@ -310,10 +362,13 @@ def test_assignment_service_falls_back_for_valid_users_without_candidates() -> N
     )
 
     assert response.assignment_count == 2
-    assert response.fallback_count == 1
-    assert response.no_candidate_fallback_count == 1
+    assert response.fallback_count == 0
+    assert response.no_candidate_fallback_count == 0
     assert response.ann_underfilled_user_count == 1
-    assert repos.assignments.inserted[1].fallback_reason == FALLBACK_REASON_NO_CANDIDATE
+    assert response.exact_rescue_user_count == 1
+    assert response.exact_reranked_pair_count == 2
+    assert repos.assignments.inserted[1].segment_id == "seg_family_trip"
+    assert repos.assignments.inserted[1].fallback is False
 
 
 def test_assignment_service_deduplicates_users_before_batch_ann() -> None:
@@ -345,7 +400,7 @@ def test_assignment_service_converts_batch_ann_contract_errors() -> None:
     assert repos.assignments.inserted == []
 
 
-def test_assignment_service_counts_underfilled_only_against_corpus_size() -> None:
+def test_assignment_service_exact_rescues_underfilled_candidates_against_corpus() -> None:
     service, _repos = make_service(
         experiments=[
             ad_experiment_record(segment_id="seg_family_trip"),
@@ -356,18 +411,21 @@ def test_assignment_service_counts_underfilled_only_against_corpus_size() -> Non
             segment_vector_record("seg_family_trip", vector(0)),
             segment_vector_record("seg_mobile_user", vector(1)),
         ],
-        ann_candidates=[
-            segment_vector_record("seg_family_trip", vector(0)),
-        ],
+        user_vectors=[user_vector_record("user_mobile", vector(1))],
+        ann_candidates=[segment_vector_record("seg_family_trip", vector(0))],
     )
 
     response = service.build_assignments(
         promotion_run_id="prun_banner_001_loop_1",
-        request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+        request=SegmentAssignmentBuildRequest(user_ids=["user_mobile"]),
     )
 
     assert response.ann_candidate_count == 1
     assert response.ann_underfilled_user_count == 1
+    assert response.exact_rescue_user_count == 1
+    assert response.exact_reranked_pair_count == 2
+    assert response.fallback_count == 0
+    assert _repos.assignments.inserted[0].segment_id == "seg_mobile_user"
 
 
 def test_assignment_service_rejects_missing_segment_vector_without_writes() -> None:
@@ -407,6 +465,29 @@ def test_assignment_service_rejects_invalid_segment_embedding_without_writes() -
     )
 
     with pytest.raises(SegmentAssignmentValidationError, match="invalid segment embedding"):
+        service.build_assignments(
+            promotion_run_id="prun_banner_001_loop_1",
+            request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
+        )
+
+    assert repos.assignments.inserted == []
+
+
+def test_assignment_service_exact_rescue_validates_full_segment_corpus_before_write() -> None:
+    service, repos = make_service(
+        experiments=[
+            ad_experiment_record(segment_id="seg_family_trip"),
+            ad_experiment_record(segment_id="seg_mobile_user"),
+            ad_experiment_record(segment_id="seg_existing_all"),
+        ],
+        segment_vectors=[
+            segment_vector_record("seg_family_trip", vector(0)),
+            segment_vector_record("seg_mobile_user", [0.0] * 64),
+        ],
+        ann_candidates=[segment_vector_record("seg_family_trip", vector(0))],
+    )
+
+    with pytest.raises(SegmentAssignmentValidationError, match="seg_mobile_user"):
         service.build_assignments(
             promotion_run_id="prun_banner_001_loop_1",
             request=SegmentAssignmentBuildRequest(user_ids=["user_family"]),
@@ -707,7 +788,7 @@ def test_assignment_service_rejects_non_increasing_page_cursor(monkeypatch) -> N
     assert len(repos.assignments.inserted) == 2
 
 
-def test_assignment_service_recall_skips_existing_without_diagnostics() -> None:
+def test_assignment_service_retry_preserves_persisted_run_fallback_summary() -> None:
     service, repos = make_service(
         user_vectors=[
             user_vector_record("user_family", vector(0)),
@@ -734,7 +815,58 @@ def test_assignment_service_recall_skips_existing_without_diagnostics() -> None:
     assert second.exact_reranked_pair_count == 0
     assert second.fallback_count == 0
     assert second.batch_has_fallback is False
+    assert first.run_assignment_count == 2
+    assert first.run_has_fallback is True
+    assert first.run_fallback_count == 1
+    assert second.run_assignment_count == 2
+    assert second.run_has_fallback is True
+    assert second.run_fallback_count == 1
     assert repos.assignments.inserted == first_assignments
+
+
+def test_assignment_service_fresh_instance_reads_persisted_run_fallback_summary() -> None:
+    service, _repos = make_service(
+        user_vectors=[user_vector_record("user_fallback", vector(1))],
+        existing_user_ids={"user_fallback"},
+        existing_fallback_user_ids={"user_fallback"},
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert response.assignment_count == 0
+    assert response.batch_has_fallback is False
+    assert response.fallback_count == 0
+    assert response.skipped_existing_count == 1
+    assert response.run_assignment_count == 1
+    assert response.run_has_fallback is True
+    assert response.run_fallback_count == 1
+
+
+def test_assignment_service_run_summary_includes_concurrent_conflict_winner() -> None:
+    service, _repos = make_service(
+        user_vectors=[
+            user_vector_record("user_family", vector(0)),
+            user_vector_record("user_fallback", vector(1)),
+        ],
+        insert_conflict_user_ids={"user_fallback"},
+        insert_conflict_fallback_user_ids={"user_fallback"},
+    )
+
+    response = service.build_assignments(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert response.assignment_count == 1
+    assert response.insert_conflict_count == 1
+    assert response.batch_has_fallback is False
+    assert response.fallback_count == 0
+    assert response.run_assignment_count == 2
+    assert response.run_has_fallback is True
+    assert response.run_fallback_count == 1
 
 
 def test_assignment_service_uses_audience_scope_vector_version_when_request_omits_it() -> None:
@@ -1035,10 +1167,16 @@ class FakeUserSegmentAssignmentRepository:
     def __init__(
         self,
         existing_user_ids: set[str],
+        existing_fallback_user_ids: set[str],
         insert_conflict_user_ids: set[str],
+        insert_conflict_fallback_user_ids: set[str],
     ) -> None:
         self.existing_user_ids = existing_user_ids
+        self.fallback_user_ids = existing_fallback_user_ids
         self.insert_conflict_user_ids = insert_conflict_user_ids
+        self.insert_conflict_fallback_user_ids = (
+            insert_conflict_fallback_user_ids
+        )
         self.inserted: list[UserSegmentAssignmentWrite] = []
 
     def list_existing_user_ids(
@@ -1062,6 +1200,18 @@ class FakeUserSegmentAssignmentRepository:
         self.existing_user_ids.update(
             assignment.user_id for assignment in assignments
         )
+        for assignment in assignments:
+            if assignment.user_id in self.insert_conflict_user_ids:
+                persisted_fallback = (
+                    assignment.user_id
+                    in self.insert_conflict_fallback_user_ids
+                )
+            else:
+                persisted_fallback = assignment.fallback
+            if persisted_fallback:
+                self.fallback_user_ids.add(assignment.user_id)
+            else:
+                self.fallback_user_ids.discard(assignment.user_id)
         return [
             UserSegmentAssignmentInsertRecord(
                 user_id=assignment.user_id,
@@ -1072,6 +1222,16 @@ class FakeUserSegmentAssignmentRepository:
             )
             for assignment in inserted
         ]
+
+    def summarize_run(
+        self,
+        promotion_run_id: str,
+    ) -> UserSegmentAssignmentRunAggregateRecord:
+        del promotion_run_id
+        return UserSegmentAssignmentRunAggregateRecord(
+            assignment_count=len(self.existing_user_ids),
+            fallback_count=len(self.fallback_user_ids),
+        )
 
 
 class FakeRepositoryBundle:
@@ -1086,7 +1246,9 @@ class FakeRepositoryBundle:
         user_vectors: list[UserBehaviorVectorRecord],
         project_pages: list[list[UserBehaviorVectorRecord]] | None,
         existing_user_ids: set[str],
+        existing_fallback_user_ids: set[str],
         insert_conflict_user_ids: set[str],
+        insert_conflict_fallback_user_ids: set[str],
     ) -> None:
         self.runs = FakePromotionRunRepository(run)
         self.ad_experiments = FakeAdExperimentRepository(experiments)
@@ -1101,7 +1263,9 @@ class FakeRepositoryBundle:
         )
         self.assignments = FakeUserSegmentAssignmentRepository(
             existing_user_ids,
+            existing_fallback_user_ids,
             insert_conflict_user_ids,
+            insert_conflict_fallback_user_ids,
         )
 
 
@@ -1115,7 +1279,9 @@ def make_service(
     user_vectors: list[UserBehaviorVectorRecord] | None = None,
     project_pages: list[list[UserBehaviorVectorRecord]] | None = None,
     existing_user_ids: set[str] | None = None,
+    existing_fallback_user_ids: set[str] | None = None,
     insert_conflict_user_ids: set[str] | None = None,
+    insert_conflict_fallback_user_ids: set[str] | None = None,
 ) -> tuple[SegmentAssignmentService, FakeRepositoryBundle]:
     repos = FakeRepositoryBundle(
         run=promotion_run_record() if run is DEFAULT_RUN else run,
@@ -1139,15 +1305,26 @@ def make_service(
         ],
         project_pages=project_pages,
         existing_user_ids=existing_user_ids or set(),
+        existing_fallback_user_ids=existing_fallback_user_ids or set(),
         insert_conflict_user_ids=insert_conflict_user_ids or set(),
+        insert_conflict_fallback_user_ids=(
+            insert_conflict_fallback_user_ids or set()
+        ),
     )
     service = SegmentAssignmentService(
-        promotion_run_repository=repos.runs,
-        ad_experiment_repository=repos.ad_experiments,
-        segment_vector_repository=repos.segment_vectors,
-        user_behavior_vector_repository=repos.user_vectors,
-        user_segment_assignment_repository=repos.assignments,
-        reranker=SegmentCandidateReranker(),
+        input_loader=AssignmentInputLoader(
+            promotion_run_repository=repos.runs,
+            ad_experiment_repository=repos.ad_experiments,
+            segment_vector_repository=repos.segment_vectors,
+            user_behavior_vector_repository=repos.user_vectors,
+        ),
+        page_matcher=AssignmentPageMatcher(
+            segment_vector_repository=repos.segment_vectors,
+            reranker=SegmentCandidateReranker(),
+        ),
+        result_writer=AssignmentResultWriter(
+            user_segment_assignment_repository=repos.assignments,
+        ),
     )
     return service, repos
 

@@ -1230,7 +1230,27 @@ def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
     )
 
 
-def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> None:
+def test_user_segment_assignment_repository_summarizes_persisted_run() -> None:
+    db = FakePostgresExecutor(
+        fetchone_result={"assignment_count": 7, "fallback_count": 2}
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    aggregate = repo.summarize_run("prun_banner_001_loop_1")
+
+    assert aggregate.assignment_count == 7
+    assert aggregate.fallback_count == 2
+    call = db.calls[0]
+    assert call.operation == "fetchone"
+    sql = compact_sql(call.query)
+    assert "count(*) as assignment_count" in sql
+    assert "count(*) filter (where fallback) as fallback_count" in sql
+    assert "from user_segment_assignments" in sql
+    assert "where promotion_run_id = %s" in sql
+    assert call.params == ("prun_banner_001_loop_1",)
+
+
+def test_user_behavior_vector_repository_reads_latest_vector_tuple() -> None:
     client = FakeClickHouseClient(
         rows=[
             (
@@ -1255,11 +1275,21 @@ def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> N
     assert vectors[0].vector_values == [1.0] + [0.0] * 63
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "argmax(vector_values, updated_at)" in sql
-    assert "argmax(vector_dim, updated_at)" in sql
-    assert "from ( select project_id, user_id, vector_dim" in sql
+    assert (
+        "argmax( tuple(vector_dim, vector_values, source), updated_at ) "
+        "as latest_vector"
+    ) in sql
+    assert "tupleelement(latest_vector, 1) as vector_dim" in sql
+    assert "tupleelement(latest_vector, 2) as vector_values" in sql
+    assert "tupleelement(latest_vector, 3) as source" in sql
+    assert "argmax(vector_dim" not in sql
+    assert "argmax(vector_values" not in sql
+    assert "argmax(source" not in sql
     assert "from user_behavior_vectors" in sql
-    assert "group by project_id, user_id, vector_version" in sql
+    assert (
+        "group by project_id, user_id, vector_version ) "
+        "where tupleelement(latest_vector, 1) = {vector_dim:uint16}"
+    ) in sql
     assert "user_id in {user_ids:array(string)}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
@@ -1282,7 +1312,10 @@ def test_user_behavior_vector_repository_filters_user_ids_by_source() -> None:
 
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "source = {source:string}" in sql
+    assert "tupleelement(latest_vector, 3) = {source:string}" in sql
+    assert sql.index("tupleelement(latest_vector, 3) =") > sql.index(
+        "group by project_id, user_id, vector_version"
+    )
     assert "user_id in {user_ids:array(string)}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
@@ -1306,8 +1339,15 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
     assert vectors == []
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "argmax(vector_values, updated_at)" in sql
-    assert "from ( select project_id, user_id, vector_dim" in sql
+    assert (
+        "argmax( tuple(vector_dim, vector_values, source), updated_at ) "
+        "as latest_vector"
+    ) in sql
+    assert "tupleelement(latest_vector, 2) as vector_values" in sql
+    assert (
+        "group by project_id, user_id, vector_version ) "
+        "where tupleelement(latest_vector, 1) = {vector_dim:uint16}"
+    ) in sql
     assert "limit {limit:uint32}" in sql
     assert "user_id in" not in sql
     assert "after_user_id" not in sql
@@ -1332,7 +1372,10 @@ def test_user_behavior_vector_repository_filters_project_scope_by_source() -> No
 
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "source = {source:string}" in sql
+    assert "tupleelement(latest_vector, 3) = {source:string}" in sql
+    assert sql.index("tupleelement(latest_vector, 3) =") > sql.index(
+        "group by project_id, user_id, vector_version"
+    )
     assert "limit {limit:uint32}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
