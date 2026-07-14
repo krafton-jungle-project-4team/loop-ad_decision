@@ -5,13 +5,16 @@ from dataclasses import replace
 import pytest
 
 from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
     CalibrationTrainingExample,
     ContextualBookingHeuristicPredictor,
     LogisticSegmentPerformanceModel,
     PREDICTION_PRIOR_USER_COUNT,
     PREDICTION_POLICY_VERSION,
     SegmentPerformanceFeatures,
+    UnsupportedCandidateTypeError,
     build_segment_performance_predictor,
+    candidate_type_prediction_support,
     fit_logistic_segment_performance_model,
     predict_segment_performance,
     write_segment_performance_model,
@@ -88,6 +91,78 @@ def test_logistic_calibration_learns_future_contextual_outcomes() -> None:
     assert model.metadata()["optimizer"]["selection_basis"] == (
         "caller_configured"
     )
+    assert model.metadata()["candidate_type_support_contract_version"] == (
+        CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+    )
+    assert model.metadata()["training_candidate_type_example_counts"] == {
+        "intent_matched": 2,
+        "target_destination_affinity": 0,
+        "funnel_recovery": 0,
+        "benefit_value_seeker": 0,
+        "promotion_responsive": 0,
+        "general_destination_explorer": 2,
+    }
+    assert model.metadata()[
+        "training_candidate_type_user_observation_counts"
+    ] == {
+        "intent_matched": 200,
+        "target_destination_affinity": 0,
+        "funnel_recovery": 0,
+        "benefit_value_seeker": 0,
+        "promotion_responsive": 0,
+        "general_destination_explorer": 200,
+    }
+
+
+def test_calibrated_model_rejects_candidate_type_without_training_examples() -> None:
+    supported_features = features(
+        destination_match_user_rate=1.0,
+        destination_match_event_rate=0.7,
+    )
+    model = fit_logistic_segment_performance_model(
+        [
+            CalibrationTrainingExample(supported_features, 20, 100),
+            CalibrationTrainingExample(supported_features, 10, 100),
+        ]
+    )
+    unsupported_features = replace(
+        supported_features,
+        candidate_type="promotion_responsive",
+    )
+
+    support = candidate_type_prediction_support(
+        model,
+        goal_metric="booking_conversion_rate",
+        candidate_type="promotion_responsive",
+    )
+
+    assert support.supported is False
+    assert support.training_example_count == 0
+    assert support.reason == "candidate_type_not_observed_in_model_training"
+    with pytest.raises(UnsupportedCandidateTypeError, match="no training examples"):
+        model.predict(unsupported_features)
+
+
+def test_non_booking_metric_does_not_use_booking_candidate_support_contract() -> None:
+    example_features = features(
+        destination_match_user_rate=1.0,
+        destination_match_event_rate=0.7,
+    )
+    model = fit_logistic_segment_performance_model(
+        [
+            CalibrationTrainingExample(example_features, 20, 100),
+            CalibrationTrainingExample(example_features, 10, 100),
+        ]
+    )
+
+    support = candidate_type_prediction_support(
+        model,
+        goal_metric="inflow_rate",
+        candidate_type="promotion_responsive",
+    )
+
+    assert support.supported is True
+    assert support.training_example_count is None
 
 
 def test_logistic_calibration_json_round_trip_preserves_prediction() -> None:
@@ -165,6 +240,16 @@ def test_bundled_model_uses_only_2013_training_outcomes() -> None:
     assert model.metadata()["optimizer"]["selection_basis"] == (
         "2014_development_validation"
     )
+    assert model.metadata()["training_candidate_type_example_counts"] == {
+        "intent_matched": 24,
+        "target_destination_affinity": 24,
+        "funnel_recovery": 24,
+        "benefit_value_seeker": 24,
+        "promotion_responsive": 0,
+        "general_destination_explorer": 0,
+    }
+    assert model.supports_candidate_type("intent_matched") is True
+    assert model.supports_candidate_type("promotion_responsive") is False
 
 
 def test_serving_prediction_limits_extreme_features_and_shrinks_small_sample() -> None:

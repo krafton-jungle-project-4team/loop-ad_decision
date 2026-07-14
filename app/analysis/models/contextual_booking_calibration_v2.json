@@ -88,6 +88,29 @@
     "training_candidate_user_observation_count": 5554,
     "training_contextual_booking_observation_count": 483,
     "training_contextual_booking_observation_rate": 0.08696435001800504,
+    "candidate_type_support_contract_version": "dec.segment-performance-candidate-support.v1",
+    "training_candidate_type_example_counts": {
+      "intent_matched": 24,
+      "target_destination_affinity": 24,
+      "funnel_recovery": 24,
+      "benefit_value_seeker": 24,
+      "promotion_responsive": 0,
+      "general_destination_explorer": 0
+    },
+    "training_candidate_type_user_observation_counts": {
+      "intent_matched": 1831,
+      "target_destination_affinity": 1377,
+      "funnel_recovery": 1054,
+      "benefit_value_seeker": 1292,
+      "promotion_responsive": 0,
+      "general_destination_explorer": 0
+    },
+    "supported_candidate_types": [
+      "intent_matched",
+      "target_destination_affinity",
+      "funnel_recovery",
+      "benefit_value_seeker"
+    ],
     "target": "future_contextual_booking_rate",
     "training_dataset": "expedia_hotel_recommendations_train",
     "applicability_scope": "destination_specific_hotel_booking_promotions",
