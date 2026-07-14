@@ -99,4 +99,4 @@ def _get_or_load_settings(app: Any) -> Settings:
     return settings
 
 
-app = create_app()
+app = create_app() 
