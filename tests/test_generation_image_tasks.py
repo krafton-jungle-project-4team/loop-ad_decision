@@ -28,9 +28,11 @@ def valid_env() -> dict[str, str]:
         "LOOPAD_CLICKHOUSE_PASSWORD": "loopad",
         "LOOPAD_DATA_STORAGE_BUCKET": "loop-ad-dev-data-storage",
         "LOOPAD_GENAI_ASSETS_BASE_PREFIX": "genai/",
-        "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX": "genai-source/",
+        "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL": "https://gen-ai.asset.dev.loop-ad.org",
         "LOOPAD_OPENAI_API_KEY": "openai-key",
+        "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
         "LOOPAD_GEMINI_API_KEY": "gemini-key",
+        "LOOPAD_GEMINI_IMAGE_MODEL": "gemini-test",
     }
 
 

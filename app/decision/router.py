@@ -87,7 +87,6 @@ from app.decision.service import (
 )
 from app.dependencies import get_settings
 from app.generation.adapters import (
-    DEFAULT_OPENAI_CONTENT_MODEL,
     build_external_content_generator,
     build_s3_creative_artifact_publisher,
 )
@@ -335,7 +334,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             brand_context_provider=brand_context_provider,
             content_generator=content_generator,
             generation_model_version=(
-                settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL
+                settings.openai_content_model
                 if settings.env != "test"
                 else None
             ),

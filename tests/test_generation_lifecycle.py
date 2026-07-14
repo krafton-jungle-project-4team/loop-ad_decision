@@ -27,6 +27,19 @@ def runtime_settings(*, env: str) -> Settings:
         genai_assets_base_prefix="genai",
         openai_api_key="openai-test",
         gemini_api_key="gemini-test",
+        genai_assets_public_base_url="https://assets.example.test",
+        openai_content_model="gpt-test",
+        gemini_image_model="gemini-test",
+        generation_worker_max_concurrency=2,
+        generation_poll_interval_seconds=1,
+        generation_idle_poll_interval_seconds=30,
+        generation_lease_seconds=180,
+        generation_heartbeat_seconds=30,
+        generation_max_retries=3,
+        generation_retry_backoff_seconds=(60, 300, 900),
+        generation_provider_timeout_seconds=30,
+        generation_db_operation_timeout_seconds=5,
+        generation_shutdown_grace_seconds=20,
     )
 
 

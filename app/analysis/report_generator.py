@@ -12,7 +12,6 @@ from app.analysis.repositories import (
 )
 from app.config import Settings
 from app.generation.adapters import (
-    DEFAULT_OPENAI_CONTENT_MODEL,
     OPENAI_RESPONSES_URL,
     JsonTransport,
     _parse_output_json,
@@ -68,7 +67,7 @@ class OpenAISegmentSuggestionReportGenerator:
         self,
         *,
         api_key: str,
-        model: str = DEFAULT_OPENAI_CONTENT_MODEL,
+        model: str,
         endpoint: str = OPENAI_RESPONSES_URL,
         timeout_seconds: float = 20.0,
         fallback_generator: SegmentSuggestionReportGenerator | None = None,
@@ -178,7 +177,7 @@ def build_segment_suggestion_report_generator(
         return DeterministicSegmentSuggestionReportGenerator()
     return OpenAISegmentSuggestionReportGenerator(
         api_key=settings.openai_api_key,
-        model=settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL,
+        model=settings.openai_content_model,
     )
 
 
