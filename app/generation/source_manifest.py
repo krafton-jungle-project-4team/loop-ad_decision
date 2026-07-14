@@ -156,6 +156,16 @@ def source_request_fingerprint(
         request["segment_ids"] = sorted(str(value) for value in segment_ids)
     promotion = asdict(prompt_input.promotion)
     promotion["channel"] = prompt_input.promotion.channel.value
+    promotion = {
+        key: value
+        for key, value in promotion.items()
+        if value is not None or key not in {"offer_type", "landing_type"}
+    }
+    target_segment = asdict(prompt_input.target_segment)
+    # These contract-only raw snapshots are already represented by the merged
+    # generation brief and must not invalidate pre-RAG private checkpoints.
+    target_segment.pop("source_content_brief_json", None)
+    target_segment.pop("data_evidence_json", None)
     payload = {
         "schema_version": "generation.source.request.v1",
         "identity": {
@@ -167,8 +177,10 @@ def source_request_fingerprint(
         "option_index": option_index,
         "request": request,
         "promotion": promotion,
-        "target_segment": asdict(prompt_input.target_segment),
+        "target_segment": target_segment,
     }
+    if prompt_input.brand_context is not None:
+        payload["brand_context"] = prompt_input.brand_context.to_snapshot()
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 

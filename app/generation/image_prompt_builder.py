@@ -66,6 +66,18 @@ class RichImagePromptBuilder:
                 "Verified hotel visual context: none. Keep the property depiction "
                 "generic and property-agnostic."
             )
+        brand_visual_context = _brand_visual_context(context.brand_context)
+        if brand_visual_context:
+            lines.append(
+                "Approved brand visual context: "
+                + json.dumps(
+                    brand_visual_context,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                + ". Use only this approved palette, image style, and asset direction."
+            )
         lines.append(_image_guardrails(constraints))
         return _compact(
             " ".join(lines),
@@ -92,6 +104,35 @@ def _verified_visual_context(
             and not item
         )
     }
+
+
+def _brand_visual_context(brand_context: object) -> Mapping[str, object]:
+    if brand_context is None:
+        return {}
+    guardrails = getattr(brand_context, "guardrails", None)
+    documents = getattr(brand_context, "documents", ())
+    selected_asset_id = getattr(brand_context, "selected_asset_id", None)
+    context: dict[str, object] = {}
+    if selected_asset_id:
+        context["selected_asset_id"] = str(selected_asset_id)
+    approved_colours = getattr(guardrails, "approved_colours", ())
+    if approved_colours:
+        context["approved_colors"] = list(approved_colours)
+    approved_styles = getattr(guardrails, "approved_image_styles", ())
+    if approved_styles:
+        context["approved_image_styles"] = list(approved_styles)
+    for document in documents:
+        if (
+            getattr(document, "source_kind", None) == "brand_asset"
+            and getattr(document, "source_id", None) == selected_asset_id
+        ):
+            description = " ".join(
+                str(getattr(document, "document_text", "")).split()
+            )
+            if description:
+                context["asset_direction"] = description[:300]
+            break
+    return context
 
 
 def _image_guardrails(constraints: Sequence[str]) -> str:

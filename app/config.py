@@ -75,7 +75,6 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
-    "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX",
     "LOOPAD_OPENAI_API_KEY",
     "LOOPAD_GEMINI_API_KEY",
 )
@@ -120,9 +119,9 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             _read_optional(source, "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL")
             or DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
         ),
-        genai_source_manifest_prefix=_read_required(
-            source,
-            "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX",
+        genai_source_manifest_prefix=(
+            _read_optional(source, "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX")
+            or DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX
         ),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),

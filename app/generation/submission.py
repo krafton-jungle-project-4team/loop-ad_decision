@@ -7,6 +7,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, Protocol
 
+from app.generation.brand_context import (
+    BrandContextSnapshot,
+    generation_versions,
+)
 from app.generation.prompt_builder import (
     GenerationInputBuilder,
     GenerationPromptInput,
@@ -54,6 +58,11 @@ class GenerationSubmissionInputReader(Protocol):
         ...
 
 
+class BrandContextSnapshotReader(Protocol):
+    def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot | None:
+        ...
+
+
 class GenerationWakeCoordinator(Protocol):
     @property
     def accepting(self) -> bool:
@@ -94,11 +103,15 @@ class GenerationSubmissionService:
         connection: GenerationSubmissionConnection,
         generation_run_repository: GenerationSubmissionRepository,
         generation_input_reader: GenerationSubmissionInputReader,
+        brand_context_repository: BrandContextSnapshotReader | None = None,
+        model_version: str = "generation-default",
         coordinator: GenerationWakeCoordinator | None = None,
     ) -> None:
         self._connection = connection
         self._generation_run_repository = generation_run_repository
         self._generation_input_reader = generation_input_reader
+        self._brand_context_repository = brand_context_repository
+        self._model_version = model_version
         self._coordinator = coordinator
 
     def submit(
@@ -125,11 +138,20 @@ class GenerationSubmissionService:
             raise GenerationInputUnavailable(
                 "confirmed promotion_target_segments are required for generation"
             )
+        brand_context = (
+            self._brand_context_repository.resolve_snapshot(
+                project_id=request.project_id,
+            )
+            if self._brand_context_repository is not None
+            else None
+        )
 
         snapshot = build_generation_input_snapshot(
             request=request,
             promotion=promotion,
             target_segments=target_segments,
+            brand_context=brand_context,
+            model_version=self._model_version,
         )
         fingerprint = generation_request_fingerprint(snapshot)
         generation_id = generation_id_for_request(
@@ -223,16 +245,19 @@ def build_generation_input_snapshot(
     request: GenerationRequest,
     promotion: PromotionPromptInput,
     target_segments: Sequence[TargetSegmentPromptInput],
+    brand_context: BrandContextSnapshot | None = None,
+    model_version: str = "generation-default",
 ) -> dict[str, Any]:
     GenerationInputBuilder().build(
         request=request,
         promotion=promotion,
         target_segments=target_segments,
+        brand_context=brand_context,
     )
     targets = sorted(target_segments, key=lambda item: item.segment_id)
     if len({target.segment_id for target in targets}) != len(targets):
         raise GenerationSnapshotError("target_segments must not contain duplicates")
-    return {
+    snapshot: dict[str, Any] = {
         "schema_version": GENERATION_REQUEST_SCHEMA_VERSION,
         "project_id": request.project_id,
         "campaign_id": request.campaign_id,
@@ -240,9 +265,23 @@ def build_generation_input_snapshot(
         "analysis_id": request.analysis_id,
         "content_option_count": request.content_option_count,
         "operator_instruction": request.operator_instruction,
+        "channel": promotion.channel.value,
         "promotion": _promotion_snapshot(promotion),
         "target_segments": [_target_segment_snapshot(item) for item in targets],
+        "placement": _placement_snapshot(promotion.channel),
+        "offer": {
+            "type": promotion.offer_type,
+            "message_brief": promotion.message_brief,
+        },
+        "landing": {
+            "url": promotion.landing_url,
+            "type": promotion.landing_type,
+        },
+        "versions": generation_versions(model_version=model_version),
     }
+    if brand_context is not None:
+        snapshot["brand_context"] = brand_context.to_snapshot()
+    return snapshot
 
 
 def generation_request_fingerprint(snapshot: Mapping[str, Any]) -> str:
@@ -297,6 +336,8 @@ def prompt_inputs_from_snapshot(
         goal_basis=_required_text(promotion_value, "goal_basis"),
         message_brief=_optional_text(promotion_value.get("message_brief")),
         landing_url=_optional_text(promotion_value.get("landing_url")),
+        offer_type=_optional_text(promotion_value.get("offer_type")),
+        landing_type=_optional_text(promotion_value.get("landing_type")),
     )
     raw_targets = value.get("target_segments")
     if not isinstance(raw_targets, list) or not raw_targets:
@@ -304,10 +345,25 @@ def prompt_inputs_from_snapshot(
     targets = [_target_segment_from_snapshot(item) for item in raw_targets]
     if len({item.segment_id for item in targets}) != len(targets):
         raise GenerationSnapshotError("target_segments must not contain duplicates")
+    brand_context_value = value.get("brand_context")
+    if brand_context_value is not None and not isinstance(
+        brand_context_value,
+        Mapping,
+    ):
+        raise GenerationSnapshotError("brand_context must be an object")
+    try:
+        brand_context = (
+            BrandContextSnapshot.from_snapshot(brand_context_value)
+            if isinstance(brand_context_value, Mapping)
+            else None
+        )
+    except ValueError as exc:
+        raise GenerationSnapshotError(str(exc)) from exc
     return GenerationInputBuilder().build(
         request=request,
         promotion=promotion,
         target_segments=targets,
+        brand_context=brand_context,
     )
 
 
@@ -320,6 +376,9 @@ def _promotion_snapshot(value: PromotionPromptInput) -> dict[str, Any]:
 def _target_segment_snapshot(value: TargetSegmentPromptInput) -> dict[str, Any]:
     snapshot = asdict(value)
     snapshot["content_brief_json"] = dict(value.content_brief_json)
+    if value.source_content_brief_json is not None:
+        snapshot["content_brief"] = dict(value.source_content_brief_json)
+        snapshot["data_evidence"] = dict(value.data_evidence_json)
     return snapshot
 
 
@@ -329,6 +388,15 @@ def _target_segment_from_snapshot(value: object) -> TargetSegmentPromptInput:
     content_brief = value.get("content_brief_json")
     if not isinstance(content_brief, Mapping):
         raise GenerationSnapshotError("content_brief_json must be an object")
+    source_content_brief = value.get("content_brief")
+    if source_content_brief is not None and not isinstance(
+        source_content_brief,
+        Mapping,
+    ):
+        raise GenerationSnapshotError("content_brief must be an object")
+    data_evidence = value.get("data_evidence")
+    if data_evidence is not None and not isinstance(data_evidence, Mapping):
+        raise GenerationSnapshotError("data_evidence must be an object")
     return TargetSegmentPromptInput(
         analysis_id=_required_text(value, "analysis_id"),
         promotion_id=_required_text(value, "promotion_id"),
@@ -345,7 +413,23 @@ def _target_segment_from_snapshot(value: object) -> TargetSegmentPromptInput:
         source=_optional_text(value.get("source")),
         query_preview_id=_optional_text(value.get("query_preview_id")),
         status=_optional_text(value.get("status")),
+        source_content_brief_json=(
+            dict(source_content_brief)
+            if isinstance(source_content_brief, Mapping)
+            else None
+        ),
+        data_evidence_json=(
+            dict(data_evidence) if isinstance(data_evidence, Mapping) else {}
+        ),
     )
+
+
+def _placement_snapshot(channel: ContentChannel) -> dict[str, str]:
+    if channel == ContentChannel.EMAIL:
+        return {"type": "email_body"}
+    if channel == ContentChannel.SMS:
+        return {"type": "sms_message"}
+    return {"type": "onsite_banner", "slot_id": "C1_MAIN_TOP"}
 
 
 def _required_mapping(value: Mapping[str, Any], key: str) -> Mapping[str, Any]:

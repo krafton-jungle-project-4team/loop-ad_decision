@@ -79,6 +79,21 @@ class GenerationReportBuilder:
             **content_values,
             "status": status,
         }
+        if prompt_result.metadata_json.get("brand_context_version"):
+            metadata.update(
+                {
+                    "brand_context_version": prompt_result.metadata_json[
+                        "brand_context_version"
+                    ],
+                    "brand_context_fingerprint": prompt_result.metadata_json.get(
+                        "brand_context_fingerprint"
+                    ),
+                    "brand_context_document_ids": prompt_result.metadata_json.get(
+                        "brand_context_document_ids",
+                        [],
+                    ),
+                }
+            )
 
         return CandidateGenerationReport(
             reason_summary=reason_summary,

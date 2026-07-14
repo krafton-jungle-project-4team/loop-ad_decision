@@ -815,7 +815,9 @@ class GenerationInputRepository:
             goal_target_value,
             goal_basis,
             message_brief,
-            landing_url
+            landing_url,
+            offer_type,
+            landing_type
         FROM promotions
         WHERE project_id = %(project_id)s
           AND campaign_id = %(campaign_id)s
@@ -890,6 +892,8 @@ class GenerationInputRepository:
             goal_basis=str(row["goal_basis"]),
             message_brief=_optional_text(row.get("message_brief")),
             landing_url=_optional_text(row.get("landing_url")),
+            offer_type=_optional_text(row.get("offer_type")),
+            landing_type=_optional_text(row.get("landing_type")),
         )
 
     def list_target_segment_inputs(
@@ -1654,6 +1658,8 @@ def _target_segment_prompt_input(
         or _optional_text(_json_object(row.get("data_evidence_json")).get("source")),
         query_preview_id=_optional_text(row.get("query_preview_id")),
         status=_optional_text(row.get("status")),
+        source_content_brief_json=_json_object(row.get("content_brief_json")),
+        data_evidence_json=_json_object(row.get("data_evidence_json")),
     )
 
 
