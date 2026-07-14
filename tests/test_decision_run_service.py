@@ -511,6 +511,87 @@ def test_run_service_omitted_segment_ids_uses_generation_snapshot_scope() -> Non
     ]
 
 
+def test_run_service_explicit_scope_uses_legacy_target_segments_snapshot() -> None:
+    service, repos = make_service(
+        generation=generation_record(
+            target_segments_snapshot=[{"segment_id": "seg_mobile_user"}],
+        ),
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_mobile_user",
+                status="approved",
+            )
+        ],
+        candidates=[content_candidate_record(segment_id="seg_mobile_user")],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(segment_ids=["seg_mobile_user"]),
+    )
+
+    assert response.segment_ids == ["seg_mobile_user"]
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", ["seg_mobile_user"])
+    ]
+    assert [experiment.segment_id for experiment in response.ad_experiments] == [
+        "seg_mobile_user",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_omitted_scope_uses_legacy_target_segments_snapshot() -> None:
+    service, repos = make_service(
+        generation=generation_record(
+            target_segments_snapshot=[{"segment_id": "seg_family_trip"}],
+        ),
+        target_segments=[
+            target_segment_record(segment_id="seg_family_trip"),
+            target_segment_record(segment_id="seg_mobile_user"),
+        ],
+        candidates=[content_candidate_record(segment_id="seg_family_trip")],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert response.segment_ids == ["seg_family_trip"]
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", ["seg_family_trip"])
+    ]
+
+
+@pytest.mark.parametrize(
+    "target_segments_snapshot",
+    [
+        {},
+        [],
+        ["seg_family_trip"],
+        [{}],
+        [{"segment_id": "   "}],
+    ],
+)
+def test_run_service_rejects_invalid_legacy_target_segments_snapshot_without_writes(
+    target_segments_snapshot: object,
+) -> None:
+    service, repos = make_service(
+        generation=generation_record(
+            target_segments_snapshot=target_segments_snapshot,
+        ),
+    )
+
+    with pytest.raises(RunValidationError, match="valid target_segments snapshot"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=["seg_family_trip"]),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
 def test_run_service_excludes_fallback_from_snapshot_scope_and_fingerprint() -> None:
     service, repos = make_service(
         generation=generation_record(
@@ -824,6 +905,7 @@ def canonical_ad_experiments(
 def make_preparation_activation_service(
     *,
     candidates: list[ContentCandidateRecord] | None = None,
+    generation: GenerationRunRecord | None = None,
     source_run: PromotionRunRecord | None = None,
     source_experiments: list[AdExperimentRecord] | None = None,
     evaluations: list[PromotionEvaluationRecord] | None = None,
@@ -845,10 +927,13 @@ def make_preparation_activation_service(
         experiments += canonical_experiments
     return make_service(
         analysis=analysis_record(analysis_id="analysis_banner_loop_2"),
-        generation=generation_record(
-            generation_id="generation_banner_loop_2",
-            analysis_id="analysis_banner_loop_2",
-            target_segment_ids=["seg_family_trip", "seg_mobile_user"],
+        generation=(
+            generation
+            or generation_record(
+                generation_id="generation_banner_loop_2",
+                analysis_id="analysis_banner_loop_2",
+                target_segment_ids=["seg_family_trip", "seg_mobile_user"],
+            )
         ),
         target_segments=[
             target_segment_record(
@@ -945,6 +1030,30 @@ def test_preparation_activation_persists_segment_lineage_and_nullable_fallback()
             ),
             2,
         )
+    ]
+
+
+def test_preparation_activation_uses_legacy_target_segments_snapshot() -> None:
+    generation = generation_record(
+        generation_id="generation_banner_loop_2",
+        analysis_id="analysis_banner_loop_2",
+        target_segments_snapshot=[
+            {"segment_id": "seg_family_trip"},
+            {"segment_id": "seg_mobile_user"},
+        ],
+    )
+    service, repos = make_preparation_activation_service(generation=generation)
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", response.promotion_run_id)
     ]
 
 
@@ -1905,11 +2014,14 @@ def generation_record(
     generation_id: str = "generation_banner_001",
     analysis_id: str = "analysis_banner_001",
     target_segment_ids: list[str] | None = None,
+    target_segments_snapshot: object = None,
     status: str = "completed",
 ) -> GenerationRunRecord:
     input_json = {"analysis_id": analysis_id}
     if target_segment_ids is not None:
         input_json["target_segment_ids"] = target_segment_ids
+    if target_segments_snapshot is not None:
+        input_json["target_segments"] = target_segments_snapshot
     return GenerationRunRecord(
         generation_id=generation_id,
         analysis_id=analysis_id,
