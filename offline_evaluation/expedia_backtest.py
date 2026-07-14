@@ -11,7 +11,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     PromotionIntent,
     RawEventIntentCompilation,
@@ -30,11 +29,11 @@ from app.analysis.segment_performance import (
 )
 from app.logging import duration_ms, log, log_context_scope, now_ms
 from offline_evaluation.audience_selection import (
-    AUDIENCE_SELECTION_EVALUATION_VERSION,
     AudienceSelectionEvaluationConfig,
     AudienceSelectionOutcome,
     AudienceSelectionPolicyEvaluation,
     build_audience_selection_policy_evaluation,
+    evaluate_audience_selection_ratios,
     write_audience_selection_evaluation_artifacts,
 )
 from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
@@ -1268,103 +1267,21 @@ def _evaluate_audience_selection_ratios(
     max_suggested_segments: int,
     min_sample_size: int,
 ) -> list[AudienceSelectionOutcome]:
-    matching_ids_by_type = {
-        str(segment.rule_json.get("candidate_type", "unknown")): tuple(
-            dict.fromkeys(segment.rule_json.get("candidate_user_ids", ()))
-        )
-        for segment in all_matching_pool
-    }
-    eligible = set(eligible_user_ids)
-    future_positive = set(future_users.contextual_booking_user_ids)
-    baseline_positive_count = len(eligible & future_positive)
-    baseline_rate = _safe_rate(baseline_positive_count, len(eligible))
-    outcomes: list[AudienceSelectionOutcome] = []
-    for ratio in config.ratios:
-        if ratio == 1.0:
-            ratio_segments = list(all_matching_segments)
-        else:
-            ratio_segments = generate_raw_event_segment_definitions(
-                promotion=promotion,
-                intent=intent,
-                compilation=compilation,
-                profiles=profiles,
-                max_suggested_segments=max_suggested_segments,
-                min_sample_size=min_sample_size,
-                performance_predictor=performance_predictor,
-                audience_selection_policy=fixed_ratio_audience_selection_policy(
-                    goal_metric=config.goal_metric,
-                    selected_ratio=ratio,
-                    minimum_selected_user_count=(
-                        config.minimum_selected_user_count
-                    ),
-                    policy_version=(
-                        f"{AUDIENCE_SELECTION_EVALUATION_VERSION}.{ratio:g}"
-                    ),
-                ),
-            )
-        for rank, segment in enumerate(ratio_segments, start=1):
-            candidate_type = str(
-                segment.rule_json.get("candidate_type", "unknown")
-            )
-            matching_ids = set(matching_ids_by_type.get(candidate_type, ()))
-            selected_ids = set(segment.rule_json.get("candidate_user_ids", ()))
-            matching_positive_count = len(matching_ids & future_positive)
-            selected_positive_count = len(selected_ids & future_positive)
-            matching_count = len(matching_ids)
-            selected_count = len(selected_ids)
-            actual_rate = _safe_rate(selected_positive_count, selected_count)
-            all_matching_rate = _safe_rate(
-                matching_positive_count,
-                matching_count,
-            )
-            audience = segment.profile_json.get("audience", {})
-            performance_estimate = segment.profile_json.get(
-                "performance_estimate",
-                {},
-            )
-            outcomes.append(
-                AudienceSelectionOutcome(
-                    cutoff=scenario.cutoff.isoformat(),
-                    scenario_id=scenario.scenario_id,
-                    selection_ratio=ratio,
-                    rank=rank,
-                    candidate_type=candidate_type,
-                    matching_user_count=matching_count,
-                    selected_user_count=selected_count,
-                    matching_positive_user_count=matching_positive_count,
-                    selected_positive_user_count=selected_positive_count,
-                    baseline_user_count=len(eligible),
-                    baseline_positive_user_count=baseline_positive_count,
-                    predicted_goal_rate=float(
-                        performance_estimate.get("value", 0.0) or 0.0
-                    ),
-                    actual_goal_rate=actual_rate,
-                    all_matching_goal_rate=all_matching_rate,
-                    baseline_goal_rate=baseline_rate,
-                    lift_vs_all_matching_percentage_points=(
-                        actual_rate - all_matching_rate
-                    )
-                    * 100.0,
-                    lift_vs_baseline_percentage_points=(
-                        actual_rate - baseline_rate
-                    )
-                    * 100.0,
-                    positive_capture_rate=(
-                        selected_positive_count / matching_positive_count
-                        if matching_positive_count > 0
-                        else None
-                    ),
-                    reach_within_matching=_safe_rate(
-                        selected_count,
-                        matching_count,
-                    ),
-                    policy_applied=bool(audience.get("selection_limited", False)),
-                    sample_stable=(
-                        selected_count >= config.minimum_selected_user_count
-                    ),
-                )
-            )
-    return outcomes
+    return evaluate_audience_selection_ratios(
+        evaluation_key=scenario.cutoff.isoformat(),
+        scenario_id=scenario.scenario_id,
+        positive_user_ids=future_users.contextual_booking_user_ids,
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        all_matching_segments=all_matching_segments,
+        all_matching_pool=all_matching_pool,
+        performance_predictor=performance_predictor,
+        config=config,
+        max_suggested_segments=max_suggested_segments,
+        min_sample_size=min_sample_size,
+    )
 
 
 def _cutoff_year_label(cutoffs: Sequence[datetime]) -> str:

@@ -4,21 +4,32 @@ import csv
 import hashlib
 import json
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
 from app.analysis.audience_selection import (
     AUDIENCE_SELECTION_ARTIFACT_SCHEMA_VERSION,
+    fixed_ratio_audience_selection_policy,
     write_audience_selection_artifact,
 )
+from app.analysis.raw_event_segments import (
+    PromotionIntent,
+    RawEventIntentCompilation,
+    generate_raw_event_segment_definitions,
+)
+from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
+from app.analysis.segment_performance import SegmentPerformancePredictor
 from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
 
 
 DEFAULT_SELECTION_RATIOS = (0.2, 0.4, 0.6, 0.8, 1.0)
 AUDIENCE_SELECTION_EVALUATION_VERSION = (
     "offline.expedia-audience-selection.v1"
+)
+AUDIENCE_SELECTION_RATIO_EVALUATION_VERSION = (
+    "offline.audience-selection-ratio.v1"
 )
 
 
@@ -79,6 +90,7 @@ class AudienceSelectionOutcome:
     reach_within_matching: float
     policy_applied: bool
     sample_stable: bool
+    maximum_prior_rank_overlap: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -103,6 +115,143 @@ def summarize_selection_ratios(
         )
         for ratio in ratios
     )
+
+
+def evaluate_audience_selection_ratios(
+    *,
+    evaluation_key: str,
+    scenario_id: str,
+    positive_user_ids: Collection[str],
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    all_matching_segments: Sequence[Any],
+    all_matching_pool: Sequence[Any],
+    performance_predictor: SegmentPerformancePredictor | None,
+    config: AudienceSelectionEvaluationConfig,
+    max_suggested_segments: int,
+    min_sample_size: int,
+) -> list[AudienceSelectionOutcome]:
+    """Compare observation-only audience selection ratios against known outcomes."""
+    if config.goal_metric != promotion.goal_metric:
+        raise ValueError(
+            "audience selection goal_metric must match the promotion goal_metric"
+        )
+
+    matching_ids_by_type = {
+        str(segment.rule_json.get("candidate_type", "unknown")): tuple(
+            dict.fromkeys(segment.rule_json.get("candidate_user_ids", ()))
+        )
+        for segment in all_matching_pool
+    }
+    eligible = {profile.user_id for profile in profiles}
+    future_positive = set(positive_user_ids) & eligible
+    baseline_positive_count = len(future_positive)
+    baseline_rate = _optional_rate(baseline_positive_count, len(eligible)) or 0.0
+    outcomes: list[AudienceSelectionOutcome] = []
+
+    for ratio in config.ratios:
+        if ratio == 1.0:
+            ratio_segments = list(all_matching_segments)
+        else:
+            ratio_segments = generate_raw_event_segment_definitions(
+                promotion=promotion,
+                intent=intent,
+                compilation=compilation,
+                profiles=profiles,
+                max_suggested_segments=max_suggested_segments,
+                min_sample_size=min_sample_size,
+                performance_predictor=performance_predictor,
+                audience_selection_policy=fixed_ratio_audience_selection_policy(
+                    goal_metric=config.goal_metric,
+                    selected_ratio=ratio,
+                    minimum_selected_user_count=(
+                        config.minimum_selected_user_count
+                    ),
+                    policy_version=(
+                        f"{AUDIENCE_SELECTION_RATIO_EVALUATION_VERSION}.{ratio:g}"
+                    ),
+                ),
+            )
+
+        prior_selected_user_sets: list[set[str]] = []
+        for rank, segment in enumerate(ratio_segments, start=1):
+            candidate_type = str(
+                segment.rule_json.get("candidate_type", "unknown")
+            )
+            matching_ids = (
+                set(matching_ids_by_type.get(candidate_type, ())) & eligible
+            )
+            selected_ids = (
+                set(segment.rule_json.get("candidate_user_ids", ())) & eligible
+            )
+            matching_positive_count = len(matching_ids & future_positive)
+            selected_positive_count = len(selected_ids & future_positive)
+            matching_count = len(matching_ids)
+            selected_count = len(selected_ids)
+            actual_rate = _optional_rate(selected_positive_count, selected_count) or 0.0
+            all_matching_rate = (
+                _optional_rate(matching_positive_count, matching_count) or 0.0
+            )
+            maximum_overlap = max(
+                (
+                    _jaccard(selected_ids, previous)
+                    for previous in prior_selected_user_sets
+                ),
+                default=0.0,
+            )
+            prior_selected_user_sets.append(selected_ids)
+            audience = segment.profile_json.get("audience", {})
+            performance_estimate = segment.profile_json.get(
+                "performance_estimate",
+                {},
+            )
+            outcomes.append(
+                AudienceSelectionOutcome(
+                    cutoff=evaluation_key,
+                    scenario_id=scenario_id,
+                    selection_ratio=ratio,
+                    rank=rank,
+                    candidate_type=candidate_type,
+                    matching_user_count=matching_count,
+                    selected_user_count=selected_count,
+                    matching_positive_user_count=matching_positive_count,
+                    selected_positive_user_count=selected_positive_count,
+                    baseline_user_count=len(eligible),
+                    baseline_positive_user_count=baseline_positive_count,
+                    predicted_goal_rate=float(
+                        performance_estimate.get("value", 0.0) or 0.0
+                    ),
+                    actual_goal_rate=actual_rate,
+                    all_matching_goal_rate=all_matching_rate,
+                    baseline_goal_rate=baseline_rate,
+                    lift_vs_all_matching_percentage_points=(
+                        actual_rate - all_matching_rate
+                    )
+                    * 100.0,
+                    lift_vs_baseline_percentage_points=(
+                        actual_rate - baseline_rate
+                    )
+                    * 100.0,
+                    positive_capture_rate=(
+                        selected_positive_count / matching_positive_count
+                        if matching_positive_count > 0
+                        else None
+                    ),
+                    reach_within_matching=(
+                        _optional_rate(selected_count, matching_count) or 0.0
+                    ),
+                    policy_applied=bool(
+                        audience.get("selection_limited", False)
+                    ),
+                    sample_stable=(
+                        selected_count >= config.minimum_selected_user_count
+                    ),
+                    maximum_prior_rank_overlap=maximum_overlap,
+                )
+            )
+    return outcomes
 
 
 def build_audience_selection_policy_evaluation(
@@ -299,6 +448,13 @@ def _summarize_ratio(
         applied_matching_positives,
         applied_matching_users,
     )
+    candidate_types = {item.candidate_type for item in outcomes}
+    non_first_rank_overlaps = [
+        item.maximum_prior_rank_overlap for item in outcomes if item.rank > 1
+    ]
+    multiple_candidate_scenario_count = sum(
+        len(scenario) > 1 for scenario in grouped.values()
+    )
     return {
         "selection_ratio": ratio,
         "result_count": len(outcomes),
@@ -307,6 +463,25 @@ def _summarize_ratio(
         "sample_stable_result_rate": _optional_rate(
             sum(item.sample_stable for item in outcomes),
             len(outcomes),
+        ),
+        "candidate_type_count": len(candidate_types),
+        "mean_candidate_count_per_scenario": _optional_rate(
+            len(outcomes),
+            len(grouped),
+        ),
+        "multiple_candidate_scenario_count": multiple_candidate_scenario_count,
+        "multiple_candidate_scenario_rate": _optional_rate(
+            multiple_candidate_scenario_count,
+            len(grouped),
+        ),
+        "mean_non_first_rank_overlap": (
+            sum(non_first_rank_overlaps) / len(non_first_rank_overlaps)
+            if non_first_rank_overlaps
+            else 0.0
+        ),
+        "maximum_non_first_rank_overlap": max(
+            non_first_rank_overlaps,
+            default=0.0,
         ),
         "selected_user_count": selected_users,
         "matching_user_count": matching_users,
@@ -557,6 +732,13 @@ def _rate_difference_points(left: float | None, right: float | None) -> float | 
     if left is None or right is None:
         return None
     return (left - right) * 100.0
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    union = left | right
+    if not union:
+        return 0.0
+    return len(left & right) / len(union)
 
 
 def _mapping(value: object) -> Mapping[str, Any]:
