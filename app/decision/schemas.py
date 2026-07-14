@@ -143,6 +143,9 @@ class SegmentAssignmentBuildResponse(BaseModel):
     page_count: int = Field(ge=0)
     processed_user_count: int = Field(ge=0)
     assignment_count: int = Field(ge=0)
+    run_assignment_count: int = Field(ge=0)
+    run_has_fallback: bool
+    run_fallback_count: int = Field(ge=0)
     insert_conflict_count: int = Field(ge=0)
     segment_assignment_counts: dict[str, int]
     batch_has_fallback: bool
@@ -152,8 +155,14 @@ class SegmentAssignmentBuildResponse(BaseModel):
     below_threshold_fallback_count: int = Field(ge=0)
     no_candidate_fallback_count: int = Field(ge=0)
     invalid_user_vector_fallback_count: int = Field(ge=0)
-    similarity_score_buckets: dict[str, int]
+    similarity_score_buckets: dict[str, int] = Field(
+        description=(
+            "Buckets of persisted similarity scores after raw cosine similarity "
+            "is clamped to the Data Contract range [0, 1]."
+        )
+    )
     ann_underfilled_user_count: int = Field(ge=0)
+    exact_rescue_user_count: int = Field(ge=0)
     ann_applied: bool
     ann_not_applied_reason: Literal[
         "no_users_to_match",
