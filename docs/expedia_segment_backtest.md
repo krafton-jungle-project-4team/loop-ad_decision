@@ -88,7 +88,8 @@ python3 scripts/backtest_expedia_segments.py smoke
 - 행동 관찰: 기준일 이전 90일
 - 미래 평가: 기준일 이후 30일
 - 분석 사용자 풀: 최근 사용자 최대 1,000명
-- 후보 사용자: 현재 운영 로직과 동일하게 후보별 최대 160명
+- 후보 사용자: 조건 일치자를 먼저 만든 뒤 검증된 비율 정책을 적용한다. 선택 인원이
+  최소 기준보다 작으면 조건 일치자 전체를 유지한다.
 - 사용자 샘플: `cityHash64(user_id) % 20 = 0`
 
 ## 3. 2013 학습 / 2014 개발 검증
@@ -122,6 +123,44 @@ Expedia 원본에는 무료 취소와 조식 포함 속성이 없다. 따라서 
 5번 결과를 본 뒤 로직을 수정했다면 2014년은 통계적인 학습 데이터는 아니더라도
 human-in-the-loop 개발 검증 데이터다. 이 수치를 최종 일반화 성능으로 발표하지 않는다.
 
+### 추천 대상 선택 비율 보정
+
+`validation`은 고정된 160명 제한 대신 조건 일치자 중 몇 %를 실제 추천 대상으로
+선택할지도 함께 검증한다.
+
+1. 각 후보 타입의 조건 일치자를 모두 생성한다.
+2. 미래 결과를 보지 않고 관찰 구간의 행동 강도와 사용자 ID tie-break로만 정렬한다.
+3. 개발 구간에서 상위 `20%`, `40%`, `60%`, `80%`, `100%`를 각각 적용한다.
+4. 실제 목적지 일치 예약률, 전체 조건 일치자 대비 lift, 예약자 포착률, reach,
+   표본 안정성, Rank 정확도를 비교해 축소 비율을 선택한다.
+5. 선택한 비율을 2014년 검증 구간에 그대로 적용하고, 사전 기준을 통과한 경우에만
+   런타임 정책으로 기록한다.
+
+기본 판정 기준은 축소 정책이 적용된 후보 결과가 3개 이상이고, 전체 조건 일치자보다
+성과가 낮지 않으며, 실제 예약자의 80% 이상을 유지하고, Rank pairwise 정확도 하락이
+5%p 이내인 것이다. 이 값들은 숨은 상수가 아니라 CLI 옵션과 정책 JSON에 함께 기록된다.
+
+```bash
+.venv/bin/python scripts/backtest_expedia_segments.py validation \
+  --user-sample-modulo 1 \
+  --profile-pool-limit 1000 \
+  --audience-selection-ratios 0.2,0.4,0.6,0.8,1.0 \
+  --audience-selection-min-selected-users 30 \
+  --audience-selection-min-applied-results 3 \
+  --audience-selection-min-positive-capture 0.8 \
+  --audience-selection-max-rank-accuracy-drop 0.05
+```
+
+현재 버전 관리되는 정책은 2013년 개발 구간에서 선택하고 2014년 검증 구간에서 확인한
+상위 `80%` 정책이다. 전체 데이터 실행의 검증 구간에서 축소 정책이 실제로 적용된
+후보들의 예약률은 `5.31%`, 전체 조건 일치자 예약률은 `5.01%`로 `+0.30%p`였고,
+실제 예약자 포착률은 `85.48%`였다. 이 결과는 추천 대상 크기 보정의 근거이며,
+Rank 1이 항상 최선이라는 증명은 아니다. 같은 실행에서 Rank 1 실제 최고 비율은
+`35.29%`였으므로 순위 모델 고도화는 별도 과제로 남는다.
+
+정책 파일이 없거나 무결성 검증에 실패하거나, 축소 후 인원이 최소 기준에 못 미치거나,
+아직 검증하지 않은 목표 지표라면 런타임은 조건 일치자 전체를 추천 대상으로 사용한다.
+
 빠른 확인은 기본 5% 결정적 사용자 표본으로 실행한다. 결론이 전체 원천 데이터에서도
 유지되는지 확인할 때는 다음처럼 해시 사전 샘플링을 끈다.
 
@@ -142,6 +181,12 @@ artifacts/expedia-segment-backtest/validation-<timestamp>/
 ├── contextual_booking_calibration_v2.json
 ├── temporal_validation_report.md
 ├── temporal_validation_summary.json
+├── audience-selection/
+│   ├── audience_selection_policy_v1.json
+│   ├── development_ratio_results.csv
+│   ├── validation_ratio_results.csv
+│   ├── ratio_summary.json
+│   └── report.md
 ├── training-2013/
 │   ├── results.csv
 │   └── summary.json
