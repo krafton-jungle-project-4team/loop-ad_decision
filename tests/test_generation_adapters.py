@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -27,6 +28,7 @@ from app.generation.errors import (
     PermanentGenerationError,
     RetryableGenerationError,
 )
+from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
@@ -694,6 +696,175 @@ def test_s3_conditional_write_conflict_is_retryable() -> None:
 
     assert exc_info.value.code == "artifact_write_conflict"
     assert s3_client.put_objects == []
+
+
+def test_external_generator_reuses_private_source_and_image_after_crash() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    first_content_client = FakeContentClient(
+        {
+            "title": "최초 생성 제목",
+            "body": "최초 생성 본문",
+            "cta": "호텔 보기",
+            "image_prompt": "first canonical hotel image, no visible text",
+        }
+    )
+    first_image_client = FakeImageClient()
+    first_generator = ExternalContentGenerator(
+        content_client=first_content_client,
+        image_client=first_image_client,
+        asset_storage=storage,
+        source_manifest_storage=storage,
+    )
+
+    first = first_generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=artifact_identity(),
+    )
+
+    retry_content_client = FakeContentClient(
+        {
+            "title": "재시도에서 생성되면 안 되는 제목",
+            "body": "재시도에서 생성되면 안 되는 본문",
+            "cta": "다시 생성",
+            "image_prompt": "different retry image prompt",
+        }
+    )
+    retry_image_client = FakeImageClient()
+    retry_generator = ExternalContentGenerator(
+        content_client=retry_content_client,
+        image_client=retry_image_client,
+        asset_storage=storage,
+        source_manifest_storage=storage,
+    )
+
+    restored = retry_generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=artifact_identity(),
+    )
+
+    assert first_content_client.calls == 1
+    assert len(first_image_client.prompts) == 1
+    assert retry_content_client.calls == 0
+    assert retry_image_client.prompts == []
+    assert restored.title == first.title
+    assert restored.body == first.body
+    assert restored.image_prompt == first.image_prompt
+    assert restored.image_url == first.image_url
+    assert len(s3_client.put_objects) == 2
+    assert str(s3_client.put_objects[0]["Key"]).startswith("genai-source/")
+    assert s3_client.put_objects[0]["CacheControl"] == "no-store"
+    assert str(s3_client.put_objects[1]["Key"]).startswith("genai/")
+
+
+def test_source_manifest_precondition_uses_first_canonical_source() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    first = GeneratedContent(
+        title="최초 제목",
+        body="최초 본문",
+        cta="호텔 보기",
+        image_prompt="first prompt, no visible text",
+        landing_url=PROMOTION_LANDING_URL,
+    )
+    second = replace(first, title="경합에서 폐기할 제목")
+
+    stored = storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=first,
+    )
+    reused = storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=second,
+    )
+
+    assert stored.title == "최초 제목"
+    assert reused == stored
+    assert len(s3_client.put_objects) == 1
+
+
+def test_source_manifest_rejects_different_request_fingerprint() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=GeneratedContent(
+            title="최초 제목",
+            body="최초 본문",
+            cta="호텔 보기",
+            image_prompt="first prompt, no visible text",
+            landing_url=PROMOTION_LANDING_URL,
+        ),
+    )
+
+    with pytest.raises(PermanentGenerationError) as exc_info:
+        storage.find_source_manifest(
+            identity=artifact_identity(),
+            channel=ContentChannel.ONSITE_BANNER,
+            request_fingerprint="b" * 64,
+        )
+
+    assert exc_info.value.code == "source_manifest_identity_mismatch"
+
+
+def test_source_manifest_conditional_conflict_is_retryable() -> None:
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        source_manifest_prefix="genai-source/",
+        s3_client=FakeS3Client(conditional_conflicts=1),
+    )
+
+    with pytest.raises(RetryableGenerationError) as exc_info:
+        storage.store_source_manifest(
+            identity=artifact_identity(),
+            channel=ContentChannel.ONSITE_BANNER,
+            request_fingerprint="a" * 64,
+            content=GeneratedContent(
+                title="최초 제목",
+                body="최초 본문",
+                cta="호텔 보기",
+                image_prompt="first prompt, no visible text",
+                landing_url=PROMOTION_LANDING_URL,
+            ),
+        )
+
+    assert exc_info.value.code == "source_manifest_write_conflict"
+
+
+def test_s3_storage_rejects_source_manifest_inside_public_prefix() -> None:
+    with pytest.raises(ValueError, match="outside the public"):
+        S3AssetStorage(
+            bucket_name="loop-ad-dev-data-storage",
+            base_prefix="genai/",
+            source_manifest_prefix="genai/source/",
+            s3_client=FakeS3Client(),
+        )
 
 
 class FakeContentClient:

@@ -10,6 +10,7 @@ from dotenv import find_dotenv, load_dotenv
 DECISION_SERVICE_ID = "decision-api"
 DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
 DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
+DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
 
 
 class SettingsError(RuntimeError):
@@ -40,6 +41,7 @@ class Settings:
     openai_api_key: str
     gemini_api_key: str
     genai_assets_public_base_url: str = DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
+    genai_source_manifest_prefix: str = DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
     segment_performance_model_path: str | None = None
@@ -73,6 +75,7 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX",
     "LOOPAD_OPENAI_API_KEY",
     "LOOPAD_GEMINI_API_KEY",
 )
@@ -116,6 +119,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         genai_assets_public_base_url=(
             _read_optional(source, "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL")
             or DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
+        ),
+        genai_source_manifest_prefix=_read_required(
+            source,
+            "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX",
         ),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
@@ -264,6 +271,18 @@ def _read_optional_positive_int_tuple(
 
 
 def _validate_generation_settings(settings: Settings) -> None:
+    public_prefix = settings.genai_assets_base_prefix.strip("/")
+    source_prefix = settings.genai_source_manifest_prefix.strip("/")
+    if (
+        not public_prefix
+        or not source_prefix
+        or source_prefix == public_prefix
+        or source_prefix.startswith(f"{public_prefix}/")
+    ):
+        raise SettingsError(
+            "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX"
+        )
     if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
         raise SettingsError(
             "GENERATION_HEARTBEAT_SECONDS must be less than "

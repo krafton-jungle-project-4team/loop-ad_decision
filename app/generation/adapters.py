@@ -36,6 +36,16 @@ from app.generation.generator import GeneratedContent
 from app.generation.image_prompt_builder import RichImagePromptBuilder
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import CHANNEL_REQUIRED_FIELDS, ContentChannel, CreativeFormat
+from app.generation.source_manifest import (
+    MAX_SOURCE_MANIFEST_BYTES,
+    SOURCE_MANIFEST_CONTENT_TYPE,
+    SOURCE_MANIFEST_SCHEMA_VERSION,
+    SourceManifest,
+    SourceManifestError,
+    SourceManifestIdentityError,
+    source_manifest_key,
+    source_request_fingerprint,
+)
 from app.logging import log, duration_ms
 
 
@@ -98,6 +108,27 @@ class AssetStorage(Protocol):
         image_prompt_sha256: str,
         image: "ImageArtifact",
     ) -> StoredAsset:
+        ...
+
+
+class SourceManifestStorage(Protocol):
+    def find_source_manifest(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        request_fingerprint: str,
+    ) -> GeneratedContent | None:
+        ...
+
+    def store_source_manifest(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        request_fingerprint: str,
+        content: GeneratedContent,
+    ) -> GeneratedContent:
         ...
 
 
@@ -281,12 +312,185 @@ class S3AssetStorage:
         bucket_name: str,
         base_prefix: str,
         public_base_url: str = DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL,
+        source_manifest_prefix: str | None = None,
         s3_client: Any | None = None,
     ) -> None:
+        public_prefix = base_prefix.strip("/")
+        private_prefix = str(source_manifest_prefix or "").strip("/")
+        if private_prefix and (
+            not public_prefix
+            or private_prefix == public_prefix
+            or private_prefix.startswith(f"{public_prefix}/")
+        ):
+            raise ValueError(
+                "source manifest prefix must be outside the public asset prefix"
+            )
         self._bucket_name = bucket_name
         self._base_prefix = base_prefix
         self._public_base_url = public_base_url
+        self._source_manifest_prefix = source_manifest_prefix
         self._s3_client = s3_client or boto3.client("s3")
+
+    def find_source_manifest(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        request_fingerprint: str,
+    ) -> GeneratedContent | None:
+        key = source_manifest_key(
+            base_prefix=self._required_source_manifest_prefix(),
+            identity=identity,
+        )
+        get_object = getattr(self._s3_client, "get_object", None)
+        if not callable(get_object):
+            raise PermanentGenerationError(
+                code="source_manifest_unavailable",
+                safe_message="Generated source checkpoint could not be read.",
+            )
+        try:
+            response = get_object(Bucket=self._bucket_name, Key=key)
+        except Exception as exc:
+            if _is_s3_not_found(exc):
+                return None
+            if _is_s3_forbidden(exc):
+                raise PermanentGenerationError(
+                    code="source_manifest_access_denied",
+                    safe_message="Generated source checkpoint could not be accessed.",
+                ) from exc
+            raise
+
+        try:
+            body = _validated_s3_source_manifest_body(response)
+            manifest = SourceManifest.from_bytes(
+                body,
+                expected_identity=identity,
+                expected_channel=channel,
+                expected_request_fingerprint=request_fingerprint,
+            )
+        except SourceManifestIdentityError as exc:
+            raise PermanentGenerationError(
+                code="source_manifest_identity_mismatch",
+                safe_message=(
+                    "Generated source checkpoint did not match the current request."
+                ),
+            ) from exc
+        except (SourceManifestError, ValueError) as exc:
+            raise PermanentGenerationError(
+                code="source_manifest_invalid",
+                safe_message="Generated source checkpoint was invalid.",
+            ) from exc
+        log.info(
+            "provider_request_reused",
+            {
+                "provider": "s3",
+                "endpoint": "get_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "contentType": SOURCE_MANIFEST_CONTENT_TYPE,
+            },
+        )
+        return manifest.content
+
+    def store_source_manifest(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        request_fingerprint: str,
+        content: GeneratedContent,
+    ) -> GeneratedContent:
+        manifest = SourceManifest(
+            identity=identity,
+            channel=channel,
+            request_fingerprint=request_fingerprint,
+            content=content,
+        )
+        body = manifest.to_bytes()
+        content_sha256 = hashlib.sha256(body).hexdigest()
+        key = source_manifest_key(
+            base_prefix=self._required_source_manifest_prefix(),
+            identity=identity,
+        )
+        started_at = perf_counter()
+        log.info(
+            "provider_request_prepared",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "contentType": SOURCE_MANIFEST_CONTENT_TYPE,
+            },
+        )
+        try:
+            self._s3_client.put_object(
+                Bucket=self._bucket_name,
+                Key=key,
+                Body=body,
+                ContentType=SOURCE_MANIFEST_CONTENT_TYPE,
+                CacheControl="no-store",
+                Metadata={
+                    "sha256": content_sha256,
+                    "schema_version": SOURCE_MANIFEST_SCHEMA_VERSION,
+                },
+                IfNoneMatch="*",
+            )
+        except Exception as exc:
+            if _is_s3_precondition_failed(exc):
+                existing = self.find_source_manifest(
+                    identity=identity,
+                    channel=channel,
+                    request_fingerprint=request_fingerprint,
+                )
+                if existing is None:
+                    raise RetryableGenerationError(
+                        code="source_manifest_visibility_delayed",
+                        safe_message=(
+                            "Generated source checkpoint visibility was delayed."
+                        ),
+                    ) from exc
+                return existing
+            if _is_s3_conditional_conflict(exc):
+                raise RetryableGenerationError(
+                    code="source_manifest_write_conflict",
+                    safe_message=(
+                        "Generated source checkpoint publication conflicted temporarily."
+                    ),
+                    status_code=409,
+                ) from exc
+            log.warn(
+                "provider_request_failed",
+                {
+                    "provider": "s3",
+                    "endpoint": "put_object",
+                    "bucket": self._bucket_name,
+                    "key": key,
+                    "err": exc,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            raise
+        log.info(
+            "provider_request_completed",
+            {
+                "provider": "s3",
+                "endpoint": "put_object",
+                "bucket": self._bucket_name,
+                "key": key,
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return manifest.content
+
+    def _required_source_manifest_prefix(self) -> str:
+        prefix = str(self._source_manifest_prefix or "").strip()
+        if not prefix:
+            raise PermanentGenerationError(
+                code="source_manifest_unconfigured",
+                safe_message="Generated source checkpoint storage was not configured.",
+            )
+        return prefix
 
     def store_image(
         self,
@@ -701,11 +905,13 @@ class ExternalContentGenerator:
         content_client: ContentTextClient,
         image_client: ImageClient,
         asset_storage: AssetStorage,
+        source_manifest_storage: SourceManifestStorage | None = None,
         generate_images: bool = True,
     ) -> None:
         self._content_client = content_client
         self._image_client = image_client
         self._asset_storage = asset_storage
+        self._source_manifest_storage = source_manifest_storage
         self._generate_images = generate_images
 
     def generate(
@@ -737,6 +943,20 @@ class ExternalContentGenerator:
         artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
         channel = prompt_input.promotion.channel
+        request_fingerprint = source_request_fingerprint(
+            identity=artifact_identity,
+            prompt_input=prompt_input,
+            option_index=option_index,
+        )
+        if self._source_manifest_storage is not None:
+            source_manifest = self._source_manifest_storage.find_source_manifest(
+                identity=artifact_identity,
+                channel=channel,
+                request_fingerprint=request_fingerprint,
+            )
+            if source_manifest is not None:
+                return source_manifest
+
         recovered_values: Mapping[str, str | None] | None = None
         find_creative_content = getattr(
             self._asset_storage,
@@ -769,6 +989,13 @@ class ExternalContentGenerator:
                 values=values,
                 landing_url=prompt_input.promotion.landing_url,
                 prompt_result=prompt_result,
+            )
+        if self._source_manifest_storage is not None:
+            content = self._source_manifest_storage.store_source_manifest(
+                identity=artifact_identity,
+                channel=channel,
+                request_fingerprint=request_fingerprint,
+                content=content,
             )
         return content
 
@@ -835,6 +1062,12 @@ def build_external_content_generator(
     *,
     generate_images: bool = True,
 ) -> ExternalContentGenerator:
+    storage = S3AssetStorage(
+        bucket_name=settings.data_storage_bucket,
+        base_prefix=settings.genai_assets_base_prefix,
+        public_base_url=settings.genai_assets_public_base_url,
+        source_manifest_prefix=settings.genai_source_manifest_prefix,
+    )
     return ExternalContentGenerator(
         content_client=OpenAIResponsesContentClient(
             api_key=settings.openai_api_key,
@@ -846,11 +1079,8 @@ def build_external_content_generator(
             model=settings.gemini_image_model or DEFAULT_GEMINI_IMAGE_MODEL,
             timeout_seconds=settings.generation_provider_timeout_seconds,
         ),
-        asset_storage=S3AssetStorage(
-            bucket_name=settings.data_storage_bucket,
-            base_prefix=settings.genai_assets_base_prefix,
-            public_base_url=settings.genai_assets_public_base_url,
-        ),
+        asset_storage=storage,
+        source_manifest_storage=storage,
         generate_images=generate_images,
     )
 
@@ -1171,6 +1401,57 @@ def _validated_s3_html_body(response: Mapping[str, Any]) -> bytes:
         raise ValueError("stored HTML hash metadata is invalid")
     if stored_sha256 != actual_sha256:
         raise ValueError("stored HTML hash does not match its body")
+    return body
+
+
+def _validated_s3_source_manifest_body(response: Mapping[str, Any]) -> bytes:
+    try:
+        content_length = int(response.get("ContentLength"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("stored source manifest content length is invalid") from exc
+    if content_length <= 0 or content_length > MAX_SOURCE_MANIFEST_BYTES:
+        raise ValueError("stored source manifest size is outside the allowed range")
+    if (
+        str(response.get("ContentType") or "").strip()
+        != SOURCE_MANIFEST_CONTENT_TYPE
+    ):
+        raise ValueError("stored source manifest content type is invalid")
+
+    body_value = response.get("Body")
+    if isinstance(body_value, (bytes, bytearray)):
+        body = bytes(body_value)
+    else:
+        read = getattr(body_value, "read", None)
+        if not callable(read):
+            raise ValueError("stored source manifest body is unavailable")
+        close = getattr(body_value, "close", None)
+        try:
+            body = bytes(read(MAX_SOURCE_MANIFEST_BYTES + 1))
+        finally:
+            if callable(close):
+                close()
+    if len(body) != content_length:
+        raise ValueError(
+            "stored source manifest content length does not match its body"
+        )
+
+    metadata = response.get("Metadata")
+    stored_sha256 = (
+        str(metadata.get("sha256") or "")
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+    schema_version = (
+        str(metadata.get("schema_version") or "")
+        if isinstance(metadata, Mapping)
+        else ""
+    )
+    if schema_version != SOURCE_MANIFEST_SCHEMA_VERSION:
+        raise ValueError("stored source manifest metadata version is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", stored_sha256):
+        raise ValueError("stored source manifest hash metadata is invalid")
+    if stored_sha256 != hashlib.sha256(body).hexdigest():
+        raise ValueError("stored source manifest hash does not match its body")
     return body
 
 

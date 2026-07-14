@@ -36,6 +36,14 @@ def test_load_settings_requires_gemini_api_key() -> None:
         load_settings(env)
 
 
+def test_load_settings_requires_private_source_manifest_prefix() -> None:
+    env = valid_env()
+    env.pop("LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX")
+
+    with pytest.raises(SettingsError, match="SOURCE_MANIFEST_PREFIX"):
+        load_settings(env)
+
+
 def test_load_settings_rejects_wrong_service_id() -> None:
     env = valid_env()
     env["LOOPAD_SERVICE_ID"] = "dashboard-api"
@@ -60,7 +68,22 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.aurora_port == 15432
     assert settings.openai_content_model == "gpt-test"
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
+    assert settings.genai_source_manifest_prefix == (
+        "value-for-loopad_genai_source_manifest_prefix"
+    )
     assert settings.segment_performance_model_path == "/models/segment.json"
+
+
+@pytest.mark.parametrize("source_prefix", ["genai", "genai/", "genai/private/"])
+def test_load_settings_rejects_source_manifest_under_public_prefix(
+    source_prefix: str,
+) -> None:
+    env = valid_env()
+    env["LOOPAD_GENAI_ASSETS_BASE_PREFIX"] = "genai/"
+    env["LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX"] = source_prefix
+
+    with pytest.raises(SettingsError, match="outside the public"):
+        load_settings(env)
 
 
 def test_load_settings_uses_safe_generation_defaults() -> None:
