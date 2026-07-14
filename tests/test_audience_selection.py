@@ -122,3 +122,18 @@ def test_invalid_artifact_falls_back_to_all_matching(tmp_path: Path) -> None:
     assert decision.selected_user_count == 50
     assert decision.calibration_status == "invalid_artifact"
     assert decision.fallback_reason == "artifact_invalid"
+
+
+def test_default_policy_uses_validated_booking_audience_ratio() -> None:
+    policy = build_audience_selection_policy()
+
+    decision = policy.decide(
+        goal_metric="booking_conversion_rate",
+        candidate_type="promotion_responsive",
+        matching_user_count=230,
+    )
+
+    assert policy.calibration_status == "validated"
+    assert decision.configured_ratio == 0.8
+    assert decision.selected_user_count == 184
+    assert decision.artifact_hash is not None
