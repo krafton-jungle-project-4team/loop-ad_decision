@@ -223,6 +223,17 @@ class BrandContextProvider(Protocol):
         ...
 
 
+class BrandContextDocumentLoader(Protocol):
+    def load_documents(
+        self,
+        *,
+        project_id: str,
+        snapshot: BrandContextSnapshot,
+        channel: ContentChannel,
+    ) -> tuple[RetrievedBrandDocument, ...]:
+        ...
+
+
 class BrandContextRepository:
     """Read the Generation v1 RAG contract with strict tenant isolation."""
 
@@ -346,9 +357,11 @@ class BrandContextRetrievalService:
         *,
         repository: BrandDocumentReader,
         embedding_client: EmbeddingClient,
+        source_loader: BrandContextDocumentLoader | None = None,
     ) -> None:
         self._repository = repository
         self._embedding_client = embedding_client
+        self._source_loader = source_loader
         self._cache: dict[tuple[str, str, str, str], RetrievedBrandContext] = {}
 
     def retrieve(
@@ -371,13 +384,26 @@ class BrandContextRetrievalService:
         if cached is not None:
             return cached
         embedding = self._embedding_client.embed(query)
-        documents = tuple(
+        retrieved_documents = tuple(
             self._repository.retrieve(
                 project_id=prompt_input.request.project_id,
                 context_version=snapshot.context_version,
                 channel=prompt_input.promotion.channel,
                 query_embedding=embedding,
             )
+        )
+        source_documents = (
+            self._source_loader.load_documents(
+                project_id=prompt_input.request.project_id,
+                snapshot=snapshot,
+                channel=prompt_input.promotion.channel,
+            )
+            if self._source_loader is not None
+            else ()
+        )
+        documents = _merge_brand_documents(
+            source_documents=source_documents,
+            retrieved_documents=retrieved_documents,
         )
         if not any(document.source_kind == "brand_guide" for document in documents):
             raise PermanentGenerationError(
@@ -415,9 +441,11 @@ class ManagedBrandContextProvider:
         *,
         connection_factory: Callable[[], Any],
         embedding_client: EmbeddingClient,
+        source_loader: BrandContextDocumentLoader | None = None,
     ) -> None:
         self._connection_factory = connection_factory
         self._embedding_client = embedding_client
+        self._source_loader = source_loader
         self._cache: dict[tuple[str, str, str, str], RetrievedBrandContext] = {}
 
     def retrieve(
@@ -441,7 +469,7 @@ class ManagedBrandContextProvider:
         embedding = self._embedding_client.embed(query)
         connection = self._connection_factory()
         try:
-            documents = tuple(
+            retrieved_documents = tuple(
                 BrandContextRepository(connection).retrieve(
                     project_id=prompt_input.request.project_id,
                     context_version=prompt_input.brand_context.context_version,
@@ -451,6 +479,19 @@ class ManagedBrandContextProvider:
             )
         finally:
             connection.close()
+        source_documents = (
+            self._source_loader.load_documents(
+                project_id=prompt_input.request.project_id,
+                snapshot=prompt_input.brand_context,
+                channel=prompt_input.promotion.channel,
+            )
+            if self._source_loader is not None
+            else ()
+        )
+        documents = _merge_brand_documents(
+            source_documents=source_documents,
+            retrieved_documents=retrieved_documents,
+        )
         if not any(document.source_kind == "brand_guide" for document in documents):
             raise PermanentGenerationError(
                 code="brand_guide_unavailable",
@@ -774,6 +815,52 @@ def _selected_asset_id(
         if document.source_kind == "brand_asset":
             return document.source_id
     return None
+
+
+def _merge_brand_documents(
+    *,
+    source_documents: Sequence[RetrievedBrandDocument],
+    retrieved_documents: Sequence[RetrievedBrandDocument],
+) -> tuple[RetrievedBrandDocument, ...]:
+    source_guides = [
+        document
+        for document in source_documents
+        if document.source_kind == "brand_guide"
+    ]
+    source_guide_identities = {
+        (document.source_kind, document.source_id, document.source_version)
+        for document in source_guides
+    }
+    retrieved = [
+        document
+        for document in retrieved_documents
+        if (
+            document.source_kind,
+            document.source_id,
+            document.source_version,
+        )
+        not in source_guide_identities
+    ]
+    retrieved_identities = {
+        (document.source_kind, document.source_id, document.source_version)
+        for document in retrieved
+    }
+    source_fallbacks = [
+        document
+        for document in source_documents
+        if document.source_kind != "brand_guide"
+        and (
+            document.source_kind,
+            document.source_id,
+            document.source_version,
+        )
+        not in retrieved_identities
+    ]
+    merged = [*source_guides, *retrieved, *source_fallbacks]
+    unique: dict[str, RetrievedBrandDocument] = {}
+    for document in merged:
+        unique.setdefault(document.document_id, document)
+    return tuple(unique.values())
 
 
 def _pgvector(values: Sequence[float]) -> str:

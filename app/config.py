@@ -46,6 +46,7 @@ class Settings:
     clickhouse_password: str
     data_storage_bucket: str
     genai_assets_base_prefix: str
+    brand_context_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
     genai_assets_public_base_url: str
@@ -84,6 +85,7 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_BRAND_CONTEXT_BASE_PREFIX",
     "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
     "LOOPAD_OPENAI_API_KEY",
     "LOOPAD_OPENAI_CONTENT_MODEL",
@@ -124,6 +126,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         genai_assets_base_prefix=_read_required(
             source,
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+        ),
+        brand_context_base_prefix=_read_required(
+            source,
+            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX",
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
@@ -174,6 +180,7 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
 def _validate_generation_settings(settings: Settings) -> None:
     public_prefix = settings.genai_assets_base_prefix.strip("/")
     source_prefix = GENAI_SOURCE_MANIFEST_PREFIX.strip("/")
+    brand_prefix = settings.brand_context_base_prefix.strip("/")
     if (
         not public_prefix
         or not source_prefix
@@ -183,6 +190,19 @@ def _validate_generation_settings(settings: Settings) -> None:
         raise SettingsError(
             "GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX"
+        )
+    if (
+        not brand_prefix
+        or brand_prefix == public_prefix
+        or brand_prefix.startswith(f"{public_prefix}/")
+        or public_prefix.startswith(f"{brand_prefix}/")
+        or brand_prefix == source_prefix
+        or brand_prefix.startswith(f"{source_prefix}/")
+        or source_prefix.startswith(f"{brand_prefix}/")
+    ):
+        raise SettingsError(
+            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX must not overlap the public "
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX or GENAI_SOURCE_MANIFEST_PREFIX"
         )
     if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
         raise SettingsError(

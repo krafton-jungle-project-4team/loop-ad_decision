@@ -1128,7 +1128,6 @@ def _gemini_image_config() -> Any:
 
     return types.GenerateContentConfig(
         response_modalities=["IMAGE"],
-        image_config=types.ImageConfig(output_mime_type="image/png"),
     )
 
 

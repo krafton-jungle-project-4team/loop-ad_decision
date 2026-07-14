@@ -8,6 +8,7 @@ def required_env_values() -> dict[str, str]:
     values.update(
         {
             "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL": "https://assets.example.test",
+            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX": "brand-context/",
             "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
             "LOOPAD_GEMINI_IMAGE_MODEL": "gemini-test",
         }

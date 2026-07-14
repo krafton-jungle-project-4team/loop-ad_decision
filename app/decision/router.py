@@ -95,6 +95,7 @@ from app.generation.brand_context import (
     BrandContextRetrievalService,
     OpenAIEmbeddingClient,
 )
+from app.generation.brand_context_s3 import S3BrandContextLoader
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
     GenerationInputRepository,
@@ -313,14 +314,19 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
         if settings.env != "test":
             content_generator = build_external_content_generator(settings)
             artifact_publisher = build_s3_creative_artifact_publisher(settings)
+            brand_context_source_loader = S3BrandContextLoader(
+                bucket_name=settings.data_storage_bucket,
+                base_prefix=settings.brand_context_base_prefix,
+            )
             brand_context_repository = BrandContextRepository(connection)
-            brand_context_snapshot_reader = brand_context_repository
+            brand_context_snapshot_reader = brand_context_source_loader
             brand_context_provider = BrandContextRetrievalService(
                 repository=brand_context_repository,
                 embedding_client=OpenAIEmbeddingClient(
                     api_key=settings.openai_api_key,
                     timeout_seconds=settings.generation_provider_timeout_seconds,
                 ),
+                source_loader=brand_context_source_loader,
             )
         generation_run_repository = GenerationGenerationRunRepository(connection)
         generation_content_candidate_repository = (

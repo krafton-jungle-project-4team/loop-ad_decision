@@ -21,6 +21,22 @@ DEFAULT_FETCHONE_RESULT = object()
 CONFIRMED_TARGET_SEGMENT_STATUSES = {"approved"}
 
 
+@pytest.fixture(autouse=True)
+def stub_s3_brand_context_loader(monkeypatch) -> None:
+    class NoBrandContextLoader:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def resolve_snapshot(self, *, project_id: str):
+            del project_id
+            return None
+
+    monkeypatch.setattr(
+        "app.generation.router.S3BrandContextLoader",
+        NoBrandContextLoader,
+    )
+
+
 def valid_env() -> dict[str, str]:
     values = required_env_values()
     values.update(

@@ -126,6 +126,13 @@ class GenerationSubmissionService:
                 "generation worker is shutting down"
             )
 
+        brand_context = (
+            self._brand_context_repository.resolve_snapshot(
+                project_id=request.project_id,
+            )
+            if self._brand_context_repository is not None
+            else None
+        )
         promotion = self._generation_input_reader.get_promotion_input(request)
         if promotion is None:
             raise GenerationInputUnavailable(
@@ -138,14 +145,6 @@ class GenerationSubmissionService:
             raise GenerationInputUnavailable(
                 "confirmed promotion_target_segments are required for generation"
             )
-        brand_context = (
-            self._brand_context_repository.resolve_snapshot(
-                project_id=request.project_id,
-            )
-            if self._brand_context_repository is not None
-            else None
-        )
-
         snapshot = build_generation_input_snapshot(
             request=request,
             promotion=promotion,

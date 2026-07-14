@@ -19,6 +19,7 @@ def valid_env() -> dict[str, str]:
             "PORT": "8080",
             "LOOPAD_AURORA_PORT": "15432",
             "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL": "https://assets.example.test",
+            "LOOPAD_BRAND_CONTEXT_BASE_PREFIX": "brand-context/",
             "LOOPAD_OPENAI_CONTENT_MODEL": "gpt-test",
             "LOOPAD_GEMINI_IMAGE_MODEL": "gemini-test",
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH": "/models/segment.json",
@@ -47,6 +48,7 @@ def test_load_settings_requires_gemini_api_key() -> None:
     "name",
     [
         "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
+        "LOOPAD_BRAND_CONTEXT_BASE_PREFIX",
         "LOOPAD_OPENAI_CONTENT_MODEL",
         "LOOPAD_GEMINI_IMAGE_MODEL",
     ],
@@ -87,6 +89,7 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.aurora_port == 15432
     assert settings.openai_content_model == "gpt-test"
     assert settings.gemini_image_model == "gemini-test"
+    assert settings.brand_context_base_prefix == "brand-context/"
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
     assert settings.segment_performance_model_path == "/models/segment.json"
 
@@ -95,7 +98,24 @@ def test_load_settings_rejects_public_prefix_matching_source_manifest() -> None:
     env = valid_env()
     env["LOOPAD_GENAI_ASSETS_BASE_PREFIX"] = "genai-source/"
 
-    with pytest.raises(SettingsError, match="outside the public"):
+    with pytest.raises(SettingsError, match="public"):
+        load_settings(env)
+
+
+def test_load_settings_rejects_brand_context_inside_public_prefix() -> None:
+    env = valid_env()
+    env["LOOPAD_GENAI_ASSETS_BASE_PREFIX"] = "genai/"
+    env["LOOPAD_BRAND_CONTEXT_BASE_PREFIX"] = "genai/brand-context/"
+
+    with pytest.raises(SettingsError, match="public"):
+        load_settings(env)
+
+
+def test_load_settings_rejects_brand_context_overlapping_source_manifest() -> None:
+    env = valid_env()
+    env["LOOPAD_BRAND_CONTEXT_BASE_PREFIX"] = "genai-source/"
+
+    with pytest.raises(SettingsError, match="GENAI_SOURCE_MANIFEST_PREFIX"):
         load_settings(env)
 
 

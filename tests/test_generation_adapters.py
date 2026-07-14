@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -492,6 +493,72 @@ def test_gemini_image_client_extracts_inline_bytes() -> None:
     assert image == ImageArtifact(data=b"image-bytes", content_type="image/png")
 
 
+def test_gemini_image_client_uses_developer_api_supported_config() -> None:
+    from google import genai
+    from google.genai import types
+
+    captured: dict[str, object] = {}
+    sdk_client = genai.Client(api_key=GEMINI_FIXTURE_KEY)
+
+    def request(
+        http_method: str,
+        path: str,
+        request_dict: dict[str, object],
+        http_options: object = None,
+    ) -> types.HttpResponse:
+        captured.update(
+            http_method=http_method,
+            path=path,
+            request_dict=request_dict,
+            http_options=http_options,
+        )
+        return types.HttpResponse(
+            headers={},
+            body=json.dumps(
+                {
+                    "candidates": [
+                        {
+                            "content": {
+                                "parts": [
+                                    {
+                                        "inlineData": {
+                                            "mimeType": "image/png",
+                                            "data": base64.b64encode(
+                                                b"image-bytes"
+                                            ).decode("ascii"),
+                                        }
+                                    }
+                                ],
+                                "role": "model",
+                            },
+                            "finishReason": "STOP",
+                            "index": 0,
+                        }
+                    ]
+                }
+            ),
+        )
+
+    sdk_client._api_client.request = request
+    try:
+        image = GeminiImageClient(
+            **provider_key_kwargs(GEMINI_FIXTURE_KEY),
+            model="gemini-test",
+            client=sdk_client,
+        ).generate_image(image_prompt="bright hotel suite banner")
+    finally:
+        sdk_client.close()
+
+    request_dict = captured["request_dict"]
+    assert isinstance(request_dict, dict)
+    assert not sdk_client._api_client.vertexai
+    assert request_dict["generationConfig"] == {
+        "responseModalities": ["IMAGE"],
+    }
+    assert "outputMimeType" not in json.dumps(request_dict)
+    assert image == ImageArtifact(data=b"image-bytes", content_type="image/png")
+
+
 def test_gemini_image_client_extracts_base64_inline_data() -> None:
     client = GeminiImageClient(
         **provider_key_kwargs(GEMINI_FIXTURE_KEY),
@@ -967,7 +1034,8 @@ class FakeGeminiClient:
         assert model == "gemini-test"
         assert contents == "bright hotel suite banner"
         assert config is not None
-        assert config.image_config.output_mime_type == "image/png"
+        assert config.response_modalities == ["IMAGE"]
+        assert config.image_config is None
         return self._response
 
 
