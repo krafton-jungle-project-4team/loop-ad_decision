@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 import json
 import math
@@ -295,6 +295,10 @@ class UserBehaviorVectorRecord:
     vector_values: list[float]
     vector_version: str
     source: str
+    window_start: datetime | None = None
+    window_end: datetime | None = None
+    updated_at: datetime | None = None
+    vector_row_id: str | None = None
 
 
 class MetricCountRecord(NamedTuple):
@@ -317,6 +321,7 @@ class UserSegmentAssignmentWrite:
     assignment_source: str
     assigned_at: datetime
     expires_at: datetime | None
+    segment_assignment_execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -326,6 +331,7 @@ class UserSegmentAssignmentInsertRecord:
     fallback: bool
     fallback_reason: str | None
     similarity_score: Decimal | None
+    segment_assignment_execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -575,12 +581,16 @@ class SegmentVectorReader(Protocol):
 
 
 class UserBehaviorVectorReader(Protocol):
+    def get_source_cutoff(self) -> datetime:
+        ...
+
     def list_by_user_ids(
         self,
         *,
         project_id: str,
         user_ids: Sequence[str],
         vector_version: str,
+        source_cutoff_at: datetime,
         source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         ...
@@ -591,6 +601,7 @@ class UserBehaviorVectorReader(Protocol):
         project_id: str,
         vector_version: str,
         limit: int,
+        source_cutoff_at: datetime,
         source: str | None = None,
         after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
@@ -598,6 +609,14 @@ class UserBehaviorVectorReader(Protocol):
 
 
 class UserSegmentAssignmentWriter(Protocol):
+    def list_existing_assignments(
+        self,
+        *,
+        promotion_run_id: str,
+        user_ids: Sequence[str],
+    ) -> list[UserSegmentAssignmentInsertRecord]:
+        ...
+
     def list_existing_user_ids(
         self,
         *,
@@ -1487,6 +1506,161 @@ class SegmentVectorRepository:
         return candidates_by_user
 
 
+class SegmentAssignmentExecutionRepository:
+    """Persist one atomic, replayable assignment execution per logical request."""
+
+    def __init__(self, db: PostgresExecutor) -> None:
+        self._db = db
+
+    def get_by_request(
+        self,
+        *,
+        promotion_run_id: str,
+        request_fingerprint: str,
+    ) -> dict[str, Any] | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                vector_version,
+                source_cutoff_at,
+                input_manifest_json,
+                created_at
+            FROM segment_assignment_executions
+            WHERE promotion_run_id = %s
+              AND request_fingerprint = %s
+            """,
+            (promotion_run_id, request_fingerprint),
+        )
+        return _segment_assignment_execution_from_row(row)
+
+    def insert_provisional(
+        self,
+        *,
+        segment_assignment_execution_id: str,
+        promotion_run_id: str,
+        request_fingerprint: str,
+        input_fingerprint: str,
+        matcher_strategy: str,
+        matcher_version: str,
+        vector_version: str,
+        source_cutoff_at: datetime,
+        input_manifest_json: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        row = self._db.fetchone(
+            """
+            INSERT INTO segment_assignment_executions (
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                vector_version,
+                source_cutoff_at,
+                input_manifest_json
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (promotion_run_id, request_fingerprint) DO NOTHING
+            RETURNING
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                vector_version,
+                source_cutoff_at,
+                input_manifest_json,
+                created_at
+            """,
+            (
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                vector_version,
+                source_cutoff_at,
+                input_manifest_json,
+            ),
+        )
+        return _segment_assignment_execution_from_row(row)
+
+    def finalize(
+        self,
+        *,
+        segment_assignment_execution_id: str,
+        promotion_run_id: str,
+        request_fingerprint: str,
+        input_fingerprint: str,
+        matcher_strategy: str,
+        matcher_version: str,
+        input_manifest_json: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        row = self._db.fetchone(
+            """
+            UPDATE segment_assignment_executions
+            SET input_fingerprint = %s,
+                matcher_strategy = %s,
+                matcher_version = %s,
+                input_manifest_json = %s
+            WHERE segment_assignment_execution_id = %s
+              AND promotion_run_id = %s
+              AND request_fingerprint = %s
+            RETURNING
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                vector_version,
+                source_cutoff_at,
+                input_manifest_json,
+                created_at
+            """,
+            (
+                input_fingerprint,
+                matcher_strategy,
+                matcher_version,
+                input_manifest_json,
+                segment_assignment_execution_id,
+                promotion_run_id,
+                request_fingerprint,
+            ),
+        )
+        parsed = _segment_assignment_execution_from_row(row)
+        if parsed is None:
+            raise RuntimeError("segment assignment execution finalization returned no row")
+        return parsed
+
+    def count_linked_assignments(
+        self,
+        *,
+        promotion_run_id: str,
+        segment_assignment_execution_id: str,
+    ) -> int:
+        row = self._db.fetchone(
+            """
+            SELECT COUNT(*) AS linked_assignment_count
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+              AND segment_assignment_execution_id = %s
+            """,
+            (promotion_run_id, segment_assignment_execution_id),
+        )
+        if row is None:
+            raise RuntimeError("linked assignment count query returned no row")
+        return int(row["linked_assignment_count"])
+
+
 class UserSegmentAssignmentRepository:
     INSERT_BATCH_SIZE = 1000
 
@@ -1512,6 +1686,33 @@ class UserSegmentAssignmentRepository:
             (promotion_run_id, list(user_ids)),
         )
         return {str(row["user_id"]) for row in rows}
+
+    def list_existing_assignments(
+        self,
+        *,
+        promotion_run_id: str,
+        user_ids: Sequence[str],
+    ) -> list[UserSegmentAssignmentInsertRecord]:
+        if not user_ids:
+            return []
+
+        rows = self._db.fetchall(
+            """
+            SELECT
+                user_id,
+                segment_id,
+                fallback,
+                fallback_reason,
+                similarity_score,
+                segment_assignment_execution_id
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+              AND user_id = ANY(%s)
+            ORDER BY user_id ASC
+            """,
+            (promotion_run_id, list(user_ids)),
+        )
+        return [_user_segment_assignment_record_from_row(row) for row in rows]
 
     def summarize_run(
         self,
@@ -1557,6 +1758,7 @@ class UserSegmentAssignmentRepository:
                         assignment_source,
                         assigned_at,
                         expires_at,
+                        segment_assignment_execution_id,
                         row_ordinal
                     FROM unnest(
                         %s::text[],
@@ -1571,7 +1773,8 @@ class UserSegmentAssignmentRepository:
                         %s::text[],
                         %s::text[],
                         %s::timestamptz[],
-                        %s::timestamptz[]
+                        %s::timestamptz[],
+                        %s::text[]
                     ) WITH ORDINALITY AS assignment_input(
                         project_id,
                         promotion_run_id,
@@ -1586,6 +1789,7 @@ class UserSegmentAssignmentRepository:
                         assignment_source,
                         assigned_at,
                         expires_at,
+                        segment_assignment_execution_id,
                         row_ordinal
                     )
                 )
@@ -1602,7 +1806,8 @@ class UserSegmentAssignmentRepository:
                     fallback_reason,
                     assignment_source,
                     assigned_at,
-                    expires_at
+                    expires_at,
+                    segment_assignment_execution_id
                 )
                 SELECT
                     project_id,
@@ -1617,7 +1822,8 @@ class UserSegmentAssignmentRepository:
                     fallback_reason,
                     assignment_source,
                     assigned_at,
-                    expires_at
+                    expires_at,
+                    segment_assignment_execution_id
                 FROM assignment_rows
                 ORDER BY row_ordinal ASC
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
@@ -1626,7 +1832,8 @@ class UserSegmentAssignmentRepository:
                     segment_id,
                     fallback,
                     fallback_reason,
-                    similarity_score
+                    similarity_score,
+                    segment_assignment_execution_id
                 """,
                 (
                     [assignment.project_id for assignment in chunk],
@@ -1642,20 +1849,14 @@ class UserSegmentAssignmentRepository:
                     [assignment.assignment_source for assignment in chunk],
                     [assignment.assigned_at for assignment in chunk],
                     [assignment.expires_at for assignment in chunk],
+                    [
+                        assignment.segment_assignment_execution_id
+                        for assignment in chunk
+                    ],
                 ),
             )
             inserted_records.extend(
-                UserSegmentAssignmentInsertRecord(
-                    user_id=str(row["user_id"]),
-                    segment_id=str(row["segment_id"]),
-                    fallback=bool(row["fallback"]),
-                    fallback_reason=(
-                        str(row["fallback_reason"])
-                        if row["fallback_reason"] is not None
-                        else None
-                    ),
-                    similarity_score=row["similarity_score"],
-                )
+                _user_segment_assignment_record_from_row(row)
                 for row in rows
             )
         return inserted_records
@@ -1663,9 +1864,22 @@ class UserSegmentAssignmentRepository:
 
 class UserBehaviorVectorRepository:
     VECTOR_DIM = 64
+    SOURCE_TABLE = "user_behavior_vector_revisions"
 
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
+
+    def get_source_cutoff(self) -> datetime:
+        result = self._client.query(
+            "SELECT now64(6, 'UTC') AS source_cutoff_at"
+        )
+        rows = _clickhouse_rows(result)
+        if len(rows) != 1:
+            raise ValueError(
+                "ClickHouse source cutoff query must return exactly one row"
+            )
+        cutoff = _clickhouse_value(rows[0], "source_cutoff_at", 0)
+        return _clickhouse_utc_datetime(cutoff, field_name="source_cutoff_at")
 
     def list_by_user_ids(
         self,
@@ -1673,55 +1887,19 @@ class UserBehaviorVectorRepository:
         project_id: str,
         user_ids: Sequence[str],
         vector_version: str,
+        source_cutoff_at: datetime,
         source: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
         if not user_ids:
             return []
 
-        latest_source_filter = (
-            "              AND tupleElement(latest_vector, 3) = {source:String}\n"
-            if source is not None
-            else ""
-        )
-        parameters: dict[str, Any] = {
-            "project_id": project_id,
-            "vector_version": vector_version,
-            "vector_dim": self.VECTOR_DIM,
-            "user_ids": list(user_ids),
-        }
-        if source is not None:
-            parameters["source"] = source
-
-        query = (
-            """
-            SELECT
-                project_id,
-                user_id,
-                tupleElement(latest_vector, 1) AS vector_dim,
-                tupleElement(latest_vector, 2) AS vector_values,
-                vector_version,
-                tupleElement(latest_vector, 3) AS source
-            FROM (
-                SELECT
-                    project_id,
-                    user_id,
-                    vector_version,
-                    argMax(
-                        tuple(vector_dim, vector_values, source),
-                        updated_at
-                    ) AS latest_vector
-                FROM user_behavior_vectors
-                WHERE project_id = {project_id:String}
-                  AND vector_version = {vector_version:String}
-                  AND user_id IN {user_ids:Array(String)}
-                GROUP BY project_id, user_id, vector_version
-            )
-            WHERE tupleElement(latest_vector, 1) = {vector_dim:UInt16}
-            """
-            + latest_source_filter
-            + """
-            ORDER BY user_id ASC
-            """
+        query, parameters = self._canonical_query(
+            project_id=project_id,
+            vector_version=vector_version,
+            source_cutoff_at=source_cutoff_at,
+            source=source,
+            selection_predicate="AND user_id IN {user_ids:Array(String)}",
+            selection_parameters={"user_ids": list(user_ids)},
         )
         result = self._client.query(
             query,
@@ -1735,63 +1913,27 @@ class UserBehaviorVectorRepository:
         project_id: str,
         vector_version: str,
         limit: int,
+        source_cutoff_at: datetime,
         source: str | None = None,
         after_user_id: str | None = None,
     ) -> list[UserBehaviorVectorRecord]:
-        latest_source_filter = (
-            "              AND tupleElement(latest_vector, 3) = {source:String}\n"
-            if source is not None
-            else ""
-        )
-        cursor_filter = (
-            "                  AND user_id > {after_user_id:String}\n"
-            if after_user_id is not None
-            else ""
-        )
-        parameters: dict[str, Any] = {
-            "project_id": project_id,
-            "vector_version": vector_version,
-            "vector_dim": self.VECTOR_DIM,
-            "limit": limit,
-        }
-        if source is not None:
-            parameters["source"] = source
+        selection_predicate = ""
+        selection_parameters: dict[str, Any] = {}
         if after_user_id is not None:
-            parameters["after_user_id"] = after_user_id
-
-        query = (
-            """
-            SELECT
-                project_id,
-                user_id,
-                tupleElement(latest_vector, 1) AS vector_dim,
-                tupleElement(latest_vector, 2) AS vector_values,
-                vector_version,
-                tupleElement(latest_vector, 3) AS source
-            FROM (
-                SELECT
-                    project_id,
-                    user_id,
-                    vector_version,
-                    argMax(
-                        tuple(vector_dim, vector_values, source),
-                        updated_at
-                    ) AS latest_vector
-                FROM user_behavior_vectors
-                WHERE project_id = {project_id:String}
-                  AND vector_version = {vector_version:String}
-            """
-            + cursor_filter
-            + """
-                GROUP BY project_id, user_id, vector_version
+            selection_predicate = (
+                "AND tuple(user_id, vector_version) > "
+                "tuple({after_user_id:String}, {vector_version:String})"
             )
-            WHERE tupleElement(latest_vector, 1) = {vector_dim:UInt16}
-            """
-            + latest_source_filter
-            + """
-            ORDER BY user_id ASC
-            LIMIT {limit:UInt32}
-            """
+            selection_parameters["after_user_id"] = after_user_id
+
+        query, parameters = self._canonical_query(
+            project_id=project_id,
+            vector_version=vector_version,
+            source_cutoff_at=source_cutoff_at,
+            source=source,
+            selection_predicate=selection_predicate,
+            selection_parameters=selection_parameters,
+            limit=limit,
         )
         result = self._client.query(
             query,
@@ -1799,21 +1941,128 @@ class UserBehaviorVectorRepository:
         )
         return self._records_from_result(result)
 
-    def _records_from_result(self, result: Any) -> list[UserBehaviorVectorRecord]:
-        return [
-            UserBehaviorVectorRecord(
-                project_id=_clickhouse_value(row, "project_id", 0),
-                user_id=_clickhouse_value(row, "user_id", 1),
-                vector_dim=int(_clickhouse_value(row, "vector_dim", 2)),
-                vector_values=[
-                    float(value)
-                    for value in _clickhouse_value(row, "vector_values", 3)
-                ],
-                vector_version=_clickhouse_value(row, "vector_version", 4),
-                source=_clickhouse_value(row, "source", 5),
+    def _canonical_query(
+        self,
+        *,
+        project_id: str,
+        vector_version: str,
+        source_cutoff_at: datetime,
+        source: str | None,
+        selection_predicate: str,
+        selection_parameters: Mapping[str, Any],
+        limit: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        cutoff = _require_utc_datetime(
+            source_cutoff_at,
+            field_name="source_cutoff_at",
+        )
+        source_predicate = (
+            "AND source = {source:String}" if source is not None else ""
+        )
+        limit_clause = "LIMIT {limit:UInt32}" if limit is not None else ""
+        query = f"""
+            SELECT
+                project_id,
+                user_id,
+                vector_version,
+                tupleElement(selected_payload, 1) AS vector_dim,
+                tupleElement(selected_payload, 2) AS vector_values,
+                tupleElement(selected_payload, 3) AS source,
+                tupleElement(selected_payload, 4) AS window_start,
+                tupleElement(selected_payload, 5) AS window_end,
+                tupleElement(selected_payload, 6) AS updated_at,
+                tupleElement(selected_payload, 7) AS vector_row_id
+            FROM (
+                SELECT
+                    project_id,
+                    user_id,
+                    vector_version,
+                    argMax(
+                        tuple(
+                            vector_dim,
+                            vector_values,
+                            CAST(source, 'String'),
+                            window_start,
+                            window_end,
+                            updated_at,
+                            vector_row_id
+                        ),
+                        tuple(updated_at, vector_row_id)
+                    ) AS selected_payload
+                FROM {self.SOURCE_TABLE}
+                WHERE project_id = {{project_id:String}}
+                  AND vector_version = {{vector_version:String}}
+                  AND ingested_at < {{source_cutoff_at:DateTime64(6, 'UTC')}}
+                  {source_predicate}
+                  {selection_predicate}
+                GROUP BY project_id, user_id, vector_version
             )
-            for row in _clickhouse_rows(result)
-        ]
+            ORDER BY user_id ASC, vector_version ASC
+            {limit_clause}
+        """
+        parameters: dict[str, Any] = {
+            "project_id": project_id,
+            "vector_version": vector_version,
+            "source_cutoff_at": cutoff,
+            **selection_parameters,
+        }
+        if source is not None:
+            parameters["source"] = source
+        if limit is not None:
+            parameters["limit"] = limit
+        return query, parameters
+
+    def _records_from_result(self, result: Any) -> list[UserBehaviorVectorRecord]:
+        records: list[UserBehaviorVectorRecord] = []
+        for row in _clickhouse_rows(result):
+            vector_row_id = _clickhouse_value(row, "vector_row_id", 9)
+            if not _is_lowercase_sha256(vector_row_id):
+                raise ValueError(
+                    "malformed user behavior vector provenance: "
+                    "vector_row_id must be a lowercase SHA-256"
+                )
+            window_start = _clickhouse_utc_datetime(
+                _clickhouse_value(row, "window_start", 6),
+                field_name="window_start",
+            )
+            window_end = _clickhouse_utc_datetime(
+                _clickhouse_value(row, "window_end", 7),
+                field_name="window_end",
+            )
+            updated_at = _clickhouse_utc_datetime(
+                _clickhouse_value(row, "updated_at", 8),
+                field_name="updated_at",
+            )
+            records.append(
+                UserBehaviorVectorRecord(
+                    project_id=_require_non_empty_string(
+                        _clickhouse_value(row, "project_id", 0),
+                        field_name="project_id",
+                    ),
+                    user_id=_require_non_empty_string(
+                        _clickhouse_value(row, "user_id", 1),
+                        field_name="user_id",
+                    ),
+                    vector_version=_require_non_empty_string(
+                        _clickhouse_value(row, "vector_version", 2),
+                        field_name="vector_version",
+                    ),
+                    vector_dim=int(_clickhouse_value(row, "vector_dim", 3)),
+                    vector_values=[
+                        float(value)
+                        for value in _clickhouse_value(row, "vector_values", 4)
+                    ],
+                    source=_require_non_empty_string(
+                        _clickhouse_value(row, "source", 5),
+                        field_name="source",
+                    ),
+                    window_start=window_start,
+                    window_end=window_end,
+                    updated_at=updated_at,
+                    vector_row_id=vector_row_id,
+                )
+            )
+        return records
 
 
 class PromotionEvaluationRepository:
@@ -2350,6 +2599,55 @@ def _next_loop_preparation_conflict(
     return NextLoopPreparationConflictError(constraint_name)
 
 
+def _segment_assignment_execution_from_row(
+    row: Mapping[str, Any] | None,
+) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    manifest = row["input_manifest_json"]
+    if isinstance(manifest, str):
+        try:
+            manifest = json.loads(manifest)
+        except json.JSONDecodeError as exc:
+            raise ValueError("execution input_manifest_json must be valid JSON") from exc
+    if not isinstance(manifest, Mapping):
+        raise ValueError("execution input_manifest_json must be a JSON object")
+    return {
+        "segment_assignment_execution_id": str(
+            row["segment_assignment_execution_id"]
+        ),
+        "promotion_run_id": str(row["promotion_run_id"]),
+        "request_fingerprint": str(row["request_fingerprint"]),
+        "input_fingerprint": str(row["input_fingerprint"]),
+        "matcher_strategy": str(row["matcher_strategy"]),
+        "matcher_version": str(row["matcher_version"]),
+        "vector_version": str(row["vector_version"]),
+        "source_cutoff_at": row["source_cutoff_at"],
+        "input_manifest_json": dict(manifest),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _user_segment_assignment_record_from_row(
+    row: Mapping[str, Any],
+) -> UserSegmentAssignmentInsertRecord:
+    execution_id = row.get("segment_assignment_execution_id")
+    return UserSegmentAssignmentInsertRecord(
+        user_id=str(row["user_id"]),
+        segment_id=str(row["segment_id"]),
+        fallback=bool(row["fallback"]),
+        fallback_reason=(
+            str(row["fallback_reason"])
+            if row["fallback_reason"] is not None
+            else None
+        ),
+        similarity_score=row["similarity_score"],
+        segment_assignment_execution_id=(
+            str(execution_id) if execution_id is not None else None
+        ),
+    )
+
+
 def _booking_conversion_denominator_event(experiment: AdExperimentRecord) -> str:
     if experiment.channel == EMAIL_CHANNEL:
         return "campaign_landing"
@@ -2366,6 +2664,55 @@ def _clickhouse_value(row: Any, key: str, index: int) -> Any:
     if isinstance(row, Mapping):
         return row[key]
     return row[index]
+
+
+def _require_utc_datetime(value: Any, *, field_name: str) -> datetime:
+    if (
+        not isinstance(value, datetime)
+        or value.tzinfo is None
+        or value.utcoffset() is None
+    ):
+        raise ValueError(
+            "malformed user behavior vector provenance: "
+            f"{field_name} must be a timezone-aware datetime"
+        )
+    return value.astimezone(UTC)
+
+
+def _clickhouse_utc_datetime(value: Any, *, field_name: str) -> datetime:
+    """Normalize values selected from ClickHouse UTC DateTime64 columns.
+
+    clickhouse-connect 0.8.x returns these typed UTC values as naive Python
+    datetimes. The query/schema provides the timezone provenance, so attaching
+    UTC here preserves the declared instant without weakening validation for
+    caller-supplied cutoff values.
+    """
+
+    if not isinstance(value, datetime):
+        raise ValueError(
+            "malformed user behavior vector provenance: "
+            f"{field_name} must be a datetime"
+        )
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
+
+
+def _require_non_empty_string(value: Any, *, field_name: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            "malformed user behavior vector provenance: "
+            f"{field_name} must be a non-empty string"
+        )
+    return value
+
+
+def _is_lowercase_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _metric_count_from_result(result: Any) -> MetricCountRecord:

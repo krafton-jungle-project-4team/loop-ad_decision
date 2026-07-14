@@ -1,6 +1,6 @@
 from enum import StrEnum
 from decimal import Decimal
-from typing import Any, ClassVar, Literal
+from typing import Annotated, Any, ClassVar, Literal
 
 from pydantic import (
     BaseModel,
@@ -125,7 +125,7 @@ class RunCreateResponse(BaseModel):
 class SegmentAssignmentBuildRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
-    user_ids: list[str] | None = None
+    user_ids: list[Annotated[str, Field(min_length=1)]] | None = None
     eligible_user_limit: int | None = Field(default=None, ge=1)
     vector_version: str = Field(default="v1", min_length=1)
     expires_in_days: int | None = Field(default=None, ge=1)
@@ -135,7 +135,11 @@ class SegmentAssignmentBuildResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     promotion_run_id: str = Field(min_length=1)
-    matching_mode: Literal["pgvector_hnsw_rerank"] = "pgvector_hnsw_rerank"
+    matching_mode: Literal[
+        "exact_cosine",
+        "pgvector_hnsw_rerank",
+        "adaptive_exact_ann",
+    ] = "exact_cosine"
     vector_version: str = Field(min_length=1)
     ann_candidate_limit: int = Field(ge=1)
     ann_candidate_count: int = Field(ge=0)
@@ -167,6 +171,7 @@ class SegmentAssignmentBuildResponse(BaseModel):
     ann_not_applied_reason: Literal[
         "no_users_to_match",
         "no_valid_user_vectors",
+        "matcher_selected_exact",
     ] | None = None
     skipped_existing_count: int = Field(ge=0)
     insufficient_segment_count: Literal[0] = Field(
@@ -179,7 +184,7 @@ class SegmentAssignmentBuildResponse(BaseModel):
     )
     completion_scope: Literal["current_request"] = "current_request"
     assignment_mode: Literal["live_keyset", "explicit_user_ids"]
-    input_stability: Literal["not_snapshotted"] = "not_snapshotted"
+    input_stability: Literal["source_cutoff_snapshot"] = "source_cutoff_snapshot"
     status: Literal["completed"] = "completed"
 
 
