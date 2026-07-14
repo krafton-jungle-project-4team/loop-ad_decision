@@ -30,10 +30,12 @@ from app.decision.assignment_service import (
     AssignmentInputLoader,
     AssignmentPageMatcher,
     AssignmentResultWriter,
+    ExactAssignmentPageMatcher,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
 )
+from app.decision.assignment_selector import AssignmentMatcherSelector
 from app.decision.evaluation_service import (
     AdExperimentEvaluationNotFoundError,
     AdExperimentEvaluationService,
@@ -64,6 +66,7 @@ from app.decision.repositories import (
     PromotionRunRepository,
     PromotionTargetSegmentRepository,
     PsycopgPostgresExecutor,
+    SegmentAssignmentExecutionRepository,
     SegmentVectorRepository,
     UserBehaviorVectorRepository,
     UserSegmentAssignmentRepository,
@@ -198,6 +201,11 @@ def get_segment_assignment_service(
                 segment_vector_repository=segment_vector_repository,
                 reranker=SegmentCandidateReranker(),
             ),
+            exact_page_matcher=ExactAssignmentPageMatcher(
+                reranker=SegmentCandidateReranker(),
+            ),
+            matcher_selector=AssignmentMatcherSelector(),
+            execution_repository=SegmentAssignmentExecutionRepository(executor),
             result_writer=AssignmentResultWriter(
                 user_segment_assignment_repository=(
                     user_segment_assignment_repository

@@ -1156,9 +1156,10 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
         [True, False],
         ["below_threshold", None],
         [AssignmentSource.FALLBACK.value, AssignmentSource.DECISION_BATCH.value],
-        [assigned_at, assigned_at],
-        [None, expires_at],
-    )
+            [assigned_at, assigned_at],
+            [None, expires_at],
+            [None, None],
+        )
 
 
 def test_user_segment_assignment_repository_skips_empty_bulk_insert() -> None:
@@ -1251,15 +1252,20 @@ def test_user_segment_assignment_repository_summarizes_persisted_run() -> None:
 
 
 def test_user_behavior_vector_repository_reads_latest_vector_tuple() -> None:
+    source_cutoff_at = datetime(2026, 7, 14, tzinfo=UTC)
     client = FakeClickHouseClient(
         rows=[
             (
                 "hotel-client-a",
                 "user_001",
+                "v1",
                 64,
                 [1.0] + [0.0] * 63,
-                "v1",
                 "batch_profile",
+                datetime(2026, 7, 1, tzinfo=UTC),
+                datetime(2026, 7, 7, tzinfo=UTC),
+                datetime(2026, 7, 8, tzinfo=UTC),
+                "a" * 64,
             )
         ]
     )
@@ -1269,6 +1275,7 @@ def test_user_behavior_vector_repository_reads_latest_vector_tuple() -> None:
         project_id="hotel-client-a",
         user_ids=["user_001"],
         vector_version="v1",
+        source_cutoff_at=source_cutoff_at,
     )
 
     assert vectors[0].user_id == "user_001"
@@ -1276,30 +1283,29 @@ def test_user_behavior_vector_repository_reads_latest_vector_tuple() -> None:
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert (
-        "argmax( tuple(vector_dim, vector_values, source), updated_at ) "
-        "as latest_vector"
+        "argmax( tuple( vector_dim, vector_values, cast(source, 'string'), "
+        "window_start, window_end, updated_at, vector_row_id ), "
+        "tuple(updated_at, vector_row_id) ) as selected_payload"
     ) in sql
-    assert "tupleelement(latest_vector, 1) as vector_dim" in sql
-    assert "tupleelement(latest_vector, 2) as vector_values" in sql
-    assert "tupleelement(latest_vector, 3) as source" in sql
+    assert "tupleelement(selected_payload, 1) as vector_dim" in sql
+    assert "tupleelement(selected_payload, 2) as vector_values" in sql
+    assert "tupleelement(selected_payload, 3) as source" in sql
     assert "argmax(vector_dim" not in sql
     assert "argmax(vector_values" not in sql
     assert "argmax(source" not in sql
-    assert "from user_behavior_vectors" in sql
-    assert (
-        "group by project_id, user_id, vector_version ) "
-        "where tupleelement(latest_vector, 1) = {vector_dim:uint16}"
-    ) in sql
+    assert "from user_behavior_vector_revisions" in sql
+    assert "ingested_at < {source_cutoff_at:datetime64(6, 'utc')}" in sql
     assert "user_id in {user_ids:array(string)}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
-        "vector_dim": 64,
+        "source_cutoff_at": source_cutoff_at,
         "user_ids": ["user_001"],
     }
 
 
 def test_user_behavior_vector_repository_filters_user_ids_by_source() -> None:
+    source_cutoff_at = datetime(2026, 7, 14, tzinfo=UTC)
     client = FakeClickHouseClient(rows=[])
     repo = UserBehaviorVectorRepository(client)
 
@@ -1307,26 +1313,28 @@ def test_user_behavior_vector_repository_filters_user_ids_by_source() -> None:
         project_id="hotel-client-a",
         user_ids=["user_001"],
         vector_version="v1",
+        source_cutoff_at=source_cutoff_at,
         source="booking_profile",
     )
 
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "tupleelement(latest_vector, 3) = {source:string}" in sql
-    assert sql.index("tupleelement(latest_vector, 3) =") > sql.index(
+    assert "source = {source:string}" in sql
+    assert sql.index("source = {source:string}") < sql.index(
         "group by project_id, user_id, vector_version"
     )
     assert "user_id in {user_ids:array(string)}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
-        "vector_dim": 64,
+        "source_cutoff_at": source_cutoff_at,
         "user_ids": ["user_001"],
         "source": "booking_profile",
     }
 
 
 def test_user_behavior_vector_repository_limits_project_scope() -> None:
+    source_cutoff_at = datetime(2026, 7, 14, tzinfo=UTC)
     client = FakeClickHouseClient(rows=[])
     repo = UserBehaviorVectorRepository(client)
 
@@ -1334,32 +1342,31 @@ def test_user_behavior_vector_repository_limits_project_scope() -> None:
         project_id="hotel-client-a",
         vector_version="v1",
         limit=500,
+        source_cutoff_at=source_cutoff_at,
     )
 
     assert vectors == []
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert (
-        "argmax( tuple(vector_dim, vector_values, source), updated_at ) "
-        "as latest_vector"
+        "argmax( tuple( vector_dim, vector_values, cast(source, 'string'), "
+        "window_start, window_end, updated_at, vector_row_id ), "
+        "tuple(updated_at, vector_row_id) ) as selected_payload"
     ) in sql
-    assert "tupleelement(latest_vector, 2) as vector_values" in sql
-    assert (
-        "group by project_id, user_id, vector_version ) "
-        "where tupleelement(latest_vector, 1) = {vector_dim:uint16}"
-    ) in sql
+    assert "tupleelement(selected_payload, 2) as vector_values" in sql
     assert "limit {limit:uint32}" in sql
     assert "user_id in" not in sql
     assert "after_user_id" not in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
-        "vector_dim": 64,
+        "source_cutoff_at": source_cutoff_at,
         "limit": 500,
     }
 
 
 def test_user_behavior_vector_repository_filters_project_scope_by_source() -> None:
+    source_cutoff_at = datetime(2026, 7, 14, tzinfo=UTC)
     client = FakeClickHouseClient(rows=[])
     repo = UserBehaviorVectorRepository(client)
 
@@ -1367,26 +1374,28 @@ def test_user_behavior_vector_repository_filters_project_scope_by_source() -> No
         project_id="hotel-client-a",
         vector_version="v1",
         limit=500,
+        source_cutoff_at=source_cutoff_at,
         source="booking_profile",
     )
 
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "tupleelement(latest_vector, 3) = {source:string}" in sql
-    assert sql.index("tupleelement(latest_vector, 3) =") > sql.index(
+    assert "source = {source:string}" in sql
+    assert sql.index("source = {source:string}") < sql.index(
         "group by project_id, user_id, vector_version"
     )
     assert "limit {limit:uint32}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v1",
-        "vector_dim": 64,
+        "source_cutoff_at": source_cutoff_at,
         "limit": 500,
         "source": "booking_profile",
     }
 
 
 def test_user_behavior_vector_repository_applies_keyset_cursor() -> None:
+    source_cutoff_at = datetime(2026, 7, 14, tzinfo=UTC)
     client = FakeClickHouseClient(rows=[])
     repo = UserBehaviorVectorRepository(client)
 
@@ -1394,19 +1403,23 @@ def test_user_behavior_vector_repository_applies_keyset_cursor() -> None:
         project_id="hotel-client-a",
         vector_version="v2",
         limit=10_000,
+        source_cutoff_at=source_cutoff_at,
         source="booking_profile",
         after_user_id="user_009999",
     )
 
     call = client.calls[0]
     sql = compact_sql(call.query)
-    assert "user_id > {after_user_id:string}" in sql
-    assert "order by user_id asc" in sql
+    assert (
+        "tuple(user_id, vector_version) > "
+        "tuple({after_user_id:string}, {vector_version:string})"
+    ) in sql
+    assert "order by user_id asc, vector_version asc" in sql
     assert "limit {limit:uint32}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "vector_version": "v2",
-        "vector_dim": 64,
+        "source_cutoff_at": source_cutoff_at,
         "limit": 10_000,
         "source": "booking_profile",
         "after_user_id": "user_009999",

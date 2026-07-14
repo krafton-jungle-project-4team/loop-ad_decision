@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from decimal import Decimal
+import hashlib
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -97,7 +99,7 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "insufficient_segment_count": 0,
         "completion_scope": "current_request",
         "assignment_mode": "explicit_user_ids",
-        "input_stability": "not_snapshotted",
+        "input_stability": "source_cutoff_snapshot",
         "status": "completed",
     }
     assert service.calls[0][0] == "prun_banner_001_loop_1"
@@ -135,6 +137,34 @@ def test_segment_assignment_api_allows_empty_json_body_to_reach_service() -> Non
     assert service.calls[0][0] == "prun_banner_001_loop_1"
     assert service.calls[0][1].user_ids is None
     assert service.calls[0][1].eligible_user_limit is None
+
+
+def test_segment_assignment_api_preserves_explicit_empty_user_set() -> None:
+    service = FakeAssignmentService()
+    client = make_client(service)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
+        json={"user_ids": []},
+    )
+
+    assert response.status_code == 200
+    assert service.calls[0][1].user_ids == []
+
+
+def test_segment_assignment_api_rejects_blank_user_ids_before_service() -> None:
+    service = FakeAssignmentService()
+    client = make_client(service)
+
+    for user_id in ("", "   "):
+        response = client.post(
+            "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
+            json={"user_ids": [user_id]},
+        )
+
+        assert response.status_code == 400
+
+    assert service.calls == []
 
 
 def test_segment_assignment_api_maps_service_errors() -> None:
@@ -186,6 +216,10 @@ def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> N
 
     assert response.status_code == 200
     assert response.json()["assignment_count"] == 1
+    assert response.json()["matching_mode"] == "exact_cosine"
+    assert response.json()["ann_applied"] is False
+    assert response.json()["ann_not_applied_reason"] == "matcher_selected_exact"
+    assert response.json()["input_stability"] == "source_cutoff_snapshot"
     assert len(connections) == 1
     assert len(clickhouse_clients) == 1
     connection = connections[0]
@@ -195,10 +229,16 @@ def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> N
     assert clickhouse_clients[0].close_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("from promotion_runs" in query for query in executed_sql)
-    assert any("set_config('hnsw.ef_search'" in query for query in executed_sql)
-    assert any("set_config('hnsw.iterative_scan'" in query for query in executed_sql)
-    assert any("set_config('hnsw.max_scan_tuples'" in query for query in executed_sql)
-    assert any("order by embedding <=>" in query for query in executed_sql)
+    assert not any("set_config('hnsw.ef_search'" in query for query in executed_sql)
+    assert not any("order by embedding <=>" in query for query in executed_sql)
+    assert any(
+        "insert into segment_assignment_executions" in query
+        for query in executed_sql
+    )
+    assert any(
+        "update segment_assignment_executions" in query
+        for query in executed_sql
+    )
     assert any("insert into user_segment_assignments" in query for query in executed_sql)
 
 
@@ -329,8 +369,8 @@ def test_segment_assignment_api_rolls_back_when_later_page_cursor_fails(
         "insert into user_segment_assignments" in compact_sql(query)
         for query, _params in connection.executed
     )
-    assert len(clickhouse_clients[0].calls) == 2
-    assert clickhouse_clients[0].calls[1][1]["after_user_id"] == "user_001"
+    assert len(clickhouse_clients[0].calls) == 3
+    assert clickhouse_clients[0].calls[2][1]["after_user_id"] == "user_001"
 
 
 class FakeAssignmentService:
@@ -389,7 +429,7 @@ class FakeAssignmentService:
             insufficient_segment_count=0,
             completion_scope="current_request",
             assignment_mode="explicit_user_ids",
-            input_stability="not_snapshotted",
+            input_stability="source_cutoff_snapshot",
             status="completed",
         )
 
@@ -398,6 +438,7 @@ class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
         self._last_query = ""
+        self._last_params: Any = None
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -407,12 +448,43 @@ class RecordingCursor:
 
     def execute(self, query: str, params: Any = None) -> None:
         self._last_query = query
+        self._last_params = params
         self._connection.executed.append((query, params))
+        sql = compact_sql(query)
+        if "insert into segment_assignment_executions" in sql:
+            manifest = getattr(params[8], "obj", params[8])
+            self._connection.execution_row = {
+                "segment_assignment_execution_id": params[0],
+                "promotion_run_id": params[1],
+                "request_fingerprint": params[2],
+                "input_fingerprint": params[3],
+                "matcher_strategy": params[4],
+                "matcher_version": params[5],
+                "vector_version": params[6],
+                "source_cutoff_at": params[7],
+                "input_manifest_json": manifest,
+                "created_at": datetime(2026, 7, 14, tzinfo=UTC),
+            }
+        elif "update segment_assignment_executions" in sql:
+            manifest = getattr(params[3], "obj", params[3])
+            assert self._connection.execution_row is not None
+            self._connection.execution_row.update(
+                {
+                    "input_fingerprint": params[0],
+                    "matcher_strategy": params[1],
+                    "matcher_version": params[2],
+                    "input_manifest_json": manifest,
+                }
+            )
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
         if "from promotion_runs" in sql:
             return self._connection.run_row
+        if "segment_assignment_executions" in sql:
+            return self._connection.execution_row
+        if "linked_assignment_count" in sql:
+            return {"linked_assignment_count": 1}
         if "count(*) as assignment_count" in sql:
             return {"assignment_count": 1, "fallback_count": 0}
         return None
@@ -420,6 +492,7 @@ class RecordingCursor:
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
         if "insert into user_segment_assignments" in sql:
+            execution_ids = self._last_params[-1]
             return [
                 {
                     "user_id": "user_001",
@@ -427,6 +500,7 @@ class RecordingCursor:
                     "fallback": False,
                     "fallback_reason": None,
                     "similarity_score": Decimal("1.000000"),
+                    "segment_assignment_execution_id": execution_ids[0],
                 }
             ]
         if "from ad_experiments" in sql:
@@ -492,6 +566,7 @@ class RecordingConnection:
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
+        self.execution_row: dict[str, object] | None = None
 
     def cursor(self, **_kwargs: object) -> RecordingCursor:
         return RecordingCursor(self)
@@ -509,16 +584,8 @@ class RecordingConnection:
 
 
 class RecordingClickHouseResult:
-    result_rows = [
-        (
-            "hotel-client-a",
-            "user_001",
-            64,
-            [1.0] + [0.0] * 63,
-            "v1",
-            "batch_profile",
-        )
-    ]
+    def __init__(self, result_rows: list[tuple[object, ...]]) -> None:
+        self.result_rows = result_rows
 
 
 class RecordingClickHouseClient:
@@ -528,7 +595,27 @@ class RecordingClickHouseClient:
 
     def query(self, query: str, parameters: Any = None) -> RecordingClickHouseResult:
         self.calls.append((query, parameters))
-        return RecordingClickHouseResult()
+        observed_at = datetime(2026, 7, 13, tzinfo=UTC)
+        if "now64(6" in query:
+            return RecordingClickHouseResult(
+                [(datetime(2026, 7, 14, tzinfo=UTC),)]
+            )
+        return RecordingClickHouseResult(
+            [
+                (
+                    "hotel-client-a",
+                    "user_001",
+                    "v1",
+                    64,
+                    [1.0] + [0.0] * 63,
+                    "batch_profile",
+                    observed_at,
+                    observed_at,
+                    observed_at,
+                    hashlib.sha256(b"user_001").hexdigest(),
+                )
+            ]
+        )
 
     def close(self) -> None:
         self.close_count += 1
