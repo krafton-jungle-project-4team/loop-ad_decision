@@ -52,7 +52,7 @@ def test_openai_segment_report_rejects_technical_terms() -> None:
     )
 
 
-def test_openai_segment_report_preserves_computed_rank_facts() -> None:
+def test_openai_segment_report_preserves_computed_candidate_facts() -> None:
     def transport(
         endpoint: str,
         headers: Mapping[str, str],
@@ -67,7 +67,8 @@ def test_openai_segment_report_preserves_computed_rank_facts() -> None:
                     "promotion_interpretation": ["예약 전환이 목표입니다.", "혜택을 안내합니다."],
                     "why_recommended": ["예약 시작 행동이 있습니다.", "숙소를 탐색했습니다."],
                     "evidence": ["6명이 포함됐습니다.", "예약 시작 신호가 있습니다."],
-                    "difference_from_other_ranks": ["근거 없이 Rank 2보다 훨씬 좋습니다."],
+                    "candidate_strengths": ["근거 없이 가장 좋은 후보입니다."],
+                    "selection_considerations": ["대상 범위를 확인하세요."],
                     "action_hint": "예약 혜택을 안내하세요.",
                     "caution": "첫 발송 결과를 확인하세요.",
                     "confidence_label": "high",
@@ -77,12 +78,14 @@ def test_openai_segment_report_preserves_computed_rank_facts() -> None:
         }
 
     base_input = _report_input()
-    computed_difference = "Rank 1보다 예상 예약 전환율은 2.0%p 낮지만, 예약 이탈 회수 전략입니다."
+    computed_strength = "예약 단계까지 진입한 고객을 회수하는 전략입니다."
+    computed_tradeoff = "목적지 조건의 직접 일치 정도를 함께 확인해야 합니다."
     report_input = replace(
         base_input,
         display_copy={
             **dict(base_input.display_copy),
-            "difference_summary": computed_difference,
+            "strength_summary": computed_strength,
+            "tradeoff_summary": computed_tradeoff,
             "performance_estimate": {
                 "label": "예상 예약 전환율",
                 "formatted": "18.0%",
@@ -97,7 +100,9 @@ def test_openai_segment_report_preserves_computed_rank_facts() -> None:
 
     report = generator.generate_report(report_input)
 
-    assert report["difference_from_other_ranks"][0] == computed_difference
+    assert report["candidate_strengths"][0] == computed_strength
+    assert report["selection_considerations"][0] == computed_tradeoff
+    assert "rank" not in str(report).lower()
     assert report["confidence_label"] == "low"
 
 
@@ -125,7 +130,8 @@ def test_openai_segment_report_replaces_unverified_sample_caution() -> None:
                         "160명을 분석했습니다.",
                         "클릭 행동이 확인됐습니다.",
                     ],
-                    "difference_from_other_ranks": ["확장형 후보입니다."],
+                    "candidate_strengths": ["확장형 후보입니다."],
+                    "selection_considerations": ["실제 성과를 함께 확인하세요."],
                     "action_hint": "혜택 메시지를 안내하세요.",
                     "caution": "표본 수가 160명으로 작아 신뢰도가 낮습니다.",
                     "confidence_label": "low",

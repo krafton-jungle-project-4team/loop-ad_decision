@@ -43,7 +43,6 @@ INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 PRIMARY_RECOMMENDATION_MIN_RELIABILITY = 0.75
 MAX_RANK_USER_OVERLAP = 0.70
-RANK_RATE_TIE_TOLERANCE = 0.001
 
 CANDIDATE_TYPE_ORDER = (
     "intent_matched",
@@ -74,33 +73,33 @@ DESTINATION_SCORE_WEIGHTS: Mapping[str, float] = {
 
 CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
     "intent_matched": {
-        "rank_role": "프로모션 조건 정합형",
+        "strategy_role": "프로모션 조건 정합형",
         "fallback_title": "프로모션 조건과 맞는 숙소 관심 고객",
     },
     "funnel_recovery": {
-        "rank_role": "예약 이탈 회수형",
+        "strategy_role": "예약 이탈 회수형",
         "fallback_title": "예약 직전 이탈 고객",
     },
     "promotion_responsive": {
-        "rank_role": "프로모션 반응 확장형",
+        "strategy_role": "프로모션 반응 확장형",
         "fallback_title": "프로모션 반응이 확인된 고객",
     },
     "target_destination_affinity": {
-        "rank_role": "이번 목적지 반복 관심형",
+        "strategy_role": "이번 목적지 반복 관심형",
         "fallback_title": "이번 여행지를 반복 탐색한 고객",
     },
     "general_destination_explorer": {
-        "rank_role": "다목적지 탐색 확장형",
+        "strategy_role": "다목적지 탐색 확장형",
         "fallback_title": "여러 여행지를 비교 탐색한 고객",
     },
     "benefit_value_seeker": {
-        "rank_role": "혜택 민감형",
+        "strategy_role": "혜택 민감형",
         "fallback_title": "할인과 혜택에 반응할 고객",
     },
 }
 
 # Stable ontology labels used for deterministic fallbacks and UI chips.
-# These labels do not select users or decide ranking.
+# These labels do not select users or decide candidate selection.
 CONDITION_LABELS: Mapping[str, tuple[str, str]] = {
     "hotel_product_interest": ("숙소 관심 행동", "숙소 관심"),
     "recent_destination_search": ("목적지 숙소 검색", "목적지 검색"),
@@ -215,7 +214,7 @@ class RawEventIntentCompilation:
 @dataclass(frozen=True)
 class _RawEventCandidate:
     candidate_type: str
-    rank_role: str
+    strategy_role: str
     title: str
     reason: str
     action_hint: str
@@ -505,7 +504,7 @@ def generate_raw_event_segment_definitions(
     if not candidates:
         return []
     total_eligible_user_count = len(profiles)
-    ranked = _rank_candidates(
+    selected_candidates = _select_candidate_portfolio(
         candidates,
         max_suggested_segments=max_suggested_segments,
     )
@@ -515,11 +514,11 @@ def generate_raw_event_segment_definitions(
             intent=intent,
             compilation=compilation,
             candidate=candidate,
-            rank=rank,
+            position=position,
             total_eligible_user_count=total_eligible_user_count,
-            ranked_candidates=ranked,
+            selected_candidates=selected_candidates,
         )
-        for rank, candidate in enumerate(ranked)
+        for position, candidate in enumerate(selected_candidates)
     ]
 
 
@@ -551,11 +550,11 @@ def generate_raw_event_segment_candidate_pool(
             intent=intent,
             compilation=compilation,
             candidate=candidate,
-            rank=rank,
+            position=position,
             total_eligible_user_count=total_eligible_user_count,
-            ranked_candidates=None,
+            selected_candidates=None,
         )
-        for rank, candidate in enumerate(candidates)
+        for position, candidate in enumerate(candidates)
     ]
 
 
@@ -993,7 +992,7 @@ def _candidate_from_profiles(
     )
     return _RawEventCandidate(
         candidate_type=candidate_type,
-        rank_role=type_labels["rank_role"],
+        strategy_role=type_labels["strategy_role"],
         title=type_labels["fallback_title"],
         reason=_fallback_candidate_reason(
             candidate_type=candidate_type,
@@ -1159,7 +1158,7 @@ def _normalize_expected_performance(
     ]
 
 
-def _rank_candidates(
+def _select_candidate_portfolio(
     candidates: Sequence[_RawEventCandidate],
     *,
     max_suggested_segments: int,
@@ -1223,7 +1222,7 @@ def _with_distinctiveness(
     distinctiveness = 0.8 * user_distinctiveness + 0.2 * chip_distinctiveness
     return _RawEventCandidate(
         candidate_type=candidate.candidate_type,
-        rank_role=candidate.rank_role,
+        strategy_role=candidate.strategy_role,
         title=candidate.title,
         reason=candidate.reason,
         action_hint=candidate.action_hint,
@@ -1276,9 +1275,9 @@ def _segment_definition_from_candidate(
     intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     candidate: _RawEventCandidate,
-    rank: int,
+    position: int,
     total_eligible_user_count: int,
-    ranked_candidates: Sequence[_RawEventCandidate] | None,
+    selected_candidates: Sequence[_RawEventCandidate] | None,
 ) -> SegmentDefinitionRecord:
     sample_ratio = _sample_ratio(
         sample_size=candidate.sample_size,
@@ -1336,32 +1335,21 @@ def _segment_definition_from_candidate(
         promotion=promotion,
         candidate=candidate,
     )
-    rank_comparison = _rank_comparison(
-        promotion=promotion,
-        ranked_candidates=ranked_candidates,
-        rank=rank,
-    )
+    strategy_summary = _strategy_difference_summary(candidate)
+    selection_consideration = _selection_consideration_summary(candidate)
     display_copy = {
         "title": candidate.title,
-        "rank_role": candidate.rank_role,
+        "strategy_role": candidate.strategy_role,
         **recommendation_tier,
-        "recommendation_rank": (
-            rank + 1 if recommendation_tier["rank_eligible"] else None
-        ),
         "audience_summary": audience_summary,
         "audience": audience,
         "performance_estimate": performance_estimate,
         "signal_chips": list(candidate.signal_chips),
         "reason": candidate.reason,
-        "difference_summary": (
-            rank_comparison["summary"]
-            if rank_comparison is not None
-            else _strategy_difference_summary(candidate)
-        ),
+        "strength_summary": strategy_summary,
+        "tradeoff_summary": selection_consideration,
         "action_hint": candidate.action_hint,
     }
-    if rank_comparison is not None:
-        display_copy["rank_comparison"] = rank_comparison
     segment_id = _raw_event_segment_id(
         promotion_id=promotion.promotion_id,
         candidate_type=candidate.candidate_type,
@@ -1370,12 +1358,10 @@ def _segment_definition_from_candidate(
     profile_json: dict[str, Any] = {
         "primary_segment": segment_id,
         "source": "raw_event_intent",
-        "rank_role": candidate.rank_role,
+        "strategy_role": candidate.strategy_role,
         "candidate_type": candidate.candidate_type,
         **recommendation_tier,
-        "recommendation_rank": (
-            rank + 1 if recommendation_tier["rank_eligible"] else None
-        ),
+        "portfolio_position": position + 1,
         "score_components": score_components,
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
@@ -1392,14 +1378,18 @@ def _segment_definition_from_candidate(
         "compiled_intent": compilation.to_json(),
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
-        "ranking_basis": {
+        "selection_basis": {
             "primary_component": "recommendation_tier",
             "metric": promotion.goal_metric,
             "metric_label": performance_estimate["label"],
-            "method": "tier_guarded_goal_performance_rerank",
+            "method": "diversified_candidate_portfolio",
             "expected_goal_achievement_count": performance_estimate[
                 "expected_count"
             ],
+            "internal_position": position + 1,
+            "portfolio_size": (
+                len(selected_candidates) if selected_candidates is not None else None
+            ),
         },
     }
     primary_signals = [
@@ -1417,7 +1407,7 @@ def _segment_definition_from_candidate(
         source="ai_suggested",
         query_preview_id=None,
         natural_language_query=(
-            f"{candidate.rank_role}: {', '.join(matched_conditions[:3])} 조건을 "
+            f"{candidate.strategy_role}: {', '.join(matched_conditions[:3])} 조건을 "
             "실제 SDK 행동 이벤트에서 만족한 고객군입니다."
         ),
         generated_sql=None,
@@ -2390,78 +2380,6 @@ def _missing_condition_keys(
     )
 
 
-def _rank_comparison(
-    *,
-    promotion: PromotionRecord,
-    ranked_candidates: Sequence[_RawEventCandidate] | None,
-    rank: int,
-) -> dict[str, Any] | None:
-    if not ranked_candidates or rank >= len(ranked_candidates):
-        return None
-    candidate = ranked_candidates[rank]
-    if not _recommendation_tier(candidate)["rank_eligible"]:
-        return None
-    primary_candidates = [
-        ranked_candidate
-        for ranked_candidate in ranked_candidates
-        if _recommendation_tier(ranked_candidate)["rank_eligible"]
-    ]
-    if len(primary_candidates) < 2:
-        return None
-    primary_rank = primary_candidates.index(candidate)
-    reference_index = 1 if primary_rank == 0 else primary_rank - 1
-    reference = primary_candidates[reference_index]
-    rate_delta = candidate.predicted_goal_rate - reference.predicted_goal_rate
-    if abs(rate_delta) <= RANK_RATE_TIE_TOLERANCE:
-        direction = "similar"
-    elif rate_delta > 0:
-        direction = "higher"
-    else:
-        direction = "lower"
-    metric_label = _performance_estimate_label(promotion.goal_metric)
-    delta_percentage_points = round(rate_delta * 100.0, 3)
-    return {
-        "reference_rank": reference_index + 1,
-        "metric": promotion.goal_metric,
-        "metric_label": metric_label,
-        "direction": direction,
-        "delta_percentage_points": delta_percentage_points,
-        "summary": _rank_comparison_summary(
-            candidate=candidate,
-            reference_rank=reference_index + 1,
-            metric_label=metric_label,
-            direction=direction,
-            delta_percentage_points=delta_percentage_points,
-        ),
-    }
-
-
-def _rank_comparison_summary(
-    *,
-    candidate: _RawEventCandidate,
-    reference_rank: int,
-    metric_label: str,
-    direction: str,
-    delta_percentage_points: float,
-) -> str:
-    strategy_summary = _strategy_difference_summary(candidate)
-    absolute_delta = abs(delta_percentage_points)
-    if direction == "similar":
-        return (
-            f"Rank {reference_rank}과 {metric_label}이 비슷하며, "
-            f"{strategy_summary}"
-        )
-    if direction == "higher":
-        return (
-            f"Rank {reference_rank}보다 {metric_label}이 {absolute_delta:.1f}%p 높고, "
-            f"{strategy_summary}"
-        )
-    return (
-        f"Rank {reference_rank}보다 {metric_label}은 {absolute_delta:.1f}%p 낮지만, "
-        f"{strategy_summary}"
-    )
-
-
 def _strategy_difference_summary(candidate: _RawEventCandidate) -> str:
     if candidate.candidate_type == "intent_matched":
         return "프로모션 조건과 직접 맞는 숙소 관심 행동을 우선한 전략입니다."
@@ -2476,6 +2394,45 @@ def _strategy_difference_summary(candidate: _RawEventCandidate) -> str:
     if candidate.candidate_type == "benefit_value_seeker":
         return "가격과 혜택에 민감한 고객을 우선한 전략입니다."
     return "다른 후보와 겹치지 않는 행동 조건을 우선한 전략입니다."
+
+
+def _selection_consideration_summary(candidate: _RawEventCandidate) -> str:
+    if _is_small_sample_candidate(candidate):
+        return (
+            "행동 의도는 뚜렷하지만 대표 표본이 작아, 좁은 고객군을 정밀하게 "
+            "공략할 때 적합합니다."
+        )
+    if candidate.candidate_type == "intent_matched":
+        return (
+            "프로모션 조건과 직접 맞는 고객을 우선하지만 예약 퍼널 깊이는 "
+            "다른 행동 근거와 함께 확인해야 합니다."
+        )
+    if candidate.candidate_type == "funnel_recovery":
+        return (
+            "예약 의도는 깊지만 프로모션 목적지와 혜택 조건의 직접 일치 정도를 "
+            "함께 고려해야 합니다."
+        )
+    if candidate.candidate_type == "promotion_responsive":
+        return (
+            "캠페인 반응은 확인됐지만 클릭 행동만으로 예약 의도를 단정하지 않는 "
+            "확장 전략입니다."
+        )
+    if candidate.candidate_type == "target_destination_affinity":
+        return (
+            "목적지 관심은 뚜렷하지만 가격이나 혜택에 대한 반응은 별도 행동 "
+            "근거와 함께 확인해야 합니다."
+        )
+    if candidate.candidate_type == "general_destination_explorer":
+        return (
+            "도달 범위를 넓힐 수 있지만 특정 목적지에 대한 의도는 상대적으로 "
+            "넓게 해석한 후보입니다."
+        )
+    if candidate.candidate_type == "benefit_value_seeker":
+        return (
+            "혜택 메시지와 잘 맞지만 목적지 선호와 예약 단계는 다른 행동 "
+            "근거와 함께 고려해야 합니다."
+        )
+    return "후보의 행동 근거와 대표 표본 규모를 함께 확인해 선택하세요."
 
 
 def _sample_ratio(*, sample_size: int, total_eligible_user_count: int) -> Decimal:
