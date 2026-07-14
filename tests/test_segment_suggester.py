@@ -856,6 +856,71 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
     assert "24.0%p 높고" in display_copy["difference_summary"]
 
 
+def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -> None:
+    profiles = [
+        *[
+            raw_signal(
+                f"destination_{index}",
+                hotel_search_count=3,
+                hotel_detail_view_count=2,
+                destination_match_count=3,
+                destination_values=("jeju",),
+            )
+            for index in range(4)
+        ],
+        *[
+            raw_signal(
+                f"responsive_{index}",
+                promotion_impression_count=3,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+            )
+            for index in range(40)
+        ],
+    ]
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=FakeRawEventSignalRepository(profiles),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=CandidateTypePerformancePredictor(
+            {
+                "target_destination_affinity": 0.09,
+                "promotion_responsive": 0.05,
+            }
+        ),
+        vector_pool_limit=100,
+        vector_sample_limit=100,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert [segment.rule_json["candidate_type"] for segment in segments] == [
+        "promotion_responsive",
+        "target_destination_affinity",
+    ]
+    primary_profile = segments[0].profile_json
+    small_profile = segments[1].profile_json
+    assert primary_profile["recommendation_tier"] == "primary"
+    assert primary_profile["rank_eligible"] is True
+    assert primary_profile["recommendation_rank"] == 1
+    assert primary_profile["performance_estimate"]["expected_count"] == 2.0
+    assert primary_profile["performance_estimate"]["expected_count_label"] == (
+        "예상 예약 인원"
+    )
+    assert small_profile["recommendation_tier"] == "small_high_intent"
+    assert small_profile["rank_eligible"] is False
+    assert small_profile["recommendation_rank"] is None
+    assert small_profile["performance_estimate"]["expected_count"] == 0.36
+    assert "표본 신뢰도" in small_profile["recommendation_tier_reason"]
+    assert "rank_comparison" not in small_profile["display_copy"]
+
+
 def test_raw_event_suggester_uses_destination_context_for_expected_conversion_rate() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [
@@ -967,6 +1032,9 @@ def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> N
     assert estimate["value"] == adjustment["adjusted_value"]
     assert estimate["value"] < 0.2
     assert estimate["confidence_label"] == "low"
+    assert segments[0].profile_json["recommendation_tier"] == "small_high_intent"
+    assert segments[0].profile_json["minimum_primary_sample_size"] == 30
+    assert segments[0].profile_json["recommendation_rank"] is None
 
 
 def test_calibrated_prediction_uses_medium_confidence_for_adequate_ood_sample() -> None:
