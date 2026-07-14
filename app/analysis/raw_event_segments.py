@@ -17,6 +17,7 @@ from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
     SegmentPerformanceFeatures,
     SegmentPerformancePredictor,
+    predict_segment_performance,
 )
 from app.config import Settings
 from app.generation.adapters import (
@@ -29,10 +30,10 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v4"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v5"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
-RAW_EVENT_CANDIDATE_USER_LIMIT = 160
+AUDIENCE_SELECTION_POLICY_VERSION = "dec.segment-audience-selection.v1"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 MAX_RANK_USER_OVERLAP = 0.70
 RANK_RATE_TIE_TOLERANCE = 0.001
@@ -927,10 +928,11 @@ def _candidate_from_profiles(
             profile.user_id,
         ),
     )
-    selected_profiles = ordered_profiles[:RAW_EVENT_CANDIDATE_USER_LIMIT]
-    candidate_user_ids = tuple(profile.user_id for profile in selected_profiles)
+    # Keep every matching user until a selection ratio is calibrated by backtest.
+    candidate_profiles = ordered_profiles
+    candidate_user_ids = tuple(profile.user_id for profile in candidate_profiles)
     signal_metrics = _signal_metrics(
-        selected_profiles,
+        candidate_profiles,
         matching_profile_count=matching_profile_count,
     )
     type_labels = CANDIDATE_TYPE_LABELS[candidate_type]
@@ -943,21 +945,21 @@ def _candidate_from_profiles(
         matched_condition_keys=matched_condition_keys,
     )
     sample_reliability = _sample_reliability(
-        sample_size=len(selected_profiles),
+        sample_size=len(candidate_profiles),
         min_sample_size=min_sample_size,
     )
     performance_features = _performance_features(
         candidate_type=candidate_type,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         signal_metrics=signal_metrics,
         baseline=baseline,
         promotion_condition_match=promotion_condition_match,
         destination_context_required=bool(intent and intent.destinations),
         sample_reliability=sample_reliability,
     )
-    predicted_goal_rate = _expected_goal_performance(
+    predicted_goal_rate, prediction_metadata = _expected_goal_performance(
         promotion=promotion,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         baseline=baseline,
         performance_features=performance_features,
         performance_predictor=performance_predictor,
@@ -983,14 +985,17 @@ def _candidate_from_profiles(
         predicted_goal_rate=predicted_goal_rate,
         expected_goal_performance=predicted_goal_rate,
         behavior_lift_vs_baseline=_behavior_lift(
-            profiles=selected_profiles,
+            profiles=candidate_profiles,
             baseline=baseline,
             candidate_type=candidate_type,
         ),
         sample_reliability=sample_reliability,
         destination_context_required=bool(intent and intent.destinations),
         performance_features=performance_features,
-        performance_model_metadata=dict(performance_predictor.metadata()),
+        performance_model_metadata={
+            **dict(performance_predictor.metadata()),
+            **dict(prediction_metadata),
+        },
     )
 
 
@@ -1181,12 +1186,34 @@ def _segment_definition_from_candidate(
         candidate.signal_metrics.get("matching_profile_count", candidate.sample_size)
         or candidate.sample_size
     )
+    matching_user_ratio = _safe_rate(
+        matching_user_count,
+        total_eligible_user_count,
+    )
+    selection_ratio_within_matching = _safe_rate(
+        candidate.sample_size,
+        matching_user_count,
+    )
     audience = {
         "total_eligible_user_count": total_eligible_user_count,
         "matching_user_count": matching_user_count,
         "selected_user_count": candidate.sample_size,
         "selected_user_ratio": round(float(sample_ratio), 6),
-        "selection_limited": matching_user_count > candidate.sample_size,
+        "matching_user_ratio": round(matching_user_ratio, 6),
+        "selection_ratio_within_matching": round(
+            selection_ratio_within_matching,
+            6,
+        ),
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": AUDIENCE_SELECTION_POLICY_VERSION,
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
     }
     performance_estimate = _performance_estimate(
         promotion=promotion,
@@ -1296,9 +1323,10 @@ def _candidate_audience_summary(
         f"분석 대상 {total_eligible_user_count}명 중 "
         f"조건 일치 {matching_user_count}명"
     )
-    if matching_user_count > candidate.sample_size:
-        return f"{summary} · 상위 {candidate.sample_size}명 사용"
-    return f"{summary} · {float(sample_ratio) * 100:g}%"
+    return (
+        f"{summary} · 조건 일치자 전체를 추천 대상으로 사용 "
+        f"({float(sample_ratio) * 100:g}%)"
+    )
 
 
 def _intent_system_instruction() -> str:
@@ -1809,19 +1837,30 @@ def _expected_goal_performance(
     baseline: Mapping[str, float],
     performance_features: SegmentPerformanceFeatures,
     performance_predictor: SegmentPerformancePredictor,
-) -> float:
+) -> tuple[float, Mapping[str, Any]]:
     if promotion.goal_metric == "booking_conversion_rate":
-        return _clamp01(performance_predictor.predict(performance_features))
-    if promotion.goal_metric == "inflow_rate":
-        return _smoothed_user_rate(
-            profiles,
-            lambda profile: profile.campaign_landing_count > 0,
-            baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
+        prediction = predict_segment_performance(
+            performance_predictor,
+            performance_features,
+            sample_size=len(profiles),
         )
-    return _smoothed_user_rate(
-        profiles,
-        lambda profile: profile.booking_start_count > 0,
-        baseline_rate=baseline.get("booking_start_user_rate", 0.0),
+        return _clamp01(prediction.value), prediction.metadata()
+    if promotion.goal_metric == "inflow_rate":
+        return (
+            _smoothed_user_rate(
+                profiles,
+                lambda profile: profile.campaign_landing_count > 0,
+                baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
+            ),
+            {},
+        )
+    return (
+        _smoothed_user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count > 0,
+            baseline_rate=baseline.get("booking_start_user_rate", 0.0),
+        ),
+        {},
     )
 
 
@@ -1940,10 +1979,10 @@ def _performance_estimate(
         }
     confidence_label, confidence_reason = _performance_confidence(
         candidate=candidate,
-        calibration_status=str(model_metadata.get("calibration_status", "")),
+        model_metadata=model_metadata,
     )
     window_days = _positive_int(model_metadata.get("outcome_days"))
-    return {
+    estimate = {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
         "availability": "available",
@@ -1963,6 +2002,10 @@ def _performance_estimate(
         "model_version": model_metadata.get("model_version"),
         "calibration_status": model_metadata.get("calibration_status"),
     }
+    prediction_adjustment = model_metadata.get("prediction_adjustment")
+    if isinstance(prediction_adjustment, Mapping):
+        estimate["prediction_adjustment"] = dict(prediction_adjustment)
+    return estimate
 
 
 def _observed_goal_rate(
@@ -2013,8 +2056,49 @@ def _performance_window_label(goal_metric: str, *, window_days: int | None) -> s
 def _performance_confidence(
     *,
     candidate: _RawEventCandidate,
-    calibration_status: str,
+    model_metadata: Mapping[str, Any],
 ) -> tuple[str, str]:
+    calibration_status = str(model_metadata.get("calibration_status", ""))
+    adjustment = model_metadata.get("prediction_adjustment")
+    if calibration_status == "calibrated" and isinstance(adjustment, Mapping):
+        policy_version = adjustment.get("policy_version")
+        sample_size = int(adjustment.get("candidate_sample_size", 0) or 0)
+        prior_user_count = float(adjustment.get("prior_user_count", 0.0) or 0.0)
+        ood_feature_count = int(
+            adjustment.get("out_of_distribution_feature_count", 0) or 0
+        )
+        influential_ood_feature_count = int(
+            adjustment.get(
+                "influential_out_of_distribution_feature_count",
+                0,
+            )
+            or 0
+        )
+        is_small_sample = prior_user_count > 0 and sample_size < prior_user_count
+        if policy_version and is_small_sample and ood_feature_count > 0:
+            return (
+                "low",
+                "후보 표본이 적고 학습 범위를 벗어난 행동 분포가 있어 "
+                "학습 기준률로 보수적으로 보정했습니다.",
+            )
+        if policy_version and is_small_sample:
+            return (
+                "low",
+                "후보 표본이 제한적이어서 학습 기준률을 함께 반영해 "
+                "보수적으로 추정했습니다.",
+            )
+        if policy_version and ood_feature_count > 0:
+            if influential_ood_feature_count > 0:
+                return (
+                    "medium",
+                    "표본은 충분하지만 예측에 영향을 주는 일부 행동 신호가 "
+                    "학습 범위를 벗어나 분포 제한을 적용했습니다.",
+                )
+            return (
+                "medium",
+                "표본은 충분하며 학습 범위 밖의 보조 신호는 "
+                "예측값에 직접 반영하지 않았습니다.",
+            )
     if calibration_status == "calibrated":
         if candidate.sample_reliability >= 0.75:
             return "high", "충분한 표본과 검증된 예약 예측 모델을 사용했습니다."

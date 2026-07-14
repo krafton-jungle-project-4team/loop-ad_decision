@@ -17,7 +17,10 @@ from app.analysis.repositories import (
     RawEventUserSignalRecord,
     UserBehaviorVectorRecord,
 )
-from app.analysis.segment_performance import SegmentPerformanceFeatures
+from app.analysis.segment_performance import (
+    SegmentPerformanceFeatures,
+    build_segment_performance_predictor,
+)
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
 
@@ -549,7 +552,7 @@ def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
     )
 
 
-def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:
+def test_raw_event_suggester_uses_all_matching_users_until_ratio_is_backtested() -> None:
     vector_reader = FakeUserBehaviorVectorRepository([])
     raw_reader = FakeRawEventSignalRepository(
         [
@@ -578,12 +581,31 @@ def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -
 
     assert len(segments) == 1
     segment = segments[0]
-    assert segment.sample_size == 160
+    assert segment.sample_size == 170
     assert segment.total_eligible_user_count == 170
     assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
     assert segment.profile_json["display_copy"]["audience_summary"] == (
-        "분석 대상 170명 중 조건 일치 170명 · 상위 160명 사용"
+        "분석 대상 170명 중 조건 일치 170명 · "
+        "조건 일치자 전체를 추천 대상으로 사용 (100%)"
     )
+    assert segment.profile_json["display_copy"]["audience"] == {
+        "total_eligible_user_count": 170,
+        "matching_user_count": 170,
+        "selected_user_count": 170,
+        "selected_user_ratio": 1.0,
+        "matching_user_ratio": 1.0,
+        "selection_ratio_within_matching": 1.0,
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v1",
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
+    }
 
 
 def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
@@ -753,7 +775,18 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
         "matching_user_count": 6,
         "selected_user_count": 6,
         "selected_user_ratio": 0.5,
+        "matching_user_ratio": 0.5,
+        "selection_ratio_within_matching": 1.0,
         "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v1",
+            "method": "all_matching",
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+        },
     }
     assert display_copy["rank_comparison"]["reference_rank"] == 2
     assert display_copy["rank_comparison"]["direction"] == "higher"
@@ -817,6 +850,97 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     score_components = segments[0].profile_json["score_components"]
     assert score_components["predicted_goal_rate"] < 1.0
     assert score_components["expected_goal_performance"] == 1.0
+
+
+def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> None:
+    user_ids = [f"extreme_{index}" for index in range(4)]
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [user_vector(user_id, vector_values(8)) for user_id in user_ids]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                user_id,
+                hotel_search_count=20,
+                hotel_detail_view_count=20,
+                promotion_impression_count=5,
+                promotion_click_count=2,
+                campaign_landing_count=3,
+                booking_start_count=5,
+                booking_complete_count=4,
+                deal_event_count=10,
+                destination_match_count=30,
+                season_match_count=1,
+                destination_values=("jeju",),
+                checkin_dates=("2026-07-15",),
+            )
+            for user_id in user_ids
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=build_segment_performance_predictor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    estimate = segments[0].profile_json["performance_estimate"]
+    adjustment = estimate["prediction_adjustment"]
+    assert adjustment["raw_model_value"] > adjustment["adjusted_value"]
+    assert adjustment["distribution_guarded_value"] > (
+        adjustment["adjusted_value"]
+    )
+    assert adjustment["candidate_sample_size"] == 4
+    assert adjustment["out_of_distribution_feature_count"] > 0
+    assert estimate["value"] == adjustment["adjusted_value"]
+    assert estimate["value"] < 0.2
+    assert estimate["confidence_label"] == "low"
+
+
+def test_calibrated_prediction_uses_medium_confidence_for_adequate_ood_sample() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(160)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    responsive_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "promotion_responsive"
+    )
+    estimate = responsive_segment.profile_json["performance_estimate"]
+    assert estimate["prediction_adjustment"]["candidate_sample_size"] == 160
+    assert estimate["confidence_label"] == "medium"
+    assert "표본은 충분" in estimate["confidence_reason"]
 
 
 def test_raw_event_suggester_requests_vector_window_signals() -> None:

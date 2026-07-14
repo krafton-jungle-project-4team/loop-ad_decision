@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from app.analysis.segment_performance import (
     CalibrationTrainingExample,
     ContextualBookingHeuristicPredictor,
     LogisticSegmentPerformanceModel,
+    PREDICTION_PRIOR_USER_COUNT,
+    PREDICTION_POLICY_VERSION,
     SegmentPerformanceFeatures,
     build_segment_performance_predictor,
     fit_logistic_segment_performance_model,
+    predict_segment_performance,
     write_segment_performance_model,
 )
 
@@ -160,3 +165,67 @@ def test_bundled_model_uses_only_2013_training_outcomes() -> None:
     assert model.metadata()["optimizer"]["selection_basis"] == (
         "2014_development_validation"
     )
+
+
+def test_serving_prediction_limits_extreme_features_and_shrinks_small_sample() -> None:
+    model = build_segment_performance_predictor()
+    assert isinstance(model, LogisticSegmentPerformanceModel)
+    extreme_features = replace(
+        features(
+            candidate_type="target_destination_affinity",
+            destination_match_user_rate=1.0,
+            destination_match_event_rate=0.679,
+        ),
+        eligible_destination_match_user_rate=4 / 312,
+        hotel_detail_view_user_rate=1.0,
+        booking_start_user_rate=1.0,
+        booking_complete_user_rate=1.0,
+        funnel_recovery_user_rate=0.75,
+        benefit_user_rate=1.0,
+        promotion_response_user_rate=1.0,
+    )
+
+    prediction = predict_segment_performance(
+        model,
+        extreme_features,
+        sample_size=4,
+    )
+
+    assert prediction.raw_model_value > 0.5
+    assert prediction.distribution_guarded_value < prediction.raw_model_value
+    assert prediction.value < prediction.distribution_guarded_value
+    assert prediction.training_baseline_rate is not None
+    assert prediction.sample_weight == pytest.approx(
+        4 / (4 + PREDICTION_PRIOR_USER_COUNT)
+    )
+    assert prediction.value == pytest.approx(
+        prediction.sample_weight * prediction.distribution_guarded_value
+        + (1.0 - prediction.sample_weight)
+        * prediction.training_baseline_rate
+    )
+    assert "destination_match_event_rate" in (
+        prediction.influential_out_of_distribution_features
+    )
+    metadata = prediction.metadata()["prediction_adjustment"]
+    assert metadata["policy_version"] == PREDICTION_POLICY_VERSION
+    assert metadata["candidate_sample_size"] == 4
+    assert metadata["out_of_distribution_feature_count"] > 0
+
+
+def test_serving_prediction_preserves_non_logistic_predictor_result() -> None:
+    predictor = ContextualBookingHeuristicPredictor()
+    example_features = features(
+        destination_match_user_rate=1.0,
+        destination_match_event_rate=0.7,
+    )
+
+    prediction = predict_segment_performance(
+        predictor,
+        example_features,
+        sample_size=4,
+    )
+
+    assert prediction.value == pytest.approx(predictor.predict(example_features))
+    assert prediction.raw_model_value == prediction.value
+    assert prediction.policy_version is None
+    assert prediction.metadata()["prediction_adjustment"]["applied"] is False

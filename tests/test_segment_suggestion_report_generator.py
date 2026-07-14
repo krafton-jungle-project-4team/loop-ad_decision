@@ -101,6 +101,74 @@ def test_openai_segment_report_preserves_computed_rank_facts() -> None:
     assert report["confidence_label"] == "low"
 
 
+def test_openai_segment_report_replaces_unverified_sample_caution() -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        return {
+            "output_text": json.dumps(
+                {
+                    "title": "프로모션 반응 고객",
+                    "summary": "프로모션에 반응한 고객입니다.",
+                    "promotion_interpretation": [
+                        "예약 전환이 목표입니다.",
+                        "혜택을 안내합니다.",
+                    ],
+                    "why_recommended": [
+                        "캠페인 랜딩 행동이 있습니다.",
+                        "프로모션 클릭 행동이 있습니다.",
+                    ],
+                    "evidence": [
+                        "160명을 분석했습니다.",
+                        "클릭 행동이 확인됐습니다.",
+                    ],
+                    "difference_from_other_ranks": ["확장형 후보입니다."],
+                    "action_hint": "혜택 메시지를 안내하세요.",
+                    "caution": "표본 수가 160명으로 작아 신뢰도가 낮습니다.",
+                    "confidence_label": "low",
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    confidence_reason = (
+        "표본은 충분하지만 예측에 영향을 주는 일부 행동 신호가 "
+        "학습 범위를 벗어나 분포 제한을 적용했습니다."
+    )
+    base_input = _report_input()
+    report_input = replace(
+        base_input,
+        display_copy={
+            **dict(base_input.display_copy),
+            "performance_estimate": {
+                "label": "예상 예약 전환율",
+                "formatted": "5.1%",
+                "confidence_label": "medium",
+                "confidence_reason": confidence_reason,
+                "prediction_adjustment": {
+                    "candidate_sample_size": 160,
+                    "prior_user_count": 30.0,
+                },
+            },
+        },
+    )
+    generator = OpenAISegmentSuggestionReportGenerator(
+        api_key="test-key",
+        transport=transport,
+    )
+
+    report = generator.generate_report(report_input)
+
+    assert report["confidence_label"] == "medium"
+    assert report["caution"] == (
+        f"{confidence_reason} 첫 발송 후 실제 전환 지표와 함께 확인하세요."
+    )
+    assert "표본 수가 160명으로 작아" not in report["caution"]
+
+
 def _report_input() -> SegmentSuggestionReportInput:
     promotion = PromotionRecord(
         project_id="demo_project",
