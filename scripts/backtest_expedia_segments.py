@@ -67,6 +67,10 @@ from app.logging import (  # noqa: E402
     log_context_scope,
     now_ms,
 )
+from offline_evaluation.audience_selection import (  # noqa: E402
+    DEFAULT_SELECTION_RATIOS,
+    AudienceSelectionEvaluationConfig,
+)
 from offline_evaluation.git_state import (  # noqa: E402
     inspect_clean_git_identity,
 )
@@ -177,6 +181,18 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
             config=config,
             training_cutoffs=training_cutoffs,
             holdout_cutoffs=validation_cutoffs,
+            audience_selection_config=AudienceSelectionEvaluationConfig(
+                ratios=args.audience_selection_ratios,
+                minimum_selected_user_count=(
+                    args.audience_selection_min_selected_users
+                ),
+                minimum_policy_applied_result_count=(
+                    args.audience_selection_min_applied_results
+                ),
+                minimum_positive_capture_rate=(
+                    args.audience_selection_min_positive_capture
+                ),
+            ),
         )
         output_dir = args.output_dir or default_output_dir(args.command)
         artifacts = write_temporal_holdout_artifacts(
@@ -194,6 +210,12 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
                 "reportPath": artifacts["report"],
                 "summaryPath": artifacts["summary"],
                 "modelPath": artifacts["model"],
+                "audienceSelectionPolicyPath": artifacts[
+                    "audience_selection_policy"
+                ],
+                "audienceSelectionReportPath": artifacts[
+                    "audience_selection_report"
+                ],
             },
         )
         log.info(
@@ -519,6 +541,30 @@ def parse_args() -> argparse.Namespace:
         type=parse_date,
         default=date(2014, 12, 1),
     )
+    holdout.add_argument(
+        "--audience-selection-ratios",
+        type=parse_selection_ratios,
+        default=DEFAULT_SELECTION_RATIOS,
+        help="평가할 조건 일치자 상위 비율 목록입니다. 기본값: 0.2,0.4,0.6,0.8,1.0",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-selected-users",
+        type=positive_int,
+        default=30,
+        help="비율 적용 후 이 인원보다 작으면 조건 일치자 전체를 유지합니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-applied-results",
+        type=positive_int,
+        default=3,
+        help="비율 정책 판정에 필요한 최소 후보 결과 수입니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-positive-capture",
+        type=unit_interval,
+        default=0.8,
+        help="조건 일치 예약자를 유지해야 하는 최소 포착률입니다.",
+    )
 
     seal = subparsers.add_parser(
         "seal-final-test",
@@ -740,6 +786,17 @@ def unit_interval(value: str) -> float:
     parsed = float(value)
     if not 0 <= parsed <= 1:
         raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def parse_selection_ratios(value: str) -> tuple[float, ...]:
+    try:
+        parsed = tuple(float(item.strip()) for item in value.split(","))
+        AudienceSelectionEvaluationConfig(ratios=parsed)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "ratios must be sorted unique values in (0, 1] and include 1.0"
+        ) from exc
     return parsed
 
 
