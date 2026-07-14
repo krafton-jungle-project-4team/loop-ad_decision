@@ -16,6 +16,7 @@ from app.generation.brand_context import (
     ManagedBrandContextProvider,
     OpenAIEmbeddingClient,
 )
+from app.generation.brand_context_s3 import S3BrandContextLoader
 from app.generation.errors import (
     PermanentGenerationError,
     classify_generation_error,
@@ -283,6 +284,10 @@ class GenerationJobProcessor:
                     timeout_seconds=(
                         self._settings.generation_provider_timeout_seconds
                     ),
+                ),
+                source_loader=S3BrandContextLoader(
+                    bucket_name=self._settings.data_storage_bucket,
+                    base_prefix=self._settings.brand_context_base_prefix,
                 ),
             ),
         )
