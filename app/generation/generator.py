@@ -3,12 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Protocol
 
+from app.generation.artifacts import ArtifactIdentity, StoredAsset
 from app.generation.image_prompt_builder import RichImagePromptBuilder
 from app.generation.prompt_builder import GenerationPromptInput, PromptBuildResult
 from app.generation.schemas import ContentChannel, missing_channel_fields
 
 
 CONTENT_GENERATOR_VERSION = "dec-c3.deterministic.v4"
+DEFAULT_DETERMINISTIC_IMAGE_URL = (
+    "https://gen-ai.asset.dev.loop-ad.org/fixtures/deterministic-hotel.png"
+)
 
 
 @dataclass(frozen=True)
@@ -21,7 +25,10 @@ class GeneratedContent:
     message: str | None = None
     image_prompt: str | None = None
     image_url: str | None = None
+    image_artifact: StoredAsset | None = None
     landing_url: str | None = None
+    artifact_renderer_version: str | None = None
+    artifact_template_version: str | None = None
 
     def to_record_values(self, channel: ContentChannel) -> dict[str, str | None]:
         values = {
@@ -51,7 +58,7 @@ class ContentGenerator(Protocol):
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
-        content_id: str,
+        artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
         ...
 
@@ -65,9 +72,9 @@ class DeterministicContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
-        content_id: str,
+        artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
-        del content_id
+        del artifact_identity
         channel = prompt_input.promotion.channel
         landing_url = prompt_input.promotion.landing_url
         if not landing_url:
@@ -147,6 +154,7 @@ def _email_content(
         ),
         cta="호텔 정보 보기",
         image_prompt=RichImagePromptBuilder().build(prompt_result),
+        image_url=DEFAULT_DETERMINISTIC_IMAGE_URL,
         landing_url=landing_url,
     )
 
@@ -219,6 +227,7 @@ def _banner_content(
         ),
         cta="호텔 정보 보기",
         image_prompt=RichImagePromptBuilder().build(prompt_result),
+        image_url=DEFAULT_DETERMINISTIC_IMAGE_URL,
         landing_url=landing_url,
     )
 

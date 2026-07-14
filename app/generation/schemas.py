@@ -1,3 +1,4 @@
+from datetime import datetime
 from enum import StrEnum
 from typing import Any, Literal
 
@@ -102,6 +103,7 @@ class CreativeArtifact(BaseModel):
     width: int | None = Field(default=None, ge=1)
     height: int | None = Field(default=None, ge=1)
     error_code: str | None = None
+    published_at: datetime | None = None
 
 
 class LoopAdAttribution(BaseModel):
@@ -128,7 +130,23 @@ class EmailHtmlSource(BaseModel):
     subject: str = Field(min_length=1)
     preheader: str = Field(min_length=1)
     text_body: str = Field(min_length=1)
-    required_placeholders: tuple[str, str] = ("{{redirect_url}}", "{{open_pixel_url}}")
+    required_placeholders: tuple[str, ...] = (
+        "{{redirect_url}}",
+        "{{open_pixel_url}}",
+        "{{unsubscribe_url}}",
+    )
+
+    @field_validator("required_placeholders")
+    @classmethod
+    def validate_required_placeholders(
+        cls,
+        placeholders: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        legacy = ("{{redirect_url}}", "{{open_pixel_url}}")
+        current = (*legacy, "{{unsubscribe_url}}")
+        if placeholders not in {legacy, current}:
+            raise ValueError("email HTML placeholders do not match a supported contract")
+        return placeholders
 
 
 class SmsTextSource(BaseModel):

@@ -16,6 +16,7 @@ from psycopg import sql
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.decision.next_loop_service import (
     NextLoopConflictError,
+    NextLoopGenerationFailedError,
     NextLoopNotFoundError,
     NextLoopValidationError,
 )
@@ -39,7 +40,17 @@ from app.decision.schemas import (
     PromotionRunStatus,
 )
 from app.main import create_app
-from app.generation.repositories import ContentCandidateRepository
+from app.generation.repositories import (
+    ContentCandidateRecord,
+    ContentCandidateRepository,
+    GenerationRunRecord,
+)
+from app.generation.schemas import ContentChannel, GenerationStatus
+from app.generation.service import (
+    GenerationService,
+    NextLoopFocusGenerationRequest,
+    NextLoopFocusGenerationResult,
+)
 
 
 DEFAULT_ROW = object()
@@ -231,6 +242,7 @@ def test_next_loop_api_rejects_extra_body() -> None:
     [
         (NextLoopNotFoundError("missing run"), 404),
         (NextLoopValidationError("invalid next-loop input"), 422),
+        (NextLoopGenerationFailedError("failed generation"), 422),
         (NextLoopConflictError("next run exists"), 409),
     ],
 )
@@ -532,7 +544,7 @@ def test_manual_next_loop_api_reuses_canonical_preparation(
     assert sum("insert into next_loop_preparations" in query for query in executed_sql) == 1
     assert sum("insert into generation_runs" in query for query in executed_sql) == 1
     assert sum("insert into content_candidates" in query for query in executed_sql) == 3
-    assert sum("pg_advisory_xact_lock" in query for query in executed_sql) == 2
+    assert sum("pg_advisory_xact_lock" in query for query in executed_sql) == 3
     preparation_lock_indices = [
         index
         for index, query in enumerate(executed_sql)
@@ -1000,6 +1012,117 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     assert content_insert_params["status"] == "approved"
 
 
+def test_next_loop_api_commits_persisted_generation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: FakeClickHouseClient(),
+    )
+
+    def failed_generate_focus(
+        service: GenerationService,
+        request: NextLoopFocusGenerationRequest,
+    ) -> NextLoopFocusGenerationResult:
+        generation_id = "generation_failed_next_001"
+        terminal_at = datetime.now(UTC)
+        assert service._generation_run_repository is not None
+        assert service._content_candidate_repository is not None
+        service._generation_run_repository.create(
+            GenerationRunRecord(
+                generation_id=generation_id,
+                analysis_id=request.analysis_id,
+                project_id=request.project_id,
+                campaign_id=request.campaign_id,
+                promotion_id=request.promotion_id,
+                content_option_count=request.content_option_count,
+                operator_instruction=request.operator_instruction,
+                input_json={
+                    "target_segment_ids": ["seg_luxury"],
+                    "next_loop": {
+                        "loop_count": request.loop_count,
+                        "source_promotion_run_id": (
+                            request.source_promotion_run_id
+                        ),
+                        "source_generation_id": request.source_generation_id,
+                        "focus_segment_ids": list(request.focus_segment_ids),
+                        "content_option_count": request.content_option_count,
+                        "attempt_no": request.attempt_no,
+                        "candidate_status": request.candidate_status.value,
+                    },
+                },
+                output_json={"status": "failed"},
+                generation_report_json={"status": "failed"},
+                status="failed",
+                started_at=terminal_at,
+                finished_at=terminal_at,
+                last_error_code="test_generation_failed",
+            )
+        )
+        service._content_candidate_repository.create(
+            ContentCandidateRecord(
+                content_id="content_failed_next_001",
+                content_option_id="option_failed_next_001",
+                generation_id=generation_id,
+                analysis_id=request.analysis_id,
+                project_id=request.project_id,
+                campaign_id=request.campaign_id,
+                promotion_id=request.promotion_id,
+                segment_id="seg_luxury",
+                channel=ContentChannel.ONSITE_BANNER,
+                status="draft",
+                title="Saved failure diagnostic",
+                body="The partial candidate remains available for diagnosis.",
+                cta="Retry",
+                image_prompt="A hotel banner diagnostic",
+                landing_url="https://demo-stay.example.com/summer",
+                image_generation_status="failed",
+                artifact_status="failed",
+                artifact_error_code="test_generation_failed",
+            )
+        )
+        return NextLoopFocusGenerationResult(
+            generation_id=generation_id,
+            generated_segment_ids=[],
+            status=GenerationStatus.FAILED,
+        )
+
+    monkeypatch.setattr(
+        GenerationService,
+        "generate_focus",
+        failed_generate_focus,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 422
+    assert "must be completed" in response.json()["detail"]
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 0
+    assert "generation_runs" in connection.committed_inserts
+    assert "content_candidates" in connection.committed_inserts
+    assert connection.content_candidate_rows[0]["generation_id"] == (
+        "generation_failed_next_001"
+    )
+    assert connection.content_candidate_rows[0]["artifact_status"] == "failed"
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert not any("insert into promotion_runs" in query for query in executed_sql)
+    assert not any("insert into ad_experiments" in query for query in executed_sql)
+
+
 def test_next_loop_api_reuses_stored_ai_segment_without_recommending_again(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1319,6 +1442,8 @@ class RecordingCursor:
 
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
+        if "pg_advisory_xact_lock" in sql:
+            return list(self._connection.generation_attempt_rows)
         if "from ad_experiments" in sql:
             return [ad_experiment_row(self._connection.segment_id)]
         if "from promotion_evaluations" in sql:
@@ -1362,6 +1487,7 @@ class RecordingConnection:
         segment_id: str = "seg_luxury",
         active_preparation_row: dict[str, object] | None = None,
         next_attempt_no: int = 1,
+        generation_attempt_rows: list[dict[str, object]] | None = None,
         promotion_evaluation_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self.segment_id = segment_id
@@ -1381,6 +1507,7 @@ class RecordingConnection:
         self.segment_id = segment_id
         self.active_preparation_row = active_preparation_row
         self.next_attempt_no = next_attempt_no
+        self.generation_attempt_rows = list(generation_attempt_rows or [])
         self.promotion_evaluation_rows = (
             promotion_evaluation_rows
             if promotion_evaluation_rows is not None
@@ -1703,6 +1830,15 @@ def content_candidate_insert_row(params: Any) -> dict[str, object]:
         "message_strategy": values["message_strategy"],
         "metadata_json": values["metadata_json"],
         "status": values["status"],
+        "creative_format": values.get("creative_format"),
+        "image_generation_status": values.get("image_generation_status"),
+        "artifact_status": values.get("artifact_status"),
+        "artifact_storage_key": values.get("artifact_storage_key"),
+        "artifact_public_url": values.get("artifact_public_url"),
+        "artifact_sha256": values.get("artifact_sha256"),
+        "artifact_content_type": values.get("artifact_content_type"),
+        "artifact_error_code": values.get("artifact_error_code"),
+        "artifact_published_at": values.get("artifact_published_at"),
         "created_at": None,
         "updated_at": None,
     }

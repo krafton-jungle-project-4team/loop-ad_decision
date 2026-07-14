@@ -9,6 +9,7 @@ from dotenv import find_dotenv, load_dotenv
 
 DECISION_SERVICE_ID = "decision-api"
 DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
+DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 
 
 class SettingsError(RuntimeError):
@@ -38,6 +39,7 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
+    genai_assets_public_base_url: str = DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
     segment_performance_model_path: str | None = None
@@ -111,6 +113,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
+        genai_assets_public_base_url=(
+            _read_optional(source, "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL")
+            or DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
+        ),
         openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
         gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
         segment_performance_model_path=_read_optional(

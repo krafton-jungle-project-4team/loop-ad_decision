@@ -267,6 +267,48 @@ def test_generation_repository_gets_latest_completed_for_promotion() -> None:
     assert call.params == ("promo_banner_001",)
 
 
+def test_generation_repository_allocates_serialized_next_loop_attempt() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "generation_id": "generation_banner_loop_2_attempt_2",
+                "analysis_id": "analysis_banner_loop_2_attempt_2",
+                "project_id": "hotel-client-a",
+                "campaign_id": "camp_summer_2026",
+                "promotion_id": "promo_banner_001",
+                "content_option_count": 1,
+                "operator_instruction": None,
+                "input_json": {"next_loop": {"attempt_no": 2}},
+                "status": "failed",
+                "analysis_input_snapshot_json": {
+                    "next_loop": {"attempt_no": 2}
+                },
+            }
+        ]
+    )
+    repo = GenerationRunRepository(db)
+
+    attempts = repo.list_next_loop_generation_attempts(
+        "prun_banner_001_loop_1"
+    )
+
+    assert len(attempts) == 1
+    assert attempts[0].generation_id == "generation_banner_loop_2_attempt_2"
+    assert attempts[0].status == "failed"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "pg_advisory_xact_lock" in sql
+    assert "left join generation_runs" in sql
+    assert "{next_loop,source_promotion_run_id}" in sql
+    assert "left join promotion_analyses" in sql
+    assert "left join next_loop_preparations" in sql
+    assert call.params == (
+        "prun_banner_001_loop_1",
+        "prun_banner_001_loop_1",
+        "prun_banner_001_loop_1",
+    )
+
+
 def test_target_segment_repository_lists_segments_for_analysis() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[

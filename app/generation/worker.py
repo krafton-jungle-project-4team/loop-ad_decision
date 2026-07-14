@@ -21,6 +21,7 @@ from app.generation.repositories import (
     ContentCandidateRecord,
     ContentCandidateRepository,
     GenerationRunRepository,
+    content_candidate_record_from_row,
 )
 from app.generation.service import DurableGenerationResult, GenerationService
 from app.generation.submission import prompt_inputs_from_snapshot
@@ -33,6 +34,8 @@ class DurableGenerationExecutor(Protocol):
         *,
         generation_id: str,
         prompt_inputs: list[Any],
+        existing_candidates: tuple[ContentCandidateRecord, ...],
+        checkpoint: Callable[[ContentCandidateRecord], None],
     ) -> DurableGenerationResult:
         ...
 
@@ -51,8 +54,8 @@ class GenerationJobProcessor:
     """Execute one claimed run and persist its terminal/retry transition.
 
     Provider and S3 work deliberately runs without an open database
-    transaction. Candidate UPSERTs and the strict completion gate share one
-    short fenced transaction.
+    transaction. Candidate checkpoints use short fenced transactions, and the
+    final UPSERTs plus strict completion gate share one fenced transaction.
     """
 
     def __init__(
@@ -85,9 +88,16 @@ class GenerationJobProcessor:
             if not isinstance(input_snapshot, Mapping):
                 raise ValueError("generation input_json must be an object")
             prompt_inputs = prompt_inputs_from_snapshot(input_snapshot)
+            existing_candidates = self._load_existing_candidates(generation_id)
             result = self._generation_service_factory().execute_durable(
                 generation_id=generation_id,
                 prompt_inputs=prompt_inputs,
+                existing_candidates=existing_candidates,
+                checkpoint=lambda candidate: self._checkpoint_candidate(
+                    candidate,
+                    worker_id=worker_id,
+                    lease_token=lease_token,
+                ),
             )
             self._persist_success(
                 result,
@@ -102,6 +112,44 @@ class GenerationJobProcessor:
                 lease_token=lease_token,
                 error=exc,
             )
+
+    def _load_existing_candidates(
+        self,
+        generation_id: str,
+    ) -> tuple[ContentCandidateRecord, ...]:
+        connection = self._connection_factory(self._settings)
+        try:
+            rows = ContentCandidateRepository(connection).list_by_generation(
+                generation_id
+            )
+            return tuple(content_candidate_record_from_row(row) for row in rows)
+        finally:
+            connection.close()
+
+    def _checkpoint_candidate(
+        self,
+        candidate: ContentCandidateRecord,
+        *,
+        worker_id: str,
+        lease_token: UUID,
+    ) -> None:
+        connection = self._connection_factory(self._settings)
+        try:
+            persisted = ContentCandidateRepository(connection).upsert_fenced(
+                candidate,
+                worker_id=worker_id,
+                lease_token=lease_token,
+            )
+            if persisted is None:
+                raise GenerationFenceRejected(
+                    "candidate checkpoint was rejected by the active lease fence"
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def _persist_success(
         self,

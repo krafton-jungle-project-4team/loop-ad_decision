@@ -209,7 +209,14 @@ class GenerationRunRepository:
             %(generation_report_json)s,
             %(status)s,
             %(started_at)s,
-            %(finished_at)s,
+            CASE
+                WHEN %(status)s::varchar IN ('completed', 'failed')
+                THEN GREATEST(
+                    COALESCE(%(finished_at)s::timestamptz, now()),
+                    now()
+                )
+                ELSE %(finished_at)s::timestamptz
+            END,
             %(retry_count)s,
             %(next_retry_at)s,
             %(last_error_code)s,
@@ -1065,129 +1072,54 @@ class ContentCandidateRecord:
         }
 
 
+def content_candidate_record_from_row(
+    row: Mapping[str, Any],
+) -> ContentCandidateRecord:
+    return ContentCandidateRecord(
+        content_id=str(row["content_id"]),
+        content_option_id=str(row["content_option_id"]),
+        generation_id=str(row["generation_id"]),
+        analysis_id=str(row["analysis_id"]),
+        project_id=str(row["project_id"]),
+        campaign_id=str(row["campaign_id"]),
+        promotion_id=str(row["promotion_id"]),
+        segment_id=str(row["segment_id"]),
+        channel=ContentChannel(str(row["channel"])),
+        status=str(row.get("status") or "draft"),
+        subject=_optional_text(row.get("subject")),
+        preheader=_optional_text(row.get("preheader")),
+        title=_optional_text(row.get("title")),
+        body=_optional_text(row.get("body")),
+        cta=_optional_text(row.get("cta")),
+        message=_optional_text(row.get("message")),
+        image_prompt=_optional_text(row.get("image_prompt")),
+        image_url=_optional_text(row.get("image_url")),
+        landing_url=_optional_text(row.get("landing_url")),
+        generation_prompt=_optional_text(row.get("generation_prompt")),
+        reason_summary=_optional_text(row.get("reason_summary")),
+        data_evidence_json=dict(row.get("data_evidence_json") or {}),
+        message_strategy=_optional_text(row.get("message_strategy")),
+        metadata_json=dict(row.get("metadata_json") or {}),
+        created_at=row.get("created_at"),
+        updated_at=row.get("updated_at"),
+        creative_format=_optional_text(row.get("creative_format")),
+        image_generation_status=_optional_text(
+            row.get("image_generation_status")
+        ),
+        artifact_status=_optional_text(row.get("artifact_status")),
+        artifact_storage_key=_optional_text(row.get("artifact_storage_key")),
+        artifact_public_url=_optional_text(row.get("artifact_public_url")),
+        artifact_sha256=_optional_text(row.get("artifact_sha256")),
+        artifact_content_type=_optional_text(row.get("artifact_content_type")),
+        artifact_error_code=_optional_text(row.get("artifact_error_code")),
+        artifact_published_at=row.get("artifact_published_at"),
+    )
+
+
 class ContentCandidateRepository:
     INSERT_SQL = """
-        INSERT INTO content_candidates (
-            content_id,
-            content_option_id,
-            generation_id,
-            analysis_id,
-            project_id,
-            campaign_id,
-            promotion_id,
-            segment_id,
-            channel,
-            subject,
-            preheader,
-            title,
-            body,
-            cta,
-            message,
-            image_prompt,
-            image_url,
-            landing_url,
-            generation_prompt,
-            reason_summary,
-            data_evidence_json,
-            message_strategy,
-            metadata_json,
-            status,
-            creative_format,
-            image_generation_status,
-            artifact_status,
-            artifact_storage_key,
-            artifact_public_url,
-            artifact_sha256,
-            artifact_content_type,
-            artifact_error_code,
-            artifact_published_at
-        )
-        VALUES (
-            %(content_id)s,
-            %(content_option_id)s,
-            %(generation_id)s,
-            %(analysis_id)s,
-            %(project_id)s,
-            %(campaign_id)s,
-            %(promotion_id)s,
-            %(segment_id)s,
-            %(channel)s,
-            %(subject)s,
-            %(preheader)s,
-            %(title)s,
-            %(body)s,
-            %(cta)s,
-            %(message)s,
-            %(image_prompt)s,
-            %(image_url)s,
-            %(landing_url)s,
-            %(generation_prompt)s,
-            %(reason_summary)s,
-            %(data_evidence_json)s,
-            %(message_strategy)s,
-            %(metadata_json)s,
-            %(status)s,
-            %(creative_format)s,
-            %(image_generation_status)s,
-            %(artifact_status)s::varchar,
-            %(artifact_storage_key)s,
-            %(artifact_public_url)s,
-            %(artifact_sha256)s,
-            %(artifact_content_type)s,
-            %(artifact_error_code)s,
-            CASE
-                WHEN %(artifact_status)s::varchar = 'published' THEN now()
-                ELSE %(artifact_published_at)s
-            END
-        )
-        RETURNING
-            content_id,
-            content_option_id,
-            generation_id,
-            analysis_id,
-            project_id,
-            campaign_id,
-            promotion_id,
-            segment_id,
-            channel,
-            subject,
-            preheader,
-            title,
-            body,
-            cta,
-            message,
-            image_prompt,
-            image_url,
-            landing_url,
-            generation_prompt,
-            reason_summary,
-            data_evidence_json,
-            message_strategy,
-            metadata_json,
-            status,
-            created_at,
-            updated_at,
-            creative_format,
-            image_generation_status,
-            artifact_status,
-            artifact_storage_key,
-            artifact_public_url,
-            artifact_sha256,
-            artifact_content_type,
-            artifact_error_code,
-            artifact_published_at
-    """
-
-    UPSERT_FENCED_SQL = """
-        WITH fenced_run AS MATERIALIZED (
-            SELECT generation_id
-            FROM generation_runs
-            WHERE generation_id = %(generation_id)s
-              AND status = 'running'
-              AND worker_id = %(worker_id)s
-              AND lease_token = %(lease_token)s
-              AND lease_expires_at > now()
-            FOR UPDATE
+        WITH write_clock AS MATERIALIZED (
+            SELECT now() AS db_now
         )
         INSERT INTO content_candidates (
             content_id,
@@ -1247,7 +1179,31 @@ class ContentCandidateRepository:
             %(reason_summary)s,
             %(data_evidence_json)s,
             %(message_strategy)s,
-            %(metadata_json)s,
+            CASE
+                WHEN %(artifact_status)s::varchar = 'published'
+                THEN COALESCE(%(metadata_json)s::jsonb, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'creative',
+                        COALESCE(
+                            %(metadata_json)s::jsonb -> 'creative',
+                            '{}'::jsonb
+                        )
+                        || jsonb_build_object(
+                            'artifact',
+                            COALESCE(
+                                %(metadata_json)s::jsonb
+                                    #> '{creative,artifact}',
+                                '{}'::jsonb
+                            )
+                            || jsonb_build_object(
+                                'published_at',
+                                write_clock.db_now
+                            )
+                        )
+                    )
+                ELSE COALESCE(%(metadata_json)s::jsonb, '{}'::jsonb)
+                    #- '{creative,artifact,published_at}'
+            END,
             %(status)s,
             %(creative_format)s,
             %(image_generation_status)s,
@@ -1258,10 +1214,162 @@ class ContentCandidateRepository:
             %(artifact_content_type)s,
             %(artifact_error_code)s,
             CASE
-                WHEN %(artifact_status)s::varchar = 'published' THEN now()
-                ELSE %(artifact_published_at)s
+                WHEN %(artifact_status)s::varchar = 'published'
+                THEN write_clock.db_now
+                ELSE NULL::timestamptz
+            END
+        FROM write_clock
+        RETURNING
+            content_id,
+            content_option_id,
+            generation_id,
+            analysis_id,
+            project_id,
+            campaign_id,
+            promotion_id,
+            segment_id,
+            channel,
+            subject,
+            preheader,
+            title,
+            body,
+            cta,
+            message,
+            image_prompt,
+            image_url,
+            landing_url,
+            generation_prompt,
+            reason_summary,
+            data_evidence_json,
+            message_strategy,
+            metadata_json,
+            status,
+            created_at,
+            updated_at,
+            creative_format,
+            image_generation_status,
+            artifact_status,
+            artifact_storage_key,
+            artifact_public_url,
+            artifact_sha256,
+            artifact_content_type,
+            artifact_error_code,
+            artifact_published_at
+    """
+
+    UPSERT_FENCED_SQL = """
+        WITH fenced_run AS MATERIALIZED (
+            SELECT generation_id
+            FROM generation_runs
+            WHERE generation_id = %(generation_id)s
+              AND status = 'running'
+              AND worker_id = %(worker_id)s
+              AND lease_token = %(lease_token)s
+              AND lease_expires_at > now()
+            FOR UPDATE
+        ),
+        write_clock AS MATERIALIZED (
+            SELECT now() AS db_now
+        )
+        INSERT INTO content_candidates (
+            content_id,
+            content_option_id,
+            generation_id,
+            analysis_id,
+            project_id,
+            campaign_id,
+            promotion_id,
+            segment_id,
+            channel,
+            subject,
+            preheader,
+            title,
+            body,
+            cta,
+            message,
+            image_prompt,
+            image_url,
+            landing_url,
+            generation_prompt,
+            reason_summary,
+            data_evidence_json,
+            message_strategy,
+            metadata_json,
+            status,
+            creative_format,
+            image_generation_status,
+            artifact_status,
+            artifact_storage_key,
+            artifact_public_url,
+            artifact_sha256,
+            artifact_content_type,
+            artifact_error_code,
+            artifact_published_at
+        )
+        SELECT
+            %(content_id)s,
+            %(content_option_id)s,
+            %(generation_id)s,
+            %(analysis_id)s,
+            %(project_id)s,
+            %(campaign_id)s,
+            %(promotion_id)s,
+            %(segment_id)s,
+            %(channel)s,
+            %(subject)s,
+            %(preheader)s,
+            %(title)s,
+            %(body)s,
+            %(cta)s,
+            %(message)s,
+            %(image_prompt)s,
+            %(image_url)s,
+            %(landing_url)s,
+            %(generation_prompt)s,
+            %(reason_summary)s,
+            %(data_evidence_json)s,
+            %(message_strategy)s,
+            CASE
+                WHEN %(artifact_status)s::varchar = 'published'
+                THEN COALESCE(%(metadata_json)s::jsonb, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'creative',
+                        COALESCE(
+                            %(metadata_json)s::jsonb -> 'creative',
+                            '{}'::jsonb
+                        )
+                        || jsonb_build_object(
+                            'artifact',
+                            COALESCE(
+                                %(metadata_json)s::jsonb
+                                    #> '{creative,artifact}',
+                                '{}'::jsonb
+                            )
+                            || jsonb_build_object(
+                                'published_at',
+                                write_clock.db_now
+                            )
+                        )
+                    )
+                ELSE COALESCE(%(metadata_json)s::jsonb, '{}'::jsonb)
+                    #- '{creative,artifact,published_at}'
+            END,
+            %(status)s,
+            %(creative_format)s,
+            %(image_generation_status)s,
+            %(artifact_status)s::varchar,
+            %(artifact_storage_key)s,
+            %(artifact_public_url)s,
+            %(artifact_sha256)s,
+            %(artifact_content_type)s,
+            %(artifact_error_code)s,
+            CASE
+                WHEN %(artifact_status)s::varchar = 'published'
+                THEN write_clock.db_now
+                ELSE NULL::timestamptz
             END
         FROM fenced_run
+        CROSS JOIN write_clock
         ON CONFLICT (generation_id, segment_id, content_option_id)
         DO UPDATE SET
             subject = EXCLUDED.subject,
@@ -1277,7 +1385,34 @@ class ContentCandidateRepository:
             reason_summary = EXCLUDED.reason_summary,
             data_evidence_json = EXCLUDED.data_evidence_json,
             message_strategy = EXCLUDED.message_strategy,
-            metadata_json = EXCLUDED.metadata_json,
+            metadata_json = CASE
+                WHEN EXCLUDED.artifact_status = 'published'
+                THEN EXCLUDED.metadata_json
+                    || jsonb_build_object(
+                        'creative',
+                        COALESCE(
+                            EXCLUDED.metadata_json -> 'creative',
+                            '{}'::jsonb
+                        )
+                        || jsonb_build_object(
+                            'artifact',
+                            COALESCE(
+                                EXCLUDED.metadata_json
+                                    #> '{creative,artifact}',
+                                '{}'::jsonb
+                            )
+                            || jsonb_build_object(
+                                'published_at',
+                                COALESCE(
+                                    content_candidates.artifact_published_at,
+                                    EXCLUDED.artifact_published_at
+                                )
+                            )
+                        )
+                    )
+                ELSE EXCLUDED.metadata_json
+                    #- '{creative,artifact,published_at}'
+            END,
             status = EXCLUDED.status,
             creative_format = EXCLUDED.creative_format,
             image_generation_status = EXCLUDED.image_generation_status,
@@ -1287,7 +1422,14 @@ class ContentCandidateRepository:
             artifact_sha256 = EXCLUDED.artifact_sha256,
             artifact_content_type = EXCLUDED.artifact_content_type,
             artifact_error_code = EXCLUDED.artifact_error_code,
-            artifact_published_at = EXCLUDED.artifact_published_at,
+            artifact_published_at = CASE
+                WHEN EXCLUDED.artifact_status = 'published'
+                THEN COALESCE(
+                    content_candidates.artifact_published_at,
+                    EXCLUDED.artifact_published_at
+                )
+                ELSE NULL::timestamptz
+            END,
             updated_at = now()
         WHERE content_candidates.content_id = EXCLUDED.content_id
           AND content_candidates.analysis_id = EXCLUDED.analysis_id

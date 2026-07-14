@@ -4,6 +4,7 @@ import threading
 
 from app.config import load_settings
 from app.generation.adapters import ImageArtifact
+from app.generation.artifacts import ArtifactIdentity, StoredAsset
 from app.generation.image_tasks import (
     ImageGenerationJob,
     run_image_generation_jobs,
@@ -32,6 +33,15 @@ def valid_env() -> dict[str, str]:
     }
 
 
+def identity(content_id: str) -> ArtifactIdentity:
+    return ArtifactIdentity(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        generation_id="generation_banner_001",
+        content_id=content_id,
+    )
+
+
 def test_run_image_generation_jobs_updates_candidate_image_url() -> None:
     connection = FakeConnection()
     image_client = FakeImageClient()
@@ -41,7 +51,7 @@ def test_run_image_generation_jobs_updates_candidate_image_url() -> None:
         settings=load_settings(valid_env()),
         jobs=[
             ImageGenerationJob(
-                content_id="content_banner_repeat_hotel_001",
+                identity=identity("content_banner_repeat_hotel_001"),
                 image_prompt="bright hotel suite banner",
             )
         ],
@@ -61,8 +71,9 @@ def test_run_image_generation_jobs_updates_candidate_image_url() -> None:
     assert params == {
         "content_id": "content_banner_repeat_hotel_001",
         "image_url": (
-            "https://gen-ai.asset.dev.loop-ad.org/generated/"
-            "content_banner_repeat_hotel_001.png"
+            "https://gen-ai.asset.dev.loop-ad.org/hotel-client-a/"
+            "promo_banner_001/generation_banner_001/"
+            "content_banner_repeat_hotel_001/image.png"
         ),
     }
 
@@ -74,7 +85,7 @@ def test_run_image_generation_jobs_records_image_generation_failure() -> None:
         settings=load_settings(valid_env()),
         jobs=[
             ImageGenerationJob(
-                content_id="content_banner_repeat_hotel_001",
+                identity=identity("content_banner_repeat_hotel_001"),
                 image_prompt="bright hotel suite banner",
             )
         ],
@@ -111,7 +122,7 @@ def test_run_image_generation_jobs_processes_multiple_jobs_in_parallel() -> None
         settings=load_settings(valid_env()),
         jobs=[
             ImageGenerationJob(
-                content_id=f"content_banner_repeat_hotel_00{index}",
+                identity=identity(f"content_banner_repeat_hotel_00{index}"),
                 image_prompt=f"bright hotel suite banner {index}",
             )
             for index in range(1, 4)
@@ -171,11 +182,31 @@ class FakeAssetStorage:
         self.saved_content_ids: list[str] = []
         self._lock = threading.Lock()
 
-    def store_image(self, *, content_id: str, image: ImageArtifact) -> str:
-        del image
+    def store_image(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        image_prompt_sha256: str,
+        image: ImageArtifact,
+    ) -> StoredAsset:
+        del image_prompt_sha256
         with self._lock:
-            self.saved_content_ids.append(content_id)
-        return f"https://gen-ai.asset.dev.loop-ad.org/generated/{content_id}.png"
+            self.saved_content_ids.append(identity.content_id)
+        public_url = (
+            "https://gen-ai.asset.dev.loop-ad.org/hotel-client-a/"
+            "promo_banner_001/generation_banner_001/"
+            f"{identity.content_id}/image.png"
+        )
+        return StoredAsset(
+            storage_key=(
+                "genai/hotel-client-a/promo_banner_001/generation_banner_001/"
+                f"{identity.content_id}/image.png"
+            ),
+            public_url=public_url,
+            sha256="0" * 64,
+            bytes=len(image.data),
+            content_type=image.content_type,
+        )
 
 
 class FakeCursor:

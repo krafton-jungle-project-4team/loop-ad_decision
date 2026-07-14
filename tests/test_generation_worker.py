@@ -91,9 +91,11 @@ class FakeExecutor:
         *,
         result: DurableGenerationResult | None = None,
         error: Exception | None = None,
+        checkpoint_records: tuple[ContentCandidateRecord, ...] = (),
     ) -> None:
         self.result = result
         self.error = error
+        self.checkpoint_records = checkpoint_records
         self.calls: list[dict[str, Any]] = []
 
     def execute_durable(
@@ -101,13 +103,19 @@ class FakeExecutor:
         *,
         generation_id: str,
         prompt_inputs: list[Any],
+        existing_candidates: tuple[ContentCandidateRecord, ...],
+        checkpoint: Any,
     ) -> DurableGenerationResult:
         self.calls.append(
             {
                 "generation_id": generation_id,
                 "prompt_inputs": prompt_inputs,
+                "existing_candidates": existing_candidates,
+                "checkpoint": checkpoint,
             }
         )
+        for record in self.checkpoint_records:
+            checkpoint(record)
         if self.error is not None:
             raise self.error
         assert self.result is not None
@@ -124,6 +132,7 @@ class RepositoryState:
     reject_completion: bool = False
     transition_succeeds: bool = True
     transition_error: Exception | None = None
+    existing_candidate_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 class FakeConnection:
@@ -175,6 +184,10 @@ class FakeContentCandidateRepository:
         if self.state.reject_candidate:
             return None
         return {"content_id": record.content_id}
+
+    def list_by_generation(self, generation_id: str) -> list[dict[str, Any]]:
+        del generation_id
+        return list(self.state.existing_candidate_rows)
 
 
 class FakeGenerationRunRepository:
@@ -249,12 +262,11 @@ def test_success_upserts_all_candidates_then_completes_and_commits(
         lease_token=LEASE_TOKEN,
     )
 
-    assert executor.calls == [
-        {
-            "generation_id": "generation_247",
-            "prompt_inputs": ["durable-prompt-input"],
-        }
-    ]
+    assert len(executor.calls) == 1
+    assert executor.calls[0]["generation_id"] == "generation_247"
+    assert executor.calls[0]["prompt_inputs"] == ["durable-prompt-input"]
+    assert executor.calls[0]["existing_candidates"] == ()
+    assert callable(executor.calls[0]["checkpoint"])
     assert [
         call["record"].content_id for call in state.candidate_calls
     ] == ["content_sms_1", "content_sms_2"]
@@ -273,8 +285,10 @@ def test_success_upserts_all_candidates_then_completes_and_commits(
     ]
     assert state.retry_calls == []
     assert state.failed_calls == []
-    assert len(connection_factory.connections) == 1
-    connection = connection_factory.connections[0]
+    assert len(connection_factory.connections) == 2
+    load_connection, connection = connection_factory.connections
+    assert load_connection.commit_count == 0
+    assert load_connection.close_count == 1
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
     assert connection.close_count == 1
@@ -314,10 +328,51 @@ def test_retryable_failure_schedules_next_retry_count_backoff(
         }
     ]
     assert state.failed_calls == []
-    connection = connection_factory.connections[0]
+    connection = connection_factory.connections[-1]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
     assert connection.close_count == 1
+
+
+def test_checkpoint_is_committed_before_retryable_failure_is_scheduled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = RepositoryState()
+    executor = FakeExecutor(
+        error=RetryableGenerationError(
+            code="artifact_publish_failed",
+            safe_message="Generated artifact publication failed.",
+        ),
+        checkpoint_records=(candidate(1),),
+    )
+    job_processor, connection_factory = processor(
+        monkeypatch=monkeypatch,
+        state=state,
+        executor=executor,
+    )
+
+    job_processor.process(
+        claimed_row(),
+        worker_id="worker-247",
+        lease_token=LEASE_TOKEN,
+    )
+
+    assert [call["record"].content_id for call in state.candidate_calls] == [
+        "content_sms_1"
+    ]
+    assert len(state.retry_calls) == 1
+    assert state.retry_calls[0]["error_code"] == "artifact_publish_failed"
+    assert len(connection_factory.connections) == 3
+    load_connection, checkpoint_connection, failure_connection = (
+        connection_factory.connections
+    )
+    assert load_connection.commit_count == 0
+    assert checkpoint_connection.commit_count == 1
+    assert checkpoint_connection.rollback_count == 0
+    assert checkpoint_connection.close_count == 1
+    assert failure_connection.commit_count == 1
+    assert failure_connection.rollback_count == 0
+    assert failure_connection.close_count == 1
 
 
 @pytest.mark.parametrize(
@@ -364,7 +419,7 @@ def test_permanent_or_exhausted_failure_marks_run_failed(
     assert len(state.failed_calls) == 1
     assert state.failed_calls[0]["error_code"] == expected_code
     assert state.failed_calls[0]["generation_id"] == "generation_247"
-    connection = connection_factory.connections[0]
+    connection = connection_factory.connections[-1]
     assert connection.commit_count == 1
     assert connection.rollback_count == 0
     assert connection.close_count == 1
@@ -392,8 +447,11 @@ def test_fenced_write_rejection_never_commits_completion(
         lease_token=LEASE_TOKEN,
     )
 
-    assert len(connection_factory.connections) == 2
-    result_connection, failure_connection = connection_factory.connections
+    assert len(connection_factory.connections) == 3
+    load_connection, result_connection, failure_connection = (
+        connection_factory.connections
+    )
+    assert load_connection.close_count == 1
     assert result_connection.commit_count == 0
     assert result_connection.rollback_count == 1
     assert result_connection.close_count == 1
@@ -430,7 +488,7 @@ def test_failure_transition_error_rolls_back_and_closes_connection(
             lease_token=LEASE_TOKEN,
         )
 
-    connection = connection_factory.connections[0]
+    connection = connection_factory.connections[-1]
     assert connection.commit_count == 0
     assert connection.rollback_count == 1
     assert connection.close_count == 1

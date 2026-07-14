@@ -183,6 +183,23 @@ class GenerationRunRecord:
 
 
 @dataclass(frozen=True)
+class NextLoopGenerationAttemptRecord:
+    generation_id: str
+    analysis_id: str
+    project_id: str
+    campaign_id: str
+    promotion_id: str
+    content_option_count: int
+    operator_instruction: str | None
+    input_json: Mapping[str, Any]
+    status: str
+    analysis_input_snapshot_json: Mapping[str, Any] | None
+    preparation_analysis_id: str | None = None
+    preparation_attempt_no: int | None = None
+    preparation_status: str | None = None
+
+
+@dataclass(frozen=True)
 class ContentCandidateRecord:
     content_id: str
     content_option_id: str
@@ -449,6 +466,12 @@ class PromotionTargetSegmentReader(Protocol):
 
 class GenerationRunReader(Protocol):
     def get_by_id(self, generation_id: str) -> GenerationRunRecord | None:
+        ...
+
+    def list_next_loop_generation_attempts(
+        self,
+        source_promotion_run_id: str,
+    ) -> list[NextLoopGenerationAttemptRecord]:
         ...
 
     def get_latest_completed_for_promotion(
@@ -878,6 +901,94 @@ class GenerationRunRepository:
         if row is None:
             return None
         return GenerationRunRecord(**row)
+
+    def list_next_loop_generation_attempts(
+        self,
+        source_promotion_run_id: str,
+    ) -> list[NextLoopGenerationAttemptRecord]:
+        _require_non_blank_string(
+            source_promotion_run_id,
+            field_name="source_promotion_run_id",
+        )
+        rows = self._db.fetchall(
+            """
+            WITH attempt_lock AS MATERIALIZED (
+                SELECT pg_advisory_xact_lock(
+                    hashtextextended(%s, 0)
+                )
+            )
+            SELECT
+                generation_run.generation_id,
+                generation_run.analysis_id,
+                generation_run.project_id,
+                generation_run.campaign_id,
+                generation_run.promotion_id,
+                generation_run.content_option_count,
+                generation_run.operator_instruction,
+                generation_run.input_json,
+                generation_run.status,
+                analysis.input_snapshot_json
+                    AS analysis_input_snapshot_json,
+                preparation.analysis_id AS preparation_analysis_id,
+                preparation.attempt_no AS preparation_attempt_no,
+                preparation.status AS preparation_status
+            FROM attempt_lock
+            LEFT JOIN generation_runs AS generation_run
+              ON generation_run.input_json
+                    #>> '{next_loop,source_promotion_run_id}' = %s
+            LEFT JOIN promotion_analyses AS analysis
+              ON analysis.analysis_id = generation_run.analysis_id
+            LEFT JOIN next_loop_preparations AS preparation
+              ON preparation.source_promotion_run_id = %s
+             AND preparation.generation_id = generation_run.generation_id
+            ORDER BY generation_run.created_at ASC,
+                     generation_run.generation_id ASC
+            """,
+            (
+                source_promotion_run_id,
+                source_promotion_run_id,
+                source_promotion_run_id,
+            ),
+        )
+        return [
+            NextLoopGenerationAttemptRecord(
+                generation_id=str(row["generation_id"]),
+                analysis_id=str(row["analysis_id"]),
+                project_id=str(row["project_id"]),
+                campaign_id=str(row["campaign_id"]),
+                promotion_id=str(row["promotion_id"]),
+                content_option_count=int(row["content_option_count"]),
+                operator_instruction=(
+                    str(row["operator_instruction"])
+                    if row.get("operator_instruction") is not None
+                    else None
+                ),
+                input_json=dict(row.get("input_json") or {}),
+                status=str(row["status"]),
+                analysis_input_snapshot_json=(
+                    dict(row["analysis_input_snapshot_json"])
+                    if row.get("analysis_input_snapshot_json") is not None
+                    else None
+                ),
+                preparation_analysis_id=(
+                    str(row["preparation_analysis_id"])
+                    if row.get("preparation_analysis_id") is not None
+                    else None
+                ),
+                preparation_attempt_no=(
+                    int(row["preparation_attempt_no"])
+                    if row.get("preparation_attempt_no") is not None
+                    else None
+                ),
+                preparation_status=(
+                    str(row["preparation_status"])
+                    if row.get("preparation_status") is not None
+                    else None
+                ),
+            )
+            for row in rows
+            if row.get("generation_id") is not None
+        ]
 
     def get_latest_completed_for_promotion(
         self,

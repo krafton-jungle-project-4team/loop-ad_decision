@@ -308,6 +308,7 @@ def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -
             "title": "이번 주말 호텔 특가",
             "body": "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요.",
             "cta": "호텔 특가 보기",
+            "image_url": "https://cdn.example.test/hotel-banner.png",
         }
     ).lower()
 

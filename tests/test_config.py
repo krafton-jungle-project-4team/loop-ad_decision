@@ -66,6 +66,10 @@ def test_load_settings_collects_validated_values() -> None:
 def test_load_settings_uses_safe_generation_defaults() -> None:
     settings = load_settings(valid_env())
 
+    assert (
+        settings.genai_assets_public_base_url
+        == "https://gen-ai.asset.dev.loop-ad.org"
+    )
     assert settings.generation_worker_max_concurrency == 2
     assert settings.generation_poll_interval_seconds == 1
     assert settings.generation_idle_poll_interval_seconds == 30
@@ -92,6 +96,9 @@ def test_load_settings_collects_generation_overrides() -> None:
             "GENERATION_PROVIDER_TIMEOUT_SECONDS": "40",
             "GENERATION_DB_OPERATION_TIMEOUT_SECONDS": "4",
             "GENERATION_SHUTDOWN_GRACE_SECONDS": "15",
+            "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL": (
+                "https://assets.example.test/genai"
+            ),
         }
     )
 
@@ -107,6 +114,10 @@ def test_load_settings_collects_generation_overrides() -> None:
     assert settings.generation_provider_timeout_seconds == 40
     assert settings.generation_db_operation_timeout_seconds == 4
     assert settings.generation_shutdown_grace_seconds == 15
+    assert (
+        settings.genai_assets_public_base_url
+        == "https://assets.example.test/genai"
+    )
 
 
 def test_load_settings_requires_heartbeat_shorter_than_lease() -> None:

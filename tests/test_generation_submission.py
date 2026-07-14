@@ -251,6 +251,22 @@ def test_submit_persists_requested_row_before_commit_and_wake() -> None:
     assert len(record.request_fingerprint or "") == 64
 
 
+def test_submit_rejects_reserved_internal_idempotency_key_prefix() -> None:
+    events: list[str] = []
+    service, connection, repository, coordinator = build_service(events=events)
+
+    with pytest.raises(ValueError, match="reserved internal prefix"):
+        service.submit(
+            generation_request(),
+            idempotency_key="loopad-internal:next-loop:attacker-controlled",
+        )
+
+    assert events == []
+    assert repository.submitted_records == []
+    assert connection.commit_count == 0
+    assert coordinator.wake_count == 0
+
+
 def test_submit_stops_before_reads_when_coordinator_is_shutting_down() -> None:
     events: list[str] = []
     coordinator = FakeCoordinator(events, accepting=False)
