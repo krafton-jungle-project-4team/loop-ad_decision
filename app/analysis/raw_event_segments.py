@@ -23,6 +23,7 @@ from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
     SegmentPerformanceFeatures,
     SegmentPerformancePredictor,
+    candidate_type_prediction_support,
     predict_segment_performance,
 )
 from app.config import Settings
@@ -569,62 +570,53 @@ def _generate_raw_event_candidates(
         return []
     baseline = _baseline_metrics(profiles)
     predictor = performance_predictor or ContextualBookingHeuristicPredictor()
-    raw_candidates = [
-        _intent_matched_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
+    candidate_factories: tuple[
+        tuple[str, Callable[..., _RawEventCandidate | None]],
+        ...,
+    ] = (
+        ("intent_matched", _intent_matched_candidate),
+        (
+            "target_destination_affinity",
+            _target_destination_affinity_candidate,
         ),
-        _target_destination_affinity_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
+        ("funnel_recovery", _funnel_recovery_candidate),
+        ("benefit_value_seeker", _benefit_value_seeker_candidate),
+        ("promotion_responsive", _promotion_responsive_candidate),
+        (
+            "general_destination_explorer",
+            _general_destination_explorer_candidate,
         ),
-        _funnel_recovery_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _benefit_value_seeker_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _promotion_responsive_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _general_destination_explorer_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-    ]
+    )
+    raw_candidates: list[_RawEventCandidate | None] = []
+    for candidate_type, candidate_factory in candidate_factories:
+        support = candidate_type_prediction_support(
+            predictor,
+            goal_metric=promotion.goal_metric,
+            candidate_type=candidate_type,
+        )
+        if not support.supported:
+            log.info(
+                "candidate_type_prediction_unsupported",
+                {
+                    "candidateType": candidate_type,
+                    "goalMetric": promotion.goal_metric,
+                    "modelVersion": predictor.version,
+                    "trainingExampleCount": support.training_example_count,
+                    "reason": support.reason,
+                },
+            )
+            continue
+        raw_candidates.append(
+            candidate_factory(
+                promotion=promotion,
+                intent=intent,
+                compilation=compilation,
+                profiles=profiles,
+                baseline=baseline,
+                min_sample_size=min_sample_size,
+                performance_predictor=predictor,
+            )
+        )
     candidates = [candidate for candidate in raw_candidates if candidate is not None]
     if audience_selection_policy is not None:
         candidates = [

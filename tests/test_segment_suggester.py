@@ -1037,7 +1037,7 @@ def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> N
     assert segments[0].profile_json["recommendation_rank"] is None
 
 
-def test_calibrated_prediction_uses_medium_confidence_for_adequate_ood_sample() -> None:
+def test_booking_model_excludes_candidate_type_without_training_examples() -> None:
     promotion = promotion_record(
         message_brief="여름 제주 숙소 예약 전환을 높인다.",
     )
@@ -1062,15 +1062,43 @@ def test_calibrated_prediction_uses_medium_confidence_for_adequate_ood_sample() 
         performance_predictor=build_segment_performance_predictor(),
     )
 
+    assert segments == []
+
+
+def test_inflow_metric_keeps_promotion_responsive_candidate() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 랜딩 유입을 높인다.",
+        goal_metric="inflow_rate",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(20)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
     responsive_segment = next(
         segment
         for segment in segments
         if segment.rule_json["candidate_type"] == "promotion_responsive"
     )
     estimate = responsive_segment.profile_json["performance_estimate"]
-    assert estimate["prediction_adjustment"]["candidate_sample_size"] == 160
-    assert estimate["confidence_label"] == "medium"
-    assert "표본은 충분" in estimate["confidence_reason"]
+    assert estimate["metric"] == "inflow_rate"
+    assert estimate["calibration_status"] == "historical_signal_estimate"
 
 
 def test_raw_event_suggester_requests_vector_window_signals() -> None:
