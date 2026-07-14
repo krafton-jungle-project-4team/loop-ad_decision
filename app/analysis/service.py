@@ -362,6 +362,7 @@ class NextLoopFocusAnalysisRequest:
     loop_count: int
     source_promotion_run_id: str
     source_failed_ad_experiment_ids: Sequence[str]
+    attempt_no: int = 1
     operator_instruction: str | None = None
 
 
@@ -370,6 +371,7 @@ class NextLoopAnalysisContext:
     loop_count: int
     source_promotion_run_id: str
     source_failed_ad_experiment_ids: Sequence[str]
+    attempt_no: int
 
 
 @dataclass(frozen=True)
@@ -487,6 +489,8 @@ class PromotionAnalysisService:
         *,
         target_status: TargetSegmentStatus = "planned",
     ) -> PromotionAnalysisResult:
+        if request.attempt_no < 1:
+            raise SegmentSelectionError("attempt_no must be at least 1")
         started_at = now_ms()
         log.assign_context(
             {
@@ -511,6 +515,7 @@ class PromotionAnalysisService:
                 source_failed_ad_experiment_ids=list(
                     request.source_failed_ad_experiment_ids
                 ),
+                attempt_no=request.attempt_no,
             ),
             refresh_segment_suggestions=False,
             persist_target_segments=True,
@@ -1105,6 +1110,7 @@ class PromotionAnalysisService:
                 "source_failed_ad_experiment_ids": list(
                     next_loop_context.source_failed_ad_experiment_ids
                 ),
+                "attempt_no": next_loop_context.attempt_no,
             }
 
         return PromotionAnalysisWrite(
@@ -1235,6 +1241,7 @@ def _analysis_id(
         promotion_id=promotion_id,
         loop_count=next_loop_context.loop_count,
         source_promotion_run_id=next_loop_context.source_promotion_run_id,
+        attempt_no=next_loop_context.attempt_no,
     )
 
 
@@ -1244,11 +1251,14 @@ def _bounded_next_loop_lineage_id(
     promotion_id: str,
     loop_count: int,
     source_promotion_run_id: str,
+    attempt_no: int = 1,
 ) -> str:
     lineage_digest = hashlib.sha256(
         source_promotion_run_id.encode("utf-8")
     ).hexdigest()[:12]
     suffix = f"_loop_{loop_count}_{lineage_digest}"
+    if attempt_no > 1:
+        suffix = f"{suffix}_attempt_{attempt_no}"
     max_slug_length = 100 - len(prefix) - len(suffix) - 1
     promotion_slug = _slug_from_promotion_id(promotion_id)
     promotion_slug = promotion_slug[:max_slug_length].rstrip("_") or "promotion"

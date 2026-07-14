@@ -29,6 +29,7 @@ from app.logging import log
 GENERATION_REQUEST_SCHEMA_VERSION = "generation.request.v1"
 MAX_IDEMPOTENCY_KEY_LENGTH = 200
 MAX_GENERATION_ID_LENGTH = 100
+INTERNAL_IDEMPOTENCY_KEY_PREFIX = "loopad-internal:"
 
 
 class GenerationSubmissionRepository(Protocol):
@@ -208,6 +209,8 @@ def normalize_idempotency_key(value: str) -> str:
     key = str(value).strip()
     if not key:
         raise ValueError("Idempotency-Key header is required")
+    if key.startswith(INTERNAL_IDEMPOTENCY_KEY_PREFIX):
+        raise ValueError("Idempotency-Key uses a reserved internal prefix")
     if len(key) > MAX_IDEMPOTENCY_KEY_LENGTH:
         raise ValueError(
             f"Idempotency-Key must be at most {MAX_IDEMPOTENCY_KEY_LENGTH} characters"

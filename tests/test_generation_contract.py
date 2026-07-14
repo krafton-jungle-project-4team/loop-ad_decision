@@ -4,6 +4,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+
+from app.generation.artifacts import ArtifactIdentity
 from fastapi.testclient import TestClient
 
 from app.generation.generator import GeneratedContent
@@ -139,6 +141,7 @@ CANDIDATE_METADATA_KEYS = {
     "image_prompt",
     "image_url",
     "landing_url",
+    "image",
     "creative",
 }
 
@@ -203,16 +206,24 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
     run_params = generation_run.to_db_params()
     assert set(run_params) == GENERATION_RUN_DB_PARAM_KEYS
     assert run_params["status"] == "completed"
-    assert run_params["input_json"].obj == {
-        "project_id": "hotel-client-a",
-        "campaign_id": "camp_summer_2026",
-        "promotion_id": "promo_banner_001",
-        "analysis_id": "analysis_banner_001",
-        "content_option_count": 1,
-        "operator_instruction": "Keep the hotel message concise.",
-        "target_segment_ids": ["seg_repeat_hotel_no_booking"],
-        "channel": "onsite_banner",
-    }
+    input_json = run_params["input_json"].obj
+    assert input_json["schema_version"] == "generation.request.v1"
+    assert input_json["project_id"] == "hotel-client-a"
+    assert input_json["campaign_id"] == "camp_summer_2026"
+    assert input_json["promotion_id"] == "promo_banner_001"
+    assert input_json["analysis_id"] == "analysis_banner_001"
+    assert input_json["content_option_count"] == 1
+    assert input_json["operator_instruction"] == "Keep the hotel message concise."
+    assert input_json["target_segment_ids"] == ["seg_repeat_hotel_no_booking"]
+    assert input_json["channel"] == "onsite_banner"
+    assert input_json["promotion"]["channel"] == "onsite_banner"
+    assert input_json["target_segments"][0]["segment_id"] == (
+        "seg_repeat_hotel_no_booking"
+    )
+    assert run_params["idempotency_key"] == (
+        "loopad-internal:inline:generation_banner_001"
+    )
+    assert len(run_params["request_fingerprint"] or "") == 64
     assert set(run_params["output_json"].obj) == RUN_OUTPUT_KEYS
     assert run_params["output_json"].obj["generation_summary"] == {
         "status": "completed",
@@ -221,6 +232,7 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
     }
     assert run_params["generation_report_json"].obj == {
         "status": "completed",
+        "schema_version": "generation.request.v1",
         "content_candidate_count": 1,
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v4",
@@ -465,9 +477,9 @@ class ImageUrlContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
-        content_id: str,
+        artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index, content_id
+        del prompt_input, prompt_result, option_index, artifact_identity
         return GeneratedContent(
             title="Hotel rooms ready this weekend",
             body="Compare refundable hotel stays before rooms run out.",

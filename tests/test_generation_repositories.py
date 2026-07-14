@@ -250,6 +250,9 @@ def test_generation_run_repository_create_executes_insert() -> None:
     assert params["generation_report_json"].obj == {"content_candidate_count": 2}
     assert "idempotency_key" in query
     assert "request_fingerprint" in query
+    assert "WHEN %(status)s::varchar IN ('completed', 'failed')" in query
+    assert "THEN GREATEST(" in query
+    assert "COALESCE(%(finished_at)s::timestamptz, now())" in query
     assert params["retry_count"] == 0
 
 
@@ -522,6 +525,11 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
     assert "creative_format" in query
     assert "artifact_public_url" in query
+    assert "SELECT now() AS db_now" in query
+    assert "THEN write_clock.db_now" in query
+    assert "FROM write_clock" in query
+    assert "jsonb_build_object(" in query
+    assert "#- '{creative,artifact,published_at}'" in query
     assert params["creative_format"] is None
     assert params["artifact_public_url"] is None
 
@@ -548,7 +556,13 @@ def test_content_candidate_repository_upserts_all_contract_fields_with_fencing()
     assert "FOR UPDATE" in query
     assert "ON CONFLICT (generation_id, segment_id, content_option_id)" in query
     assert "content_candidates.content_id = EXCLUDED.content_id" in query
-    assert "WHEN %(artifact_status)s::varchar = 'published' THEN now()" in query
+    assert "SELECT now() AS db_now" in query
+    assert "THEN write_clock.db_now" in query
+    assert "CROSS JOIN write_clock" in query
+    assert "'{creative,artifact,published_at}'" in query
+    assert "jsonb_build_object(" in query
+    assert "#- '{creative,artifact,published_at}'" in query
+    assert "content_candidates.artifact_published_at" in query
     assert "artifact_sha256 = EXCLUDED.artifact_sha256" in query
     assert params is not None
     assert params["worker_id"] == "decision-task-1"

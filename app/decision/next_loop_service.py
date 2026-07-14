@@ -15,6 +15,7 @@ from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
     GenerationRunReader,
+    NextLoopGenerationAttemptRecord,
     NextLoopPreparationConflictError,
     NextLoopPreparationRecord,
     NextLoopPreparationWrite,
@@ -45,6 +46,7 @@ from app.generation.service import GenerationService, NextLoopFocusGenerationReq
 from app.logging import duration_ms, log, log_context_scope, now_ms
 
 COMPLETED_STATUS = "completed"
+FAILED_STATUS = "failed"
 MANUAL_CONTENT_OPTION_COUNT = 3
 SELECTABLE_CANDIDATE_STATUSES = frozenset({"draft", "approved", "active"})
 EXHAUSTED_CANDIDATE_STATUSES = frozenset({"rejected", "archived"})
@@ -59,6 +61,10 @@ class NextLoopNotFoundError(Exception):
 
 class NextLoopValidationError(Exception):
     pass
+
+
+class NextLoopGenerationFailedError(NextLoopValidationError):
+    """A failed generation attempt whose diagnostics are ready to commit."""
 
 
 class NextLoopConflictError(Exception):
@@ -76,6 +82,7 @@ class NextLoopGenerationResult:
     generation_id: str
     generated_segment_ids: Sequence[str]
     status: str = COMPLETED_STATUS
+    failure_persisted: bool = False
 
 
 @dataclass(frozen=True)
@@ -98,6 +105,7 @@ class NextLoopAnalysisGateway(Protocol):
         loop_count: int,
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
+        attempt_no: int,
         operator_instruction: str | None,
         target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
@@ -114,6 +122,7 @@ class NextLoopGenerationGateway(Protocol):
         analysis_id: str,
         focus_segment_ids: Sequence[str],
         loop_count: int,
+        attempt_no: int,
         source_promotion_run_id: str,
         source_generation_id: str,
         operator_instruction: str | None,
@@ -169,6 +178,7 @@ class UnavailableNextLoopAnalysisGateway:
         loop_count: int,
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
+        attempt_no: int,
         operator_instruction: str | None,
         target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
@@ -180,6 +190,7 @@ class UnavailableNextLoopAnalysisGateway:
             loop_count,
             source_promotion_run_id,
             source_failed_ad_experiment_ids,
+            attempt_no,
             operator_instruction,
             target_status,
         )
@@ -199,6 +210,7 @@ class UnavailableNextLoopGenerationGateway:
         analysis_id: str,
         focus_segment_ids: Sequence[str],
         loop_count: int,
+        attempt_no: int,
         source_promotion_run_id: str,
         source_generation_id: str,
         operator_instruction: str | None,
@@ -210,6 +222,7 @@ class UnavailableNextLoopGenerationGateway:
             analysis_id,
             focus_segment_ids,
             loop_count,
+            attempt_no,
             source_promotion_run_id,
             source_generation_id,
             operator_instruction,
@@ -265,6 +278,7 @@ class ServiceNextLoopAnalysisGateway:
         loop_count: int,
         source_promotion_run_id: str,
         source_failed_ad_experiment_ids: Sequence[str],
+        attempt_no: int,
         operator_instruction: str | None,
         target_status: TargetSegmentStatus,
     ) -> NextLoopAnalysisResult:
@@ -278,6 +292,7 @@ class ServiceNextLoopAnalysisGateway:
                     loop_count=loop_count,
                     source_promotion_run_id=source_promotion_run_id,
                     source_failed_ad_experiment_ids=source_failed_ad_experiment_ids,
+                    attempt_no=attempt_no,
                     operator_instruction=operator_instruction,
                 ),
                 target_status=target_status,
@@ -306,6 +321,7 @@ class ServiceNextLoopGenerationGateway:
         analysis_id: str,
         focus_segment_ids: Sequence[str],
         loop_count: int,
+        attempt_no: int,
         source_promotion_run_id: str,
         source_generation_id: str,
         operator_instruction: str | None,
@@ -319,6 +335,7 @@ class ServiceNextLoopGenerationGateway:
                     analysis_id=analysis_id,
                     focus_segment_ids=focus_segment_ids,
                     loop_count=loop_count,
+                    attempt_no=(attempt_no if attempt_no > 1 else None),
                     source_promotion_run_id=source_promotion_run_id,
                     source_generation_id=source_generation_id,
                     operator_instruction=operator_instruction,
@@ -331,6 +348,7 @@ class ServiceNextLoopGenerationGateway:
             generation_id=result.generation_id,
             generated_segment_ids=result.generated_segment_ids,
             status=result.status.value,
+            failure_persisted=result.status.value == FAILED_STATUS,
         )
 
     def start_manual_generation(
@@ -371,6 +389,7 @@ class ServiceNextLoopGenerationGateway:
             generation_id=result.generation_id,
             generated_segment_ids=result.generated_segment_ids,
             status=result.status.value,
+            failure_persisted=result.status.value == FAILED_STATUS,
         )
 
 
@@ -492,6 +511,18 @@ class NextLoopService:
                 )
             ),
         )
+        attempt_no = _next_loop_generation_attempt_no(
+            attempts=self._generation_run_repository.list_next_loop_generation_attempts(
+                previous_run.promotion_run_id
+            ),
+            previous_run=previous_run,
+            loop_count=next_loop_count,
+            focus_segment_ids=failed_segment_ids,
+            failed_ad_experiment_ids=failed_ad_experiment_ids,
+            operator_instruction=request.operator_instruction,
+            candidate_status=ContentCandidateStatus.APPROVED,
+            content_option_count=1,
+        )
 
         analysis_result = self._analysis_gateway.start_analysis(
             project_id=previous_run.project_id,
@@ -501,6 +532,7 @@ class NextLoopService:
             loop_count=next_loop_count,
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
+            attempt_no=attempt_no,
             operator_instruction=request.operator_instruction,
             target_status="approved",
         )
@@ -518,6 +550,7 @@ class NextLoopService:
             analysis_id=analysis_result.analysis_id,
             focus_segment_ids=failed_segment_ids,
             loop_count=next_loop_count,
+            attempt_no=attempt_no,
             source_promotion_run_id=previous_run.promotion_run_id,
             source_generation_id=previous_run.generation_id,
             operator_instruction=request.operator_instruction,
@@ -642,13 +675,30 @@ class NextLoopService:
                 operator_instruction=request.operator_instruction,
             )
 
-        attempt_no = self._next_loop_preparation_repository.get_next_attempt_no(
-            previous_run.promotion_run_id
+        next_preparation_attempt_no = (
+            self._next_loop_preparation_repository.get_next_attempt_no(
+                previous_run.promotion_run_id
+            )
         )
-        if attempt_no != 1:
+        if next_preparation_attempt_no != 1:
             raise NextLoopConflictError(
                 "next-loop replacement generation is not supported"
             )
+        attempt_no = max(
+            next_preparation_attempt_no,
+            _next_loop_generation_attempt_no(
+                attempts=self._generation_run_repository.list_next_loop_generation_attempts(
+                    previous_run.promotion_run_id
+                ),
+                previous_run=previous_run,
+                loop_count=next_loop_count,
+                focus_segment_ids=failed_segment_ids,
+                failed_ad_experiment_ids=failed_ad_experiment_ids,
+                operator_instruction=request.operator_instruction,
+                candidate_status=ContentCandidateStatus.DRAFT,
+                content_option_count=MANUAL_CONTENT_OPTION_COUNT,
+            ),
+        )
 
         analysis_result = self._analysis_gateway.start_analysis(
             project_id=previous_run.project_id,
@@ -658,6 +708,7 @@ class NextLoopService:
             loop_count=next_loop_count,
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
+            attempt_no=attempt_no,
             operator_instruction=request.operator_instruction,
             target_status="planned",
         )
@@ -812,26 +863,34 @@ class NextLoopService:
             _normalize_instruction(operator_instruction)
             or _normalize_instruction(generation.operator_instruction)
         )
-        rejected = self._next_loop_preparation_repository.mark_rejected(
-            preparation.next_loop_preparation_id
-        )
-        if (
-            rejected is None
-            or rejected.next_loop_preparation_id
-            != preparation.next_loop_preparation_id
-            or rejected.status != "rejected"
-        ):
-            raise NextLoopConflictError(
-                "next-loop preparation changed while regeneration was requested"
+        next_preparation_attempt_no = (
+            self._next_loop_preparation_repository.get_next_attempt_no(
+                previous_run.promotion_run_id
             )
-
-        attempt_no = self._next_loop_preparation_repository.get_next_attempt_no(
-            previous_run.promotion_run_id
         )
-        if attempt_no != preparation.attempt_no + 1:
+        if next_preparation_attempt_no != preparation.attempt_no + 1:
             raise NextLoopConflictError(
                 "next-loop preparation attempt sequence is not continuous"
             )
+        attempt_no = max(
+            next_preparation_attempt_no,
+            _next_loop_generation_attempt_no(
+                attempts=self._generation_run_repository.list_next_loop_generation_attempts(
+                    previous_run.promotion_run_id
+                ),
+                previous_run=previous_run,
+                loop_count=next_loop_count,
+                focus_segment_ids=expected_segment_ids,
+                failed_ad_experiment_ids=(
+                    preparation.failed_ad_experiment_ids_json
+                ),
+                operator_instruction=effective_instruction,
+                candidate_status=ContentCandidateStatus.DRAFT,
+                content_option_count=MANUAL_CONTENT_OPTION_COUNT,
+                allowed_completed_generation_id=preparation.generation_id,
+                operator_validation_after_attempt_no=preparation.attempt_no,
+            ),
+        )
 
         generation_result = self._generation_gateway.start_manual_generation(
             project_id=previous_run.project_id,
@@ -880,6 +939,19 @@ class NextLoopService:
                 "replacement generation must use new content_option_id values"
             )
 
+        rejected = self._next_loop_preparation_repository.mark_rejected(
+            preparation.next_loop_preparation_id
+        )
+        if (
+            rejected is None
+            or rejected.next_loop_preparation_id
+            != preparation.next_loop_preparation_id
+            or rejected.status != "rejected"
+        ):
+            raise NextLoopConflictError(
+                "next-loop preparation changed while regeneration was requested"
+            )
+
         preparation_write = NextLoopPreparationWrite(
             next_loop_preparation_id=_next_loop_preparation_id(
                 previous_run.promotion_run_id,
@@ -918,6 +990,157 @@ class NextLoopService:
             log.warn("promotion_run_not_found", {"promotionRunId": promotion_run_id})
             raise NextLoopNotFoundError(f"promotion_run not found: {promotion_run_id}")
         return run
+
+
+def _next_loop_generation_attempt_no(
+    *,
+    attempts: Sequence[NextLoopGenerationAttemptRecord],
+    previous_run: PromotionRunRecord,
+    loop_count: int,
+    focus_segment_ids: Sequence[str],
+    failed_ad_experiment_ids: Sequence[str],
+    operator_instruction: str | None,
+    candidate_status: ContentCandidateStatus,
+    content_option_count: int,
+    allowed_completed_generation_id: str | None = None,
+    operator_validation_after_attempt_no: int = 0,
+) -> int:
+    expected_focus_ids = frozenset(focus_segment_ids)
+    expected_failed_ad_experiment_ids = frozenset(failed_ad_experiment_ids)
+    expected_instruction = _normalize_instruction(operator_instruction)
+    seen_attempt_numbers: set[int] = set()
+    highest_attempt_no = 0
+
+    for attempt in attempts:
+        next_loop_context = attempt.input_json.get("next_loop")
+        analysis_snapshot = attempt.analysis_input_snapshot_json
+        analysis_next_loop_context = (
+            analysis_snapshot.get("next_loop")
+            if isinstance(analysis_snapshot, Mapping)
+            else None
+        )
+        raw_attempt_no = (
+            next_loop_context.get("attempt_no")
+            if isinstance(next_loop_context, Mapping)
+            else None
+        )
+        attempt_no = (
+            1
+            if raw_attempt_no is None
+            else _context_positive_int(raw_attempt_no)
+        )
+        raw_analysis_attempt_no = (
+            analysis_next_loop_context.get("attempt_no")
+            if isinstance(analysis_next_loop_context, Mapping)
+            else None
+        )
+        analysis_attempt_no = (
+            1
+            if raw_analysis_attempt_no is None
+            else _context_positive_int(raw_analysis_attempt_no)
+        )
+        has_matching_preparation = (
+            attempt.preparation_analysis_id == attempt.analysis_id
+            and attempt.preparation_attempt_no == attempt_no
+        )
+        is_rejected_preparation_history = (
+            candidate_status is ContentCandidateStatus.DRAFT
+            and has_matching_preparation
+            and attempt.preparation_status == "rejected"
+        )
+        is_allowed_active_preparation = (
+            candidate_status is ContentCandidateStatus.DRAFT
+            and has_matching_preparation
+            and attempt.generation_id == allowed_completed_generation_id
+            and attempt.preparation_status == "awaiting_content_approval"
+        )
+        is_allowed_completed = (
+            attempt.status == COMPLETED_STATUS
+            and (
+                is_rejected_preparation_history
+                or is_allowed_active_preparation
+            )
+        )
+
+        intent_matches = (
+            isinstance(next_loop_context, Mapping)
+            and isinstance(analysis_snapshot, Mapping)
+            and isinstance(analysis_next_loop_context, Mapping)
+            and attempt.project_id == previous_run.project_id
+            and attempt.campaign_id == previous_run.campaign_id
+            and attempt.promotion_id == previous_run.promotion_id
+            and attempt.content_option_count == content_option_count
+            and _context_positive_int(next_loop_context.get("loop_count"))
+            == loop_count
+            and str(next_loop_context.get("source_promotion_run_id", ""))
+            == previous_run.promotion_run_id
+            and str(next_loop_context.get("source_generation_id", ""))
+            == previous_run.generation_id
+            and _context_id_set(next_loop_context.get("focus_segment_ids"))
+            == expected_focus_ids
+            and _context_positive_int(
+                next_loop_context.get("content_option_count")
+            )
+            == content_option_count
+            and str(next_loop_context.get("candidate_status", ""))
+            == candidate_status.value
+            and _context_positive_int(
+                analysis_next_loop_context.get("loop_count")
+            )
+            == loop_count
+            and str(
+                analysis_next_loop_context.get(
+                    "source_promotion_run_id",
+                    "",
+                )
+            )
+            == previous_run.promotion_run_id
+            and _context_id_set(
+                analysis_next_loop_context.get(
+                    "source_failed_ad_experiment_ids"
+                )
+            )
+            == expected_failed_ad_experiment_ids
+            and _context_id_set(analysis_snapshot.get("focus_segment_ids"))
+            == expected_focus_ids
+            and attempt_no is not None
+            and analysis_attempt_no is not None
+            and analysis_attempt_no <= attempt_no
+            and (
+                is_allowed_completed
+                or attempt_no <= operator_validation_after_attempt_no
+                or _normalize_instruction(attempt.operator_instruction)
+                == expected_instruction
+            )
+        )
+        if not intent_matches:
+            raise NextLoopConflictError(
+                "existing next-loop generation has a different intent"
+            )
+        if attempt_no in seen_attempt_numbers:
+            raise NextLoopConflictError(
+                "existing next-loop generation attempt sequence is invalid"
+            )
+        seen_attempt_numbers.add(attempt_no)
+        highest_attempt_no = max(highest_attempt_no, attempt_no)
+
+        if attempt.status == FAILED_STATUS or is_allowed_completed:
+            continue
+        if attempt.status in {"requested", "running"}:
+            raise NextLoopConflictError(
+                "next-loop generation is already in progress"
+            )
+        if attempt.status == COMPLETED_STATUS:
+            raise NextLoopConflictError("next-loop output already exists")
+        raise NextLoopConflictError(
+            "existing next-loop generation status is invalid"
+        )
+
+    if seen_attempt_numbers != set(range(1, highest_attempt_no + 1)):
+        raise NextLoopConflictError(
+            "existing next-loop generation attempt sequence is invalid"
+        )
+    return highest_attempt_no + 1
 
 
 def _no_op_response(run: PromotionRunRecord) -> NextLoopResponse:
@@ -1207,6 +1430,11 @@ def _validate_gateway_segments(
 def _validate_generation_completed(result: NextLoopGenerationResult) -> None:
     if result.status != COMPLETED_STATUS:
         log.warn("next_loop_generation_invalid", {"status": result.status})
-        raise NextLoopValidationError(
+        error_type = (
+            NextLoopGenerationFailedError
+            if result.failure_persisted
+            else NextLoopValidationError
+        )
+        raise error_type(
             "next-loop generation result must be completed before run creation"
         )

@@ -14,14 +14,23 @@ from app.generation.adapters import (
     ImageArtifact,
     S3AssetStorage,
 )
+from app.generation.artifacts import (
+    ArtifactIdentity,
+    StoredAsset,
+    image_prompt_sha256,
+)
 from app.generation.repositories import ContentCandidateRepository
 from app.logging import duration_ms, log, log_context_scope, now_ms
 
 
 @dataclass(frozen=True)
 class ImageGenerationJob:
-    content_id: str
+    identity: ArtifactIdentity
     image_prompt: str
+
+    @property
+    def content_id(self) -> str:
+        return self.identity.content_id
 
 
 class ImageGenerationJobCollector:
@@ -37,7 +46,13 @@ class ImageGenerationJobCollector:
 
 
 class AssetStorageClient(Protocol):
-    def store_image(self, *, content_id: str, image: ImageArtifact) -> str:
+    def store_image(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        image_prompt_sha256: str,
+        image: ImageArtifact,
+    ) -> StoredAsset:
         ...
 
 
@@ -126,6 +141,7 @@ def _run_image_generation_job_with_connection(
         resolved_asset_storage = asset_storage or S3AssetStorage(
             bucket_name=settings.data_storage_bucket,
             base_prefix=settings.genai_assets_base_prefix,
+            public_base_url=settings.genai_assets_public_base_url,
         )
         return _run_single_image_generation_job(
             job=job,
@@ -150,12 +166,22 @@ def _run_single_image_generation_job(
     log.assign_context({"contentId": job.content_id})
     try:
         image = image_client.generate_image(image_prompt=job.image_prompt)
-        image_url = asset_storage.store_image(content_id=job.content_id, image=image)
-        repository.update_image_url(content_id=job.content_id, image_url=image_url)
+        stored_image = asset_storage.store_image(
+            identity=job.identity,
+            image_prompt_sha256=image_prompt_sha256(job.image_prompt),
+            image=image,
+        )
+        repository.update_image_url(
+            content_id=job.content_id,
+            image_url=stored_image.public_url,
+        )
         connection.commit()
         log.info(
             "image_generation_completed",
-            {"imageUrl": image_url, "durationMs": duration_ms(job_started_at)},
+            {
+                "imageUrl": stored_image.public_url,
+                "durationMs": duration_ms(job_started_at),
+            },
         )
         return True
     except Exception as exc:

@@ -5,6 +5,7 @@ from json import JSONDecodeError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from psycopg import IntegrityError, errors
 from pydantic import ValidationError
 
@@ -42,6 +43,7 @@ from app.decision.evaluation_service import (
 from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
     NextLoopConflictError,
+    NextLoopGenerationFailedError,
     NextLoopNotFoundError,
     NextLoopService,
     NextLoopValidationError,
@@ -462,8 +464,11 @@ async def evaluate_promotion_run(
 async def create_next_loop(
     promotion_run_id: str,
     request: Request,
-    next_loop_service: NextLoopService = Depends(get_next_loop_service),
-) -> NextLoopResponse:
+    next_loop_service: NextLoopService = Depends(
+        get_next_loop_service,
+        scope="function",
+    ),
+) -> NextLoopResponse | JSONResponse:
     next_loop_request = await _parse_next_loop_request(request)
     try:
         return next_loop_service.create_next_loop(
@@ -475,6 +480,13 @@ async def create_next_loop(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+    except NextLoopGenerationFailedError as exc:
+        # Returning a response lets the dependency commit the failed generation
+        # diagnostics while preserving the existing 422 API contract.
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": str(exc)},
+        )
     except NextLoopValidationError as exc:
         raise HTTPException(
             status_code=422,
