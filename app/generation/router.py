@@ -7,7 +7,8 @@ from pydantic import ValidationError
 
 from app.db import create_postgres_connection
 from app.dependencies import get_settings
-from app.generation.brand_context import BrandContextRepository
+from app.generation.brand_context_s3 import S3BrandContextLoader
+from app.generation.errors import GenerationError
 from app.generation.repositories import (
     GenerationInputRepository,
     GenerationRunRepository,
@@ -39,7 +40,10 @@ def get_generation_service(request: Request) -> Iterator[GenerationSubmissionSer
             connection=connection,
             generation_run_repository=GenerationRunRepository(connection),
             generation_input_reader=GenerationInputRepository(connection),
-            brand_context_repository=BrandContextRepository(connection),
+            brand_context_repository=S3BrandContextLoader(
+                bucket_name=settings.data_storage_bucket,
+                base_prefix=settings.brand_context_base_prefix,
+            ),
             model_version=settings.openai_content_model,
             coordinator=getattr(
                 request.app.state,
@@ -95,6 +99,15 @@ async def create_generation(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(exc),
+        ) from exc
+    except GenerationError as exc:
+        raise HTTPException(
+            status_code=(
+                status.HTTP_503_SERVICE_UNAVAILABLE
+                if exc.retryable
+                else status.HTTP_409_CONFLICT
+            ),
+            detail=exc.safe_message,
         ) from exc
     except ValueError as exc:
         raise HTTPException(

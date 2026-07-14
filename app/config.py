@@ -8,6 +8,7 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
+BRAND_CONTEXT_BASE_PREFIX = "brand-context/"
 GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
 OPENAI_CONTENT_MODEL = "gpt-4o-mini"
@@ -51,6 +52,7 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
+    brand_context_base_prefix: str = BRAND_CONTEXT_BASE_PREFIX
     genai_assets_public_base_url: str = GENAI_ASSETS_PUBLIC_BASE_URL
     openai_content_model: str = OPENAI_CONTENT_MODEL
     gemini_image_model: str = GEMINI_IMAGE_MODEL
@@ -165,6 +167,7 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
 def _validate_generation_settings(settings: Settings) -> None:
     public_prefix = settings.genai_assets_base_prefix.strip("/")
     source_prefix = GENAI_SOURCE_MANIFEST_PREFIX.strip("/")
+    brand_prefix = settings.brand_context_base_prefix.strip("/")
     if (
         not public_prefix
         or not source_prefix
@@ -174,6 +177,19 @@ def _validate_generation_settings(settings: Settings) -> None:
         raise SettingsError(
             "GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX"
+        )
+    if (
+        not brand_prefix
+        or brand_prefix == public_prefix
+        or brand_prefix.startswith(f"{public_prefix}/")
+        or public_prefix.startswith(f"{brand_prefix}/")
+        or brand_prefix == source_prefix
+        or brand_prefix.startswith(f"{source_prefix}/")
+        or source_prefix.startswith(f"{brand_prefix}/")
+    ):
+        raise SettingsError(
+            "BRAND_CONTEXT_BASE_PREFIX must not overlap the public "
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX or GENAI_SOURCE_MANIFEST_PREFIX"
         )
     if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
         raise SettingsError(

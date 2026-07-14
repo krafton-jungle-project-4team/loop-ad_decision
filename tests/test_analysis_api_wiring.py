@@ -171,6 +171,14 @@ def test_confirmed_segment_analysis_hands_approved_targets_to_generation(
     connection = RecordingConnection()
     clickhouse_client = RecordingClickHouseClient()
 
+    class NoBrandContextLoader:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        def resolve_snapshot(self, *, project_id: str):
+            del project_id
+            return None
+
     monkeypatch.setattr(
         "app.analysis.router.create_postgres_connection",
         lambda _settings: connection,
@@ -182,6 +190,10 @@ def test_confirmed_segment_analysis_hands_approved_targets_to_generation(
     monkeypatch.setattr(
         "app.generation.router.create_postgres_connection",
         lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.S3BrandContextLoader",
+        NoBrandContextLoader,
     )
 
     connection.target_segment_rows.append(

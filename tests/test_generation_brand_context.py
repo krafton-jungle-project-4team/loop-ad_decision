@@ -114,6 +114,16 @@ class CountingDocumentReader:
         return self.documents
 
 
+class CountingDocumentLoader:
+    def __init__(self, documents: tuple[RetrievedBrandDocument, ...]) -> None:
+        self.documents = documents
+        self.calls = 0
+
+    def load_documents(self, **_: object) -> tuple[RetrievedBrandDocument, ...]:
+        self.calls += 1
+        return self.documents
+
+
 def snapshot() -> BrandContextSnapshot:
     return BrandContextSnapshot(
         context_version="v1",
@@ -429,6 +439,32 @@ def test_retrieval_is_cached_per_promotion_snapshot_for_consistent_lineage() -> 
     assert first_result is second_result
     assert embedding_client.calls == 1
     assert repository.calls == 1
+
+
+def test_retrieval_uses_verified_s3_context_when_rag_index_is_empty() -> None:
+    value = prompt_input()
+    expected = retrieved_context()
+    embedding_client = CountingEmbeddingClient()
+    repository = CountingDocumentReader([])
+    source_loader = CountingDocumentLoader(expected.documents)
+    provider = BrandContextRetrievalService(
+        repository=repository,
+        embedding_client=embedding_client,
+        source_loader=source_loader,
+    )
+
+    result = provider.retrieve(
+        value,
+        GenerationContextBuilder().build(value),
+    )
+
+    assert result is not None
+    assert result.documents == expected.documents
+    assert result.selected_asset_id == "home-hero"
+    assert result.guardrails.approved_colours == ("#123456",)
+    assert embedding_client.calls == 1
+    assert repository.calls == 1
+    assert source_loader.calls == 1
 
 
 def test_generation_persists_contract_lineage_and_private_text_stays_internal() -> None:

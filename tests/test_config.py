@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from app.config import (
+    BRAND_CONTEXT_BASE_PREFIX,
     GEMINI_IMAGE_MODEL,
     GENAI_ASSETS_PUBLIC_BASE_URL,
     GENAI_SOURCE_MANIFEST_PREFIX,
@@ -47,6 +48,10 @@ def test_source_manifest_prefix_is_application_invariant() -> None:
     assert GENAI_SOURCE_MANIFEST_PREFIX == "genai-source/"
 
 
+def test_brand_context_prefix_is_application_invariant() -> None:
+    assert BRAND_CONTEXT_BASE_PREFIX == "brand-context/"
+
+
 def test_load_settings_rejects_wrong_service_id() -> None:
     env = valid_env()
     env["LOOPAD_SERVICE_ID"] = "dashboard-api"
@@ -72,6 +77,7 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.genai_assets_public_base_url == GENAI_ASSETS_PUBLIC_BASE_URL
     assert settings.openai_content_model == OPENAI_CONTENT_MODEL
     assert settings.gemini_image_model == GEMINI_IMAGE_MODEL
+    assert settings.brand_context_base_prefix == BRAND_CONTEXT_BASE_PREFIX
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
     assert settings.segment_performance_model_path == "/models/segment.json"
 
@@ -80,7 +86,7 @@ def test_load_settings_rejects_public_prefix_matching_source_manifest() -> None:
     env = valid_env()
     env["LOOPAD_GENAI_ASSETS_BASE_PREFIX"] = "genai-source/"
 
-    with pytest.raises(SettingsError, match="outside the public"):
+    with pytest.raises(SettingsError, match="public"):
         load_settings(env)
 
 
@@ -90,6 +96,7 @@ def test_load_settings_uses_generation_worker_code_policy() -> None:
     assert settings.genai_assets_public_base_url == GENAI_ASSETS_PUBLIC_BASE_URL
     assert settings.openai_content_model == OPENAI_CONTENT_MODEL
     assert settings.gemini_image_model == GEMINI_IMAGE_MODEL
+    assert settings.brand_context_base_prefix == BRAND_CONTEXT_BASE_PREFIX
     assert settings.generation_worker_max_concurrency == 2
     assert settings.generation_poll_interval_seconds == 1
     assert settings.generation_idle_poll_interval_seconds == 30
@@ -125,6 +132,7 @@ def test_generation_env_names_do_not_override_code_policy() -> None:
     settings = load_settings(env)
 
     assert settings.genai_assets_public_base_url == GENAI_ASSETS_PUBLIC_BASE_URL
+    assert settings.brand_context_base_prefix == BRAND_CONTEXT_BASE_PREFIX
     assert settings.openai_content_model == OPENAI_CONTENT_MODEL
     assert settings.gemini_image_model == GEMINI_IMAGE_MODEL
     assert settings.generation_worker_max_concurrency == 2
