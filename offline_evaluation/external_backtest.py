@@ -52,6 +52,9 @@ class ExternalDatasetManifest:
     unsupported_claims: tuple[str, ...]
     signal_mappings: Mapping[str, Mapping[str, str]]
     source_files: tuple[Mapping[str, Any], ...]
+    supported_claim_ids: tuple[str, ...] = ()
+    unsupported_claim_ids: tuple[str, ...] = ()
+    verdict_scope: str = "supporting_evidence"
     evaluation_role: str = "development_diagnostic"
     prediction_error_comparable: bool = False
     prediction_error_comparability_reason: str = (
@@ -70,6 +73,9 @@ class ExternalDatasetManifest:
             "supports_temporal_holdout": self.supports_temporal_holdout,
             "supported_claims": list(self.supported_claims),
             "unsupported_claims": list(self.unsupported_claims),
+            "supported_claim_ids": list(self.supported_claim_ids),
+            "unsupported_claim_ids": list(self.unsupported_claim_ids),
+            "verdict_scope": self.verdict_scope,
             "signal_mappings": {
                 key: dict(value) for key, value in self.signal_mappings.items()
             },
