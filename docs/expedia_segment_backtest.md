@@ -391,7 +391,7 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 
 봉인 최종 테스트는 관측 outcome과 Rank 2·3 후보가 부족하면 `FAIL` 대신 `INCONCLUSIVE`로 기록한다. 충분한 근거가 있을 때만 예상값 보정, Top 3 유용성, 전체 순위 정확성을 함께 사용해 `PASS` 또는 `FAIL`을 결정한다.
 
-이 기준은 `expedia.sealed-final-test.v2` manifest에 사전 등록된다. 아직 결과를 열지 않은 v1 manifest가 있다면 새 코드와 모델을 동결한 뒤 v2 manifest를 다시 생성해야 한다.
+이 기준과 후보 타입별 학습 지원 계약은 `expedia.sealed-final-test.v3` manifest에 사전 등록된다. manifest에는 후보 타입별 학습 사례 수와 지원 목록이 함께 기록되며, 봉인 후 이 계약이 달라지면 최종 평가를 시작하지 않는다. 아직 결과를 열지 않은 v1 또는 v2 manifest가 있다면 새 코드와 모델을 동결한 뒤 v3 manifest를 다시 생성해야 한다.
 
 ## 시간 누수 방지
 

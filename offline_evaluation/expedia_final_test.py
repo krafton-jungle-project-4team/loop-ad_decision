@@ -7,7 +7,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
-from app.analysis.segment_performance import LogisticSegmentPerformanceModel
+from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
+    MODEL_CANDIDATE_TYPES,
+    LogisticSegmentPerformanceModel,
+)
 from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
@@ -33,7 +37,7 @@ from offline_evaluation.sealed_execution import (
 )
 
 
-SEALED_FINAL_TEST_VERSION = "expedia.sealed-final-test.v2"
+SEALED_FINAL_TEST_VERSION = "expedia.sealed-final-test.v3"
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +213,7 @@ def build_sealed_final_test_manifest(
             "training_end_cutoff"
         ),
         "training_target": model.training_metadata.get("target"),
+        "candidate_type_support": _candidate_type_support_payload(model),
     }
     criteria_payload = asdict(criteria or ExpediaFinalTestCriteria())
     base_payload: dict[str, Any] = {
@@ -335,6 +340,12 @@ def verify_sealed_final_test_runtime(
         raise ValueError("sealed final test model changed after sealing")
     if model.version != manifest.model.get("version"):
         raise ValueError("sealed final test model version changed after sealing")
+    if _candidate_type_support_payload(model) != manifest.model.get(
+        "candidate_type_support"
+    ):
+        raise ValueError(
+            "sealed final test candidate type support changed after sealing"
+        )
     if code_commit != manifest.code_commit or code_tree != manifest.code_tree:
         raise ValueError("sealed final test code changed after sealing")
 
@@ -788,6 +799,84 @@ def _mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise ValueError(f"sealed final test manifest field {key!r} must be an object")
     return dict(value)
+
+
+def _candidate_type_support_payload(
+    model: LogisticSegmentPerformanceModel,
+) -> dict[str, Any]:
+    metadata = model.training_metadata
+    contract_version = str(
+        metadata.get("candidate_type_support_contract_version", "")
+    )
+    if contract_version != CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION:
+        raise ValueError(
+            "segment performance model candidate type support contract is missing "
+            "or unsupported"
+        )
+
+    training_example_counts = _candidate_type_counts(
+        metadata,
+        "training_candidate_type_example_counts",
+    )
+    training_user_observation_counts = _candidate_type_counts(
+        metadata,
+        "training_candidate_type_user_observation_counts",
+    )
+    supported_candidate_types = [
+        candidate_type
+        for candidate_type in MODEL_CANDIDATE_TYPES
+        if training_example_counts[candidate_type] > 0
+    ]
+    declared_supported = metadata.get("supported_candidate_types")
+    if not isinstance(declared_supported, Sequence) or isinstance(
+        declared_supported,
+        (str, bytes),
+    ):
+        raise ValueError(
+            "segment performance model supported candidate types are missing"
+        )
+    if set(str(value) for value in declared_supported) != set(
+        supported_candidate_types
+    ):
+        raise ValueError(
+            "segment performance model candidate type support metadata is inconsistent"
+        )
+
+    return {
+        "contract_version": contract_version,
+        "training_example_counts": training_example_counts,
+        "training_user_observation_counts": training_user_observation_counts,
+        "supported_candidate_types": supported_candidate_types,
+    }
+
+
+def _candidate_type_counts(
+    metadata: Mapping[str, Any],
+    key: str,
+) -> dict[str, int]:
+    raw_counts = metadata.get(key)
+    if not isinstance(raw_counts, Mapping):
+        raise ValueError(f"segment performance model metadata {key!r} is missing")
+
+    counts: dict[str, int] = {}
+    for candidate_type in MODEL_CANDIDATE_TYPES:
+        raw_value = raw_counts.get(candidate_type)
+        if isinstance(raw_value, bool):
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            )
+        try:
+            count = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            ) from exc
+        if count < 0:
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            )
+        counts[candidate_type] = count
+    return counts
 
 
 def _file_sha256(path: Path) -> str:

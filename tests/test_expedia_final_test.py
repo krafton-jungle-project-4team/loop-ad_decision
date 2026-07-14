@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -27,6 +28,7 @@ from offline_evaluation.sealed_execution import (
 )
 from app.analysis.repositories import RawEventUserSignalRecord
 from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
     MODEL_FEATURE_NAMES,
     LogisticSegmentPerformanceModel,
     write_segment_performance_model,
@@ -111,6 +113,13 @@ def test_seal_selects_unseen_destinations_without_reading_future_outcomes(
     assert len(set(final_destination_ids)) == 4
     assert not {100, 101}.intersection(final_destination_ids)
     assert manifest.final_test["selection_uses_future_outcomes"] is False
+    candidate_support = manifest.model["candidate_type_support"]
+    assert candidate_support["training_example_counts"][
+        "promotion_responsive"
+    ] == 0
+    assert "promotion_responsive" not in candidate_support[
+        "supported_candidate_types"
+    ]
 
 
 def test_manifest_integrity_rejects_changed_scenario(tmp_path) -> None:
@@ -150,6 +159,35 @@ def test_runtime_verification_rejects_changed_code_or_source(tmp_path) -> None:
             source_checksum="changed",
             model_path=model_path,
             model=model,
+            code_commit="commit-1",
+            code_tree="tree-1",
+        )
+
+
+def test_runtime_verification_rejects_changed_candidate_support(tmp_path) -> None:
+    repository = FakeSealedFinalTestRepository()
+    model_path, model = model_fixture(tmp_path)
+    manifest = build_manifest(repository, model_path, model)
+    changed_metadata = dict(model.training_metadata)
+    changed_counts = dict(
+        changed_metadata["training_candidate_type_example_counts"]
+    )
+    changed_counts["promotion_responsive"] = 1
+    changed_metadata["training_candidate_type_example_counts"] = changed_counts
+    changed_metadata["supported_candidate_types"] = [
+        *changed_metadata["supported_candidate_types"],
+        "promotion_responsive",
+    ]
+    changed_model = replace(model, training_metadata=changed_metadata)
+
+    with pytest.raises(ValueError, match="candidate type support changed"):
+        verify_sealed_final_test_runtime(
+            manifest,
+            source_table="expedia_hotel_events",
+            source_stats=source_stats(),
+            source_checksum="123:456",
+            model_path=model_path,
+            model=changed_model,
             code_commit="commit-1",
             code_tree="tree-1",
         )
@@ -263,6 +301,9 @@ def model_fixture(tmp_path):
             "training_end_cutoff": "2013-12-01T00:00:00+00:00",
             "training_target": "future_contextual_booking_rate",
             "training_contextual_booking_observation_rate": 0.04,
+            "candidate_type_support_contract_version": (
+                CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+            ),
             "training_candidate_type_example_counts": {
                 "intent_matched": 12,
                 "target_destination_affinity": 12,
@@ -271,6 +312,20 @@ def model_fixture(tmp_path):
                 "promotion_responsive": 0,
                 "general_destination_explorer": 0,
             },
+            "training_candidate_type_user_observation_counts": {
+                "intent_matched": 120,
+                "target_destination_affinity": 120,
+                "funnel_recovery": 120,
+                "benefit_value_seeker": 120,
+                "promotion_responsive": 0,
+                "general_destination_explorer": 0,
+            },
+            "supported_candidate_types": [
+                "intent_matched",
+                "target_destination_affinity",
+                "funnel_recovery",
+                "benefit_value_seeker",
+            ],
         },
     )
     model_path = tmp_path / "model.json"

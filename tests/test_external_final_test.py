@@ -7,7 +7,10 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.segment_performance import ContextualBookingHeuristicPredictor
+from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
+    ContextualBookingHeuristicPredictor,
+)
 from offline_evaluation.external_backtest import (
     ExternalBacktestConfig,
 )
@@ -73,6 +76,9 @@ def test_sealing_hashes_booking_outcome_file_without_parsing_it(
 
     assert manifest.source["selection_uses_outcomes"] is False
     assert manifest.model["trained_on_external_data"] is False
+    assert manifest.model["metadata"][
+        "training_candidate_type_example_counts"
+    ]["promotion_responsive"] == 0
     assert manifest.outcome_contract["prediction_error_comparable"] is False
     assert manifest.partition_contract["final"]["disjoint_from_development"] is True
 
@@ -95,6 +101,21 @@ def test_external_manifest_integrity_and_runtime_fingerprint_are_enforced(
         code_commit="commit-1",
         code_tree="tree-1",
     )
+    changed_metadata = _model_metadata()
+    changed_counts = dict(
+        changed_metadata["training_candidate_type_example_counts"]
+    )
+    changed_counts["promotion_responsive"] = 1
+    changed_metadata["training_candidate_type_example_counts"] = changed_counts
+    with pytest.raises(ValueError, match="model metadata changed"):
+        verify_external_sealed_final_test_runtime(
+            loaded,
+            source_dir=source_dir,
+            model_path=model_path,
+            model_metadata=changed_metadata,
+            code_commit="commit-1",
+            code_tree="tree-1",
+        )
     with (source_dir / "ground_truth.csv").open("a", encoding="utf-8") as output:
         output.write("trip-new,999,Z\n")
     with pytest.raises(ValueError, match="source data changed"):
@@ -281,4 +302,21 @@ def _model_metadata() -> dict[str, object]:
     return {
         "model_version": "fixture.v1",
         "training_dataset": "expedia",
+        "candidate_type_support_contract_version": (
+            CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+        ),
+        "training_candidate_type_example_counts": {
+            "intent_matched": 12,
+            "target_destination_affinity": 12,
+            "funnel_recovery": 12,
+            "benefit_value_seeker": 12,
+            "promotion_responsive": 0,
+            "general_destination_explorer": 0,
+        },
+        "supported_candidate_types": [
+            "intent_matched",
+            "target_destination_affinity",
+            "funnel_recovery",
+            "benefit_value_seeker",
+        ],
     }
