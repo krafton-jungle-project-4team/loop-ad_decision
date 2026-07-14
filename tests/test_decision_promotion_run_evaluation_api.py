@@ -6,7 +6,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.decision.evaluation_service import (
     PromotionRunEvaluationNotFoundError,
     PromotionRunEvaluationValidationError,
@@ -26,7 +27,7 @@ DEFAULT_ROW = object()
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
@@ -150,7 +151,66 @@ def test_promotion_run_evaluation_api_wires_repositories_and_commits(
     assert any("from ad_experiments" in query for query in executed_sql)
     assert not any("from promotion_evaluations" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
+    assert not any("update ad_experiments" in query for query in executed_sql)
     assert any("update promotion_runs" in query for query in executed_sql)
+
+
+def test_running_experiment_can_be_reevaluated_after_insufficient_data(
+    monkeypatch,
+) -> None:
+    connection = RecordingConnection()
+    clickhouse_client = RecordingClickHouseClient(rows=[(1, 5), (1, 10)])
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        lambda _settings: clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    insufficient = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/evaluate",
+        json={},
+    )
+    goal_not_met = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/evaluate",
+        json={},
+    )
+
+    assert insufficient.status_code == 200, insufficient.text
+    assert insufficient.json()["status"] == PromotionRunStatus.INSUFFICIENT_DATA.value
+    assert insufficient.json()["next_loop_required"] is False
+    assert insufficient.json()["failed_segment_ids"] == []
+    assert insufficient.json()["failed_ad_experiment_ids"] == []
+    assert goal_not_met.status_code == 200, goal_not_met.text
+    assert goal_not_met.json()["status"] == PromotionRunStatus.GOAL_NOT_MET.value
+    assert goal_not_met.json()["next_loop_required"] is True
+    assert goal_not_met.json()["failed_segment_ids"] == ["seg_family_trip"]
+    assert goal_not_met.json()["failed_ad_experiment_ids"] == [
+        "adexp_family_trip_001"
+    ]
+    assert connection.ad_experiment_rows[0]["status"] == "running"
+
+    individual_evaluation_inserts = [
+        params
+        for query, params in connection.executed
+        if "insert into promotion_evaluations" in compact_sql(query)
+        and params[5] is not None
+    ]
+    assert [params[16] for params in individual_evaluation_inserts] == [
+        PromotionEvaluationStatus.INSUFFICIENT_DATA.value,
+        PromotionEvaluationStatus.GOAL_NOT_MET.value,
+    ]
+    assert {params[5] for params in individual_evaluation_inserts} == {
+        "adexp_family_trip_001"
+    }
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert not any("update ad_experiments" in query for query in executed_sql)
+    assert connection.commit_count == 2
+    assert connection.rollback_count == 0
 
 
 def test_promotion_run_evaluation_api_rolls_back_and_closes_on_failure(
@@ -228,7 +288,7 @@ def test_promotion_run_metric_guard_rolls_back_partial_request(monkeypatch) -> N
     assert connection.rollback_count == 1
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert sum("insert into promotion_evaluations" in query for query in executed_sql) == 1
-    assert sum("update ad_experiments" in query for query in executed_sql) == 1
+    assert sum("update ad_experiments" in query for query in executed_sql) == 0
     assert not any("update promotion_runs" in query for query in executed_sql)
     cutoffs = [parameters["evaluation_cutoff_at"] for _query, parameters in clickhouse_client.queries]
     assert len(set(cutoffs)) == 1
@@ -377,6 +437,8 @@ def default_promotion_run_row() -> dict[str, object]:
             "goal_basis": "all_segments",
             "min_sample_size": 10,
         },
+        "segment_scope_json": ["seg_family_trip", "seg_luxury"],
+        "segment_scope_fingerprint": "a" * 64,
     }
 
 

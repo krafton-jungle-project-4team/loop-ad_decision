@@ -9,10 +9,11 @@ from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from app.analysis.raw_event_segments import (
     PromotionIntent,
+    RawEventIntentCompilation,
     compile_raw_event_intent,
     generate_raw_event_segment_candidate_pool,
     generate_raw_event_segment_definitions,
@@ -27,6 +28,15 @@ from app.analysis.segment_performance import (
     write_segment_performance_model,
 )
 from app.logging import duration_ms, log, log_context_scope, now_ms
+from offline_evaluation.audience_selection import (
+    AudienceSelectionEvaluationConfig,
+    AudienceSelectionOutcome,
+    AudienceSelectionPolicyEvaluation,
+    build_audience_selection_policy_evaluation,
+    evaluate_audience_selection_ratios,
+    write_audience_selection_evaluation_artifacts,
+)
+from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_quality
 
 
 EXPEDIA_TRAIN_COLUMNS = (
@@ -227,6 +237,7 @@ class ExpediaBacktestSkippedScenario:
 class ExpediaBacktestRun:
     results: tuple[ExpediaBacktestResult, ...]
     skipped_scenarios: tuple[ExpediaBacktestSkippedScenario, ...]
+    audience_selection_outcomes: tuple[AudienceSelectionOutcome, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,6 +245,7 @@ class ExpediaTemporalHoldoutRun:
     training_run: ExpediaBacktestRun
     holdout_run: ExpediaBacktestRun
     calibration_model: LogisticSegmentPerformanceModel
+    audience_selection_evaluation: AudienceSelectionPolicyEvaluation
 
 
 class ExpediaBacktestRepository(Protocol):
@@ -528,11 +540,17 @@ class ExpediaSegmentBacktestService:
         config: ExpediaBacktestConfig,
         performance_predictor: SegmentPerformancePredictor | None = None,
         calibration_candidate_pool: bool = False,
+        audience_selection_evaluation_config: (
+            AudienceSelectionEvaluationConfig | None
+        ) = None,
     ) -> None:
         self._repository = repository
         self._config = config
         self._performance_predictor = performance_predictor
         self._calibration_candidate_pool = calibration_candidate_pool
+        self._audience_selection_evaluation_config = (
+            audience_selection_evaluation_config
+        )
 
     @log_context_scope
     def run(
@@ -541,6 +559,7 @@ class ExpediaSegmentBacktestService:
         *,
         fixed_scenarios: Mapping[datetime, Sequence[ExpediaBacktestScenario]]
         | None = None,
+        on_outcomes_opened: Callable[[], None] | None = None,
     ) -> ExpediaBacktestRun:
         started_at = now_ms()
         log.info(
@@ -554,7 +573,9 @@ class ExpediaSegmentBacktestService:
             },
         )
         results: list[ExpediaBacktestResult] = []
+        audience_selection_outcomes: list[AudienceSelectionOutcome] = []
         skipped: list[ExpediaBacktestSkippedScenario] = []
+        outcomes_opened = False
         for cutoff in cutoffs:
             normalized_cutoff = _as_utc_datetime(cutoff)
             if normalized_cutoff is None:
@@ -619,6 +640,7 @@ class ExpediaSegmentBacktestService:
                         profiles=profiles,
                         min_sample_size=self._config.min_sample_size,
                         performance_predictor=self._performance_predictor,
+                        enforce_prediction_support=False,
                     )
                 else:
                     segments = generate_raw_event_segment_definitions(
@@ -640,6 +662,10 @@ class ExpediaSegmentBacktestService:
                     )
                     continue
                 eligible_user_ids = tuple(profile.user_id for profile in profiles)
+                if not outcomes_opened:
+                    if on_outcomes_opened is not None:
+                        on_outcomes_opened()
+                    outcomes_opened = True
                 future_users = self._repository.future_booking_users(
                     scenario=scenario,
                     outcome_end=outcome_end,
@@ -654,6 +680,37 @@ class ExpediaSegmentBacktestService:
                     segments=segments,
                 )
                 results.extend(scenario_results)
+                if (
+                    self._audience_selection_evaluation_config is not None
+                    and not self._calibration_candidate_pool
+                ):
+                    all_matching_pool = generate_raw_event_segment_candidate_pool(
+                        promotion=promotion,
+                        intent=intent,
+                        compilation=compilation,
+                        profiles=profiles,
+                        min_sample_size=self._config.min_sample_size,
+                        performance_predictor=self._performance_predictor,
+                    )
+                    audience_selection_outcomes.extend(
+                        _evaluate_audience_selection_ratios(
+                            scenario=scenario,
+                            eligible_user_ids=eligible_user_ids,
+                            future_users=future_users,
+                            promotion=promotion,
+                            intent=intent,
+                            compilation=compilation,
+                            profiles=profiles,
+                            all_matching_segments=segments,
+                            all_matching_pool=all_matching_pool,
+                            performance_predictor=self._performance_predictor,
+                            config=self._audience_selection_evaluation_config,
+                            max_suggested_segments=(
+                                self._config.max_suggested_segments
+                            ),
+                            min_sample_size=self._config.min_sample_size,
+                        )
+                    )
                 cutoff_result_count += len(scenario_results)
             log.info(
                 "backtest_cutoff_completed",
@@ -663,11 +720,18 @@ class ExpediaSegmentBacktestService:
                     "candidateResultCount": cutoff_result_count,
                 },
             )
-        response = ExpediaBacktestRun(tuple(results), tuple(skipped))
+        response = ExpediaBacktestRun(
+            tuple(results),
+            tuple(skipped),
+            tuple(audience_selection_outcomes),
+        )
         log.info(
             "completed",
             {
                 "candidateResultCount": len(response.results),
+                "audienceSelectionResultCount": len(
+                    response.audience_selection_outcomes
+                ),
                 "skippedScenarioCount": len(response.skipped_scenarios),
                 "durationMs": duration_ms(started_at),
             },
@@ -677,6 +741,8 @@ class ExpediaSegmentBacktestService:
     def run_scenarios(
         self,
         scenarios: Sequence[ExpediaBacktestScenario],
+        *,
+        on_outcomes_opened: Callable[[], None] | None = None,
     ) -> ExpediaBacktestRun:
         scenarios_by_cutoff: dict[datetime, list[ExpediaBacktestScenario]] = (
             defaultdict(list)
@@ -691,6 +757,7 @@ class ExpediaSegmentBacktestService:
         return self.run(
             sorted(scenarios_by_cutoff),
             fixed_scenarios=scenarios_by_cutoff,
+            on_outcomes_opened=on_outcomes_opened,
         )
 
 
@@ -700,6 +767,7 @@ def run_temporal_holdout_backtest(
     config: ExpediaBacktestConfig,
     training_cutoffs: Sequence[datetime],
     holdout_cutoffs: Sequence[datetime],
+    audience_selection_config: AudienceSelectionEvaluationConfig | None = None,
 ) -> ExpediaTemporalHoldoutRun:
     if not training_cutoffs or not holdout_cutoffs:
         raise ValueError("training and validation cutoffs must not be empty")
@@ -744,20 +812,33 @@ def run_temporal_holdout_backtest(
             "candidate_training_scope": "all_eligible_candidate_types",
         },
     )
+    selection_config = (
+        audience_selection_config or AudienceSelectionEvaluationConfig()
+    )
     training_run = ExpediaSegmentBacktestService(
         repository,
         config=config,
         performance_predictor=model,
+        audience_selection_evaluation_config=selection_config,
     ).run(normalized_training)
     holdout_run = ExpediaSegmentBacktestService(
         repository,
         config=config,
         performance_predictor=model,
+        audience_selection_evaluation_config=selection_config,
     ).run(normalized_holdout)
+    audience_selection_evaluation = build_audience_selection_policy_evaluation(
+        development_outcomes=training_run.audience_selection_outcomes,
+        validation_outcomes=holdout_run.audience_selection_outcomes,
+        config=selection_config,
+        development_split=_cutoff_year_label(normalized_training),
+        validation_split=_cutoff_year_label(normalized_holdout),
+    )
     return ExpediaTemporalHoldoutRun(
         training_run=training_run,
         holdout_run=holdout_run,
         calibration_model=model,
+        audience_selection_evaluation=audience_selection_evaluation,
     )
 
 
@@ -868,19 +949,19 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
     calibration_rank_one = [
         result for result in calibration_results if result.rank == 1
     ]
-    rank_one_is_best = 0
-    for scenario_results in evaluable_grouped.values():
-        rank_one_result = next(
-            (result for result in scenario_results if result.rank == 1),
-            None,
-        )
-        if rank_one_result is None:
-            continue
-        best_actual = max(
-            result.actual_contextual_conversion_rate for result in scenario_results
-        )
-        if rank_one_result.actual_contextual_conversion_rate >= best_actual:
-            rank_one_is_best += 1
+    rank_quality = summarize_rank_quality(
+        [
+            [
+                RankedOutcome(
+                    rank=result.rank,
+                    actual_rate=result.actual_contextual_conversion_rate,
+                    baseline_rate=result.baseline_contextual_conversion_rate,
+                )
+                for result in scenario_results
+            ]
+            for scenario_results in grouped.values()
+        ]
+    )
     by_candidate_type: dict[str, dict[str, Any]] = {}
     for candidate_type in sorted(
         {result.candidate_type for result in evaluable_results}
@@ -947,6 +1028,21 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             for result in calibration_rank_one
         ),
         "rank_one_brier_score": _brier_score(calibration_rank_one),
+        "all_candidate_mean_predicted_conversion_rate": _mean(
+            result.predicted_conversion_rate for result in calibration_results
+        ),
+        "all_candidate_mean_actual_contextual_conversion_rate": _mean(
+            result.actual_contextual_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_baseline_contextual_conversion_rate": _mean(
+            result.baseline_contextual_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_actual_any_conversion_rate": _mean(
+            result.actual_any_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_baseline_any_conversion_rate": _mean(
+            result.baseline_any_conversion_rate for result in evaluable_results
+        ),
         "all_candidate_mean_absolute_error_percentage_points": _mean(
             result.calibration_error_percentage_points
             for result in calibration_results
@@ -960,17 +1056,7 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             * 100.0
             for result in calibration_results
         ),
-        "rank_one_beats_baseline_rate": _safe_rate(
-            sum(
-                result.actual_contextual_conversion_rate
-                > result.baseline_contextual_conversion_rate
-                for result in rank_one
-            ),
-            len(rank_one),
-        ),
-        "rank_one_is_best_rate": _safe_rate(
-            rank_one_is_best, len(evaluable_grouped)
-        ),
+        **rank_quality,
         "by_candidate_type": by_candidate_type,
     }
 
@@ -1042,6 +1128,15 @@ def write_temporal_holdout_artifacts(
     )
     model_path = output_dir / "contextual_booking_calibration_v2.json"
     write_segment_performance_model(run.calibration_model, model_path)
+    audience_selection_paths = write_audience_selection_evaluation_artifacts(
+        run.audience_selection_evaluation,
+        development_outcomes=run.training_run.audience_selection_outcomes,
+        validation_outcomes=run.holdout_run.audience_selection_outcomes,
+        output_dir=output_dir / "audience-selection",
+    )
+    audience_selection_artifact = json.loads(
+        audience_selection_paths["policy"].read_text(encoding="utf-8")
+    )
     summary_path = output_dir / "temporal_validation_summary.json"
     summary = {
         "split": {
@@ -1054,6 +1149,7 @@ def write_temporal_holdout_artifacts(
         "model": run.calibration_model.to_json(),
         "training_metrics": summarize_backtest(run.training_run),
         "validation_metrics": summarize_backtest(run.holdout_run),
+        "audience_selection_policy": audience_selection_artifact,
     }
     summary_path.write_text(
         json.dumps(summary, ensure_ascii=False, indent=2, default=str) + "\n",
@@ -1070,6 +1166,15 @@ def write_temporal_holdout_artifacts(
         "report": report_path,
         "training_results": training_paths["results"],
         "validation_results": validation_paths["results"],
+        "audience_selection_policy": audience_selection_paths["policy"],
+        "audience_selection_summary": audience_selection_paths["summary"],
+        "audience_selection_report": audience_selection_paths["report"],
+        "audience_selection_development_results": audience_selection_paths[
+            "development_results"
+        ],
+        "audience_selection_validation_results": audience_selection_paths[
+            "validation_results"
+        ],
     }
 
 
@@ -1160,6 +1265,44 @@ def _evaluate_segments(
             )
         )
     return results
+
+
+def _evaluate_audience_selection_ratios(
+    *,
+    scenario: ExpediaBacktestScenario,
+    eligible_user_ids: Sequence[str],
+    future_users: ExpediaFutureBookingUsers,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    all_matching_segments: Sequence[Any],
+    all_matching_pool: Sequence[Any],
+    performance_predictor: SegmentPerformancePredictor | None,
+    config: AudienceSelectionEvaluationConfig,
+    max_suggested_segments: int,
+    min_sample_size: int,
+) -> list[AudienceSelectionOutcome]:
+    return evaluate_audience_selection_ratios(
+        evaluation_key=scenario.cutoff.isoformat(),
+        scenario_id=scenario.scenario_id,
+        positive_user_ids=future_users.contextual_booking_user_ids,
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        all_matching_segments=all_matching_segments,
+        all_matching_pool=all_matching_pool,
+        performance_predictor=performance_predictor,
+        config=config,
+        max_suggested_segments=max_suggested_segments,
+        min_sample_size=min_sample_size,
+    )
+
+
+def _cutoff_year_label(cutoffs: Sequence[datetime]) -> str:
+    years = sorted({cutoff.year for cutoff in cutoffs})
+    return ",".join(str(year) for year in years)
 
 
 def _promotion_for_scenario(
@@ -1382,34 +1525,36 @@ def _markdown_report(
         "- 미래 목적지 예약이 있어 평가 가능한 시나리오: "
         f"{metrics['evaluable_scenario_count']}개",
         f"- 추천 후보 결과: {metrics['candidate_result_count']}개",
-        "- Rank 1 실제 전환율: "
-        f"{_format_percent(metrics['rank_one_mean_actual_contextual_conversion_rate'])}",
+        "- 추천 후보 평균 실제 전환율: "
+        f"{_format_percent(metrics['all_candidate_mean_actual_contextual_conversion_rate'])}",
         "- 전체 기준 실제 전환율: "
-        f"{_format_percent(metrics['rank_one_mean_baseline_contextual_conversion_rate'])}",
-        "- Rank 1 평균 절대 향상: "
-        f"{metrics['rank_one_mean_absolute_lift_percentage_points']:.2f}%p",
-        "- Rank 1 목적지 무관 예약률: "
-        f"{_format_percent(metrics['rank_one_mean_actual_any_conversion_rate'])}",
+        f"{_format_percent(metrics['all_candidate_mean_baseline_contextual_conversion_rate'])}",
+        "- 추천 후보 평균 절대 향상: "
+        f"{metrics['portfolio_mean_candidate_lift_percentage_points']:.2f}%p",
+        "- 추천 후보 평균 목적지 무관 예약률: "
+        f"{_format_percent(metrics['all_candidate_mean_actual_any_conversion_rate'])}",
         "- 전체 기준 목적지 무관 예약률: "
-        f"{_format_percent(metrics['rank_one_mean_baseline_any_conversion_rate'])}",
-        "- Rank 1이 기준선을 이긴 비율: "
-        f"{_format_percent(metrics['rank_one_beats_baseline_rate'])}",
-        "- Rank 1이 실제 최고 후보였던 비율: "
-        f"{_format_percent(metrics['rank_one_is_best_rate'])}",
+        f"{_format_percent(metrics['all_candidate_mean_baseline_any_conversion_rate'])}",
+        "- 전체 추천 후보가 기준선을 이긴 비율: "
+        f"{_format_optional_percent(metrics['portfolio_candidate_beats_baseline_rate'])}",
+        "- 유용한 후보가 하나 이상인 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+        "- 모든 후보가 기준선을 이긴 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
         "- 예상값 평균 절대 오차: "
-        f"{metrics['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
+        f"{metrics['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
         "",
         "## 후보별 결과",
         "",
-        "| 기준일 | 목적지 | Rank | 후보 유형 | 예상 전환율 | "
+        "| 기준일 | 목적지 | 후보 유형 | 예상 전환율 | "
         "미래 실제 전환율 | 기준 전환율 | 향상(%p) | 표본 |",
-        "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in run.results:
         lines.append(
             "| "
             f"{result.cutoff.date().isoformat()} | {result.target_destination_id} | "
-            f"{result.rank} | {result.candidate_type} | "
+            f"{result.candidate_type} | "
             f"{_format_percent(result.predicted_conversion_rate)} | "
             f"{_format_percent(result.actual_contextual_conversion_rate)} | "
             f"{_format_percent(result.baseline_contextual_conversion_rate)} | "
@@ -1452,13 +1597,14 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 2014년 개발 검증 결과",
             "",
             f"- 평가 시나리오: {validation['scenario_count']}개",
-            "- Rank 1이 실제 최고 후보였던 비율: "
-            f"{_format_percent(validation['rank_one_is_best_rate'])}",
-            "- Rank 1이 기준선을 이긴 비율: "
-            f"{_format_percent(validation['rank_one_beats_baseline_rate'])}",
-            "- Rank 1 평균 절대 오차: "
-            f"{validation['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
-            f"- Rank 1 Brier score: {validation['rank_one_brier_score']:.6f}",
+            "- 전체 추천 후보가 기준선을 이긴 비율: "
+            f"{_format_optional_percent(validation['portfolio_candidate_beats_baseline_rate'])}",
+            "- 유용한 후보가 하나 이상인 시나리오 비율: "
+            f"{_format_optional_percent(validation['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+            "- 모든 후보가 기준선을 이긴 시나리오 비율: "
+            f"{_format_optional_percent(validation['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
+            "- 추천 후보 평균 lift: "
+            f"{validation['portfolio_mean_candidate_lift_percentage_points']:.2f}%p",
             "- 전체 후보 평균 절대 오차: "
             f"{validation['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
             f"- 전체 후보 Brier score: {validation['all_candidate_brier_score']:.6f}",
@@ -1468,8 +1614,8 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 학습 구간 참고 지표",
             "",
             f"- 학습 시나리오: {training['scenario_count']}개",
-            "- 학습 Rank 1 실제 최고 후보 비율: "
-            f"{_format_percent(training['rank_one_is_best_rate'])}",
+            "- 학습 구간 전체 추천 후보 기준선 초과율: "
+            f"{_format_optional_percent(training['portfolio_candidate_beats_baseline_rate'])}",
             "",
             "## 해석 주의사항",
             "",
@@ -1580,3 +1726,9 @@ def _brier_score(results: Sequence[ExpediaBacktestResult]) -> float:
 
 def _format_percent(value: float) -> str:
     return f"{value * 100.0:.2f}%"
+
+
+def _format_optional_percent(value: float | None) -> str:
+    if value is None:
+        return "N/A"
+    return _format_percent(value)

@@ -1,17 +1,18 @@
+import pytest
 from fastapi.testclient import TestClient
 
-from app.config import REQUIRED_ENV_NAMES, load_settings
-from app.generation.generator import GeneratedContent
-from app.generation.artifacts import StaticCreativeArtifactPublisher
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.generation.router import get_generation_service
 from app.generation.schemas import (
-    ContentCandidateResponse,
-    ContentChannel,
+    GenerationAcceptedResponse,
     GenerationRequest,
-    GenerationResponse,
     GenerationStatus,
 )
-from app.generation.service import GenerationService
+from app.generation.submission import (
+    GenerationIdempotencyConflict,
+    GenerationSubmissionUnavailable,
+)
 from app.main import create_app
 
 
@@ -21,7 +22,7 @@ CONFIRMED_TARGET_SEGMENT_STATUSES = {"approved"}
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
@@ -36,12 +37,12 @@ def valid_env() -> dict[str, str]:
 def make_generation_client(service=None) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_generation_service] = (
-        lambda: service or GenerationService()
+        lambda: service or FakeGenerationSubmissionService()
     )
     return TestClient(app)
 
 
-def test_generation_api_returns_v1_6_final_names() -> None:
+def test_generation_api_returns_durable_acceptance_contract() -> None:
     client = make_generation_client()
 
     response = client.post(
@@ -54,33 +55,62 @@ def test_generation_api_returns_v1_6_final_names() -> None:
             "content_option_count": 3,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-api-001"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.json()
-    assert payload["generation_id"] == "generation_banner_001"
+    assert payload["generation_id"] == "generation_fake"
     assert payload["promotion_id"] == "promo_banner_001"
-    assert payload["status"] == "completed"
-    assert len(payload["content_candidates"]) == 3
-    assert "content_candidates" in payload
+    assert payload["status"] == "requested"
+    assert set(payload) == {"generation_id", "promotion_id", "status"}
     assert_no_forbidden_public_keys(payload)
 
-    first_candidate = payload["content_candidates"][0]
-    assert first_candidate["channel"] == "onsite_banner"
-    assert first_candidate["creative_format"] == "banner_html"
-    assert first_candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
-    assert first_candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
-    assert first_candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert first_candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
-    assert first_candidate["source"] == {
-        "creative_format": "banner_html",
-        "width": 320,
-        "height": 100,
-        "click_protocol": "post_message",
-        "allowed_message_type": "loopad:click",
-    }
-    assert first_candidate["artifact"]["creative_format"] == "banner_html"
-    assert first_candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
+
+def test_generation_api_requires_idempotency_key() -> None:
+    client = make_generation_client()
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json=generation_payload(),
+    )
+
+    assert response.status_code == 400
+    assert "Idempotency-Key" in response.json()["detail"]
+
+
+def test_generation_api_maps_idempotency_conflict_to_409() -> None:
+    client = make_generation_client(
+        RaisingGenerationSubmissionService(
+            GenerationIdempotencyConflict("idempotency conflict")
+        )
+    )
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json=generation_payload(),
+        headers={"Idempotency-Key": "generation-conflict-001"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "idempotency conflict"
+
+
+def test_generation_api_rejects_new_work_with_503_during_shutdown() -> None:
+    client = make_generation_client(
+        RaisingGenerationSubmissionService(
+            GenerationSubmissionUnavailable("generation worker is shutting down")
+        )
+    )
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json=generation_payload(),
+        headers={"Idempotency-Key": "generation-shutdown-001"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "generation worker is shutting down"
 
 
 def test_generation_api_rejects_path_body_promotion_mismatch() -> None:
@@ -122,7 +152,7 @@ def test_generation_api_rejects_non_positive_content_option_count() -> None:
 
 def test_generation_api_calls_generation_service() -> None:
     app = create_app()
-    fake_service = FakeGenerationService()
+    fake_service = FakeGenerationSubmissionService()
     app.dependency_overrides[get_generation_service] = lambda: fake_service
     client = TestClient(app)
 
@@ -133,16 +163,45 @@ def test_generation_api_calls_generation_service() -> None:
             "campaign_id": "camp_summer_2026",
             "promotion_id": "promo_banner_001",
             "analysis_id": "analysis_banner_001",
+            "segment_ids": ["seg_mobile_user"],
             "content_option_count": 1,
             "operator_instruction": "Keep it short.",
         },
+        headers={"Idempotency-Key": "generation-api-call-001"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert response.json()["generation_id"] == "generation_fake"
     assert len(fake_service.requests) == 1
     assert fake_service.requests[0].analysis_id == "analysis_banner_001"
+    assert fake_service.requests[0].segment_ids == ["seg_mobile_user"]
     assert fake_service.requests[0].operator_instruction == "Keep it short."
+    assert fake_service.idempotency_keys == ["generation-api-call-001"]
+
+
+@pytest.mark.parametrize(
+    "segment_ids",
+    [[], ["seg_family_trip", "seg_family_trip"], ["   "]],
+)
+def test_generation_api_rejects_empty_duplicate_or_blank_segment_ids(
+    segment_ids: list[str],
+) -> None:
+    client = make_generation_client()
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "analysis_id": "analysis_banner_001",
+            "segment_ids": segment_ids,
+            "content_option_count": 1,
+            "operator_instruction": None,
+        },
+    )
+
+    assert response.status_code == 400
 
 
 def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
@@ -170,9 +229,10 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
             "content_option_count": 2,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-db-001"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     assert len(connections) == 1
     connection = connections[0]
     assert connection.commit_count == 1
@@ -181,10 +241,7 @@ def test_generation_api_wires_postgres_repositories(monkeypatch) -> None:
 
     executed_queries = [query for query, _params in connection.executed]
     assert sum("INSERT INTO generation_runs" in query for query in executed_queries) == 1
-    assert (
-        sum("INSERT INTO content_candidates" in query for query in executed_queries)
-        == 2
-    )
+    assert all("INSERT INTO content_candidates" not in query for query in executed_queries)
     assert any("FROM promotion_target_segments" in query for query in executed_queries)
     assert all("promotion_segment_suggestions" not in query for query in executed_queries)
 
@@ -222,6 +279,7 @@ def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-no-target-001"},
     )
 
     assert response.status_code == 409
@@ -237,42 +295,19 @@ def test_generation_api_rejects_without_confirmed_target_segments(monkeypatch) -
     assert connection.close_count == 1
 
 
-def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) -> None:
+def test_generation_api_does_not_invoke_provider_or_artifact_work(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
-    built_settings = []
-    dispatched_jobs = []
 
     def fake_create_postgres_connection(_settings) -> RecordingConnection:
         connection = RecordingConnection()
         connections.append(connection)
         return connection
 
-    def fake_build_external_content_generator(settings, *, generate_images=True):
-        built_settings.append((settings, generate_images))
-        return FakeExternalContentGenerator()
-
-    def fake_dispatch_image_generation_jobs(*, settings, jobs):
-        dispatched_jobs.append((settings, list(jobs)))
-
     monkeypatch.setattr(
         "app.generation.router.create_postgres_connection",
         fake_create_postgres_connection,
     )
-    monkeypatch.setattr(
-        "app.generation.router.build_external_content_generator",
-        fake_build_external_content_generator,
-    )
-    monkeypatch.setattr(
-        "app.generation.router.dispatch_image_generation_jobs",
-        fake_dispatch_image_generation_jobs,
-    )
-    monkeypatch.setattr(
-        "app.generation.router.build_s3_creative_artifact_publisher",
-        lambda _settings: StaticCreativeArtifactPublisher(),
-    )
-    env = valid_env()
-    env["LOOPAD_ENV"] = "dev"
-    app = create_app(settings=load_settings(env))
+    app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
 
     response = client.post(
@@ -285,28 +320,18 @@ def test_generation_api_uses_external_generator_outside_test_env(monkeypatch) ->
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-no-provider-001"},
     )
 
-    assert response.status_code == 200
-    candidate = response.json()["content_candidates"][0]
-    assert candidate["creative_format"] == "banner_html"
-    assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
+    assert response.status_code == 202
+    assert response.json()["status"] == "requested"
     assert len(connections) == 1
-    assert built_settings[0][0].env == "dev"
-    assert built_settings[0][1] is False
-    assert len(dispatched_jobs) == 1
-    assert dispatched_jobs[0][0].env == "dev"
-    assert [job.content_id for job in dispatched_jobs[0][1]] == [
-        "content_banner_repeat_hotel_no_booking_001"
-    ]
-    assert [job.image_prompt for job in dispatched_jobs[0][1]] == [
-        "bright hotel suite banner"
-    ]
+    queries = [query for query, _params in connections[0].executed]
+    assert all("content_candidates" not in query for query in queries)
 
 
-def test_generation_api_skips_planned_segments_and_image_jobs(monkeypatch) -> None:
+def test_generation_api_snapshots_only_confirmed_segments(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
-    dispatched_jobs = []
 
     def fake_create_postgres_connection(_settings) -> RecordingConnection:
         connection = RecordingConnection(
@@ -326,32 +351,11 @@ def test_generation_api_skips_planned_segments_and_image_jobs(monkeypatch) -> No
         connections.append(connection)
         return connection
 
-    def fake_build_external_content_generator(settings, *, generate_images=True):
-        del settings, generate_images
-        return FakeExternalContentGenerator()
-
-    def fake_dispatch_image_generation_jobs(*, settings, jobs):
-        dispatched_jobs.append((settings, list(jobs)))
-
     monkeypatch.setattr(
         "app.generation.router.create_postgres_connection",
         fake_create_postgres_connection,
     )
-    monkeypatch.setattr(
-        "app.generation.router.build_external_content_generator",
-        fake_build_external_content_generator,
-    )
-    monkeypatch.setattr(
-        "app.generation.router.dispatch_image_generation_jobs",
-        fake_dispatch_image_generation_jobs,
-    )
-    monkeypatch.setattr(
-        "app.generation.router.build_s3_creative_artifact_publisher",
-        lambda _settings: StaticCreativeArtifactPublisher(),
-    )
-    env = valid_env()
-    env["LOOPAD_ENV"] = "dev"
-    app = create_app(settings=load_settings(env))
+    app = create_app(settings=load_settings(valid_env()))
     client = TestClient(app)
 
     response = client.post(
@@ -364,18 +368,10 @@ def test_generation_api_skips_planned_segments_and_image_jobs(monkeypatch) -> No
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-confirmed-001"},
     )
 
-    assert response.status_code == 200
-    segment_ids = [
-        candidate["attribution"]["segment_id"]
-        for candidate in response.json()["content_candidates"]
-    ]
-    assert segment_ids == ["seg_repeat_hotel_no_booking"]
-    assert len(dispatched_jobs) == 1
-    assert [job.content_id for job in dispatched_jobs[0][1]] == [
-        "content_banner_repeat_hotel_no_booking_001"
-    ]
+    assert response.status_code == 202
 
     connection = connections[0]
     executed_queries = [query for query, _params in connection.executed]
@@ -383,6 +379,15 @@ def test_generation_api_skips_planned_segments_and_image_jobs(monkeypatch) -> No
         "pts.status = 'approved'" in query
         for query in executed_queries
     )
+    insert_params = next(
+        params
+        for query, params in connection.executed
+        if "INSERT INTO generation_runs" in query
+    )
+    snapshot = insert_params["input_json"].obj
+    assert [target["segment_id"] for target in snapshot["target_segments"]] == [
+        "seg_repeat_hotel_no_booking"
+    ]
 
 
 def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> None:
@@ -410,6 +415,7 @@ def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> N
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "generation-write-fail-001"},
     )
 
     assert response.status_code == 500
@@ -417,7 +423,7 @@ def test_generation_api_rolls_back_when_repository_write_fails(monkeypatch) -> N
     assert len(connections) == 1
     connection = connections[0]
     assert connection.commit_count == 0
-    assert connection.rollback_count == 1
+    assert connection.rollback_count == 2
     assert connection.close_count == 1
 
 
@@ -444,59 +450,49 @@ def assert_no_forbidden_public_keys(value) -> None:
             assert_no_forbidden_public_keys(item)
 
 
-class FakeGenerationService:
+class FakeGenerationSubmissionService:
     def __init__(self) -> None:
         self.requests: list[GenerationRequest] = []
+        self.idempotency_keys: list[str] = []
 
-    def generate(self, request: GenerationRequest) -> GenerationResponse:
+    def submit(
+        self,
+        request: GenerationRequest,
+        *,
+        idempotency_key: str,
+    ) -> GenerationAcceptedResponse:
         self.requests.append(request)
-        return GenerationResponse(
+        self.idempotency_keys.append(idempotency_key)
+        return GenerationAcceptedResponse(
             generation_id="generation_fake",
             promotion_id=request.promotion_id,
-            status=GenerationStatus.COMPLETED,
-            content_candidates=[
-                ContentCandidateResponse(
-                    channel=ContentChannel.ONSITE_BANNER,
-                    creative_format="banner_html",
-                    attribution={
-                        "project_id": request.project_id,
-                        "campaign_id": request.campaign_id,
-                        "promotion_id": request.promotion_id,
-                        "promotion_run_id": "run_fake",
-                        "ad_experiment_id": "exp_fake",
-                        "segment_id": "seg_repeat_hotel_no_booking",
-                        "content_id": "content_banner_fake_001",
-                        "content_option_id": "banner_fake_option_001",
-                        "promotion_channel": "onsite_banner",
-                        "target_url": "https://demo-stay.example.com/summer",
-                    },
-                    source={
-                        "creative_format": "banner_html",
-                        "width": 320,
-                        "height": 100,
-                        "click_protocol": "post_message",
-                        "allowed_message_type": "loopad:click",
-                    },
-                    artifact={
-                        "creative_format": "banner_html",
-                        "artifact_status": "pending",
-                    },
-                )
-            ],
+            status=GenerationStatus.REQUESTED,
         )
 
 
-class FakeExternalContentGenerator:
-    version = "dec-c6.external-test.v1"
+class RaisingGenerationSubmissionService:
+    def __init__(self, error: Exception) -> None:
+        self._error = error
 
-    def generate(self, **_kwargs) -> GeneratedContent:
-        return GeneratedContent(
-            title="Hotel rooms ready this weekend",
-            body="Compare refundable hotel stays before rooms run out.",
-            cta="View hotel deals",
-            image_prompt="bright hotel suite banner",
-            landing_url="https://demo-stay.example.com/summer",
-        )
+    def submit(
+        self,
+        request: GenerationRequest,
+        *,
+        idempotency_key: str,
+    ) -> GenerationAcceptedResponse:
+        del request, idempotency_key
+        raise self._error
+
+
+def generation_payload() -> dict[str, object]:
+    return {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "content_option_count": 1,
+        "operator_instruction": None,
+    }
 
 
 def target_segment_row(
@@ -539,6 +535,7 @@ class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
         self._last_query = ""
+        self._last_params: dict[str, object] | None = None
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -548,11 +545,24 @@ class RecordingCursor:
 
     def execute(self, query: str, params: dict[str, object] | None = None) -> None:
         self._last_query = query
+        self._last_params = params
         self._connection.executed.append((query, params))
 
     def fetchone(self) -> dict[str, object] | None:
         if "FROM promotions" in self._last_query:
             return self._connection.promotion_row
+        if "INSERT INTO generation_runs" in self._last_query:
+            if self._connection.insert_fetchone_result is None:
+                return None
+            assert self._last_params is not None
+            return {
+                **self._last_params,
+                "input_json": self._last_params["input_json"].obj,
+                "generation_report_json": self._last_params[
+                    "generation_report_json"
+                ].obj,
+                "output_json": None,
+            }
         return self._connection.insert_fetchone_result
 
     def fetchall(self) -> list[dict[str, object]]:

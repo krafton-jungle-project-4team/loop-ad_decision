@@ -125,6 +125,40 @@ def test_content_candidate_response_rejects_unknown_channel() -> None:
         )
 
 
+def test_email_source_accepts_legacy_tracking_placeholders() -> None:
+    dto = ContentCandidateResponse.model_validate(
+        {
+            "channel": "email",
+            "creative_format": "email_html",
+            "attribution": attribution_for_candidate("email"),
+            "source": {
+                "creative_format": "email_html",
+                "subject": "Weekend rooms are still available",
+                "preheader": "See refundable summer hotel offers.",
+                "text_body": "Compare today's hotel offer.",
+                "required_placeholders": [
+                    "{{redirect_url}}",
+                    "{{open_pixel_url}}",
+                ],
+            },
+            "artifact": {
+                "creative_format": "email_html",
+                "artifact_status": "published",
+                "storage_key": "genai/legacy/creative.email.html",
+                "public_url": "https://assets.example.test/legacy/creative.email.html",
+                "sha256": "abc123",
+                "bytes": 128,
+                "content_type": "text/html; charset=utf-8",
+            },
+        }
+    )
+
+    assert dto.source.required_placeholders == (
+        "{{redirect_url}}",
+        "{{open_pixel_url}}",
+    )
+
+
 def test_content_candidate_response_rejects_missing_channel_fields() -> None:
     with pytest.raises(ValidationError):
         ContentCandidateResponse(

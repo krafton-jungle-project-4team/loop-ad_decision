@@ -22,6 +22,7 @@ from app.analysis.service import (
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
+    _bounded_next_loop_lineage_id,
 )
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
@@ -396,7 +397,10 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
         segment_record("seg_near_checkin"),
         segment_record("seg_existing_all"),
     ]
-    service, _, _ = build_service(promotion=promotion, segments=segments)
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=segments,
+    )
 
     result = service.analyze(
         analysis_request(promotion_id=promotion.promotion_id),
@@ -409,7 +413,9 @@ def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
         "seg_near_checkin",
     ]
     assert result.target_segments[0].priority == "high"
-    assert result.target_segments[0].status == "planned"
+    assert {segment.status for segment in result.target_segments} == {"planned"}
+    assert analysis_repository.saved.target_segments is None
+    assert analysis_repository.events == ["analysis", "segment_suggestions"]
 
 
 def test_service_applies_sms_default_segment_order() -> None:
@@ -452,6 +458,7 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
 
     assert segment_ids(result.target_segments) == ["seg_near_checkin"]
     assert analysis_repository.saved.target_segments == result.target_segments
+    assert {segment.status for segment in result.target_segments} == {"planned"}
     assert analysis_repository.events == [
         "analysis",
         "target_segments",
@@ -474,6 +481,51 @@ def test_service_analyzes_focus_segment_ids_only() -> None:
                 candidate_user_ids=[],
             )
     ]
+
+
+def test_service_can_approve_automatic_next_loop_focus_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+    )
+
+    result = service.analyze_focus(
+        NextLoopFocusAnalysisRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id=promotion.promotion_id,
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_failed_ad_experiment_ids=["adexp_near_checkin_001"],
+        ),
+        target_status="approved",
+    )
+
+    assert analysis_repository.saved.target_segments == result.target_segments
+    assert {segment.status for segment in result.target_segments} == {"approved"}
+
+
+def test_next_loop_analysis_id_separates_and_bounds_source_lineage() -> None:
+    common = {
+        "prefix": "analysis",
+        "promotion_id": "promo_" + ("long_hotel_promotion_" * 10),
+        "loop_count": 2,
+    }
+
+    first = _bounded_next_loop_lineage_id(
+        **common,
+        source_promotion_run_id="prun_scope_a",
+    )
+    second = _bounded_next_loop_lineage_id(
+        **common,
+        source_promotion_run_id="prun_scope_b",
+    )
+
+    assert first != second
+    assert len(first) <= 100
+    assert len(second) <= 100
 
 
 def test_service_analyzes_requested_segments_without_refreshing_suggestions() -> None:
@@ -504,6 +556,8 @@ def test_service_analyzes_requested_segments_without_refreshing_suggestions() ->
     )
 
     assert segment_ids(result.target_segments) == ["seg_family_trip"]
+    assert {segment.status for segment in result.target_segments} == {"approved"}
+    assert analysis_repository.saved.target_segments == result.target_segments
     assert result.segment_suggestions == []
     assert suggester.calls == []
     assert segment_definition_repository.saved_ai_suggested == []
@@ -700,13 +754,14 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
         "action_hint": "사이트 내 배너로 호텔 혜택을 노출하기 적합합니다.",
     }
     ai_report = result.segment_suggestions[0].metadata_json["ai_report"]
-    assert ai_report["version"] == "dec.segment-report.v2"
+    assert ai_report["version"] == "dec.segment-report.v3"
     assert ai_report["title"] == "예약 가능성이 높은 프로모션 반응 고객"
     assert ai_report["summary"]
     assert ai_report["promotion_interpretation"]
     assert ai_report["why_recommended"]
     assert ai_report["evidence"]
-    assert ai_report["difference_from_other_ranks"]
+    assert ai_report["candidate_strengths"]
+    assert ai_report["selection_considerations"]
     assert ai_report["action_hint"]
     assert ai_report["confidence_label"] in {"high", "medium", "low"}
     assert all(

@@ -2,6 +2,13 @@ from dataclasses import replace
 
 import pytest
 
+from app.generation.artifacts import (
+    ArtifactIdentity,
+    StaticCreativeArtifactPublisher,
+    StoredAsset,
+    image_prompt_sha256,
+    recovered_image_prompt,
+)
 from app.generation.generator import GeneratedContent
 from app.generation.image_tasks import ImageGenerationJob
 from app.generation.prompt_builder import (
@@ -16,16 +23,20 @@ from app.generation.repositories import (
     GenerationRunRecord,
 )
 from app.generation.schemas import (
+    ContentCandidateStatus,
     ContentChannel,
     GenerationRequest,
 )
 from app.generation.service import (
+    ArtifactFinalizationError,
     DEMO_DEFAULT_LANDING_URL,
     DEMO_PROJECT_ID,
     GenerationInputUnavailable,
     GenerationService,
     NextLoopFocusGenerationRequest,
+    _next_loop_generation_id,
 )
+from app.generation.submission import generation_id_for_request
 
 
 class FakeGenerationRunRepository:
@@ -68,6 +79,7 @@ class FakeImageGenerationScheduler:
 def generation_request(
     *,
     project_id: str = "hotel-client-a",
+    segment_ids: list[str] | None = None,
     content_option_count: int = 2,
     operator_instruction: str | None = "Make the banner direct and concise.",
 ) -> GenerationRequest:
@@ -76,6 +88,7 @@ def generation_request(
         campaign_id="camp_summer_2026",
         promotion_id="promo_banner_001",
         analysis_id="analysis_banner_001",
+        segment_ids=segment_ids,
         content_option_count=content_option_count,
         operator_instruction=operator_instruction,
     )
@@ -101,16 +114,27 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert generation_run.generation_id == response.generation_id
     assert generation_run.project_id == "hotel-client-a"
     assert generation_run.status == "completed"
-    assert generation_run.input_json == {
-        "project_id": "hotel-client-a",
-        "campaign_id": "camp_summer_2026",
-        "promotion_id": "promo_banner_001",
-        "analysis_id": "analysis_banner_001",
-        "content_option_count": 2,
-        "operator_instruction": "Make the banner direct and concise.",
-        "target_segment_ids": ["seg_repeat_hotel_no_booking"],
-        "channel": "onsite_banner",
-    }
+    assert generation_run.input_json["schema_version"] == "generation.request.v1"
+    assert generation_run.input_json["project_id"] == "hotel-client-a"
+    assert generation_run.input_json["campaign_id"] == "camp_summer_2026"
+    assert generation_run.input_json["promotion_id"] == "promo_banner_001"
+    assert generation_run.input_json["analysis_id"] == "analysis_banner_001"
+    assert generation_run.input_json["content_option_count"] == 2
+    assert generation_run.input_json["operator_instruction"] == (
+        "Make the banner direct and concise."
+    )
+    assert generation_run.input_json["target_segment_ids"] == [
+        "seg_repeat_hotel_no_booking"
+    ]
+    assert generation_run.input_json["channel"] == "onsite_banner"
+    assert generation_run.input_json["promotion"]["channel"] == "onsite_banner"
+    assert generation_run.input_json["target_segments"][0]["segment_id"] == (
+        "seg_repeat_hotel_no_booking"
+    )
+    assert generation_run.idempotency_key == (
+        "loopad-internal:inline:generation_banner_001"
+    )
+    assert len(generation_run.request_fingerprint or "") == 64
     assert generation_run.output_json is not None
     assert generation_run.output_json["report_version"] == "dec-c4.v3"
     assert generation_run.output_json["content_candidate_ids"] == [
@@ -133,13 +157,13 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     ]
     assert generation_run.generation_report_json == {
         "status": "completed",
+        "schema_version": "generation.request.v1",
         "content_candidate_count": 2,
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v4",
         "content_generator": "dec-c3.deterministic.v4",
         "report_builder": "dec-c4.v3",
     }
-
     assert len(content_candidate_repository.saved) == 2
     first_candidate = content_candidate_repository.saved[0]
     assert first_candidate.content_id == "content_banner_repeat_hotel_001"
@@ -193,10 +217,567 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     )
     for unsupported_claim in ("환불 가능", "객실 마감", "특가"):
         assert unsupported_claim not in fallback_copy
-    assert first_candidate.image_url is None
-    assert first_candidate.metadata_json["image_url"] is None
+    assert first_candidate.image_url == (
+        "https://gen-ai.asset.dev.loop-ad.org/fixtures/deterministic-hotel.png"
+    )
+    assert first_candidate.metadata_json["image_url"] == first_candidate.image_url
     assert first_candidate.metadata_json["source_query_preview_id"] is None
     assert first_candidate.metadata_json["generated_sql_summary"] is None
+
+
+def test_durable_execution_requires_and_returns_ready_artifact_fields() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generation_id = "generation_banner_001_0123456789abcdef"
+
+    result = GenerationService(
+        content_generator=ReadyImageContentGenerator()
+    ).execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    )
+
+    candidate = result.content_candidates[0]
+    assert candidate.generation_id == generation_id
+    assert candidate.content_id == (
+        "content_banner_repeat_hotel_0123456789abcdef_001"
+    )
+    assert candidate.status == "draft"
+    assert candidate.image_generation_status == "completed"
+    assert candidate.image_url == "https://assets.example.test/banner.png"
+    assert candidate.artifact_status == "published"
+    assert candidate.artifact_public_url
+    assert candidate.artifact_sha256
+    assert candidate.artifact_content_type == "text/html; charset=utf-8"
+    assert candidate.artifact_published_at is not None
+    assert candidate.metadata_json["creative"]["image"] == {
+        "prompt": "hotel room, no visible text",
+        "public_url": "https://assets.example.test/banner.png",
+    }
+    assert result.generation_report_json["status"] == "completed"
+
+
+def test_candidate_records_canonical_stored_image_metadata() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+
+    candidate = GenerationService(
+        content_generator=ReadyStoredImageContentGenerator()
+    ).execute_durable(
+        generation_id="generation_banner_001_0123456789abcdef",
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+
+    assert candidate.metadata_json["creative"]["image"] == {
+        "prompt": "hotel room, no visible text",
+        "storage_key": "genai/project/promotion/generation/content/image.png",
+        "public_url": "https://assets.example.test/banner.png",
+        "sha256": "a" * 64,
+        "byte_size": 1234,
+        "content_type": "image/png",
+    }
+    assert candidate.metadata_json["image"]["bytes"] == 1234
+    assert candidate.metadata_json["creative"]["artifact"]["published_at"] == (
+        candidate.artifact_published_at.isoformat()
+    )
+
+
+def test_recovered_image_records_prompt_fingerprint_without_false_prompt() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+
+    candidate = GenerationService(
+        content_generator=RecoveredImageContentGenerator()
+    ).execute_durable(
+        generation_id="generation_banner_001_0123456789abcdef",
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+
+    image_metadata = candidate.metadata_json["creative"]["image"]
+    assert "prompt" not in image_metadata
+    assert image_metadata["prompt_sha256"] == image_prompt_sha256(
+        "original private prompt"
+    )
+    assert image_metadata["prompt_recovered"] is False
+    assert candidate.metadata_json["creative"]["renderer"] == {
+        "version": "generation.renderer.old",
+        "template_version": "banner.overlay.old",
+    }
+
+
+def test_durable_retry_resumes_checkpointed_source_without_duplicate_image() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    rejected_generator = CheckpointedStagedContentGenerator()
+    rejected_service = GenerationService(content_generator=rejected_generator)
+
+    def reject_source_checkpoint(_candidate: ContentCandidateRecord) -> None:
+        raise RuntimeError("source checkpoint rejected")
+
+    with pytest.raises(RuntimeError, match="source checkpoint rejected"):
+        rejected_service.execute_durable(
+            generation_id="generation_banner_001_rejected_0123456789abcdef",
+            prompt_inputs=[prompt_input],
+            checkpoint=reject_source_checkpoint,
+        )
+
+    assert rejected_generator.content_calls == 1
+    assert rejected_generator.image_calls == 0
+    assert rejected_generator.images == {}
+
+    generator = CheckpointedStagedContentGenerator()
+    service = GenerationService(content_generator=generator)
+    checkpoints: list[ContentCandidateRecord] = []
+
+    def crash_after_image(candidate: ContentCandidateRecord) -> None:
+        checkpoints.append(candidate)
+        if len(checkpoints) == 2:
+            raise RuntimeError("simulated crash after image storage")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        service.execute_durable(
+            generation_id="generation_banner_001_0123456789abcdef",
+            prompt_inputs=[prompt_input],
+            checkpoint=crash_after_image,
+        )
+
+    source_checkpoint = checkpoints[0]
+    assert source_checkpoint.image_prompt == "canonical prompt A"
+    assert source_checkpoint.image_generation_status == "pending"
+    assert source_checkpoint.image_url is None
+    assert generator.content_calls == 1
+    assert generator.image_calls == 1
+    assert len(generator.images) == 1
+
+    generator.next_prompt = "different prompt B"
+    retried = service.execute_durable(
+        generation_id="generation_banner_001_0123456789abcdef",
+        prompt_inputs=[prompt_input],
+        existing_candidates=[source_checkpoint],
+    ).content_candidates[0]
+
+    assert retried.image_prompt == "canonical prompt A"
+    assert retried.image_generation_status == "completed"
+    assert retried.artifact_status == "published"
+    assert generator.content_calls == 1
+    assert generator.image_calls == 1
+    assert len(generator.images) == 1
+
+
+def test_durable_execution_keeps_candidate_ids_unique_for_long_promotion_ids() -> None:
+    promotion_id = "promo_" + ("a" * 80)
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id=promotion_id,
+        analysis_id="analysis_banner_001",
+        content_option_count=1,
+    )
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=replace(
+            target_segment_input(),
+            promotion_id=promotion_id,
+        ),
+    )
+    service = GenerationService(content_generator=ReadyImageContentGenerator())
+    first_generation_id = generation_id_for_request(
+        promotion_id=promotion_id,
+        project_id=request.project_id,
+        idempotency_key="first-request",
+    )
+    second_generation_id = generation_id_for_request(
+        promotion_id=promotion_id,
+        project_id=request.project_id,
+        idempotency_key="second-request",
+    )
+
+    first = service.execute_durable(
+        generation_id=first_generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    second = service.execute_durable(
+        generation_id=second_generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+
+    assert first_generation_id != second_generation_id
+    assert first.content_id != second.content_id
+    assert first.content_option_id != second.content_option_id
+    assert len(first.content_id) <= 100
+    assert len(second.content_id) <= 100
+
+
+def test_durable_execution_rejects_html_without_generated_image() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+
+    with pytest.raises(ArtifactFinalizationError) as exc_info:
+        GenerationService(
+            content_generator=MissingImageUrlContentGenerator()
+        ).execute_durable(
+            generation_id="generation_banner_001_0123456789abcdef",
+            prompt_inputs=[prompt_input],
+        )
+
+    assert exc_info.value.candidate.artifact_status == "failed"
+    assert exc_info.value.candidate.artifact_error_code == "artifact_render_failed"
+
+
+def test_sync_generation_persists_failed_artifact_candidate() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    response = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        content_generator=MissingImageUrlContentGenerator(),
+    ).generate(generation_request(content_option_count=1))
+
+    assert response.status == "failed"
+    assert generation_run_repository.saved[0].status == "failed"
+    assert len(content_candidate_repository.saved) == 1
+    failed_candidate = content_candidate_repository.saved[0]
+    assert failed_candidate.artifact_status == "failed"
+    assert failed_candidate.artifact_error_code == "artifact_render_failed"
+
+
+def test_durable_retry_reuses_published_candidate_and_resumes_failed_artifact() -> None:
+    request = generation_request(content_option_count=2)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    publisher = FailSecondArtifactOncePublisher()
+    service = GenerationService(artifact_publisher=publisher)
+    checkpoints: list[ContentCandidateRecord] = []
+    generation_id = "generation_banner_001_0123456789abcdef"
+
+    with pytest.raises(ArtifactFinalizationError):
+        service.execute_durable(
+            generation_id=generation_id,
+            prompt_inputs=[prompt_input],
+            checkpoint=checkpoints.append,
+        )
+
+    latest_by_id = {candidate.content_id: candidate for candidate in checkpoints}
+    first_id, second_id = sorted(latest_by_id)
+    assert latest_by_id[first_id].artifact_status == "published"
+    assert latest_by_id[second_id].artifact_status == "failed"
+    assert latest_by_id[second_id].artifact_error_code == "artifact_publish_failed"
+    calls_before_retry = list(publisher.content_ids)
+
+    retry_checkpoints: list[ContentCandidateRecord] = []
+    result = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+        existing_candidates=tuple(latest_by_id.values()),
+        checkpoint=retry_checkpoints.append,
+    )
+
+    assert calls_before_retry == [first_id, second_id]
+    assert publisher.content_ids == [first_id, second_id, second_id]
+    assert [candidate.content_id for candidate in retry_checkpoints] == [second_id]
+    assert all(
+        candidate.artifact_status == "published"
+        and candidate.artifact_error_code is None
+        for candidate in result.content_candidates
+    )
+
+
+def test_hash_conflict_retry_recovers_content_instead_of_republishing_stale_copy() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generation_id = "generation_banner_001_0123456789abcdef"
+    service = GenerationService(content_generator=ReadyImageContentGenerator())
+    initial = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    conflicted = replace(
+        initial,
+        title="stale conflicting copy",
+        artifact_status="failed",
+        artifact_storage_key=None,
+        artifact_public_url=None,
+        artifact_sha256=None,
+        artifact_content_type=None,
+        artifact_error_code="artifact_hash_conflict",
+        artifact_published_at=None,
+    )
+
+    retried = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+        existing_candidates=[conflicted],
+    ).content_candidates[0]
+
+    assert retried.title == "이번 주말 호텔 특가"
+    assert retried.artifact_status == "published"
+    assert retried.artifact_error_code is None
+
+
+def test_artifact_retry_preserves_contract_creative_metadata() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generation_id = "generation_banner_001_0123456789abcdef"
+    service = GenerationService(content_generator=ReadyImageContentGenerator())
+    initial = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    contract_siblings = {
+        "model": {"provider": "fixture", "model_version": "model-v1"},
+        "lineage": {
+            "document_ids": ["doc-1"],
+            "provider_request_id": "provider-request-1",
+        },
+        "image": {
+            "prompt": "stale prompt",
+            "public_url": "https://stale.example.test/image.png",
+            "canary": "preserve-image",
+        },
+        "guardrail": {"version": "generation-v1", "status": "passed"},
+        "extension": {"nested": "preserve-extension"},
+    }
+    resumable = replace(
+        initial,
+        metadata_json={
+            **initial.metadata_json,
+            "top_level_canary": "preserve-top-level",
+            "creative": {
+                **initial.metadata_json["creative"],
+                **contract_siblings,
+                "artifact": {
+                    "artifact_status": "failed",
+                    "error_code": "previous_failure",
+                    "published_at": "2025-01-01T00:00:00+00:00",
+                    "vendor_extension": {"preserve": True},
+                },
+            },
+        },
+        artifact_status="failed",
+        artifact_storage_key=None,
+        artifact_public_url=None,
+        artifact_sha256=None,
+        artifact_content_type=None,
+        artifact_error_code="previous_failure",
+        artifact_published_at=None,
+    )
+
+    retried = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+        existing_candidates=[resumable],
+    ).content_candidates[0]
+
+    assert retried.metadata_json["top_level_canary"] == "preserve-top-level"
+    for key, value in contract_siblings.items():
+        if key == "image":
+            continue
+        assert retried.metadata_json["creative"][key] == value
+    assert retried.metadata_json["creative"]["image"] == {
+        "prompt": initial.image_prompt,
+        "public_url": initial.image_url,
+        "canary": "preserve-image",
+    }
+    assert retried.metadata_json["creative"]["artifact"]["artifact_status"] == (
+        "published"
+    )
+    assert "error_code" not in retried.metadata_json["creative"]["artifact"]
+    assert retried.metadata_json["creative"]["artifact"]["vendor_extension"] == {
+        "preserve": True
+    }
+    assert retried.metadata_json["creative"]["artifact"]["published_at"] == (
+        retried.artifact_published_at.isoformat()
+    )
+
+
+def test_failed_artifact_retry_preserves_contract_creative_metadata() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generation_id = "generation_banner_001_0123456789abcdef"
+    initial = GenerationService(
+        content_generator=ReadyImageContentGenerator()
+    ).execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    resumable = replace(
+        initial,
+        metadata_json={
+            **initial.metadata_json,
+            "creative": {
+                **initial.metadata_json["creative"],
+                "model": {"provider": "fixture"},
+                "lineage": {"document_ids": ["doc-1"]},
+                "guardrail": {"status": "passed"},
+                "artifact": {
+                    **initial.metadata_json["creative"]["artifact"],
+                    "vendor_extension": {"preserve": True},
+                },
+            },
+        },
+        artifact_status="failed",
+        artifact_error_code="previous_failure",
+        artifact_published_at=None,
+    )
+
+    with pytest.raises(ArtifactFinalizationError) as exc_info:
+        GenerationService(
+            content_generator=ReadyImageContentGenerator(),
+            artifact_publisher=AlwaysFailArtifactPublisher(),
+        ).execute_durable(
+            generation_id=generation_id,
+            prompt_inputs=[prompt_input],
+            existing_candidates=[resumable],
+        )
+
+    failed = exc_info.value.candidate
+    assert failed.metadata_json["creative"]["model"] == {"provider": "fixture"}
+    assert failed.metadata_json["creative"]["lineage"] == {
+        "document_ids": ["doc-1"]
+    }
+    assert failed.metadata_json["creative"]["guardrail"] == {"status": "passed"}
+    assert failed.metadata_json["creative"]["artifact"] == {
+        "creative_format": "banner_html",
+        "artifact_status": "failed",
+        "error_code": "artifact_publish_failed",
+        "vendor_extension": {"preserve": True},
+    }
 
 
 def test_generation_service_can_generate_response_without_repositories() -> None:
@@ -211,7 +792,7 @@ def test_generation_service_can_generate_response_without_repositories() -> None
     )
 
 
-def test_generation_service_enqueues_deferred_banner_image_generation() -> None:
+def test_generation_service_does_not_defer_image_after_artifact_finalization() -> None:
     content_candidate_repository = FakeContentCandidateRepository()
     image_generation_scheduler = FakeImageGenerationScheduler()
     service = GenerationService(
@@ -225,16 +806,11 @@ def test_generation_service_enqueues_deferred_banner_image_generation() -> None:
         "published",
         "published",
     ]
-    assert image_generation_scheduler.jobs == [
-        ImageGenerationJob(
-            content_id="content_banner_repeat_hotel_001",
-            image_prompt=content_candidate_repository.saved[0].image_prompt or "",
-        ),
-        ImageGenerationJob(
-            content_id="content_banner_repeat_hotel_002",
-            image_prompt=content_candidate_repository.saved[1].image_prompt or "",
-        ),
-    ]
+    assert image_generation_scheduler.jobs == []
+    assert all(
+        candidate.image_generation_status == "completed"
+        for candidate in content_candidate_repository.saved
+    )
 
 
 def test_generation_service_uses_new_generation_id_for_regeneration() -> None:
@@ -299,6 +875,64 @@ def test_generation_service_requires_confirmed_target_segments_from_reader() -> 
 
     with pytest.raises(GenerationInputUnavailable, match="promotion_target_segments"):
         service.generate(generation_request(content_option_count=1))
+
+    assert generation_run_repository.saved == []
+    assert content_candidate_repository.saved == []
+
+
+def test_generation_service_generates_only_requested_segment_ids_and_snapshots_them() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    segment_id="seg_family_trip",
+                    content_slug="family_trip",
+                ),
+                target_segment_input(
+                    segment_id="seg_mobile_user",
+                    content_slug="mobile_user",
+                ),
+            ]
+        ),
+    )
+
+    response = service.generate(
+        generation_request(
+            segment_ids=["seg_mobile_user"],
+            content_option_count=1,
+        )
+    )
+
+    assert [
+        candidate.attribution.segment_id for candidate in response.content_candidates
+    ] == ["seg_mobile_user"]
+    assert generation_run_repository.saved[0].input_json["target_segment_ids"] == [
+        "seg_mobile_user"
+    ]
+
+
+def test_generation_service_rejects_requested_segment_ids_missing_from_reader() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [target_segment_input(segment_id="seg_family_trip")]
+        ),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match="segment_ids"):
+        service.generate(
+            generation_request(
+                segment_ids=["seg_family_trip", "seg_mobile_user"],
+                content_option_count=1,
+            )
+        )
 
     assert generation_run_repository.saved == []
     assert content_candidate_repository.saved == []
@@ -389,11 +1023,18 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         )
     )
 
-    assert result.generation_id == "generation_banner_001_loop_2"
+    assert result.generation_id == (
+        "generation_banner_001_loop_2_1d7b63967183"
+    )
     assert result.generated_segment_ids == ["seg_near_checkin"]
     assert result.status == "completed"
     assert len(generation_run_repository.saved) == 1
     generation_run = generation_run_repository.saved[0]
+    assert generation_run.input_json["schema_version"] == "generation.request.v1"
+    assert generation_run.idempotency_key == (
+        "loopad-internal:next-loop:generation_banner_001_loop_2_1d7b63967183"
+    )
+    assert len(generation_run.request_fingerprint or "") == 64
     assert generation_run.input_json["target_segment_ids"] == ["seg_near_checkin"]
     assert generation_run.input_json["content_option_count"] == 1
     assert generation_run.input_json["next_loop"] == {
@@ -401,6 +1042,9 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         "source_promotion_run_id": "prun_banner_001_loop_1",
         "source_generation_id": "generation_banner_001",
         "focus_segment_ids": ["seg_near_checkin"],
+        "content_option_count": 1,
+        "attempt_no": None,
+        "candidate_status": "approved",
     }
     assert len(content_candidate_repository.saved) == 1
     assert {
@@ -410,8 +1054,126 @@ def test_generation_service_generates_next_loop_focus_candidate_as_approved() ->
         candidate.status for candidate in content_candidate_repository.saved
     } == {"approved"}
     candidate = content_candidate_repository.saved[0]
-    assert candidate.content_id == "content_banner_near_checkin_loop_2_001"
-    assert candidate.content_option_id == "banner_near_checkin_loop_2_option_001"
+    assert candidate.content_id == (
+        "content_banner_near_checkin_loop_2_1d7b63967183_001"
+    )
+    assert candidate.content_option_id == (
+        "banner_near_checkin_loop_2_1d7b63967183_option_001"
+    )
+
+
+def test_focus_generation_persists_failed_artifact_candidate() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                )
+            ]
+        ),
+        content_generator=MissingImageUrlContentGenerator(),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+        )
+    )
+
+    assert result.status == "failed"
+    assert generation_run_repository.saved[0].status == "failed"
+    assert len(content_candidate_repository.saved) == 1
+    failed_candidate = content_candidate_repository.saved[0]
+    assert failed_candidate.artifact_status == "failed"
+    assert failed_candidate.artifact_error_code == "artifact_render_failed"
+
+
+def test_next_loop_generation_id_separates_and_bounds_source_lineage() -> None:
+    common = {
+        "promotion_id": "promo_" + ("long_hotel_promotion_" * 10),
+        "loop_count": 2,
+    }
+
+    first = _next_loop_generation_id(
+        **common,
+        source_promotion_run_id="prun_scope_a",
+    )
+    second = _next_loop_generation_id(
+        **common,
+        source_promotion_run_id="prun_scope_b",
+    )
+
+    assert first != second
+    assert len(first) <= 100
+    assert len(second) <= 100
+
+
+def test_generation_service_generates_attempt_aware_multi_draft_focus_candidates() -> None:
+    generation_run_repository = FakeGenerationRunRepository()
+    content_candidate_repository = FakeContentCandidateRepository()
+    service = GenerationService(
+        generation_run_repository=generation_run_repository,
+        content_candidate_repository=content_candidate_repository,
+        generation_input_reader=StaticGenerationInputReader(
+            [
+                target_segment_input(
+                    analysis_id="analysis_banner_001_loop_2",
+                    segment_id="seg_near_checkin",
+                    content_slug="near_checkin",
+                )
+            ]
+        ),
+    )
+
+    result = service.generate_focus(
+        NextLoopFocusGenerationRequest(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_banner_001_loop_2",
+            focus_segment_ids=["seg_near_checkin"],
+            loop_count=2,
+            source_promotion_run_id="prun_banner_001_loop_1",
+            source_generation_id="generation_banner_001",
+            operator_instruction="Stress breakfast.",
+            content_option_count=3,
+            attempt_no=1,
+            candidate_status=ContentCandidateStatus.DRAFT,
+        )
+    )
+
+    assert result.generation_id == (
+        "generation_banner_001_loop_2_1d7b63967183_attempt_1"
+    )
+    assert result.generated_segment_ids == ["seg_near_checkin"]
+    assert len(content_candidate_repository.saved) == 3
+    assert {
+        candidate.status for candidate in content_candidate_repository.saved
+    } == {"draft"}
+    assert {
+        candidate.content_id for candidate in content_candidate_repository.saved
+    } == {
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_001",
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_002",
+        "content_banner_near_checkin_loop_2_1d7b63967183_attempt_1_003",
+    }
+    generation_run = generation_run_repository.saved[0]
+    assert generation_run.content_option_count == 3
+    assert generation_run.input_json["next_loop"]["attempt_no"] == 1
+    assert generation_run.input_json["next_loop"]["candidate_status"] == "draft"
 
 
 def test_generation_service_bounds_long_next_loop_content_identifiers() -> None:
@@ -453,11 +1215,11 @@ def test_generation_service_bounds_long_next_loop_content_identifiers() -> None:
     candidate = content_candidate_repository.saved[0]
     assert candidate.content_id == (
         "content_email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
-        "target_destination_affi_6c87bac404eb7fd3_001"
+        "target_destination_affi_f1e2c89951c932fa_001"
     )
     assert candidate.content_option_id == (
         "email_ai_raw_promo_864e3031_5e33_4715_ad00_17_1_"
-        "target_destination_affi_6c87bac404eb7fd3_option_001"
+        "target_destination_affi_f1e2c89951c932fa_option_001"
     )
     assert len(candidate.content_id) == 100
     assert len(candidate.content_option_id) == 99
@@ -534,6 +1296,7 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
     }
     assert generation_run.generation_report_json == {
         "status": "failed",
+        "schema_version": "generation.request.v1",
         "content_candidate_count": 0,
         "target_segment_count": 1,
         "prompt_builder": "dec-c2.v4",
@@ -1069,8 +1832,14 @@ class StaticGenerationInputReader:
         self,
         request: GenerationRequest,
     ) -> list[TargetSegmentPromptInput]:
-        del request
-        return list(self._target_segments)
+        if request.segment_ids is None:
+            return list(self._target_segments)
+        requested_ids = set(request.segment_ids)
+        return [
+            target_segment
+            for target_segment in self._target_segments
+            if target_segment.segment_id in requested_ids
+        ]
 
     def list_focus_target_segment_inputs(
         self,
@@ -1087,9 +1856,210 @@ class FailingContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index
+        del prompt_input, prompt_result, option_index, artifact_identity
         raise RuntimeError("provider failed with secret-token-value")
+
+
+class FailSecondArtifactOncePublisher:
+    def __init__(self) -> None:
+        self._delegate = StaticCreativeArtifactPublisher()
+        self._failed = False
+        self.content_ids: list[str] = []
+
+    def publish(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        content_values: dict[str, str | None],
+    ) -> dict[str, object]:
+        self.content_ids.append(identity.content_id)
+        if identity.content_id.endswith("_002") and not self._failed:
+            self._failed = True
+            raise TimeoutError("temporary S3 timeout with secret details")
+        return self._delegate.publish(
+            identity=identity,
+            channel=channel,
+            content_values=content_values,
+        )
+
+
+class AlwaysFailArtifactPublisher:
+    def publish(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        channel: ContentChannel,
+        content_values: dict[str, str | None],
+    ) -> dict[str, object]:
+        del identity, channel, content_values
+        raise TimeoutError("temporary artifact timeout")
+
+
+class ReadyImageContentGenerator:
+    version = "ready-image-test.v1"
+
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, artifact_identity
+        return GeneratedContent(
+            title="이번 주말 호텔 특가",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt="hotel room, no visible text",
+            image_url="https://assets.example.test/banner.png",
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+
+class ReadyStoredImageContentGenerator:
+    version = "ready-stored-image-test.v1"
+
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, artifact_identity
+        stored = StoredAsset(
+            storage_key="genai/project/promotion/generation/content/image.png",
+            public_url="https://assets.example.test/banner.png",
+            sha256="a" * 64,
+            bytes=1234,
+            content_type="image/png",
+        )
+        return GeneratedContent(
+            title="이번 주말 호텔 특가",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt="hotel room, no visible text",
+            image_url=stored.public_url,
+            image_artifact=stored,
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+
+class RecoveredImageContentGenerator:
+    version = "recovered-image-test.v1"
+
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, artifact_identity
+        stored = StoredAsset(
+            storage_key="genai/project/promotion/generation/content/image.png",
+            public_url="https://assets.example.test/banner.png",
+            sha256="b" * 64,
+            bytes=456,
+            content_type="image/png",
+        )
+        return GeneratedContent(
+            title="이번 주말 호텔 특가",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt=recovered_image_prompt(
+                image_prompt_sha256("original private prompt")
+            ),
+            image_url=stored.public_url,
+            image_artifact=stored,
+            landing_url="https://demo-stay.example.com/summer",
+            artifact_renderer_version="generation.renderer.old",
+            artifact_template_version="banner.overlay.old",
+        )
+
+
+class CheckpointedStagedContentGenerator:
+    version = "checkpointed-staged-test.v1"
+
+    def __init__(self) -> None:
+        self.content_calls = 0
+        self.image_calls = 0
+        self.next_prompt = "canonical prompt A"
+        self.images: dict[str, StoredAsset] = {}
+
+    def generate_source(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, artifact_identity
+        self.content_calls += 1
+        return GeneratedContent(
+            title="이번 주말 호텔 특가",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt=self.next_prompt,
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+    def ensure_image(
+        self,
+        *,
+        channel: ContentChannel,
+        content: GeneratedContent,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        assert channel == ContentChannel.ONSITE_BANNER
+        prompt_digest = image_prompt_sha256(content.image_prompt)
+        stored = self.images.get(prompt_digest)
+        if stored is None:
+            self.image_calls += 1
+            stored = StoredAsset(
+                storage_key=(
+                    f"genai/{artifact_identity.project_id}/"
+                    f"{artifact_identity.promotion_id}/"
+                    f"{artifact_identity.generation_id}/"
+                    f"{artifact_identity.content_id}/image.{prompt_digest}.png"
+                ),
+                public_url=f"https://assets.example.test/{prompt_digest}.png",
+                sha256="c" * 64,
+                bytes=789,
+                content_type="image/png",
+            )
+            self.images[prompt_digest] = stored
+        return replace(
+            content,
+            image_url=stored.public_url,
+            image_artifact=stored,
+        )
+
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        return self.ensure_image(
+            channel=prompt_input.promotion.channel,
+            content=self.generate_source(
+                prompt_input=prompt_input,
+                prompt_result=prompt_result,
+                option_index=option_index,
+                artifact_identity=artifact_identity,
+            ),
+            artifact_identity=artifact_identity,
+        )
 
 
 class MissingImagePromptContentGenerator:
@@ -1099,12 +2069,32 @@ class MissingImagePromptContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        artifact_identity: ArtifactIdentity,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index
+        del prompt_input, prompt_result, option_index, artifact_identity
         return GeneratedContent(
             title="Hotel rooms ready this weekend",
             body="Compare refundable hotel stays before rooms run out.",
             cta="View hotel deals",
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+
+class MissingImageUrlContentGenerator:
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, artifact_identity
+        return GeneratedContent(
+            title="Hotel rooms ready this weekend",
+            body="Compare refundable hotel stays before rooms run out.",
+            cta="View hotel deals",
+            image_prompt="hotel room, no visible text",
             landing_url="https://demo-stay.example.com/summer",
         )
 

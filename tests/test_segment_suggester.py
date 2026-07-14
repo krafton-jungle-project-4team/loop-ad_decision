@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 import pytest
 
+from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
     compile_raw_event_intent,
@@ -16,6 +17,10 @@ from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
     UserBehaviorVectorRecord,
+)
+from app.analysis.segment_performance import (
+    SegmentPerformanceFeatures,
+    build_segment_performance_predictor,
 )
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
@@ -65,6 +70,26 @@ class FakeRawEventSignalRepository:
             }
         )
         return self.profiles
+
+
+class CandidateTypePerformancePredictor:
+    version = "test.goal-performance.v1"
+    method = "test_candidate_type_rates"
+    calibration_status = "calibrated"
+
+    def __init__(self, rates: Mapping[str, float]) -> None:
+        self.rates = rates
+
+    def predict(self, features: SegmentPerformanceFeatures) -> float:
+        return self.rates.get(features.candidate_type, 0.01)
+
+    def metadata(self) -> Mapping[str, Any]:
+        return {
+            "model_version": self.version,
+            "method": self.method,
+            "calibration_status": self.calibration_status,
+            "outcome_days": 30,
+        }
 
 
 def promotion_record(
@@ -281,7 +306,8 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
     assert all(segment.rule_json["source"] == "raw_event_intent" for segment in segments)
     assert all(segment.profile_json["source"] == "raw_event_intent" for segment in segments)
-    assert all("rank_role" in segment.profile_json for segment in segments)
+    assert all("strategy_role" in segment.profile_json for segment in segments)
+    assert all("rank_role" not in segment.profile_json for segment in segments)
     assert all("display_copy" in segment.profile_json for segment in segments)
     assert all("performance_estimate" in segment.profile_json for segment in segments)
     assert all(
@@ -291,7 +317,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
     assert all(
         segment.profile_json["display_copy"]["performance_estimate"]["label"]
-        == "예상 전환율"
+        == "예상 예약 전환율"
         for segment in segments
     )
     assert all(
@@ -342,11 +368,13 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
                 "target_repeat_1",
                 hotel_search_count=4,
                 destination_match_count=3,
+                destination_values=("제주 제주",),
             ),
             raw_signal(
                 "target_repeat_2",
                 hotel_search_count=3,
                 destination_match_count=2,
+                destination_values=("jeju 제주 제주",),
             ),
             raw_signal(
                 "general_1",
@@ -526,7 +554,7 @@ def test_calibration_candidate_pool_keeps_overlapping_candidate_types() -> None:
     )
 
 
-def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -> None:
+def test_raw_event_suggester_uses_all_matching_users_until_ratio_is_backtested() -> None:
     vector_reader = FakeUserBehaviorVectorRepository([])
     raw_reader = FakeRawEventSignalRepository(
         [
@@ -555,12 +583,89 @@ def test_raw_event_suggester_distinguishes_matching_and_selected_user_counts() -
 
     assert len(segments) == 1
     segment = segments[0]
-    assert segment.sample_size == 160
+    assert segment.sample_size == 170
     assert segment.total_eligible_user_count == 170
     assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 170
     assert segment.profile_json["display_copy"]["audience_summary"] == (
-        "분석 대상 170명 중 조건 일치 170명 · 상위 160명 사용"
+        "분석 대상 170명 중 조건 일치 170명 · "
+        "조건 일치자 전체를 추천 대상으로 사용"
     )
+    assert segment.profile_json["display_copy"]["audience"] == {
+        "total_eligible_user_count": 170,
+        "matching_user_count": 170,
+        "selected_user_count": 170,
+        "selected_user_ratio": 1.0,
+        "matching_user_ratio": 1.0,
+        "selection_ratio_within_matching": 1.0,
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v2",
+            "method": "all_matching",
+            "configured_ratio": 1.0,
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+            "artifact_hash": None,
+            "fallback_reason": "artifact_missing",
+        },
+    }
+
+
+def test_raw_event_suggester_applies_validated_ratio_to_behavior_order() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                f"hotel_user_{index:03d}",
+                hotel_search_count=index + 1,
+                hotel_detail_view_count=1,
+            )
+            for index in range(10)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        audience_selection_policy=fixed_ratio_audience_selection_policy(
+            goal_metric="booking_conversion_rate",
+            selected_ratio=0.4,
+            minimum_selected_user_count=2,
+            policy_version="test-selection-policy.v1",
+        ),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="호텔 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.rule_json["candidate_user_ids"] == [
+        "hotel_user_009",
+        "hotel_user_008",
+        "hotel_user_007",
+        "hotel_user_006",
+    ]
+    assert segment.sample_size == 4
+    audience = segment.profile_json["audience"]
+    assert audience["matching_user_count"] == 10
+    assert audience["selected_user_count"] == 4
+    assert audience["selection_ratio_within_matching"] == 0.4
+    assert audience["selection_limited"] is True
+    assert audience["selection_policy"]["method"] == (
+        "top_behavior_strength_ratio"
+    )
+    assert audience["selection_policy"]["configured_ratio"] == 0.4
+    assert segment.profile_json["signal_metrics"]["profile_count"] == 4
+    assert segment.profile_json["signal_metrics"]["matching_profile_count"] == 10
 
 
 def test_raw_event_suggester_does_not_repeat_the_same_audience_across_ranks() -> None:
@@ -657,7 +762,7 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     assert performance_estimate["label"] == "예상 유입률"
     assert performance_estimate["metric"] == "inflow_rate"
     assert performance_estimate["basis_label"] == (
-        "과거 행동 기반 프로모션 조건 일치 성과 추정"
+        "최근 클릭·랜딩 행동을 전체 고객 기준으로 보정한 추정치"
     )
     assert performance_estimate["calibration_status"] == (
         "historical_signal_estimate"
@@ -665,6 +770,170 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     assert segments[0].profile_json["display_copy"]["performance_estimate"] == (
         performance_estimate
     )
+
+
+def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> None:
+    profiles = [
+        *[
+            raw_signal(
+                f"intent_{index}",
+                hotel_search_count=2,
+                hotel_detail_view_count=1,
+            )
+            for index in range(6)
+        ],
+        *[
+            raw_signal(
+                f"recovery_{index}",
+                booking_start_count=1,
+            )
+            for index in range(6)
+        ],
+    ]
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=FakeRawEventSignalRepository(profiles),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=CandidateTypePerformancePredictor(
+            {
+                "intent_matched": 0.18,
+                "funnel_recovery": 0.42,
+            }
+        ),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="숙소 예약 전환을 높이는 프로모션",
+        )
+    )
+
+    assert [segment.rule_json["candidate_type"] for segment in segments] == [
+        "funnel_recovery",
+        "intent_matched",
+    ]
+    first_profile = segments[0].profile_json
+    assert first_profile["score_components"]["weights"][
+        "expected_goal_performance"
+    ] == 0.70
+    assert first_profile["score_components"]["primary_component"] == (
+        "expected_goal_performance"
+    )
+    estimate = first_profile["performance_estimate"]
+    assert estimate["label"] == "예상 예약 전환율"
+    assert estimate["value"] == 0.42
+    assert estimate["window_days"] == 30
+    assert estimate["window_label"] == "향후 30일 내 프로모션 조건 일치 예약"
+    assert estimate["confidence_label"] == "high"
+    display_copy = first_profile["display_copy"]
+    assert display_copy["audience"] == {
+        "total_eligible_user_count": 12,
+        "matching_user_count": 6,
+        "selected_user_count": 6,
+        "selected_user_ratio": 0.5,
+        "matching_user_ratio": 0.5,
+        "selection_ratio_within_matching": 1.0,
+        "selection_limited": False,
+        "selection_basis": "candidate_condition_match",
+        "selection_limit": None,
+        "selected_user_role": "recommended_audience",
+        "selection_policy": {
+            "version": "dec.segment-audience-selection.v2",
+            "method": "all_matching",
+            "configured_ratio": 1.0,
+            "applied_ratio": 1.0,
+            "calibration_status": "pending_backtest",
+            "artifact_hash": None,
+            "fallback_reason": "artifact_missing",
+        },
+    }
+    assert display_copy["strategy_role"] == "예약 이탈 회수형"
+    assert display_copy["strength_summary"]
+    assert display_copy["tradeoff_summary"]
+    assert "recommendation_rank" not in display_copy
+    assert "rank_comparison" not in display_copy
+    assert "difference_summary" not in display_copy
+    assert first_profile["portfolio_position"] == 1
+    assert first_profile["selection_basis"]["method"] == (
+        "diversified_candidate_portfolio"
+    )
+
+
+def test_raw_event_suggester_keeps_tier_as_candidate_context_not_rank() -> None:
+    profiles = [
+        *[
+            raw_signal(
+                f"destination_{index}",
+                hotel_search_count=3,
+                hotel_detail_view_count=2,
+                destination_match_count=3,
+                destination_values=("jeju",),
+            )
+            for index in range(4)
+        ],
+        *[
+            raw_signal(
+                f"responsive_{index}",
+                promotion_impression_count=3,
+                promotion_click_count=1,
+                campaign_landing_count=1,
+            )
+            for index in range(40)
+        ],
+    ]
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=FakeRawEventSignalRepository(profiles),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=CandidateTypePerformancePredictor(
+            {
+                "target_destination_affinity": 0.09,
+                "promotion_responsive": 0.05,
+            }
+        ),
+        vector_pool_limit=100,
+        vector_sample_limit=100,
+        max_suggested_segments=2,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 랜딩 유입을 높이는 프로모션",
+            goal_metric="inflow_rate",
+        )
+    )
+
+    assert [segment.rule_json["candidate_type"] for segment in segments] == [
+        "promotion_responsive",
+        "target_destination_affinity",
+    ]
+    primary_profile = segments[0].profile_json
+    small_profile = segments[1].profile_json
+    assert primary_profile["recommendation_tier"] == "primary"
+    assert primary_profile["rank_eligible"] is True
+    assert primary_profile["portfolio_position"] == 1
+    assert "recommendation_rank" not in primary_profile
+    assert primary_profile["performance_estimate"]["expected_count"] == pytest.approx(
+        primary_profile["performance_estimate"]["value"] * 40
+    )
+    assert primary_profile["performance_estimate"]["expected_count_label"] == (
+        "예상 유입 인원"
+    )
+    assert small_profile["recommendation_tier"] == "small_high_intent"
+    assert small_profile["rank_eligible"] is False
+    assert small_profile["portfolio_position"] == 2
+    assert "recommendation_rank" not in small_profile
+    assert small_profile["performance_estimate"]["expected_count"] == pytest.approx(
+        small_profile["performance_estimate"]["value"] * 4
+    )
+    assert "표본 신뢰도" in small_profile["recommendation_tier_reason"]
+    assert "rank_comparison" not in small_profile["display_copy"]
+    assert small_profile["display_copy"]["tradeoff_summary"]
 
 
 def test_raw_event_suggester_uses_destination_context_for_expected_conversion_rate() -> None:
@@ -711,7 +980,7 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     )
 
     performance_estimate = segments[0].profile_json["performance_estimate"]
-    assert performance_estimate["label"] == "예상 전환율"
+    assert performance_estimate["label"] == "예상 예약 전환율"
     assert performance_estimate["value"] < 1.0
     assert performance_estimate["formatted"] != "100.0%"
     assert performance_estimate["observed_value"] == 1.0
@@ -723,6 +992,215 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     score_components = segments[0].profile_json["score_components"]
     assert score_components["predicted_goal_rate"] < 1.0
     assert score_components["expected_goal_performance"] == 1.0
+
+
+def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> None:
+    user_ids = [f"extreme_{index}" for index in range(4)]
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [user_vector(user_id, vector_values(8)) for user_id in user_ids]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                user_id,
+                hotel_search_count=20,
+                hotel_detail_view_count=20,
+                promotion_impression_count=5,
+                promotion_click_count=2,
+                campaign_landing_count=3,
+                booking_start_count=5,
+                booking_complete_count=4,
+                deal_event_count=10,
+                destination_match_count=30,
+                season_match_count=1,
+                destination_values=("jeju",),
+                checkin_dates=("2026-07-15",),
+            )
+            for user_id in user_ids
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        performance_predictor=build_segment_performance_predictor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    estimate = segments[0].profile_json["performance_estimate"]
+    adjustment = estimate["prediction_adjustment"]
+    assert adjustment["raw_model_value"] > adjustment["adjusted_value"]
+    assert adjustment["distribution_guarded_value"] > (
+        adjustment["adjusted_value"]
+    )
+    assert adjustment["candidate_sample_size"] == 4
+    assert adjustment["out_of_distribution_feature_count"] > 0
+    assert estimate["value"] == adjustment["adjusted_value"]
+    assert estimate["value"] < 0.2
+    assert estimate["confidence_label"] == "low"
+    assert "학습 범위" not in estimate["confidence_reason"]
+    assert "분포" not in estimate["confidence_reason"]
+    assert segments[0].profile_json["recommendation_tier"] == "small_high_intent"
+    assert segments[0].profile_json["minimum_primary_sample_size"] == 30
+    assert segments[0].profile_json["portfolio_position"] == 1
+    assert "recommendation_rank" not in segments[0].profile_json
+
+
+def test_supported_candidate_keeps_internal_distribution_diagnostics_out_of_user_copy() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"supported_extreme_{index}",
+            hotel_search_count=20,
+            hotel_detail_view_count=20,
+            booking_start_count=5,
+            booking_complete_count=4,
+            deal_event_count=10,
+            destination_match_count=30,
+            season_match_count=1,
+            destination_values=("jeju",),
+            checkin_dates=("2026-07-15",),
+        )
+        for index in range(40)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    destination_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "target_destination_affinity"
+    )
+    estimate = destination_segment.profile_json["performance_estimate"]
+    adjustment = estimate["prediction_adjustment"]
+    assert adjustment["candidate_sample_size"] == 40
+    assert adjustment["out_of_distribution_feature_count"] > 0
+    assert estimate["confidence_label"] == "high"
+    assert "학습 범위" not in estimate["confidence_reason"]
+    assert "분포" not in estimate["confidence_reason"]
+
+
+def test_booking_model_excludes_candidate_type_without_training_examples() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(160)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    assert segments == []
+
+
+def test_booking_fallback_blocks_responsive_candidate_but_calibration_can_collect_it() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_fallback_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(20)
+    ]
+
+    ranked = generate_raw_event_segment_definitions(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        max_suggested_segments=3,
+        min_sample_size=2,
+    )
+    calibration_pool = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        enforce_prediction_support=False,
+    )
+
+    assert ranked == []
+    assert [
+        segment.rule_json["candidate_type"] for segment in calibration_pool
+    ] == ["promotion_responsive"]
+
+
+def test_inflow_metric_keeps_promotion_responsive_candidate() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 랜딩 유입을 높인다.",
+        goal_metric="inflow_rate",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(20)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    responsive_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "promotion_responsive"
+    )
+    estimate = responsive_segment.profile_json["performance_estimate"]
+    assert estimate["metric"] == "inflow_rate"
+    assert estimate["calibration_status"] == "historical_signal_estimate"
 
 
 def test_raw_event_suggester_requests_vector_window_signals() -> None:

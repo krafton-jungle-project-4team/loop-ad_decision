@@ -8,6 +8,20 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
+GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
+GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
+OPENAI_CONTENT_MODEL = "gpt-4o-mini"
+GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
+GENERATION_WORKER_MAX_CONCURRENCY = 2
+GENERATION_POLL_INTERVAL_SECONDS = 1
+GENERATION_IDLE_POLL_INTERVAL_SECONDS = 30
+GENERATION_LEASE_SECONDS = 180
+GENERATION_HEARTBEAT_SECONDS = 30
+GENERATION_MAX_RETRIES = 3
+GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
+GENERATION_PROVIDER_TIMEOUT_SECONDS = 30
+GENERATION_DB_OPERATION_TIMEOUT_SECONDS = 5
+GENERATION_SHUTDOWN_GRACE_SECONDS = 20
 
 
 class SettingsError(RuntimeError):
@@ -37,8 +51,23 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
-    openai_content_model: str | None = None
-    gemini_image_model: str | None = None
+    genai_assets_public_base_url: str = GENAI_ASSETS_PUBLIC_BASE_URL
+    openai_content_model: str = OPENAI_CONTENT_MODEL
+    gemini_image_model: str = GEMINI_IMAGE_MODEL
+    generation_worker_max_concurrency: int = GENERATION_WORKER_MAX_CONCURRENCY
+    generation_poll_interval_seconds: int = GENERATION_POLL_INTERVAL_SECONDS
+    generation_idle_poll_interval_seconds: int = GENERATION_IDLE_POLL_INTERVAL_SECONDS
+    generation_lease_seconds: int = GENERATION_LEASE_SECONDS
+    generation_heartbeat_seconds: int = GENERATION_HEARTBEAT_SECONDS
+    generation_max_retries: int = GENERATION_MAX_RETRIES
+    generation_retry_backoff_seconds: tuple[int, ...] = (
+        GENERATION_RETRY_BACKOFF_SECONDS
+    )
+    generation_provider_timeout_seconds: int = GENERATION_PROVIDER_TIMEOUT_SECONDS
+    generation_db_operation_timeout_seconds: int = (
+        GENERATION_DB_OPERATION_TIMEOUT_SECONDS
+    )
+    generation_shutdown_grace_seconds: int = GENERATION_SHUTDOWN_GRACE_SECONDS
     segment_performance_model_path: str | None = None
 
 
@@ -77,7 +106,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             f"LOOPAD_SERVICE_ID must be {DECISION_SERVICE_ID!r}, got {service_id!r}"
         )
 
-    return Settings(
+    settings = Settings(
         env=_read_required(source, "LOOPAD_ENV"),
         service_id=service_id,
         port=_read_positive_int(source, "PORT"),
@@ -98,13 +127,13 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
-        openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
-        gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
         segment_performance_model_path=_read_optional(
             source,
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
         ),
     )
+    _validate_generation_settings(settings)
+    return settings
 
 
 def load_local_dotenv() -> None:
@@ -131,3 +160,39 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
     if value <= 0:
         raise SettingsError(f"{name} must be a positive integer")
     return value
+
+
+def _validate_generation_settings(settings: Settings) -> None:
+    public_prefix = settings.genai_assets_base_prefix.strip("/")
+    source_prefix = GENAI_SOURCE_MANIFEST_PREFIX.strip("/")
+    if (
+        not public_prefix
+        or not source_prefix
+        or source_prefix == public_prefix
+        or source_prefix.startswith(f"{public_prefix}/")
+    ):
+        raise SettingsError(
+            "GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
+            "LOOPAD_GENAI_ASSETS_BASE_PREFIX"
+        )
+    if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
+        raise SettingsError(
+            "GENERATION_HEARTBEAT_SECONDS must be less than "
+            "GENERATION_LEASE_SECONDS"
+        )
+    if len(settings.generation_retry_backoff_seconds) < settings.generation_max_retries:
+        raise SettingsError(
+            "GENERATION_RETRY_BACKOFF_SECONDS must provide at least "
+            "GENERATION_MAX_RETRIES entries"
+        )
+    heartbeat_budget = (
+        settings.generation_heartbeat_seconds
+        + 2
+        * (settings.generation_worker_max_concurrency + 1)
+        * settings.generation_db_operation_timeout_seconds
+    )
+    if heartbeat_budget >= settings.generation_lease_seconds:
+        raise SettingsError(
+            "GENERATION_HEARTBEAT_SECONDS plus coordinator DB timeout budget "
+            "must be less than GENERATION_LEASE_SECONDS"
+        )

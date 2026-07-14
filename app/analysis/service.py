@@ -5,7 +5,7 @@ import re
 import uuid
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Mapping, Protocol, Sequence
+from typing import Any, Literal, Mapping, Protocol, Sequence
 
 from app.analysis.booking_model import (
     BookingPropensityModel,
@@ -42,6 +42,8 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 MAX_DEFAULT_TARGET_SEGMENTS = 4
+
+TargetSegmentStatus = Literal["planned", "approved"]
 
 CUSTOM_SEGMENT_SOURCES = {"custom_chatkit", "manual_rule"}
 
@@ -360,6 +362,7 @@ class NextLoopFocusAnalysisRequest:
     loop_count: int
     source_promotion_run_id: str
     source_failed_ad_experiment_ids: Sequence[str]
+    attempt_no: int = 1
     operator_instruction: str | None = None
 
 
@@ -368,6 +371,7 @@ class NextLoopAnalysisContext:
     loop_count: int
     source_promotion_run_id: str
     source_failed_ad_experiment_ids: Sequence[str]
+    attempt_no: int
 
 
 @dataclass(frozen=True)
@@ -438,6 +442,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=True,
             persist_target_segments=False,
             persist_segment_suggestions=True,
+            target_status="planned",
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -468,6 +473,7 @@ class PromotionAnalysisService:
             refresh_segment_suggestions=False,
             persist_target_segments=True,
             persist_segment_suggestions=False,
+            target_status="approved",
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info(
@@ -480,7 +486,11 @@ class PromotionAnalysisService:
     def analyze_focus(
         self,
         request: NextLoopFocusAnalysisRequest,
+        *,
+        target_status: TargetSegmentStatus = "planned",
     ) -> PromotionAnalysisResult:
+        if request.attempt_no < 1:
+            raise SegmentSelectionError("attempt_no must be at least 1")
         started_at = now_ms()
         log.assign_context(
             {
@@ -505,10 +515,12 @@ class PromotionAnalysisService:
                 source_failed_ad_experiment_ids=list(
                     request.source_failed_ad_experiment_ids
                 ),
+                attempt_no=request.attempt_no,
             ),
             refresh_segment_suggestions=False,
             persist_target_segments=True,
             persist_segment_suggestions=False,
+            target_status=target_status,
         )
         log.assign_context({"analysisId": response.analysis.analysis_id})
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -523,6 +535,7 @@ class PromotionAnalysisService:
         refresh_segment_suggestions: bool,
         persist_target_segments: bool,
         persist_segment_suggestions: bool,
+        target_status: TargetSegmentStatus,
     ) -> PromotionAnalysisResult:
         promotion = self._get_promotion(request)
         log.info("promotion_loaded", {"promotion": promotion})
@@ -612,6 +625,7 @@ class PromotionAnalysisService:
                 candidate=candidate,
                 rank=rank,
                 operator_instruction=request.operator_instruction,
+                status=target_status,
                 segment_vector_id=self._prepare_segment_vector_id(
                     analysis_id=analysis_id,
                     promotion=promotion,
@@ -820,6 +834,7 @@ class PromotionAnalysisService:
         candidate: SegmentCandidate,
         rank: int,
         operator_instruction: str | None,
+        status: TargetSegmentStatus,
         segment_vector_id: str,
     ) -> PromotionTargetSegmentWrite:
         segment = candidate.definition
@@ -850,7 +865,7 @@ class PromotionAnalysisService:
                 min_sample_size=promotion.min_sample_size,
                 rank=rank,
             ),
-            status="planned",
+            status=status,
         )
 
     def _build_segment_suggestion(
@@ -1039,7 +1054,7 @@ class PromotionAnalysisService:
             "cluster_quality_score",
             "sample_size_score",
             "candidate_type",
-            "rank_role",
+            "strategy_role",
             "performance_estimate",
             "matched_conditions",
             "missing_conditions",
@@ -1095,6 +1110,7 @@ class PromotionAnalysisService:
                 "source_failed_ad_experiment_ids": list(
                     next_loop_context.source_failed_ad_experiment_ids
                 ),
+                "attempt_no": next_loop_context.attempt_no,
             }
 
         return PromotionAnalysisWrite(
@@ -1220,10 +1236,33 @@ def _analysis_id(
 ) -> str:
     if next_loop_context is None:
         return f"analysis_{promotion_id}_run_{uuid.uuid4().hex[:8]}"
-    return (
-        f"analysis_{_slug_from_promotion_id(promotion_id)}"
-        f"_loop_{next_loop_context.loop_count}"
+    return _bounded_next_loop_lineage_id(
+        prefix="analysis",
+        promotion_id=promotion_id,
+        loop_count=next_loop_context.loop_count,
+        source_promotion_run_id=next_loop_context.source_promotion_run_id,
+        attempt_no=next_loop_context.attempt_no,
     )
+
+
+def _bounded_next_loop_lineage_id(
+    *,
+    prefix: str,
+    promotion_id: str,
+    loop_count: int,
+    source_promotion_run_id: str,
+    attempt_no: int = 1,
+) -> str:
+    lineage_digest = hashlib.sha256(
+        source_promotion_run_id.encode("utf-8")
+    ).hexdigest()[:12]
+    suffix = f"_loop_{loop_count}_{lineage_digest}"
+    if attempt_no > 1:
+        suffix = f"{suffix}_attempt_{attempt_no}"
+    max_slug_length = 100 - len(prefix) - len(suffix) - 1
+    promotion_slug = _slug_from_promotion_id(promotion_id)
+    promotion_slug = promotion_slug[:max_slug_length].rstrip("_") or "promotion"
+    return f"{prefix}_{promotion_slug}{suffix}"
 
 
 def _slug_from_promotion_id(promotion_id: str) -> str:
@@ -1323,9 +1362,12 @@ def _display_copy(
     if isinstance(raw_display_copy, Mapping):
         display_copy = dict(raw_display_copy)
         display_copy.setdefault("title", target_segment.segment_name)
-        rank_role = target_segment.profile_json.get("rank_role")
-        if rank_role:
-            display_copy.setdefault("rank_role", rank_role)
+        strategy_role = target_segment.profile_json.get(
+            "strategy_role",
+            target_segment.profile_json.get("rank_role"),
+        )
+        if strategy_role:
+            display_copy.setdefault("strategy_role", strategy_role)
         display_copy.setdefault(
             "audience_summary",
             f"분석 대상 {total_users}명 중 {sample_size}명 · {sample_ratio}",
@@ -1361,9 +1403,12 @@ def _display_copy(
             "프로모션 메시지의 우선 타겟으로 적합합니다.",
         ),
     }
-    rank_role = target_segment.profile_json.get("rank_role")
-    if rank_role:
-        display_copy["rank_role"] = rank_role
+    strategy_role = target_segment.profile_json.get(
+        "strategy_role",
+        target_segment.profile_json.get("rank_role"),
+    )
+    if strategy_role:
+        display_copy["strategy_role"] = strategy_role
     return display_copy
 
 
@@ -1387,8 +1432,20 @@ def _display_copy_from_report(
         enhanced["reason"] = why_recommended[0]
     elif summary := _text_value(report.get("summary")):
         enhanced["reason"] = summary
-    if difference := _text_list(report.get("difference_from_other_ranks")):
-        enhanced["difference_summary"] = difference[0]
+    if (
+        "strength_summary" not in enhanced
+        and (strengths := _text_list(report.get("candidate_strengths")))
+    ):
+        enhanced["strength_summary"] = strengths[0]
+    if (
+        "tradeoff_summary" not in enhanced
+        and (
+            considerations := _text_list(
+                report.get("selection_considerations")
+            )
+        )
+    ):
+        enhanced["tradeoff_summary"] = considerations[0]
     if action_hint := _text_value(report.get("action_hint")):
         enhanced["action_hint"] = action_hint
     return enhanced
@@ -1466,8 +1523,15 @@ def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
         "cluster_quality_score",
         "sample_size_score",
         "candidate_type",
-        "rank_role",
+        "strategy_role",
+        "recommendation_tier",
+        "recommendation_tier_label",
+        "recommendation_tier_reason",
+        "rank_eligible",
+        "minimum_primary_sample_size",
         "performance_estimate",
+        "portfolio_position",
+        "selection_basis",
     ):
         value = segment.profile_json.get(key)
         if value is not None:

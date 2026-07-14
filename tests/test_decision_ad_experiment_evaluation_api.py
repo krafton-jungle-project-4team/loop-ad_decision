@@ -6,7 +6,8 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.decision.evaluation_service import (
     AdExperimentEvaluationNotFoundError,
     AdExperimentEvaluationValidationError,
@@ -26,7 +27,7 @@ DEFAULT_ROW = object()
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
@@ -151,7 +152,7 @@ def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch
     assert any("from ad_experiments" in query for query in executed_sql)
     assert any("from promotion_runs" in query for query in executed_sql)
     assert any("insert into promotion_evaluations" in query for query in executed_sql)
-    assert any("update ad_experiments" in query for query in executed_sql)
+    assert not any("update ad_experiments" in query for query in executed_sql)
 
 
 def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
@@ -327,6 +328,8 @@ def default_promotion_run_row() -> dict[str, object]:
             "goal_target_value": "0.300000",
             "min_sample_size": 10,
         },
+        "segment_scope_json": ["seg_family_trip"],
+        "segment_scope_fingerprint": "a" * 64,
     }
 
 

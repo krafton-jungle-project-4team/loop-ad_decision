@@ -1,18 +1,19 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
-from app.analysis.expedia_backtest import (
+from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
     ExpediaBacktestScenario,
     ExpediaFutureBookingUsers,
     ExpediaSourceStats,
 )
-from app.analysis.expedia_final_test import (
+from offline_evaluation.expedia_final_test import (
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,
     reserve_sealed_final_test_execution,
@@ -21,8 +22,13 @@ from app.analysis.expedia_final_test import (
     write_sealed_final_test_artifacts,
     write_sealed_final_test_manifest,
 )
+from offline_evaluation.sealed_execution import (
+    mark_execution_failure,
+    mark_outcomes_opened,
+)
 from app.analysis.repositories import RawEventUserSignalRecord
 from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
     MODEL_FEATURE_NAMES,
     LogisticSegmentPerformanceModel,
     write_segment_performance_model,
@@ -32,6 +38,7 @@ from app.analysis.segment_performance import (
 class FakeSealedFinalTestRepository:
     def __init__(self) -> None:
         self.future_call_count = 0
+        self.outcome_events: list[str] = []
         self.scenario_calls: list[dict[str, object]] = []
 
     def source_stats(self) -> ExpediaSourceStats:
@@ -77,6 +84,7 @@ class FakeSealedFinalTestRepository:
 
     def future_booking_users(self, **kwargs):
         self.future_call_count += 1
+        self.outcome_events.append("future_query")
         return ExpediaFutureBookingUsers(
             any_booking_user_ids=frozenset(
                 {"expedia-user-1", "expedia-user-3", "expedia-user-5"}
@@ -105,6 +113,13 @@ def test_seal_selects_unseen_destinations_without_reading_future_outcomes(
     assert len(set(final_destination_ids)) == 4
     assert not {100, 101}.intersection(final_destination_ids)
     assert manifest.final_test["selection_uses_future_outcomes"] is False
+    candidate_support = manifest.model["candidate_type_support"]
+    assert candidate_support["training_example_counts"][
+        "promotion_responsive"
+    ] == 0
+    assert "promotion_responsive" not in candidate_support[
+        "supported_candidate_types"
+    ]
 
 
 def test_manifest_integrity_rejects_changed_scenario(tmp_path) -> None:
@@ -149,25 +164,58 @@ def test_runtime_verification_rejects_changed_code_or_source(tmp_path) -> None:
         )
 
 
-def test_execution_marker_blocks_reusing_exposed_test_set(tmp_path) -> None:
+def test_runtime_verification_rejects_changed_candidate_support(tmp_path) -> None:
+    repository = FakeSealedFinalTestRepository()
+    model_path, model = model_fixture(tmp_path)
+    manifest = build_manifest(repository, model_path, model)
+    changed_metadata = dict(model.training_metadata)
+    changed_counts = dict(
+        changed_metadata["training_candidate_type_example_counts"]
+    )
+    changed_counts["promotion_responsive"] = 1
+    changed_metadata["training_candidate_type_example_counts"] = changed_counts
+    changed_metadata["supported_candidate_types"] = [
+        *changed_metadata["supported_candidate_types"],
+        "promotion_responsive",
+    ]
+    changed_model = replace(model, training_metadata=changed_metadata)
+
+    with pytest.raises(ValueError, match="candidate type support changed"):
+        verify_sealed_final_test_runtime(
+            manifest,
+            source_table="expedia_hotel_events",
+            source_stats=source_stats(),
+            source_checksum="123:456",
+            model_path=model_path,
+            model=changed_model,
+            code_commit="commit-1",
+            code_tree="tree-1",
+        )
+
+
+def test_expedia_execution_blocks_retry_after_outcomes_are_opened(tmp_path) -> None:
     repository = FakeSealedFinalTestRepository()
     model_path, model = model_fixture(tmp_path)
     manifest = build_manifest(repository, model_path, model)
     manifest_path = tmp_path / "sealed.json"
     write_sealed_final_test_manifest(manifest, manifest_path)
 
-    marker = reserve_sealed_final_test_execution(
+    execution = reserve_sealed_final_test_execution(
         manifest_path,
         manifest,
         code_commit="commit-1",
+        output_dir=tmp_path / "result",
     )
+    mark_outcomes_opened(execution)
+    mark_execution_failure(execution, RuntimeError("evaluation failed"))
 
-    assert marker.exists()
-    with pytest.raises(ExpediaBacktestError, match="already started"):
+    with pytest.raises(ExpediaBacktestError, match="repeat the final test"):
         reserve_sealed_final_test_execution(
             manifest_path,
             manifest,
             code_commit="commit-1",
+            output_dir=tmp_path / "result",
+            resume_execution_id=execution.execution_id,
         )
 
 
@@ -180,6 +228,9 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
         repository,
         manifest=manifest,
         model=model,
+        on_outcomes_opened=lambda: repository.outcome_events.append(
+            "outcomes_opened"
+        ),
     )
     artifacts = write_sealed_final_test_artifacts(
         result,
@@ -189,11 +240,25 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
     )
 
     assert repository.future_call_count == 4
+    assert repository.outcome_events == [
+        "outcomes_opened",
+        "future_query",
+        "future_query",
+        "future_query",
+        "future_query",
+    ]
     assert result.metrics["candidate_result_count"] > 0
     assert "all_candidate_brier_skill_score" in result.metrics
     summary = json.loads(artifacts["summary"].read_text(encoding="utf-8"))
     assert summary["manifest_id"] == manifest.manifest_id
-    assert len(summary["criteria_results"]) == 5
+    assert summary["verdict"] == "inconclusive"
+    assert summary["passed"] is False
+    assert "portfolio_candidate_beats_baseline_rate" in summary[
+        "criteria_results"
+    ]
+    assert "portfolio_three_candidate_scenario_count" in summary[
+        "criteria_results"
+    ]
     assert "새로운 연도" in artifacts["report"].read_text(encoding="utf-8")
 
 
@@ -240,6 +305,31 @@ def model_fixture(tmp_path):
             "training_end_cutoff": "2013-12-01T00:00:00+00:00",
             "training_target": "future_contextual_booking_rate",
             "training_contextual_booking_observation_rate": 0.04,
+            "candidate_type_support_contract_version": (
+                CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+            ),
+            "training_candidate_type_example_counts": {
+                "intent_matched": 12,
+                "target_destination_affinity": 12,
+                "funnel_recovery": 12,
+                "benefit_value_seeker": 12,
+                "promotion_responsive": 0,
+                "general_destination_explorer": 0,
+            },
+            "training_candidate_type_user_observation_counts": {
+                "intent_matched": 120,
+                "target_destination_affinity": 120,
+                "funnel_recovery": 120,
+                "benefit_value_seeker": 120,
+                "promotion_responsive": 0,
+                "general_destination_explorer": 0,
+            },
+            "supported_candidate_types": [
+                "intent_matched",
+                "target_destination_affinity",
+                "funnel_recovery",
+                "benefit_value_seeker",
+            ],
         },
     )
     model_path = tmp_path / "model.json"

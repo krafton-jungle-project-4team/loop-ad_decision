@@ -1,3 +1,8 @@
+from datetime import UTC, datetime
+from uuid import UUID
+
+import pytest
+
 from app.generation.repositories import (
     CONTENT_CANDIDATE_COLUMNS,
     GENERATION_RUN_COLUMNS,
@@ -16,9 +21,11 @@ class FakeCursor:
         self,
         *,
         fetchone_result: dict[str, object] | None = None,
+        fetchone_results: list[dict[str, object] | None] | None = None,
         fetchall_result: list[dict[str, object]] | None = None,
     ) -> None:
         self.fetchone_result = fetchone_result
+        self.fetchone_results = list(fetchone_results or [])
         self.fetchall_result = fetchall_result or []
         self.executed: list[tuple[str, dict[str, object] | None]] = []
         self._last_query = ""
@@ -34,16 +41,19 @@ class FakeCursor:
         self.executed.append((query, params))
 
     def fetchone(self) -> dict[str, object] | None:
+        if self.fetchone_results:
+            return self.fetchone_results.pop(0)
         return self.fetchone_result
 
     def fetchall(self) -> list[dict[str, object]]:
+        rows = list(self.fetchall_result)
         if "pts.status = 'approved'" in self._last_query:
-            return [
-                row
-                for row in self.fetchall_result
-                if row.get("status") == "approved"
-            ]
-        return self.fetchall_result
+            rows = [row for row in rows if row.get("status") == "approved"]
+        if "pts.segment_id = any(%(segment_ids)s)" in self._last_query.lower():
+            params = self.executed[-1][1] or {}
+            requested_ids = set(params["segment_ids"])
+            rows = [row for row in rows if row.get("segment_id") in requested_ids]
+        return rows
 
 
 class FakeConnection:
@@ -54,6 +64,61 @@ class FakeConnection:
     def cursor(self, *, row_factory: object = None) -> FakeCursor:
         self.row_factories.append(row_factory)
         return self.cursor_instance
+
+
+LEASE_TOKEN = UUID("00000000-0000-0000-0000-000000000247")
+
+
+def generation_run_record(**overrides: object) -> GenerationRunRecord:
+    values: dict[str, object] = {
+        "generation_id": "generation_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "content_option_count": 2,
+        "operator_instruction": None,
+        "input_json": {
+            "schema_version": "generation.request.v1",
+            "target_segments": [{"segment_id": "seg_repeat_hotel_no_booking"}],
+        },
+        "output_json": None,
+        "generation_report_json": {},
+        "status": "requested",
+        "idempotency_key": "generation:banner:001",
+        "request_fingerprint": "a" * 64,
+    }
+    values.update(overrides)
+    return GenerationRunRecord(**values)  # type: ignore[arg-type]
+
+
+def content_candidate_record(**overrides: object) -> ContentCandidateRecord:
+    values: dict[str, object] = {
+        "content_id": "content_banner_001",
+        "content_option_id": "banner_option_001",
+        "generation_id": "generation_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "segment_id": "seg_repeat_hotel_no_booking",
+        "channel": ContentChannel.ONSITE_BANNER,
+        "title": "Book this weekend's rooms",
+        "body": "Compare refundable summer offers before rooms run out.",
+        "cta": "View hotel deals",
+        "image_prompt": "bright modern hotel room, summer travel banner",
+        "image_url": "https://cdn.example.test/content_banner_001.png",
+        "landing_url": "https://demo-stay.example.com/summer",
+        "creative_format": "banner_html",
+        "image_generation_status": "completed",
+        "artifact_status": "published",
+        "artifact_storage_key": "genai/project/content_banner_001/banner.html",
+        "artifact_public_url": "https://cdn.example.test/content_banner_001.html",
+        "artifact_sha256": "b" * 64,
+        "artifact_content_type": "text/html; charset=utf-8",
+    }
+    values.update(overrides)
+    return ContentCandidateRecord(**values)  # type: ignore[arg-type]
 
 
 def test_generation_run_repository_columns_match_data_source_contract() -> None:
@@ -71,6 +136,18 @@ def test_generation_run_repository_columns_match_data_source_contract() -> None:
         "status",
         "created_at",
         "updated_at",
+        "started_at",
+        "finished_at",
+        "retry_count",
+        "next_retry_at",
+        "last_error_code",
+        "last_error_message",
+        "worker_id",
+        "lease_token",
+        "heartbeat_at",
+        "lease_expires_at",
+        "idempotency_key",
+        "request_fingerprint",
     )
 
 
@@ -102,6 +179,15 @@ def test_content_candidate_repository_columns_match_data_source_contract() -> No
         "status",
         "created_at",
         "updated_at",
+        "creative_format",
+        "image_generation_status",
+        "artifact_status",
+        "artifact_storage_key",
+        "artifact_public_url",
+        "artifact_sha256",
+        "artifact_content_type",
+        "artifact_error_code",
+        "artifact_published_at",
     )
 
 
@@ -162,6 +248,221 @@ def test_generation_run_repository_create_executes_insert() -> None:
         "content_candidate_ids": ["content_banner_001"]
     }
     assert params["generation_report_json"].obj == {"content_candidate_count": 2}
+    assert "idempotency_key" in query
+    assert "request_fingerprint" in query
+    assert "WHEN %(status)s::varchar IN ('completed', 'failed')" in query
+    assert "THEN GREATEST(" in query
+    assert "COALESCE(%(finished_at)s::timestamptz, now())" in query
+    assert params["retry_count"] == 0
+
+
+def test_generation_run_repository_create_or_get_idempotent_creates_once() -> None:
+    created_row = {
+        "generation_id": "generation_banner_001",
+        "request_fingerprint": "a" * 64,
+    }
+    cursor = FakeCursor(fetchone_result=created_row)
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result, created = repository.create_or_get_idempotent(
+        generation_run_record()
+    )
+
+    assert result == created_row
+    assert created is True
+    assert len(cursor.executed) == 1
+    query, params = cursor.executed[0]
+    assert "ON CONFLICT (project_id, idempotency_key)" in query
+    assert "WHERE idempotency_key IS NOT NULL" in query
+    assert params is not None
+    assert params["idempotency_key"] == "generation:banner:001"
+
+
+def test_generation_run_repository_create_or_get_idempotent_returns_existing() -> None:
+    existing_row = {
+        "generation_id": "generation_banner_001",
+        "request_fingerprint": "a" * 64,
+    }
+    cursor = FakeCursor(fetchone_results=[None, existing_row])
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result, created = repository.create_or_get_idempotent(
+        generation_run_record()
+    )
+
+    assert result == existing_row
+    assert created is False
+    assert len(cursor.executed) == 2
+    query, params = cursor.executed[1]
+    assert "project_id = %(project_id)s" in query
+    assert "idempotency_key = %(idempotency_key)s" in query
+    assert params == {
+        "project_id": "hotel-client-a",
+        "idempotency_key": "generation:banner:001",
+    }
+
+
+def test_generation_run_repository_rejects_reused_key_with_new_fingerprint() -> None:
+    cursor = FakeCursor(
+        fetchone_results=[
+            None,
+            {
+                "generation_id": "generation_banner_001",
+                "request_fingerprint": "b" * 64,
+            },
+        ]
+    )
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    with pytest.raises(ValueError, match="different request"):
+        repository.create_or_get_idempotent(generation_run_record())
+
+
+def test_generation_run_repository_claims_due_job_with_new_lease() -> None:
+    claimed_row = {"generation_id": "generation_banner_001", "status": "running"}
+    cursor = FakeCursor(fetchone_result=claimed_row)
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result = repository.claim_next(
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+        lease_seconds=180,
+    )
+
+    assert result == claimed_row
+    query, params = cursor.executed[0]
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "status = 'requested'" in query
+    assert "next_retry_at <= now()" in query
+    assert "status = 'running'" in query
+    assert "started_at = COALESCE(run.started_at, now())" in query
+    assert params == {
+        "worker_id": "decision-task-1",
+        "lease_token": LEASE_TOKEN,
+        "lease_seconds": 180,
+    }
+
+
+def test_generation_run_repository_heartbeat_is_fenced_and_requires_live_lease() -> None:
+    cursor = FakeCursor(fetchone_result={"generation_id": "generation_banner_001"})
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    assert repository.heartbeat(
+        generation_id="generation_banner_001",
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+        lease_seconds=180,
+    )
+
+    query, params = cursor.executed[0]
+    assert "worker_id = %(worker_id)s" in query
+    assert "lease_token = %(lease_token)s" in query
+    assert "lease_expires_at > now()" in query
+    assert params is not None
+    assert params["lease_seconds"] == 180
+
+
+def test_generation_run_repository_recovers_expired_leases_with_retry_budget() -> None:
+    rows = [
+        {"generation_id": "generation_retry", "status": "requested"},
+        {"generation_id": "generation_failed", "status": "failed"},
+    ]
+    cursor = FakeCursor(fetchall_result=rows)
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result = repository.recover_expired(
+        max_retries=3,
+        retry_backoff_seconds=(60, 300, 900),
+        limit=25,
+    )
+
+    assert result == rows
+    query, params = cursor.executed[0]
+    assert "lease_expires_at <= now()" in query
+    assert "FOR UPDATE SKIP LOCKED" in query
+    assert "retry_count + 1" in query
+    assert "generation_lease_expired" in query
+    assert "worker_id = NULL" in query
+    assert params == {
+        "max_retries": 3,
+        "retry_backoff_seconds": [60, 300, 900],
+        "limit": 25,
+    }
+
+
+def test_generation_run_repository_schedules_retry_with_fencing() -> None:
+    cursor = FakeCursor(fetchone_result={"generation_id": "generation_banner_001"})
+    repository = GenerationRunRepository(FakeConnection(cursor))
+    retry_at = datetime(2026, 7, 14, 7, 1, tzinfo=UTC)
+
+    assert repository.schedule_retry_fenced(
+        generation_id="generation_banner_001",
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+        next_retry_at=retry_at,
+        error_code="provider_rate_limited",
+        error_message="provider temporarily unavailable",
+    )
+
+    query, params = cursor.executed[0]
+    assert "status = 'requested'" in query
+    assert "retry_count = retry_count + 1" in query
+    assert "lease_expires_at > now()" in query
+    assert "lease_token = NULL" in query
+    assert params is not None
+    assert params["next_retry_at"] == retry_at
+
+
+def test_generation_run_repository_marks_terminal_failure_with_fencing() -> None:
+    cursor = FakeCursor(fetchone_result={"generation_id": "generation_banner_001"})
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    assert repository.mark_failed_fenced(
+        generation_id="generation_banner_001",
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+        error_code="invalid_generation_input",
+        error_message="required target segment is missing",
+    )
+
+    query, _params = cursor.executed[0]
+    assert "status = 'failed'" in query
+    assert "finished_at = now()" in query
+    assert "next_retry_at = NULL" in query
+    assert "lease_expires_at > now()" in query
+
+
+def test_generation_run_repository_completes_only_after_strict_readiness() -> None:
+    completed_row = {
+        "generation_id": "generation_banner_001",
+        "status": "completed",
+    }
+    cursor = FakeCursor(fetchone_result=completed_row)
+    repository = GenerationRunRepository(FakeConnection(cursor))
+
+    result = repository.complete_if_ready_fenced(
+        generation_id="generation_banner_001",
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+        output_json={"status": "completed"},
+        generation_report_json={"candidate_count": 2},
+    )
+
+    assert result == completed_row
+    query, params = cursor.executed[0]
+    assert "FOR UPDATE" in query
+    assert "lease_expires_at > now()" in query
+    assert "generation.request.v1" in query
+    assert "count(DISTINCT segment_id)" in query
+    assert "<> run.content_option_count" in query
+    assert "candidate.channel = 'sms'" in query
+    assert "candidate.channel IN ('email', 'onsite_banner')" in query
+    assert "candidate.image_generation_status = 'completed'" in query
+    assert "candidate.artifact_status = 'published'" in query
+    assert "candidate.artifact_published_at <= now()" in query
+    assert "status = 'completed'" in query
+    assert params is not None
+    assert params["output_json"].obj == {"status": "completed"}
 
 
 def test_generation_run_repository_lists_ids_by_promotion() -> None:
@@ -222,6 +523,110 @@ def test_content_candidate_repository_create_executes_insert() -> None:
         "segment_id": "seg_repeat_hotel_no_booking"
     }
     assert params["metadata_json"].obj == {"content_id": "content_banner_001"}
+    assert "creative_format" in query
+    assert "artifact_public_url" in query
+    assert "SELECT now() AS db_now" in query
+    assert "THEN write_clock.db_now" in query
+    assert "FROM write_clock" in query
+    assert "jsonb_build_object(" in query
+    assert "#- '{creative,artifact,published_at}'" in query
+    assert params["creative_format"] is None
+    assert params["artifact_public_url"] is None
+
+
+@pytest.mark.parametrize(
+    ("channel", "source", "record_overrides"),
+    (
+        (
+            ContentChannel.EMAIL,
+            {
+                "creative_format": "email_html",
+                "subject": "이번 주말 호텔 특가를 확인해보세요",
+                "preheader": "원하는 일정에 맞는 숙소를 비교해보세요.",
+                "text_body": "환불 가능한 객실을 지금 확인해보세요.",
+                "html_body": "<!doctype html><html><body>legacy</body></html>",
+                "required_placeholders": [
+                    "{{redirect_url}}",
+                    "{{open_pixel_url}}",
+                ],
+            },
+            {
+                "subject": "이번 주말 호텔 특가를 확인해보세요",
+                "preheader": "원하는 일정에 맞는 숙소를 비교해보세요.",
+            },
+        ),
+        (
+            ContentChannel.ONSITE_BANNER,
+            {
+                "creative_format": "banner_html",
+                "width": 320,
+                "height": 100,
+                "click_protocol": "post_message",
+                "allowed_message_type": "loopad:click",
+                "html_body": "<!doctype html><html><body>legacy</body></html>",
+            },
+            {},
+        ),
+    ),
+)
+def test_content_candidate_public_values_omit_legacy_html_body(
+    channel: ContentChannel,
+    source: dict[str, object],
+    record_overrides: dict[str, object],
+) -> None:
+    metadata = {"creative": {"source": source}}
+    candidate = content_candidate_record(
+        channel=channel,
+        metadata_json=metadata,
+        **record_overrides,
+    )
+
+    public_values = candidate.to_public_values()
+
+    assert "html_body" not in public_values["source"]
+    assert public_values["source"]["creative_format"] == source["creative_format"]
+    assert metadata["creative"]["source"]["html_body"]
+
+
+def test_content_candidate_repository_upserts_all_contract_fields_with_fencing() -> None:
+    stored_row = {
+        "content_id": "content_banner_001",
+        "artifact_status": "published",
+    }
+    cursor = FakeCursor(fetchone_result=stored_row)
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.upsert_fenced(
+        content_candidate_record(),
+        worker_id="decision-task-1",
+        lease_token=LEASE_TOKEN,
+    )
+
+    assert result == stored_row
+    query, params = cursor.executed[0]
+    assert "FROM generation_runs" in query
+    assert "status = 'running'" in query
+    assert "lease_expires_at > now()" in query
+    assert "FOR UPDATE" in query
+    assert "ON CONFLICT (generation_id, segment_id, content_option_id)" in query
+    assert "content_candidates.content_id = EXCLUDED.content_id" in query
+    assert "SELECT now() AS db_now" in query
+    assert "THEN write_clock.db_now" in query
+    assert "CROSS JOIN write_clock" in query
+    assert "'{creative,artifact,published_at}'" in query
+    assert "jsonb_build_object(" in query
+    assert "#- '{creative,artifact,published_at}'" in query
+    assert "content_candidates.artifact_published_at" in query
+    assert "artifact_sha256 = EXCLUDED.artifact_sha256" in query
+    assert params is not None
+    assert params["worker_id"] == "decision-task-1"
+    assert params["creative_format"] == "banner_html"
+    assert params["image_generation_status"] == "completed"
+    assert params["artifact_status"] == "published"
+    assert params["artifact_public_url"] == (
+        "https://cdn.example.test/content_banner_001.html"
+    )
+    assert params["artifact_sha256"] == "b" * 64
 
 
 def test_content_candidate_repository_updates_image_url() -> None:
@@ -274,6 +679,23 @@ def test_content_candidate_repository_lists_by_generation() -> None:
     assert result == rows
     query, params = cursor.executed[0]
     assert "FROM content_candidates" in query
+    assert "ORDER BY segment_id, content_option_id, content_id" in query
+    assert "FOR UPDATE" not in query
+    assert params == {"generation_id": "generation_banner_001"}
+
+
+def test_content_candidate_repository_locks_entire_generation_in_stable_order() -> None:
+    rows = [{"content_id": "content_banner_001"}]
+    cursor = FakeCursor(fetchall_result=rows)
+    repository = ContentCandidateRepository(FakeConnection(cursor))
+
+    result = repository.list_by_generation_for_update("generation_banner_001")
+
+    assert result == rows
+    query, params = cursor.executed[0]
+    assert "FROM content_candidates" in query
+    assert "ORDER BY segment_id, content_option_id, content_id" in query
+    assert "FOR UPDATE" in query
     assert params == {"generation_id": "generation_banner_001"}
 
 
@@ -418,6 +840,82 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
     assert "pts.status = 'approved'" in executed_sql
     assert "LEFT JOIN segment_definitions" in executed_sql
     assert "promotion_segment_suggestions" not in executed_sql
+    target_segment_params = next(
+        params
+        for query, params in cursor.executed
+        if "FROM promotion_target_segments" in query
+    )
+    assert target_segment_params == {
+        "project_id": "hotel-client-a",
+        "campaign_id": "camp_summer_2026",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+    }
+
+
+def test_generation_input_repository_limits_confirmed_targets_to_requested_segment_ids() -> None:
+    cursor = FakeCursor(
+        fetchall_result=[
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_family_trip",
+                "segment_name": "Family trip planners",
+                "content_brief_json": {"message_direction": "Family stays."},
+                "data_evidence_json": {},
+                "segment_vector_id": "segvec_family_trip_v1",
+                "estimated_size": 1200,
+                "priority": "high",
+                "status": "approved",
+                "segment_source": "manual_rule",
+                "query_preview_id": None,
+                "natural_language_query": None,
+                "generated_sql": None,
+                "segment_sample_size": 1200,
+                "segment_sample_ratio": "0.010000",
+            },
+            {
+                "analysis_id": "analysis_banner_001",
+                "promotion_id": "promo_banner_001",
+                "segment_id": "seg_mobile_user",
+                "segment_name": "Mobile hotel users",
+                "content_brief_json": {"message_direction": "Mobile booking."},
+                "data_evidence_json": {},
+                "segment_vector_id": "segvec_mobile_user_v1",
+                "estimated_size": 900,
+                "priority": "medium",
+                "status": "approved",
+                "segment_source": "manual_rule",
+                "query_preview_id": None,
+                "natural_language_query": None,
+                "generated_sql": None,
+                "segment_sample_size": 900,
+                "segment_sample_ratio": "0.008000",
+            },
+        ]
+    )
+    repository = GenerationInputRepository(FakeConnection(cursor))
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        segment_ids=["seg_mobile_user"],
+        content_option_count=1,
+        operator_instruction=None,
+    )
+
+    target_segments = repository.list_target_segment_inputs(request)
+
+    assert [segment.segment_id for segment in target_segments] == ["seg_mobile_user"]
+    query, params = next(
+        (query, params)
+        for query, params in cursor.executed
+        if "FROM promotion_target_segments" in query
+    )
+    assert "pts.segment_id = ANY(%(segment_ids)s)" in query
+    assert params is not None
+    assert params["segment_ids"] == ["seg_mobile_user"]
 
 
 def test_generation_input_repository_focus_read_bypasses_confirmed_status_filter() -> None:

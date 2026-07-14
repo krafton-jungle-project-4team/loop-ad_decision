@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 
-from app.analysis.expedia_backtest import (
+from app.analysis.audience_selection import load_audience_selection_policy
+from offline_evaluation.expedia_backtest import (
     ClickHouseExpediaBacktestRepository,
     EXPEDIA_TRAIN_COLUMNS,
     ExpediaBacktestConfig,
@@ -199,7 +200,7 @@ def test_backtest_calculates_user_level_future_rates_and_lift() -> None:
     assert intent_result.calibration_error_percentage_points >= 0
 
 
-def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
+def test_backtest_summary_measures_candidate_portfolio_against_outcomes() -> None:
     repository = FakeExpediaBacktestRepository()
     run = ExpediaSegmentBacktestService(
         repository,
@@ -214,8 +215,22 @@ def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
 
     assert summary["scenario_count"] == 1
     assert summary["candidate_result_count"] == len(run.results)
+    assert summary["portfolio_candidate_result_count"] == len(run.results)
+    assert 0 <= summary["portfolio_candidate_beats_baseline_rate"] <= 1
+    assert summary[
+        "portfolio_scenario_any_candidate_beats_baseline_rate"
+    ] == 1.0
+    assert summary[
+        "portfolio_scenario_all_candidates_beat_baseline_rate"
+    ] == 0.0
+    # Stored order diagnostics remain available for offline debugging only.
     assert 0 <= summary["rank_one_beats_baseline_rate"] <= 1
-    assert 0 <= summary["rank_one_is_best_rate"] <= 1
+    assert summary["rank_one_is_best_rate"] == 0.0
+    assert summary["rank_one_tied_best_rate"] == 1.0
+    assert summary["pairwise_rank_accuracy"] == 1.0
+    assert summary["pairwise_rank_tie_rate"] == pytest.approx(1 / 3)
+    assert summary["rank_two_beats_baseline_rate"] == 1.0
+    assert summary["rank_three_beats_baseline_rate"] == 0.0
 
 
 def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -> None:
@@ -242,7 +257,7 @@ def test_backtest_summary_excludes_scenarios_without_future_context_outcomes() -
     assert summary["scenario_count"] == 1
     assert summary["evaluable_scenario_count"] == 0
     assert summary["unevaluable_scenario_count"] == 1
-    assert summary["rank_one_is_best_rate"] == 0
+    assert summary["rank_one_is_best_rate"] is None
 
 
 def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
@@ -280,6 +295,22 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     assert temporal_run.calibration_model.training_metadata[
         "training_example_count"
     ] > len(temporal_run.training_run.results)
+    candidate_type_counts = temporal_run.calibration_model.training_metadata[
+        "training_candidate_type_example_counts"
+    ]
+    assert sum(candidate_type_counts.values()) == (
+        temporal_run.calibration_model.training_metadata[
+            "training_example_count"
+        ]
+    )
+    supported_candidate_types = {
+        candidate_type
+        for candidate_type, count in candidate_type_counts.items()
+        if count > 0
+    }
+    assert {
+        result.candidate_type for result in temporal_run.holdout_run.results
+    } <= supported_candidate_types
     assert all(
         result.cutoff.year == 2013
         for result in temporal_run.training_run.results
@@ -292,6 +323,13 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
         result.prediction_method == "temporal_holdout_logistic_calibration"
         for result in temporal_run.holdout_run.results
     )
+    assert {
+        outcome.selection_ratio
+        for outcome in temporal_run.training_run.audience_selection_outcomes
+    } == {0.2, 0.4, 0.6, 0.8, 1.0}
+    assert temporal_run.audience_selection_evaluation.artifact["provenance"][
+        "final_test"
+    ] == "not_run"
     holdout_summary = summarize_backtest(temporal_run.holdout_run)
     assert holdout_summary["all_candidate_brier_score"] >= 0
 
@@ -329,6 +367,15 @@ def test_temporal_artifacts_label_2014_as_development_validation(
     assert "개발 검증" in report
     assert "최종 일반화 성능" in report
     assert (tmp_path / "development-validation-2014" / "results.csv").exists()
+    assert artifacts["audience_selection_policy"].exists()
+    assert artifacts["audience_selection_development_results"].exists()
+    assert artifacts["audience_selection_validation_results"].exists()
+    policy = load_audience_selection_policy(
+        artifacts["audience_selection_policy"]
+    )
+    assert policy.policy_version.startswith(
+        "expedia-booking-audience-selection."
+    )
 
 
 def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None:
@@ -354,7 +401,8 @@ def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None
         encoding="utf-8"
     )
     report = artifacts["report"].read_text(encoding="utf-8")
-    assert "Rank 1 실제 전환율" in report
+    assert "추천 후보 평균 실제 전환율" in report
+    assert "Rank 1" not in report
     assert "광고의 인과적 증분 효과" in report
 
 

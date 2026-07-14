@@ -4,6 +4,7 @@ from typing import NoReturn
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from psycopg import IntegrityError, errors
 
+from app.analysis.audience_selection import build_audience_selection_policy
 from app.analysis.repositories import (
     HotelProfileRepository,
     PromotionAnalysisRepository,
@@ -79,6 +80,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
                 performance_predictor=build_segment_performance_predictor(
                     settings.segment_performance_model_path
                 ),
+                audience_selection_policy=build_audience_selection_policy(),
             ),
             segment_report_generator=segment_report_generator,
         )

@@ -5,6 +5,7 @@ from json import JSONDecodeError
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
+from fastapi.responses import JSONResponse
 from psycopg import IntegrityError, errors
 from pydantic import ValidationError
 
@@ -42,6 +43,7 @@ from app.decision.evaluation_service import (
 from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
     NextLoopConflictError,
+    NextLoopGenerationFailedError,
     NextLoopNotFoundError,
     NextLoopService,
     NextLoopValidationError,
@@ -53,6 +55,8 @@ from app.decision.repositories import (
     ContentCandidateRepository,
     EvaluationMetricRepository,
     GenerationRunRepository,
+    NextLoopPreparationRecord,
+    NextLoopPreparationRepository,
     PromotionAnalysisRepository,
     PromotionEvaluationRepository,
     PromotionRepository,
@@ -86,6 +90,11 @@ from app.generation.adapters import (
     build_external_content_generator,
     build_s3_creative_artifact_publisher,
 )
+from app.generation.brand_context import (
+    BrandContextRepository,
+    BrandContextRetrievalService,
+    OpenAIEmbeddingClient,
+)
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
     GenerationInputRepository,
@@ -99,11 +108,30 @@ UNIQUE_CONSTRAINTS = {
     "generation_runs_pkey",
     "content_candidates_pkey",
     "uq_content_candidates_one_approved_per_segment",
-    "uq_promotion_runs_loop",
+    "uq_promotion_runs_segment_scope",
     "uq_ad_experiments_segment_per_run",
 }
 
 APPROVED_CONTENT_UNIQUE_CONSTRAINT = "uq_content_candidates_one_approved_per_segment"
+
+
+class SerializedNextLoopPreparationRepository(NextLoopPreparationRepository):
+    """Serialize manual preparation creation for a single source run."""
+
+    def get_active_by_source_run(
+        self,
+        source_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        self._db.execute(
+            """
+            SELECT pg_advisory_xact_lock(
+                hashtext('next-loop-preparation'),
+                hashtext(%s)
+            )
+            """,
+            (source_promotion_run_id,),
+        )
+        return super().get_active_by_source_run(source_promotion_run_id)
 
 
 router = APIRouter(
@@ -137,6 +165,9 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
+            promotion_evaluation_repository=PromotionEvaluationRepository(executor),
+            next_loop_preparation_repository=NextLoopPreparationRepository(executor),
+            manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
     except Exception:
@@ -157,9 +188,6 @@ def get_segment_assignment_service(
         yield SegmentAssignmentService(
             promotion_run_repository=PromotionRunRepository(executor),
             ad_experiment_repository=AdExperimentRepository(executor),
-            promotion_target_segment_repository=PromotionTargetSegmentRepository(
-                executor,
-            ),
             segment_vector_repository=SegmentVectorRepository(executor),
             user_behavior_vector_repository=UserBehaviorVectorRepository(
                 clickhouse_client,
@@ -246,6 +274,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
     promotion_run_repository = PromotionRunRepository(executor)
     ad_experiment_repository = AdExperimentRepository(executor)
     promotion_evaluation_repository = PromotionEvaluationRepository(executor)
+    next_loop_preparation_repository = SerializedNextLoopPreparationRepository(
+        executor
+    )
     try:
         clickhouse_client = create_clickhouse_client(settings)
         analysis_executor = AnalysisPostgresExecutor(connection)
@@ -277,17 +308,36 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
         )
         content_generator = None
         artifact_publisher = None
+        brand_context_snapshot_reader = None
+        brand_context_provider = None
         if settings.env != "test":
             content_generator = build_external_content_generator(settings)
             artifact_publisher = build_s3_creative_artifact_publisher(settings)
+            brand_context_repository = BrandContextRepository(connection)
+            brand_context_snapshot_reader = brand_context_repository
+            brand_context_provider = BrandContextRetrievalService(
+                repository=brand_context_repository,
+                embedding_client=OpenAIEmbeddingClient(
+                    api_key=settings.openai_api_key,
+                    timeout_seconds=settings.generation_provider_timeout_seconds,
+                ),
+            )
         generation_run_repository = GenerationGenerationRunRepository(connection)
+        generation_content_candidate_repository = (
+            GenerationContentCandidateRepository(connection)
+        )
         generation_service = GenerationService(
             generation_run_repository=generation_run_repository,
-            content_candidate_repository=GenerationContentCandidateRepository(
-                connection
-            ),
+            content_candidate_repository=generation_content_candidate_repository,
             generation_input_reader=GenerationInputRepository(connection),
+            brand_context_snapshot_reader=brand_context_snapshot_reader,
+            brand_context_provider=brand_context_provider,
             content_generator=content_generator,
+            generation_model_version=(
+                settings.openai_content_model
+                if settings.env != "test"
+                else None
+            ),
             artifact_publisher=artifact_publisher,
         )
         run_creator = PromotionRunService(
@@ -300,15 +350,22 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             content_candidate_repository=ContentCandidateRepository(executor),
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
+            promotion_evaluation_repository=promotion_evaluation_repository,
+            next_loop_preparation_repository=next_loop_preparation_repository,
+            manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         yield NextLoopService(
             promotion_repository=promotion_repository,
             promotion_run_repository=promotion_run_repository,
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
+            next_loop_preparation_repository=next_loop_preparation_repository,
+            generation_run_repository=GenerationRunRepository(executor),
+            content_candidate_repository=generation_content_candidate_repository,
             analysis_gateway=ServiceNextLoopAnalysisGateway(analysis_service),
             generation_gateway=ServiceNextLoopGenerationGateway(generation_service),
             run_creator=run_creator,
+            manual_prepare_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
     except Exception:
@@ -430,8 +487,11 @@ async def evaluate_promotion_run(
 async def create_next_loop(
     promotion_run_id: str,
     request: Request,
-    next_loop_service: NextLoopService = Depends(get_next_loop_service),
-) -> NextLoopResponse:
+    next_loop_service: NextLoopService = Depends(
+        get_next_loop_service,
+        scope="function",
+    ),
+) -> NextLoopResponse | JSONResponse:
     next_loop_request = await _parse_next_loop_request(request)
     try:
         return next_loop_service.create_next_loop(
@@ -443,6 +503,13 @@ async def create_next_loop(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
         ) from exc
+    except NextLoopGenerationFailedError as exc:
+        # Returning a response lets the dependency commit the failed generation
+        # diagnostics while preserving the existing 422 API contract.
+        return JSONResponse(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            content={"detail": str(exc)},
+        )
     except NextLoopValidationError as exc:
         raise HTTPException(
             status_code=422,
@@ -591,6 +658,16 @@ async def _parse_next_loop_request(request: Request) -> NextLoopRequest:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=jsonable_encoder(exc.errors()),
         ) from exc
+
+
+def _manual_next_loop_enabled(request: Request) -> bool:
+    return bool(
+        getattr(
+            getattr(getattr(request, "app", None), "state", None),
+            "manual_next_loop_enabled",
+            False,
+        )
+    )
 
 
 def _is_unique_violation(exc: IntegrityError) -> bool:

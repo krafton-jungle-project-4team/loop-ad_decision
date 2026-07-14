@@ -12,7 +12,6 @@ from app.analysis.repositories import (
 )
 from app.config import Settings
 from app.generation.adapters import (
-    DEFAULT_OPENAI_CONTENT_MODEL,
     OPENAI_RESPONSES_URL,
     JsonTransport,
     _parse_output_json,
@@ -21,9 +20,18 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-REPORT_GENERATOR_VERSION = "dec.segment-report.v2"
+REPORT_GENERATOR_VERSION = "dec.segment-report.v3"
 
-FORBIDDEN_REPORT_TERMS = ("벡터", "군집", "클러스터", "centroid", "유사도", "cosine")
+FORBIDDEN_REPORT_TERMS = (
+    "벡터",
+    "군집",
+    "클러스터",
+    "centroid",
+    "유사도",
+    "cosine",
+    "Rank",
+    "랭크",
+)
 
 
 class SegmentSuggestionReportGenerator(Protocol):
@@ -59,7 +67,7 @@ class OpenAISegmentSuggestionReportGenerator:
         self,
         *,
         api_key: str,
-        model: str = DEFAULT_OPENAI_CONTENT_MODEL,
+        model: str,
         endpoint: str = OPENAI_RESPONSES_URL,
         timeout_seconds: float = 20.0,
         fallback_generator: SegmentSuggestionReportGenerator | None = None,
@@ -169,7 +177,7 @@ def build_segment_suggestion_report_generator(
         return DeterministicSegmentSuggestionReportGenerator()
     return OpenAISegmentSuggestionReportGenerator(
         api_key=settings.openai_api_key,
-        model=settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL,
+        model=settings.openai_content_model,
     )
 
 
@@ -186,6 +194,7 @@ def _system_instruction() -> str:
     return (
         "당신은 숙박 예약 플랫폼의 기획자가 읽을 수 있는 마케팅 리포트를 작성합니다. "
         "한국어로만 답하고, 비전문가가 이해하기 쉬운 표현을 사용하세요. "
+        "고객 행동을 설명할 때는 전문적이고 구체적인 표현을 사용하고, 쳐다보다 같은 구어체나 모호한 표현은 쓰지 마세요. "
         "벡터, 군집, 클러스터, centroid, cosine, 유사도 같은 기술 용어는 절대 쓰지 마세요. "
         "데이터로 확인된 사실만 말하고, 과장하지 말고, 실행 가능한 마케팅 판단을 돕는 문장으로 작성하세요."
     )
@@ -196,6 +205,7 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
     display_copy = report_input.display_copy
     evidence = report_input.target_segment.data_evidence_json
     signal_chips = display_copy.get("signal_chips", [])
+    performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
     return "\n".join(
         [
             "아래 세그먼트 추천 결과를 대시보드 리포트로 정리하세요.",
@@ -206,10 +216,19 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             f"- 랜딩 URL: {promotion.landing_url or '-'}",
             f"- 프로모션 설명: {promotion.message_brief or '-'}",
             f"- 추천 고객군 이름: {display_copy.get('title', report_input.target_segment.segment_name)}",
+            f"- 추천 전략: {display_copy.get('strategy_role', display_copy.get('rank_role', '-'))}",
+            f"- 추천 분류: {display_copy.get('recommendation_tier_label', '주요 추천')}",
+            f"- 추천 분류 근거: {display_copy.get('recommendation_tier_reason', '-')}",
             f"- 분석 대상 요약: {display_copy.get('audience_summary', '-')}",
             f"- 주요 행동 신호: {', '.join(map(str, signal_chips)) or '-'}",
             f"- 표본 수: {evidence.get('sample_size', report_input.target_segment.estimated_size)}",
             f"- 전체 분석 대상 수: {evidence.get('total_eligible_user_count', '-')}",
+            f"- 예상 목표 성과: {performance_estimate.get('label', '-')} {performance_estimate.get('formatted', '-')}",
+            f"- 예상 기준: {performance_estimate.get('window_label', performance_estimate.get('basis_label', '-'))}",
+            f"- 예측 신뢰도: {performance_estimate.get('confidence_label', '-')}",
+            f"- 예측 신뢰도 근거: {performance_estimate.get('confidence_reason', '-')}",
+            f"- 후보의 강점: {display_copy.get('strength_summary', '-')}",
+            f"- 선택 시 고려사항: {display_copy.get('tradeoff_summary', '-')}",
             "",
             "JSON 필드 설명:",
             "- title: 카드 제목으로 쓸 짧은 고객군 이름",
@@ -217,9 +236,10 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             "- promotion_interpretation: 프로모션 조건을 사용자가 이해할 수 있게 해석한 문장 2개",
             "- why_recommended: 추천 이유 2~3개",
             "- evidence: 판단 근거 2~3개",
-            "- difference_from_other_ranks: 다른 Rank와 비교했을 때의 차이 1~2개",
+            "- candidate_strengths: 이 후보 자체의 강점 1~2개",
+            "- selection_considerations: 이 후보를 선택할 때 고려할 점 1~2개",
             "- action_hint: 이 프로모션에서 어떻게 활용하면 좋은지",
-            "- caution: 표본 수, 해석 주의점, 다음 액션 중 하나",
+            "- caution: 제공된 예측 신뢰도 근거만 사용하고 표본 크기를 임의로 평가하지 말 것",
             "- confidence_label: high, medium, low 중 하나",
         ],
     )
@@ -235,7 +255,8 @@ def _report_schema() -> dict[str, Any]:
             "promotion_interpretation",
             "why_recommended",
             "evidence",
-            "difference_from_other_ranks",
+            "candidate_strengths",
+            "selection_considerations",
             "action_hint",
             "caution",
             "confidence_label",
@@ -261,7 +282,13 @@ def _report_schema() -> dict[str, Any]:
                 "minItems": 2,
                 "maxItems": 3,
             },
-            "difference_from_other_ranks": {
+            "candidate_strengths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 2,
+            },
+            "selection_considerations": {
                 "type": "array",
                 "items": {"type": "string"},
                 "minItems": 1,
@@ -281,6 +308,32 @@ def _sanitize_report(
     source: str,
 ) -> dict[str, Any]:
     fallback = _fallback_report(report_input=report_input, source=source)
+    computed_strength = _safe_text(
+        report_input.display_copy.get("strength_summary")
+    )
+    computed_tradeoff = _safe_text(
+        report_input.display_copy.get("tradeoff_summary")
+    )
+    generated_strengths = _safe_text_list(report.get("candidate_strengths"))
+    generated_considerations = _safe_text_list(
+        report.get("selection_considerations")
+    )
+    candidate_strengths = _merge_report_facts(
+        computed_strength,
+        generated_strengths,
+        fallback["candidate_strengths"],
+    )
+    selection_considerations = _merge_report_facts(
+        computed_tradeoff,
+        generated_considerations,
+        fallback["selection_considerations"],
+    )
+    performance_estimate = _mapping_value(
+        report_input.display_copy.get("performance_estimate")
+    )
+    computed_confidence = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
     sanitized = {
         "version": REPORT_GENERATOR_VERSION,
         "source": source,
@@ -293,14 +346,13 @@ def _sanitize_report(
         "why_recommended": _safe_text_list(report.get("why_recommended"))
         or fallback["why_recommended"],
         "evidence": _safe_text_list(report.get("evidence")) or fallback["evidence"],
-        "difference_from_other_ranks": _safe_text_list(
-            report.get("difference_from_other_ranks")
-        )
-        or fallback["difference_from_other_ranks"],
+        "candidate_strengths": candidate_strengths,
+        "selection_considerations": selection_considerations,
         "action_hint": _safe_text(report.get("action_hint"))
         or fallback["action_hint"],
-        "caution": _safe_text(report.get("caution")) or fallback["caution"],
-        "confidence_label": _confidence_label(report.get("confidence_label"))
+        "caution": _verified_caution(report_input),
+        "confidence_label": computed_confidence
+        or _confidence_label(report.get("confidence_label"))
         or fallback["confidence_label"],
     }
     if _contains_forbidden_terms(sanitized):
@@ -335,7 +387,12 @@ def _fallback_report(
         _promotion_goal_sentence(report_input.promotion),
         _promotion_message_sentence(report_input.promotion),
     ]
-    difference_summary = str(display_copy.get("difference_summary", "")).strip()
+    strength_summary = str(display_copy.get("strength_summary", "")).strip()
+    tradeoff_summary = str(display_copy.get("tradeoff_summary", "")).strip()
+    performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
+    performance_confidence = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
 
     return {
         "version": REPORT_GENERATOR_VERSION,
@@ -349,17 +406,18 @@ def _fallback_report(
             _signals_sentence(signal_chips),
         ],
         "evidence": evidence_items[:3],
-        "difference_from_other_ranks": [
-            difference_summary
-            or "다른 후보와 다른 행동 조건을 기준으로 분리한 고객군입니다."
+        "candidate_strengths": [
+            strength_summary
+            or "프로모션 목표와 연결되는 행동 조건이 확인된 고객군입니다."
+        ],
+        "selection_considerations": [
+            tradeoff_summary
+            or "예상 성과와 대표 표본 규모를 함께 확인해 선택하세요."
         ],
         "action_hint": str(display_copy.get("action_hint", "")).strip()
         or "이 고객군을 우선 타겟으로 테스트해보는 것이 좋습니다.",
-        "caution": _caution_text(
-            sample_size=int(evidence.get("sample_size", 0) or 0),
-            min_sample_size=report_input.promotion.min_sample_size,
-        ),
-        "confidence_label": _fallback_confidence_label(
+        "caution": _verified_caution(report_input),
+        "confidence_label": performance_confidence or _fallback_confidence_label(
             sample_size=int(evidence.get("sample_size", 0) or 0),
             min_sample_size=report_input.promotion.min_sample_size,
         ),
@@ -400,6 +458,31 @@ def _caution_text(*, sample_size: int, min_sample_size: int) -> str:
     return "첫 발송 후 랜딩과 예약 시작 지표를 함께 확인하면 다음 액션을 더 잘 정할 수 있습니다."
 
 
+def _verified_caution(report_input: SegmentSuggestionReportInput) -> str:
+    performance_estimate = _mapping_value(
+        report_input.display_copy.get("performance_estimate")
+    )
+    confidence_label = _confidence_label(
+        performance_estimate.get("confidence_label")
+    )
+    if confidence_label == "low":
+        return (
+            "대표 표본이 제한적인 후보이므로 실제 캠페인 성과와 함께 "
+            "비교해 활용하세요."
+        )
+    if confidence_label in {"high", "medium"}:
+        return (
+            "예상값은 과거 행동을 바탕으로 한 참고 지표이며 실제 캠페인 "
+            "성과와 함께 활용하세요."
+        )
+
+    evidence = report_input.target_segment.data_evidence_json
+    return _caution_text(
+        sample_size=int(evidence.get("sample_size", 0) or 0),
+        min_sample_size=report_input.promotion.min_sample_size,
+    )
+
+
 def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str:
     if sample_size < min_sample_size:
         return "low"
@@ -410,6 +493,10 @@ def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str
 
 def _format_goal_value(value: Decimal) -> str:
     return f"{float(value) * 100:g}%"
+
+
+def _mapping_value(value: object) -> Mapping[str, Any]:
+    return value if isinstance(value, Mapping) else {}
 
 
 def _safe_text(value: object) -> str | None:
@@ -423,6 +510,20 @@ def _safe_text_list(value: object) -> list[str]:
     if isinstance(value, str) or not isinstance(value, Sequence):
         return []
     return [text for item in value if (text := _safe_text(item))]
+
+
+def _merge_report_facts(
+    computed_fact: str | None,
+    generated_facts: Sequence[str],
+    fallback_facts: Sequence[str],
+) -> list[str]:
+    facts: list[str] = []
+    if computed_fact:
+        facts.append(computed_fact)
+    facts.extend(fact for fact in generated_facts if fact not in facts)
+    if not facts:
+        facts.extend(fallback_facts)
+    return facts[:2]
 
 
 def _confidence_label(value: object) -> str | None:

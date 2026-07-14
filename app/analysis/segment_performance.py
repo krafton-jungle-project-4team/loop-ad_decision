@@ -8,6 +8,13 @@ from typing import Any, Mapping, Protocol, Sequence
 
 
 CONTEXTUAL_BOOKING_MODEL_VERSION = "dec.contextual-booking-calibration.v2"
+CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION = (
+    "dec.segment-performance-candidate-support.v1"
+)
+# Runtime candidates can be much smaller and narrower than calibration cohorts.
+PREDICTION_POLICY_VERSION = "dec.segment-performance-serving.v1"
+STANDARDIZED_FEATURE_LIMIT = 3.0
+PREDICTION_PRIOR_USER_COUNT = 30.0
 DEFAULT_MODEL_PATH = (
     Path(__file__).resolve().parent
     / "models"
@@ -146,6 +153,60 @@ class SegmentPerformanceFeatures:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SegmentPerformancePrediction:
+    value: float
+    raw_model_value: float
+    distribution_guarded_value: float
+    training_baseline_rate: float | None
+    candidate_sample_size: int
+    sample_weight: float
+    prior_user_count: float
+    out_of_distribution_features: tuple[str, ...]
+    influential_out_of_distribution_features: tuple[str, ...]
+    max_abs_standardized_value: float
+    policy_version: str | None
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "prediction_adjustment": {
+                "policy_version": self.policy_version,
+                "applied": self.policy_version is not None,
+                "raw_model_value": round(self.raw_model_value, 6),
+                "distribution_guarded_value": round(
+                    self.distribution_guarded_value,
+                    6,
+                ),
+                "adjusted_value": round(self.value, 6),
+                "training_baseline_rate": (
+                    round(self.training_baseline_rate, 6)
+                    if self.training_baseline_rate is not None
+                    else None
+                ),
+                "candidate_sample_size": self.candidate_sample_size,
+                "sample_weight": round(self.sample_weight, 6),
+                "prior_user_count": self.prior_user_count,
+                "out_of_distribution_feature_count": len(
+                    self.out_of_distribution_features
+                ),
+                "out_of_distribution_features": list(
+                    self.out_of_distribution_features
+                ),
+                "influential_out_of_distribution_feature_count": len(
+                    self.influential_out_of_distribution_features
+                ),
+                "influential_out_of_distribution_features": list(
+                    self.influential_out_of_distribution_features
+                ),
+                "max_abs_standardized_value": round(
+                    self.max_abs_standardized_value,
+                    6,
+                ),
+                "standardized_feature_limit": STANDARDIZED_FEATURE_LIMIT,
+            }
+        }
+
+
 class SegmentPerformancePredictor(Protocol):
     version: str
     method: str
@@ -156,6 +217,17 @@ class SegmentPerformancePredictor(Protocol):
 
     def metadata(self) -> Mapping[str, Any]:
         ...
+
+
+@dataclass(frozen=True, slots=True)
+class CandidateTypePredictionSupport:
+    supported: bool
+    training_example_count: int | None
+    reason: str | None = None
+
+
+class UnsupportedCandidateTypeError(ValueError):
+    pass
 
 
 @dataclass(frozen=True, slots=True)
@@ -198,6 +270,7 @@ class LogisticSegmentPerformanceModel:
             raise ValueError("calibration feature scales must be positive")
 
     def predict(self, features: SegmentPerformanceFeatures) -> float:
+        self.require_candidate_type_support(features.candidate_type)
         raw_values = features.model_values()
         linear = self.intercept
         for index, feature_name in enumerate(self.feature_names):
@@ -207,6 +280,92 @@ class LogisticSegmentPerformanceModel:
             linear += self.coefficients[index] * standardized
         return _sigmoid(linear)
 
+    def predict_with_diagnostics(
+        self,
+        features: SegmentPerformanceFeatures,
+        *,
+        sample_size: int,
+    ) -> SegmentPerformancePrediction:
+        self.require_candidate_type_support(features.candidate_type)
+        raw_values = features.model_values()
+        raw_linear = self.intercept
+        guarded_linear = self.intercept
+        out_of_distribution_features: list[str] = []
+        influential_out_of_distribution_features: list[str] = []
+        max_abs_standardized_value = 0.0
+
+        for index, feature_name in enumerate(self.feature_names):
+            raw_value = raw_values.get(feature_name, 0.0)
+            standardized = (
+                raw_value - self.feature_means[index]
+            ) / self.feature_scales[index]
+            coefficient = self.coefficients[index]
+            raw_linear += coefficient * standardized
+            max_abs_standardized_value = max(
+                max_abs_standardized_value,
+                abs(standardized),
+            )
+            is_numeric_feature = feature_name in NUMERIC_FEATURE_NAMES
+            is_unseen_candidate_type = (
+                not is_numeric_feature
+                and raw_value == 1.0
+                and self.feature_means[index] <= 1e-9
+            )
+            if (
+                is_numeric_feature
+                and abs(standardized) > STANDARDIZED_FEATURE_LIMIT
+            ) or is_unseen_candidate_type:
+                out_of_distribution_features.append(feature_name)
+                if abs(coefficient) > 1e-12:
+                    influential_out_of_distribution_features.append(feature_name)
+            guarded_standardized = (
+                max(
+                    -STANDARDIZED_FEATURE_LIMIT,
+                    min(STANDARDIZED_FEATURE_LIMIT, standardized),
+                )
+                if is_numeric_feature
+                else standardized
+            )
+            guarded_linear += coefficient * guarded_standardized
+
+        raw_model_value = _sigmoid(raw_linear)
+        distribution_guarded_value = _sigmoid(guarded_linear)
+        baseline_rate = _optional_rate(
+            self.training_metadata.get(
+                "training_contextual_booking_observation_rate"
+            )
+        )
+        normalized_sample_size = max(int(sample_size), 0)
+        if baseline_rate is None:
+            sample_weight = 1.0
+            adjusted_value = distribution_guarded_value
+        else:
+            sample_weight = normalized_sample_size / (
+                normalized_sample_size + PREDICTION_PRIOR_USER_COUNT
+            )
+            adjusted_value = (
+                sample_weight * distribution_guarded_value
+                + (1.0 - sample_weight) * baseline_rate
+            )
+
+        return SegmentPerformancePrediction(
+            value=_clamp01(adjusted_value),
+            raw_model_value=raw_model_value,
+            distribution_guarded_value=distribution_guarded_value,
+            training_baseline_rate=baseline_rate,
+            candidate_sample_size=normalized_sample_size,
+            sample_weight=sample_weight,
+            prior_user_count=(
+                PREDICTION_PRIOR_USER_COUNT if baseline_rate is not None else 0.0
+            ),
+            out_of_distribution_features=tuple(out_of_distribution_features),
+            influential_out_of_distribution_features=tuple(
+                influential_out_of_distribution_features
+            ),
+            max_abs_standardized_value=max_abs_standardized_value,
+            policy_version=PREDICTION_POLICY_VERSION,
+        )
+
     def metadata(self) -> Mapping[str, Any]:
         return {
             "model_version": self.version,
@@ -214,6 +373,25 @@ class LogisticSegmentPerformanceModel:
             "calibration_status": self.calibration_status,
             **dict(self.training_metadata),
         }
+
+    def candidate_type_training_example_count(self, candidate_type: str) -> int:
+        counts = self.training_metadata.get(
+            "training_candidate_type_example_counts"
+        )
+        if not isinstance(counts, Mapping):
+            return 0
+        return _nonnegative_int(counts.get(candidate_type))
+
+    def supports_candidate_type(self, candidate_type: str) -> bool:
+        return self.candidate_type_training_example_count(candidate_type) > 0
+
+    def require_candidate_type_support(self, candidate_type: str) -> None:
+        if self.supports_candidate_type(candidate_type):
+            return
+        raise UnsupportedCandidateTypeError(
+            "calibration model has no training examples for candidate type: "
+            f"{candidate_type}"
+        )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -285,6 +463,71 @@ class ContextualBookingHeuristicPredictor:
         }
 
 
+def candidate_type_prediction_support(
+    predictor: SegmentPerformancePredictor,
+    *,
+    goal_metric: str,
+    candidate_type: str,
+) -> CandidateTypePredictionSupport:
+    if goal_metric != "booking_conversion_rate":
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=None,
+        )
+    if not isinstance(predictor, LogisticSegmentPerformanceModel):
+        if candidate_type == "promotion_responsive":
+            return CandidateTypePredictionSupport(
+                supported=False,
+                training_example_count=None,
+                reason="booking_outcome_training_support_unavailable",
+            )
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=None,
+        )
+    training_example_count = predictor.candidate_type_training_example_count(
+        candidate_type
+    )
+    if training_example_count > 0:
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=training_example_count,
+        )
+    return CandidateTypePredictionSupport(
+        supported=False,
+        training_example_count=training_example_count,
+        reason="candidate_type_not_observed_in_model_training",
+    )
+
+
+def predict_segment_performance(
+    predictor: SegmentPerformancePredictor,
+    features: SegmentPerformanceFeatures,
+    *,
+    sample_size: int,
+) -> SegmentPerformancePrediction:
+    if isinstance(predictor, LogisticSegmentPerformanceModel):
+        return predictor.predict_with_diagnostics(
+            features,
+            sample_size=sample_size,
+        )
+
+    value = _clamp01(predictor.predict(features))
+    return SegmentPerformancePrediction(
+        value=value,
+        raw_model_value=value,
+        distribution_guarded_value=value,
+        training_baseline_rate=None,
+        candidate_sample_size=max(int(sample_size), 0),
+        sample_weight=1.0,
+        prior_user_count=0.0,
+        out_of_distribution_features=(),
+        influential_out_of_distribution_features=(),
+        max_abs_standardized_value=0.0,
+        policy_version=None,
+    )
+
+
 def fit_logistic_segment_performance_model(
     examples: Sequence[CalibrationTrainingExample],
     *,
@@ -304,6 +547,23 @@ def fit_logistic_segment_performance_model(
         raise ValueError("at least two calibration examples are required")
     if iterations <= 0 or learning_rate <= 0 or l2_penalty < 0:
         raise ValueError("invalid calibration optimizer settings")
+
+    candidate_type_example_counts = {
+        candidate_type: 0 for candidate_type in MODEL_CANDIDATE_TYPES
+    }
+    candidate_type_user_observation_counts = {
+        candidate_type: 0 for candidate_type in MODEL_CANDIDATE_TYPES
+    }
+    for example in valid:
+        candidate_type = example.features.candidate_type
+        if candidate_type not in candidate_type_example_counts:
+            raise ValueError(
+                f"unsupported calibration candidate type: {candidate_type!r}"
+            )
+        candidate_type_example_counts[candidate_type] += 1
+        candidate_type_user_observation_counts[candidate_type] += (
+            example.sample_size
+        )
 
     rows = [example.features.model_values() for example in valid]
     sample_weights = [math.sqrt(example.sample_size) for example in valid]
@@ -372,13 +632,27 @@ def fit_logistic_segment_performance_model(
             coefficients[index] -= step * regularized_gradient
 
     metadata = {
+        **dict(training_metadata or {}),
         "training_example_count": len(valid),
         "training_candidate_user_observation_count": total_sample,
         "training_contextual_booking_observation_count": total_success,
         "training_contextual_booking_observation_rate": _clamp01(
             total_success / max(total_sample, 1)
         ),
-        **dict(training_metadata or {}),
+        "candidate_type_support_contract_version": (
+            CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+        ),
+        "training_candidate_type_example_counts": (
+            candidate_type_example_counts
+        ),
+        "training_candidate_type_user_observation_counts": (
+            candidate_type_user_observation_counts
+        ),
+        "supported_candidate_types": [
+            candidate_type
+            for candidate_type, count in candidate_type_example_counts.items()
+            if count > 0
+        ],
         "optimizer": {
             "iterations": iterations,
             "learning_rate": learning_rate,
@@ -441,3 +715,21 @@ def _logit(value: float) -> float:
 
 def _clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
+
+
+def _optional_rate(value: object) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
+        return None
+    return parsed
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)

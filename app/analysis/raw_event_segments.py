@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -8,6 +9,11 @@ from time import perf_counter
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
+from app.analysis.audience_selection import (
+    AudienceSelectionDecision,
+    AudienceSelectionPolicyProtocol,
+    all_matching_audience_selection_policy,
+)
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -17,10 +23,11 @@ from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
     SegmentPerformanceFeatures,
     SegmentPerformancePredictor,
+    candidate_type_prediction_support,
+    predict_segment_performance,
 )
 from app.config import Settings
 from app.generation.adapters import (
-    DEFAULT_OPENAI_CONTENT_MODEL,
     OPENAI_RESPONSES_URL,
     JsonTransport,
     _parse_output_json,
@@ -29,11 +36,11 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v3"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v7"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
-RAW_EVENT_CANDIDATE_USER_LIMIT = 160
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
+PRIMARY_RECOMMENDATION_MIN_RELIABILITY = 0.75
 MAX_RANK_USER_OVERLAP = 0.70
 
 CANDIDATE_TYPE_ORDER = (
@@ -46,11 +53,11 @@ CANDIDATE_TYPE_ORDER = (
 )
 
 DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
-    "promotion_condition_match": 0.30,
-    "expected_goal_performance": 0.25,
-    "behavior_lift_vs_baseline": 0.20,
-    "sample_reliability": 0.15,
-    "rank_distinctiveness": 0.10,
+    "promotion_condition_match": 0.15,
+    "expected_goal_performance": 0.70,
+    "behavior_lift_vs_baseline": 0.06,
+    "sample_reliability": 0.06,
+    "rank_distinctiveness": 0.03,
 }
 
 # Destination-specific candidates already require a matching destination event.
@@ -65,33 +72,33 @@ DESTINATION_SCORE_WEIGHTS: Mapping[str, float] = {
 
 CANDIDATE_TYPE_LABELS: Mapping[str, Mapping[str, str]] = {
     "intent_matched": {
-        "rank_role": "프로모션 조건 정합형",
+        "strategy_role": "프로모션 조건 정합형",
         "fallback_title": "프로모션 조건과 맞는 숙소 관심 고객",
     },
     "funnel_recovery": {
-        "rank_role": "예약 이탈 회수형",
+        "strategy_role": "예약 이탈 회수형",
         "fallback_title": "예약 직전 이탈 고객",
     },
     "promotion_responsive": {
-        "rank_role": "프로모션 반응 확장형",
+        "strategy_role": "프로모션 반응 확장형",
         "fallback_title": "프로모션 반응이 확인된 고객",
     },
     "target_destination_affinity": {
-        "rank_role": "이번 목적지 반복 관심형",
+        "strategy_role": "이번 목적지 반복 관심형",
         "fallback_title": "이번 여행지를 반복 탐색한 고객",
     },
     "general_destination_explorer": {
-        "rank_role": "다목적지 탐색 확장형",
+        "strategy_role": "다목적지 탐색 확장형",
         "fallback_title": "여러 여행지를 비교 탐색한 고객",
     },
     "benefit_value_seeker": {
-        "rank_role": "혜택 민감형",
+        "strategy_role": "혜택 민감형",
         "fallback_title": "할인과 혜택에 반응할 고객",
     },
 }
 
 # Stable ontology labels used for deterministic fallbacks and UI chips.
-# These labels do not select users or decide ranking.
+# These labels do not select users or decide candidate selection.
 CONDITION_LABELS: Mapping[str, tuple[str, str]] = {
     "hotel_product_interest": ("숙소 관심 행동", "숙소 관심"),
     "recent_destination_search": ("목적지 숙소 검색", "목적지 검색"),
@@ -206,7 +213,7 @@ class RawEventIntentCompilation:
 @dataclass(frozen=True)
 class _RawEventCandidate:
     candidate_type: str
-    rank_role: str
+    strategy_role: str
     title: str
     reason: str
     action_hint: str
@@ -223,6 +230,7 @@ class _RawEventCandidate:
     destination_context_required: bool
     performance_features: SegmentPerformanceFeatures
     performance_model_metadata: Mapping[str, Any]
+    audience_selection: AudienceSelectionDecision
     rank_distinctiveness: float = 1.0
 
     @property
@@ -240,7 +248,7 @@ class OpenAIPromotionIntentExtractor:
         self,
         *,
         api_key: str,
-        model: str = DEFAULT_OPENAI_CONTENT_MODEL,
+        model: str,
         endpoint: str = OPENAI_RESPONSES_URL,
         timeout_seconds: float = 15.0,
         fallback_extractor: PromotionIntentExtractor | None = None,
@@ -347,7 +355,7 @@ def build_promotion_intent_extractor(settings: Settings) -> PromotionIntentExtra
         return DeterministicPromotionIntentExtractor()
     return OpenAIPromotionIntentExtractor(
         api_key=settings.openai_api_key,
-        model=settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL,
+        model=settings.openai_content_model,
     )
 
 
@@ -480,6 +488,7 @@ def generate_raw_event_segment_definitions(
     max_suggested_segments: int,
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None = None,
+    audience_selection_policy: AudienceSelectionPolicyProtocol | None = None,
 ) -> list[SegmentDefinitionRecord]:
     candidates = _generate_raw_event_candidates(
         promotion=promotion,
@@ -488,11 +497,13 @@ def generate_raw_event_segment_definitions(
         profiles=profiles,
         min_sample_size=min_sample_size,
         performance_predictor=performance_predictor,
+        audience_selection_policy=audience_selection_policy,
+        enforce_prediction_support=True,
     )
     if not candidates:
         return []
     total_eligible_user_count = len(profiles)
-    ranked = _rank_candidates(
+    selected_candidates = _select_candidate_portfolio(
         candidates,
         max_suggested_segments=max_suggested_segments,
     )
@@ -502,10 +513,11 @@ def generate_raw_event_segment_definitions(
             intent=intent,
             compilation=compilation,
             candidate=candidate,
-            rank=rank,
+            position=position,
             total_eligible_user_count=total_eligible_user_count,
+            selected_candidates=selected_candidates,
         )
-        for rank, candidate in enumerate(ranked)
+        for position, candidate in enumerate(selected_candidates)
     ]
 
 
@@ -517,8 +529,9 @@ def generate_raw_event_segment_candidate_pool(
     profiles: Sequence[RawEventUserSignalRecord],
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None = None,
+    enforce_prediction_support: bool = True,
 ) -> list[SegmentDefinitionRecord]:
-    """Return every eligible candidate type for offline model calibration."""
+    """Return every eligible candidate before overlap and rank pruning."""
     candidates = _generate_raw_event_candidates(
         promotion=promotion,
         intent=intent,
@@ -526,6 +539,8 @@ def generate_raw_event_segment_candidate_pool(
         profiles=profiles,
         min_sample_size=min_sample_size,
         performance_predictor=performance_predictor,
+        audience_selection_policy=None,
+        enforce_prediction_support=enforce_prediction_support,
     )
     total_eligible_user_count = len(profiles)
     return [
@@ -534,10 +549,11 @@ def generate_raw_event_segment_candidate_pool(
             intent=intent,
             compilation=compilation,
             candidate=candidate,
-            rank=rank,
+            position=position,
             total_eligible_user_count=total_eligible_user_count,
+            selected_candidates=None,
         )
-        for rank, candidate in enumerate(candidates)
+        for position, candidate in enumerate(candidates)
     ]
 
 
@@ -549,69 +565,77 @@ def _generate_raw_event_candidates(
     profiles: Sequence[RawEventUserSignalRecord],
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None,
+    audience_selection_policy: AudienceSelectionPolicyProtocol | None,
+    enforce_prediction_support: bool,
 ) -> list[_RawEventCandidate]:
     if len(profiles) < min_sample_size:
         return []
     baseline = _baseline_metrics(profiles)
     predictor = performance_predictor or ContextualBookingHeuristicPredictor()
-    raw_candidates = [
-        _intent_matched_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
+    candidate_factories: tuple[
+        tuple[str, Callable[..., _RawEventCandidate | None]],
+        ...,
+    ] = (
+        ("intent_matched", _intent_matched_candidate),
+        (
+            "target_destination_affinity",
+            _target_destination_affinity_candidate,
         ),
-        _target_destination_affinity_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
+        ("funnel_recovery", _funnel_recovery_candidate),
+        ("benefit_value_seeker", _benefit_value_seeker_candidate),
+        ("promotion_responsive", _promotion_responsive_candidate),
+        (
+            "general_destination_explorer",
+            _general_destination_explorer_candidate,
         ),
-        _funnel_recovery_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _benefit_value_seeker_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _promotion_responsive_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-        _general_destination_explorer_candidate(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            baseline=baseline,
-            min_sample_size=min_sample_size,
-            performance_predictor=predictor,
-        ),
-    ]
+    )
+    raw_candidates: list[_RawEventCandidate | None] = []
+    for candidate_type, candidate_factory in candidate_factories:
+        if enforce_prediction_support:
+            support = candidate_type_prediction_support(
+                predictor,
+                goal_metric=promotion.goal_metric,
+                candidate_type=candidate_type,
+            )
+            if not support.supported:
+                log.info(
+                    "candidate_type_prediction_unsupported",
+                    {
+                        "candidateType": candidate_type,
+                        "goalMetric": promotion.goal_metric,
+                        "modelVersion": predictor.version,
+                        "trainingExampleCount": support.training_example_count,
+                        "reason": support.reason,
+                    },
+                )
+                continue
+        raw_candidates.append(
+            candidate_factory(
+                promotion=promotion,
+                intent=intent,
+                compilation=compilation,
+                profiles=profiles,
+                baseline=baseline,
+                min_sample_size=min_sample_size,
+                performance_predictor=predictor,
+            )
+        )
+    candidates = [candidate for candidate in raw_candidates if candidate is not None]
+    if audience_selection_policy is not None:
+        candidates = [
+            _apply_audience_selection(
+                candidate=candidate,
+                promotion=promotion,
+                all_profiles=profiles,
+                baseline=baseline,
+                min_sample_size=min_sample_size,
+                performance_predictor=predictor,
+                audience_selection_policy=audience_selection_policy,
+            )
+            for candidate in candidates
+        ]
     return _normalize_expected_performance(
-        [candidate for candidate in raw_candidates if candidate is not None]
+        candidates
     )
 
 
@@ -924,10 +948,16 @@ def _candidate_from_profiles(
             profile.user_id,
         ),
     )
-    selected_profiles = ordered_profiles[:RAW_EVENT_CANDIDATE_USER_LIMIT]
-    candidate_user_ids = tuple(profile.user_id for profile in selected_profiles)
+    # Keep every matching user until a selection ratio is calibrated by backtest.
+    candidate_profiles = ordered_profiles
+    candidate_user_ids = tuple(profile.user_id for profile in candidate_profiles)
+    audience_selection = all_matching_audience_selection_policy().decide(
+        goal_metric=promotion.goal_metric,
+        candidate_type=candidate_type,
+        matching_user_count=matching_profile_count,
+    )
     signal_metrics = _signal_metrics(
-        selected_profiles,
+        candidate_profiles,
         matching_profile_count=matching_profile_count,
     )
     type_labels = CANDIDATE_TYPE_LABELS[candidate_type]
@@ -940,28 +970,28 @@ def _candidate_from_profiles(
         matched_condition_keys=matched_condition_keys,
     )
     sample_reliability = _sample_reliability(
-        sample_size=len(selected_profiles),
+        sample_size=len(candidate_profiles),
         min_sample_size=min_sample_size,
     )
     performance_features = _performance_features(
         candidate_type=candidate_type,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         signal_metrics=signal_metrics,
         baseline=baseline,
         promotion_condition_match=promotion_condition_match,
         destination_context_required=bool(intent and intent.destinations),
         sample_reliability=sample_reliability,
     )
-    predicted_goal_rate = _expected_goal_performance(
+    predicted_goal_rate, prediction_metadata = _expected_goal_performance(
         promotion=promotion,
-        profiles=selected_profiles,
+        profiles=candidate_profiles,
         baseline=baseline,
         performance_features=performance_features,
         performance_predictor=performance_predictor,
     )
     return _RawEventCandidate(
         candidate_type=candidate_type,
-        rank_role=type_labels["rank_role"],
+        strategy_role=type_labels["strategy_role"],
         title=type_labels["fallback_title"],
         reason=_fallback_candidate_reason(
             candidate_type=candidate_type,
@@ -980,14 +1010,101 @@ def _candidate_from_profiles(
         predicted_goal_rate=predicted_goal_rate,
         expected_goal_performance=predicted_goal_rate,
         behavior_lift_vs_baseline=_behavior_lift(
-            profiles=selected_profiles,
+            profiles=candidate_profiles,
             baseline=baseline,
             candidate_type=candidate_type,
         ),
         sample_reliability=sample_reliability,
         destination_context_required=bool(intent and intent.destinations),
         performance_features=performance_features,
-        performance_model_metadata=dict(performance_predictor.metadata()),
+        performance_model_metadata={
+            **dict(performance_predictor.metadata()),
+            **dict(prediction_metadata),
+        },
+        audience_selection=audience_selection,
+    )
+
+
+def _apply_audience_selection(
+    *,
+    candidate: _RawEventCandidate,
+    promotion: PromotionRecord,
+    all_profiles: Sequence[RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+    audience_selection_policy: AudienceSelectionPolicyProtocol,
+) -> _RawEventCandidate:
+    decision = audience_selection_policy.decide(
+        goal_metric=promotion.goal_metric,
+        candidate_type=candidate.candidate_type,
+        matching_user_count=candidate.sample_size,
+    )
+    if not decision.selection_limited:
+        return replace(candidate, audience_selection=decision)
+
+    profiles_by_user_id = {profile.user_id: profile for profile in all_profiles}
+    selected_profiles = [
+        profile
+        for user_id in candidate.candidate_user_ids[: decision.selected_user_count]
+        if (profile := profiles_by_user_id.get(user_id)) is not None
+    ]
+    if len(selected_profiles) != decision.selected_user_count:
+        return replace(
+            candidate,
+            audience_selection=all_matching_audience_selection_policy(
+                calibration_status="runtime_fallback",
+                fallback_reason="selected_profiles_unavailable",
+            ).decide(
+                goal_metric=promotion.goal_metric,
+                candidate_type=candidate.candidate_type,
+                matching_user_count=candidate.sample_size,
+            ),
+        )
+
+    matching_profile_count = candidate.sample_size
+    signal_metrics = _signal_metrics(
+        selected_profiles,
+        matching_profile_count=matching_profile_count,
+    )
+    sample_reliability = _sample_reliability(
+        sample_size=len(selected_profiles),
+        min_sample_size=min_sample_size,
+    )
+    performance_features = _performance_features(
+        candidate_type=candidate.candidate_type,
+        profiles=selected_profiles,
+        signal_metrics=signal_metrics,
+        baseline=baseline,
+        promotion_condition_match=candidate.promotion_condition_match,
+        destination_context_required=candidate.destination_context_required,
+        sample_reliability=sample_reliability,
+    )
+    predicted_goal_rate, prediction_metadata = _expected_goal_performance(
+        promotion=promotion,
+        profiles=selected_profiles,
+        baseline=baseline,
+        performance_features=performance_features,
+        performance_predictor=performance_predictor,
+    )
+    return replace(
+        candidate,
+        candidate_user_ids=tuple(profile.user_id for profile in selected_profiles),
+        signal_metrics=signal_metrics,
+        predicted_goal_rate=predicted_goal_rate,
+        expected_goal_performance=predicted_goal_rate,
+        behavior_lift_vs_baseline=_behavior_lift(
+            profiles=selected_profiles,
+            baseline=baseline,
+            candidate_type=candidate.candidate_type,
+        ),
+        sample_reliability=sample_reliability,
+        performance_features=performance_features,
+        performance_model_metadata={
+            **dict(performance_predictor.metadata()),
+            **dict(prediction_metadata),
+        },
+        audience_selection=decision,
     )
 
 
@@ -1040,7 +1157,7 @@ def _normalize_expected_performance(
     ]
 
 
-def _rank_candidates(
+def _select_candidate_portfolio(
     candidates: Sequence[_RawEventCandidate],
     *,
     max_suggested_segments: int,
@@ -1067,7 +1184,9 @@ def _rank_candidates(
         next_candidate = max(
             distinct_candidates,
             key=lambda candidate: (
+                _recommendation_tier_priority(candidate),
                 _final_score(candidate),
+                _expected_goal_achievement_count(candidate),
                 -CANDIDATE_TYPE_ORDER.index(candidate.candidate_type),
                 candidate.sample_size,
             ),
@@ -1102,7 +1221,7 @@ def _with_distinctiveness(
     distinctiveness = 0.8 * user_distinctiveness + 0.2 * chip_distinctiveness
     return _RawEventCandidate(
         candidate_type=candidate.candidate_type,
-        rank_role=candidate.rank_role,
+        strategy_role=candidate.strategy_role,
         title=candidate.title,
         reason=candidate.reason,
         action_hint=candidate.action_hint,
@@ -1119,6 +1238,7 @@ def _with_distinctiveness(
         destination_context_required=candidate.destination_context_required,
         performance_features=candidate.performance_features,
         performance_model_metadata=candidate.performance_model_metadata,
+        audience_selection=candidate.audience_selection,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
     )
 
@@ -1154,8 +1274,9 @@ def _segment_definition_from_candidate(
     intent: PromotionIntent,
     compilation: RawEventIntentCompilation,
     candidate: _RawEventCandidate,
-    rank: int,
+    position: int,
     total_eligible_user_count: int,
+    selected_candidates: Sequence[_RawEventCandidate] | None,
 ) -> SegmentDefinitionRecord:
     sample_ratio = _sample_ratio(
         sample_size=candidate.sample_size,
@@ -1173,18 +1294,59 @@ def _segment_definition_from_candidate(
         total_eligible_user_count=total_eligible_user_count,
         sample_ratio=sample_ratio,
     )
+    matching_user_count = int(
+        candidate.signal_metrics.get("matching_profile_count", candidate.sample_size)
+        or candidate.sample_size
+    )
+    matching_user_ratio = _safe_rate(
+        matching_user_count,
+        total_eligible_user_count,
+    )
+    selection_ratio_within_matching = _safe_rate(
+        candidate.sample_size,
+        matching_user_count,
+    )
+    selection_decision = candidate.audience_selection
+    recommendation_tier = _recommendation_tier(candidate)
+    audience = {
+        "total_eligible_user_count": total_eligible_user_count,
+        "matching_user_count": matching_user_count,
+        "selected_user_count": candidate.sample_size,
+        "selected_user_ratio": round(float(sample_ratio), 6),
+        "matching_user_ratio": round(matching_user_ratio, 6),
+        "selection_ratio_within_matching": round(
+            selection_ratio_within_matching,
+            6,
+        ),
+        "selection_limited": selection_decision.selection_limited,
+        "selection_basis": (
+            "behavior_strength_within_candidate"
+            if selection_decision.selection_limited
+            else "candidate_condition_match"
+        ),
+        "selection_limit": (
+            candidate.sample_size if selection_decision.selection_limited else None
+        ),
+        "selected_user_role": "recommended_audience",
+        "selection_policy": selection_decision.to_metadata(),
+    }
     performance_estimate = _performance_estimate(
         promotion=promotion,
         candidate=candidate,
     )
+    strategy_summary = _strategy_difference_summary(candidate)
+    selection_consideration = _selection_consideration_summary(candidate)
     display_copy = {
         "title": candidate.title,
-        "rank_role": candidate.rank_role,
+        "strategy_role": candidate.strategy_role,
+        **recommendation_tier,
         "audience_summary": audience_summary,
+        "audience": audience,
         "performance_estimate": performance_estimate,
         "signal_chips": list(candidate.signal_chips),
         "reason": candidate.reason,
-        "difference_summary": _difference_summary(candidate, rank=rank),
+        "strength_summary": strategy_summary,
+        "tradeoff_summary": selection_consideration,
         "action_hint": candidate.action_hint,
     }
     segment_id = _raw_event_segment_id(
@@ -1195,12 +1357,15 @@ def _segment_definition_from_candidate(
     profile_json: dict[str, Any] = {
         "primary_segment": segment_id,
         "source": "raw_event_intent",
-        "rank_role": candidate.rank_role,
+        "strategy_role": candidate.strategy_role,
         "candidate_type": candidate.candidate_type,
+        **recommendation_tier,
+        "portfolio_position": position + 1,
         "score_components": score_components,
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
         "signal_chips": list(candidate.signal_chips),
+        "audience": audience,
         "performance_estimate": performance_estimate,
         "performance_features": candidate.performance_features.to_json(),
         "signal_metrics": {
@@ -1212,6 +1377,19 @@ def _segment_definition_from_candidate(
         "compiled_intent": compilation.to_json(),
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
+        "selection_basis": {
+            "primary_component": "recommendation_tier",
+            "metric": promotion.goal_metric,
+            "metric_label": performance_estimate["label"],
+            "method": "diversified_candidate_portfolio",
+            "expected_goal_achievement_count": performance_estimate[
+                "expected_count"
+            ],
+            "internal_position": position + 1,
+            "portfolio_size": (
+                len(selected_candidates) if selected_candidates is not None else None
+            ),
+        },
     }
     primary_signals = [
         key for key in candidate.matched_condition_keys if key.strip()
@@ -1228,7 +1406,7 @@ def _segment_definition_from_candidate(
         source="ai_suggested",
         query_preview_id=None,
         natural_language_query=(
-            f"{candidate.rank_role}: {', '.join(matched_conditions[:3])} 조건을 "
+            f"{candidate.strategy_role}: {', '.join(matched_conditions[:3])} 조건을 "
             "실제 SDK 행동 이벤트에서 만족한 고객군입니다."
         ),
         generated_sql=None,
@@ -1262,9 +1440,13 @@ def _candidate_audience_summary(
         f"분석 대상 {total_eligible_user_count}명 중 "
         f"조건 일치 {matching_user_count}명"
     )
-    if matching_user_count > candidate.sample_size:
-        return f"{summary} · 상위 {candidate.sample_size}명 사용"
-    return f"{summary} · {float(sample_ratio) * 100:g}%"
+    selection = candidate.audience_selection
+    if selection.selection_limited:
+        return (
+            f"{summary} 중 행동 신호 상위 {candidate.sample_size}명 추천 "
+            f"({selection.applied_ratio * 100:g}%)"
+        )
+    return f"{summary} · 조건 일치자 전체를 추천 대상으로 사용"
 
 
 def _intent_system_instruction() -> str:
@@ -1775,19 +1957,53 @@ def _expected_goal_performance(
     baseline: Mapping[str, float],
     performance_features: SegmentPerformanceFeatures,
     performance_predictor: SegmentPerformancePredictor,
-) -> float:
+) -> tuple[float, Mapping[str, Any]]:
     if promotion.goal_metric == "booking_conversion_rate":
-        return _clamp01(performance_predictor.predict(performance_features))
-    if promotion.goal_metric == "inflow_rate":
-        return _smoothed_user_rate(
-            profiles,
-            lambda profile: profile.campaign_landing_count > 0,
-            baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
+        prediction = predict_segment_performance(
+            performance_predictor,
+            performance_features,
+            sample_size=len(profiles),
         )
-    return _smoothed_user_rate(
-        profiles,
-        lambda profile: profile.booking_start_count > 0,
-        baseline_rate=baseline.get("booking_start_user_rate", 0.0),
+        prediction_metadata = prediction.metadata()
+        adjustment = prediction_metadata.get("prediction_adjustment")
+        if isinstance(adjustment, Mapping) and adjustment.get("applied"):
+            log.info(
+                "segment_performance_prediction_adjusted",
+                {
+                    "candidateType": performance_features.candidate_type,
+                    "goalMetric": promotion.goal_metric,
+                    "modelVersion": performance_predictor.version,
+                    "candidateSampleSize": len(profiles),
+                    "rawModelValue": adjustment.get("raw_model_value"),
+                    "adjustedValue": adjustment.get("adjusted_value"),
+                    "outOfDistributionFeatureCount": adjustment.get(
+                        "out_of_distribution_feature_count"
+                    ),
+                    "influentialOutOfDistributionFeatureCount": adjustment.get(
+                        "influential_out_of_distribution_feature_count"
+                    ),
+                    "maxAbsStandardizedValue": adjustment.get(
+                        "max_abs_standardized_value"
+                    ),
+                },
+            )
+        return _clamp01(prediction.value), prediction_metadata
+    if promotion.goal_metric == "inflow_rate":
+        return (
+            _smoothed_user_rate(
+                profiles,
+                lambda profile: profile.campaign_landing_count > 0,
+                baseline_rate=baseline.get("campaign_landing_user_rate", 0.0),
+            ),
+            {},
+        )
+    return (
+        _smoothed_user_rate(
+            profiles,
+            lambda profile: profile.booking_start_count > 0,
+            baseline_rate=baseline.get("booking_start_user_rate", 0.0),
+        ),
+        {},
     )
 
 
@@ -1870,9 +2086,69 @@ def _sample_reliability(*, sample_size: int, min_sample_size: int) -> float:
     return _clamp01(sample_size / max(min_sample_size * 3, 1))
 
 
+def _prediction_prior_user_count(candidate: _RawEventCandidate) -> int | None:
+    adjustment = candidate.performance_model_metadata.get("prediction_adjustment")
+    if not isinstance(adjustment, Mapping):
+        return None
+    try:
+        prior_user_count = float(adjustment.get("prior_user_count", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if prior_user_count <= 0:
+        return None
+    return max(1, math.ceil(prior_user_count))
+
+
+def _is_small_sample_candidate(candidate: _RawEventCandidate) -> bool:
+    prior_user_count = _prediction_prior_user_count(candidate)
+    if prior_user_count is not None:
+        return candidate.sample_size < prior_user_count
+    return candidate.sample_reliability < PRIMARY_RECOMMENDATION_MIN_RELIABILITY
+
+
+def _recommendation_tier(candidate: _RawEventCandidate) -> dict[str, Any]:
+    prior_user_count = _prediction_prior_user_count(candidate)
+    if _is_small_sample_candidate(candidate):
+        if prior_user_count is not None:
+            reason = (
+                f"행동 신호는 확인됐지만 추천 대상 {candidate.sample_size}명이 "
+                f"예측 기준 표본 {prior_user_count}명보다 적어 별도 후보로 분류했습니다."
+            )
+        else:
+            reason = (
+                "행동 신호는 확인됐지만 표본 신뢰도가 주요 추천 기준에 "
+                "미치지 않아 별도 후보로 분류했습니다."
+            )
+        return {
+            "recommendation_tier": "small_high_intent",
+            "recommendation_tier_label": "소규모 고의도 후보",
+            "recommendation_tier_reason": reason,
+            "rank_eligible": False,
+            "minimum_primary_sample_size": prior_user_count,
+        }
+    return {
+        "recommendation_tier": "primary",
+        "recommendation_tier_label": "주요 추천",
+        "recommendation_tier_reason": (
+            "주요 추천에 필요한 표본 수준을 충족해 캠페인 집행 후보로 분류했습니다."
+        ),
+        "rank_eligible": True,
+        "minimum_primary_sample_size": prior_user_count,
+    }
+
+
+def _recommendation_tier_priority(candidate: _RawEventCandidate) -> int:
+    return 1 if _recommendation_tier(candidate)["rank_eligible"] else 0
+
+
+def _expected_goal_achievement_count(candidate: _RawEventCandidate) -> float:
+    return max(candidate.predicted_goal_rate, 0.0) * candidate.sample_size
+
+
 def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
     final_score = _final_score(candidate)
     weights = _score_weights(candidate)
+    recommendation_tier = _recommendation_tier(candidate)
     return {
         "promotion_condition_match": round(candidate.promotion_condition_match, 6),
         "predicted_goal_rate": round(candidate.predicted_goal_rate, 6),
@@ -1881,8 +2157,15 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
         "sample_reliability": round(candidate.sample_reliability, 6),
         "rank_distinctiveness": round(candidate.rank_distinctiveness, 6),
         "final_score": round(final_score, 6),
+        "expected_goal_achievement_count": round(
+            _expected_goal_achievement_count(candidate),
+            6,
+        ),
+        "recommendation_tier": recommendation_tier["recommendation_tier"],
+        "rank_eligible": recommendation_tier["rank_eligible"],
         "weights": dict(weights),
         "destination_context_required": candidate.destination_context_required,
+        "primary_component": "expected_goal_performance",
     }
 
 
@@ -1903,17 +2186,41 @@ def _performance_estimate(
             "method": "empirical_bayes_user_rate",
             "calibration_status": "historical_signal_estimate",
         }
-    return {
+    confidence_label, confidence_reason = _performance_confidence(
+        candidate=candidate,
+        model_metadata=model_metadata,
+    )
+    window_days = _positive_int(model_metadata.get("outcome_days"))
+    expected_count = _expected_goal_achievement_count(candidate)
+    estimate = {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
+        "availability": "available",
+        "unit": "rate",
         "value": round(value, 6),
         "formatted": _format_percent(value),
+        "expected_count": round(expected_count, 6),
+        "expected_count_formatted": _format_expected_count(expected_count),
+        "expected_count_label": _performance_expected_count_label(
+            promotion.goal_metric
+        ),
         "observed_value": round(observed_value, 6),
-        "basis_label": "과거 행동 기반 프로모션 조건 일치 성과 추정",
+        "basis_label": _performance_basis_label(promotion.goal_metric),
+        "window_days": window_days,
+        "window_label": _performance_window_label(
+            promotion.goal_metric,
+            window_days=window_days,
+        ),
+        "confidence_label": confidence_label,
+        "confidence_reason": confidence_reason,
         "method": model_metadata.get("method"),
         "model_version": model_metadata.get("model_version"),
         "calibration_status": model_metadata.get("calibration_status"),
     }
+    prediction_adjustment = model_metadata.get("prediction_adjustment")
+    if isinstance(prediction_adjustment, Mapping):
+        estimate["prediction_adjustment"] = dict(prediction_adjustment)
+    return estimate
 
 
 def _observed_goal_rate(
@@ -1931,16 +2238,92 @@ def _observed_goal_rate(
 
 def _performance_estimate_label(goal_metric: str) -> str:
     if goal_metric == "booking_conversion_rate":
-        return "예상 전환율"
+        return "예상 예약 전환율"
     if goal_metric == "inflow_rate":
         return "예상 유입률"
     if goal_metric == "funnel_step_rate":
-        return "예상 퍼널 이동률"
+        return "예상 예약 시작 전환율"
     return "예상 성과"
+
+
+def _performance_expected_count_label(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return "예상 예약 인원"
+    if goal_metric == "inflow_rate":
+        return "예상 유입 인원"
+    if goal_metric == "funnel_step_rate":
+        return "예상 다음 단계 진입 인원"
+    return "예상 목표 달성 인원"
+
+
+def _performance_basis_label(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return "과거 행동과 프로모션 조건을 반영한 예약 가능성"
+    if goal_metric == "inflow_rate":
+        return "최근 클릭·랜딩 행동을 전체 고객 기준으로 보정한 추정치"
+    if goal_metric == "funnel_step_rate":
+        return "최근 예약 시작 행동을 전체 고객 기준으로 보정한 추정치"
+    return "최근 행동과 프로모션 조건을 반영한 추정치"
+
+
+def _performance_window_label(goal_metric: str, *, window_days: int | None) -> str:
+    if goal_metric == "booking_conversion_rate":
+        if window_days is not None:
+            return f"향후 {window_days}일 내 프로모션 조건 일치 예약"
+        return "향후 프로모션 조건 일치 예약"
+    if goal_metric == "inflow_rate":
+        return "최근 행동 관찰 구간의 캠페인 랜딩"
+    if goal_metric == "funnel_step_rate":
+        return "최근 행동 관찰 구간의 예약 시작"
+    return "최근 행동 관찰 구간"
+
+
+def _performance_confidence(
+    *,
+    candidate: _RawEventCandidate,
+    model_metadata: Mapping[str, Any],
+) -> tuple[str, str]:
+    calibration_status = str(model_metadata.get("calibration_status", ""))
+    adjustment = model_metadata.get("prediction_adjustment")
+    if calibration_status == "calibrated" and isinstance(adjustment, Mapping):
+        sample_size = int(adjustment.get("candidate_sample_size", 0) or 0)
+        prior_user_count = float(adjustment.get("prior_user_count", 0.0) or 0.0)
+        is_small_sample = prior_user_count > 0 and sample_size < prior_user_count
+        if is_small_sample:
+            return (
+                "low",
+                "대표 표본이 제한적이어서 전체 고객의 행동 기준률을 함께 "
+                "반영했습니다.",
+            )
+    if calibration_status == "calibrated":
+        if candidate.sample_reliability >= 0.75:
+            return "high", "충분한 행동 표본과 검증된 예약 예측 모델을 사용했습니다."
+        return (
+            "medium",
+            "검증된 예약 예측 모델을 사용했으며 대표 표본 규모를 함께 "
+            "고려했습니다.",
+        )
+    if calibration_status == "historical_signal_estimate":
+        if candidate.sample_reliability >= 0.75:
+            return "medium", "충분한 표본의 최근 행동 신호를 전체 고객 기준으로 보정했습니다."
+        return "low", "최근 행동 신호를 사용했지만 표본 규모가 제한적입니다."
+    return "low", "현재 데이터에서는 최근 행동 신호를 중심으로 추정했습니다."
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _format_percent(value: float) -> str:
     return f"{_clamp01(value) * 100:.1f}%"
+
+
+def _format_expected_count(value: float) -> str:
+    return f"약 {max(value, 0.0):.1f}명"
 
 
 def _final_score(candidate: _RawEventCandidate) -> float:
@@ -1996,20 +2379,59 @@ def _missing_condition_keys(
     )
 
 
-def _difference_summary(candidate: _RawEventCandidate, *, rank: int) -> str:
-    if rank == 0:
-        return "프로모션 조건과 가장 직접적으로 연결되는 행동 신호를 우선한 후보입니다."
+def _strategy_difference_summary(candidate: _RawEventCandidate) -> str:
+    if candidate.candidate_type == "intent_matched":
+        return "프로모션 조건과 직접 맞는 숙소 관심 행동을 우선한 전략입니다."
     if candidate.candidate_type == "funnel_recovery":
-        return "상위 후보보다 목적지 조건은 약할 수 있지만 예약 의도 깊이가 더 강합니다."
+        return "예약 시작 후 완료하지 않은 고객을 회수하는 전략입니다."
     if candidate.candidate_type == "promotion_responsive":
-        return "상위 후보보다 구매 단계는 넓지만 캠페인 메시지 반응 가능성이 더 높습니다."
+        return "캠페인 메시지에 반응한 고객을 확장하는 전략입니다."
     if candidate.candidate_type == "target_destination_affinity":
-        return "상위 후보보다 퍼널 깊이는 낮아도 이번 프로모션 목적지를 반복 탐색했습니다."
+        return "이번 프로모션 목적지를 반복 탐색한 고객을 우선한 전략입니다."
     if candidate.candidate_type == "general_destination_explorer":
-        return "이번 목적지 직접 관심은 약하지만 여러 여행지를 비교하는 확장 타겟입니다."
+        return "여러 여행지를 비교하는 고객까지 넓히는 전략입니다."
     if candidate.candidate_type == "benefit_value_seeker":
-        return "상위 후보보다 넓은 타겟이지만 할인과 혜택 메시지에 반응할 가능성이 큽니다."
-    return "다른 Rank와 다른 행동 조건을 기준으로 분리한 후보입니다."
+        return "가격과 혜택에 민감한 고객을 우선한 전략입니다."
+    return "다른 후보와 겹치지 않는 행동 조건을 우선한 전략입니다."
+
+
+def _selection_consideration_summary(candidate: _RawEventCandidate) -> str:
+    if _is_small_sample_candidate(candidate):
+        return (
+            "행동 의도는 뚜렷하지만 대표 표본이 작아, 좁은 고객군을 정밀하게 "
+            "공략할 때 적합합니다."
+        )
+    if candidate.candidate_type == "intent_matched":
+        return (
+            "프로모션 조건과 직접 맞는 고객을 우선하지만 예약 퍼널 깊이는 "
+            "다른 행동 근거와 함께 확인해야 합니다."
+        )
+    if candidate.candidate_type == "funnel_recovery":
+        return (
+            "예약 의도는 깊지만 프로모션 목적지와 혜택 조건의 직접 일치 정도를 "
+            "함께 고려해야 합니다."
+        )
+    if candidate.candidate_type == "promotion_responsive":
+        return (
+            "캠페인 반응은 확인됐지만 클릭 행동만으로 예약 의도를 단정하지 않는 "
+            "확장 전략입니다."
+        )
+    if candidate.candidate_type == "target_destination_affinity":
+        return (
+            "목적지 관심은 뚜렷하지만 가격이나 혜택에 대한 반응은 별도 행동 "
+            "근거와 함께 확인해야 합니다."
+        )
+    if candidate.candidate_type == "general_destination_explorer":
+        return (
+            "도달 범위를 넓힐 수 있지만 특정 목적지에 대한 의도는 상대적으로 "
+            "넓게 해석한 후보입니다."
+        )
+    if candidate.candidate_type == "benefit_value_seeker":
+        return (
+            "혜택 메시지와 잘 맞지만 목적지 선호와 예약 단계는 다른 행동 "
+            "근거와 함께 고려해야 합니다."
+        )
+    return "후보의 행동 근거와 대표 표본 규모를 함께 확인해 선택하세요."
 
 
 def _sample_ratio(*, sample_size: int, total_eligible_user_count: int) -> Decimal:

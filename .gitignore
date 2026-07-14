@@ -13,6 +13,8 @@ venv/
 .env.local
 .env.*.local
 artifacts/
+evaluation_manifests/**/*.execution-started.json
+evaluation_manifests/**/*.execution-started.json.lock
 
 # Local planning/reference files that are not part of remote dev yet.
 agent.md

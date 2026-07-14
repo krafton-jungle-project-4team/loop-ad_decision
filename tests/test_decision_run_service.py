@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -9,7 +11,10 @@ from app.decision.repositories import (
     AdExperimentWrite,
     ContentCandidateRecord,
     GenerationRunRecord,
+    NextLoopPreparationConflictError,
+    NextLoopPreparationRecord,
     PromotionAnalysisRecord,
+    PromotionEvaluationRecord,
     PromotionRecord,
     PromotionRunRecord,
     PromotionRunWrite,
@@ -21,14 +26,18 @@ from app.decision.schemas import (
     Channel,
     GoalBasis,
     GoalMetric,
+    PromotionEvaluationStatus,
     PromotionRunStatus,
     RunCreateRequest,
 )
 from app.decision.service import (
     PromotionRunService,
     RunConflictError,
+    RunSegmentScopeValidationError,
     RunValidationError,
     build_bounded_decision_id,
+    build_promotion_run_id,
+    build_segment_scope_fingerprint,
 )
 
 
@@ -45,9 +54,14 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
 
     assert repos.analyses.latest_calls == ["promo_banner_001"]
     assert repos.generations.latest_calls == ["promo_banner_001"]
+    assert repos.target_segments.calls == []
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", None)
+    ]
     assert response.analysis_id == "analysis_banner_001"
     assert response.generation_id == "generation_banner_001"
     assert response.status == PromotionRunStatus.PLANNED
+    assert repos.runs.activation_lock_calls == []
     assert len(repos.runs.inserted) == 1
     assert repos.runs.inserted[0].goal_snapshot_json == {
         "source": "promotions",
@@ -62,6 +76,10 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
         "generation_id": "generation_banner_001",
         "loop_count": 1,
     }
+    assert repos.runs.inserted[0].segment_scope_json == ("seg_family_trip",)
+    assert repos.runs.inserted[0].segment_scope_fingerprint == (
+        build_segment_scope_fingerprint(["seg_family_trip"])
+    )
 
 
 def test_run_service_rejects_generation_for_different_analysis_without_writes() -> None:
@@ -112,16 +130,157 @@ def test_run_service_requires_latest_completed_dependencies(
     assert repos.ad_experiments.inserted_batches == []
 
 
-def test_run_service_rejects_duplicate_promotion_loop_without_writes() -> None:
-    service, repos = make_service(run_exists=True)
+def test_run_service_reuses_identical_scope_without_duplicate_writes() -> None:
+    service, repos = make_service()
 
-    with pytest.raises(RunConflictError, match="promotion_id and loop_count"):
-        service.create_run(
-            promotion_id="promo_banner_001",
-            request=RunCreateRequest(loop_count=2),
-        )
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(loop_count=2),
+    )
+    second = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(loop_count=2),
+    )
 
-    assert repos.runs.exists_calls == [("promo_banner_001", 2)]
+    assert second == first
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+
+
+def test_run_service_creates_distinct_runs_for_different_segment_scopes() -> None:
+    generation = generation_record(target_segment_ids=["seg_a", "seg_b"])
+    service, repos = make_service(
+        generation=generation,
+        target_segments=[
+            target_segment_record(segment_id="seg_a"),
+            target_segment_record(segment_id="seg_b"),
+        ],
+        candidates=[
+            content_candidate_record(
+                generation_id=generation.generation_id,
+                segment_id="seg_a",
+            ),
+            content_candidate_record(
+                generation_id=generation.generation_id,
+                segment_id="seg_b",
+            ),
+        ],
+    )
+
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            generation_id=generation.generation_id,
+            segment_ids=["seg_a"],
+        ),
+    )
+    second = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            generation_id=generation.generation_id,
+            segment_ids=["seg_b"],
+        ),
+    )
+
+    assert first.promotion_run_id != second.promotion_run_id
+    assert first.segment_ids == ["seg_a"]
+    assert second.segment_ids == ["seg_b"]
+    assert [run.loop_count for run in repos.runs.inserted] == [1, 1]
+
+
+def test_run_service_reuses_scope_when_segment_input_order_changes() -> None:
+    target_segments = [
+        target_segment_record(segment_id="seg_a"),
+        target_segment_record(segment_id="seg_b"),
+    ]
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_a", "seg_b"]),
+        target_segments=target_segments,
+        candidates=[
+            content_candidate_record(segment_id="seg_a"),
+            content_candidate_record(segment_id="seg_b"),
+        ],
+    )
+
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            segment_ids=[" seg_b ", "seg_a", "seg_a"]
+        ),
+    )
+    second = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(segment_ids=["seg_a", "seg_b"]),
+    )
+
+    assert first == second
+    assert first.segment_ids == ["seg_a", "seg_b"]
+    assert len(repos.runs.inserted) == 1
+
+
+def test_run_service_rejects_corrupted_existing_scope() -> None:
+    service, repos = make_service()
+    request = RunCreateRequest()
+    service.create_run(promotion_id="promo_banner_001", request=request)
+    repos.ad_experiments.records = [
+        experiment
+        for experiment in repos.ad_experiments.records
+        if experiment.segment_id != FALLBACK_SEGMENT_ID
+    ]
+
+    with pytest.raises(RunConflictError, match="do not match its segment scope"):
+        service.create_run(promotion_id="promo_banner_001", request=request)
+
+
+def test_run_service_reuses_scope_after_concurrent_insert_loses_race() -> None:
+    service, repos = make_service()
+    fingerprint = build_segment_scope_fingerprint(
+        segment_ids=["seg_family_trip"],
+    )
+    existing_run = PromotionRunRecord(
+        promotion_run_id=build_bounded_decision_id(
+            "prun",
+            "promo_banner_001",
+            "loop_1",
+            fingerprint[:24],
+        ),
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        loop_count=1,
+        status=PromotionRunStatus.PLANNED.value,
+        goal_snapshot_json={"source": "promotions"},
+        segment_scope_json=["seg_family_trip"],
+        segment_scope_fingerprint=fingerprint,
+    )
+    repos.ad_experiments.records = [
+        ad_experiment_record(
+            promotion_run_id=existing_run.promotion_run_id,
+            segment_id="seg_family_trip",
+        ),
+        ad_experiment_record(
+            promotion_run_id=existing_run.promotion_run_id,
+            segment_id=FALLBACK_SEGMENT_ID,
+        ),
+    ]
+    scope_lookup_count = 0
+
+    def get_by_scope(**_scope: object) -> PromotionRunRecord | None:
+        nonlocal scope_lookup_count
+        scope_lookup_count += 1
+        return None if scope_lookup_count == 1 else existing_run
+
+    repos.runs.get_by_scope = get_by_scope  # type: ignore[method-assign]
+    repos.runs.insert_if_absent = lambda _run: False  # type: ignore[method-assign]
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert response.promotion_run_id == existing_run.promotion_run_id
     assert repos.runs.inserted == []
     assert repos.ad_experiments.inserted_batches == []
 
@@ -223,11 +382,179 @@ def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
     assert experiments[2].content_id == "content_family_001"
     assert experiments[2].content_option_id == "family_option_a"
     assert response.promotion_run_id == run.promotion_run_id
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
     assert [item.segment_id for item in response.ad_experiments] == [
         "seg_family_trip",
         "seg_mobile_user",
         FALLBACK_SEGMENT_ID,
     ]
+    assert [item.is_fallback for item in response.ad_experiments] == [
+        False,
+        False,
+        True,
+    ]
+
+
+def test_run_service_creates_experiments_only_for_requested_approved_segments() -> None:
+    target_segments = [
+        target_segment_record(
+            segment_id="seg_family_trip",
+            segment_name="Family hotel trip",
+            status="approved",
+        ),
+        target_segment_record(
+            segment_id="seg_mobile_user",
+            segment_name="Mobile hotel users",
+            status="approved",
+        ),
+    ]
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_mobile_user"]),
+        target_segments=target_segments,
+        candidates=[
+            content_candidate_record(
+                segment_id="seg_family_trip",
+                content_id="content_family_001",
+                content_option_id="family_option_a",
+            ),
+            content_candidate_record(
+                segment_id="seg_mobile_user",
+                content_id="content_mobile_001",
+                content_option_id="mobile_option_a",
+            ),
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_ids=["seg_mobile_user"],
+        ),
+    )
+
+    assert repos.target_segments.calls == []
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", ["seg_mobile_user"])
+    ]
+    assert [experiment.segment_id for experiment in response.ad_experiments] == [
+        "seg_mobile_user",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_rejects_requested_segment_ids_that_are_not_approved_without_writes() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[target_segment_record(status="planned")],
+    )
+
+    with pytest.raises(RunValidationError, match="segment_ids"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=["seg_family_trip"]),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_rejects_generation_snapshot_mismatch_without_writes() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_mobile_user",
+                status="approved",
+            )
+        ],
+    )
+
+    with pytest.raises(RunValidationError, match="generation target_segment_ids snapshot"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=["seg_mobile_user"]),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_omitted_segment_ids_uses_generation_snapshot_scope() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_family_trip"]),
+        target_segments=[
+            target_segment_record(
+                segment_id="seg_family_trip",
+                status="approved",
+            ),
+            target_segment_record(
+                segment_id="seg_mobile_user",
+                status="planned",
+            ),
+        ],
+        candidates=[content_candidate_record(segment_id="seg_family_trip")],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert repos.target_segments.approved_calls == [
+        ("analysis_banner_001", ["seg_family_trip"])
+    ]
+    assert [experiment.segment_id for experiment in response.ad_experiments] == [
+        "seg_family_trip",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_excludes_fallback_from_snapshot_scope_and_fingerprint() -> None:
+    service, repos = make_service(
+        generation=generation_record(
+            target_segment_ids=[FALLBACK_SEGMENT_ID, "seg_family_trip"]
+        ),
+        target_segments=[
+            target_segment_record(segment_id="seg_family_trip"),
+            target_segment_record(segment_id=FALLBACK_SEGMENT_ID),
+        ],
+        candidates=[
+            content_candidate_record(segment_id="seg_family_trip"),
+            content_candidate_record(segment_id=FALLBACK_SEGMENT_ID),
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert response.segment_ids == ["seg_family_trip"]
+    assert repos.runs.inserted[0].segment_scope_fingerprint == (
+        build_segment_scope_fingerprint(segment_ids=["seg_family_trip"])
+    )
+    assert [item.segment_id for item in response.ad_experiments] == [
+        "seg_family_trip",
+        FALLBACK_SEGMENT_ID,
+    ]
+
+
+def test_run_service_omitted_segment_ids_requires_snapshot_segments_to_be_approved() -> None:
+    service, repos = make_service(
+        generation=generation_record(target_segment_ids=["seg_mobile_user"]),
+        target_segments=[target_segment_record(status="approved")],
+    )
+
+    with pytest.raises(RunValidationError, match="approved promotion_target_segments"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
 
 
 def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
@@ -317,6 +644,657 @@ def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> No
     assert experiments[1].content_id == "content_luxury_approved_001"
 
 
+def source_promotion_run_record() -> PromotionRunRecord:
+    return PromotionRunRecord(
+        promotion_run_id="prun_source_loop_1",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        loop_count=1,
+        status=PromotionRunStatus.GOAL_NOT_MET.value,
+        goal_snapshot_json={},
+        segment_scope_json=("seg_family_trip", "seg_mobile_user"),
+        segment_scope_fingerprint=build_segment_scope_fingerprint(
+            ["seg_family_trip", "seg_mobile_user"]
+        ),
+    )
+
+
+def canonical_promotion_run_record() -> PromotionRunRecord:
+    return PromotionRunRecord(
+        promotion_run_id=build_bounded_decision_id(
+            "prun",
+            "promo_banner_001",
+            "loop_2",
+        ),
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        analysis_id="analysis_banner_loop_2",
+        generation_id="generation_banner_loop_2",
+        loop_count=2,
+        status=PromotionRunStatus.PLANNED.value,
+        goal_snapshot_json={},
+        segment_scope_json=("seg_family_trip", "seg_mobile_user"),
+        segment_scope_fingerprint=build_segment_scope_fingerprint(
+            ["seg_family_trip", "seg_mobile_user"]
+        ),
+    )
+
+
+def preparation_record(
+    *,
+    status: str = "awaiting_content_approval",
+    activated_promotion_run_id: str | None = None,
+) -> NextLoopPreparationRecord:
+    now = datetime(2026, 7, 13, tzinfo=UTC)
+    return NextLoopPreparationRecord(
+        next_loop_preparation_id="prep_loop_2",
+        source_promotion_run_id="prun_source_loop_1",
+        analysis_id="analysis_banner_loop_2",
+        generation_id="generation_banner_loop_2",
+        attempt_no=1,
+        failed_segment_ids_json=("seg_family_trip", "seg_mobile_user"),
+        failed_ad_experiment_ids_json=(
+            "adexp_source_family",
+            "adexp_source_mobile",
+        ),
+        source_evaluation_ids_json=(
+            "eval_source_family",
+            "eval_source_mobile",
+        ),
+        status=status,  # type: ignore[arg-type]
+        activated_promotion_run_id=activated_promotion_run_id,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def activation_request() -> RunCreateRequest:
+    return RunCreateRequest(
+        analysis_id="analysis_banner_loop_2",
+        generation_id="generation_banner_loop_2",
+        segment_ids=["seg_family_trip", "seg_mobile_user"],
+        loop_count=2,
+        next_loop_preparation_id="prep_loop_2",
+    )
+
+
+def activation_candidates() -> list[ContentCandidateRecord]:
+    return [
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_family_trip",
+            content_id="content_family_loop_2",
+            status="approved",
+        ),
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_mobile_user",
+            content_id="content_mobile_loop_2",
+            content_option_id="mobile_option_a",
+            status="active",
+        ),
+    ]
+
+
+def source_ad_experiments() -> list[AdExperimentRecord]:
+    return [
+        ad_experiment_record(
+            ad_experiment_id="adexp_source_family",
+            promotion_run_id="prun_source_loop_1",
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_id="seg_family_trip",
+            loop_count=1,
+        ),
+        ad_experiment_record(
+            ad_experiment_id="adexp_source_mobile",
+            promotion_run_id="prun_source_loop_1",
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_id="seg_mobile_user",
+            loop_count=1,
+        ),
+        ad_experiment_record(
+            ad_experiment_id="adexp_source_fallback",
+            promotion_run_id="prun_source_loop_1",
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_id=FALLBACK_SEGMENT_ID,
+            loop_count=1,
+        ),
+    ]
+
+
+def activation_evaluations() -> list[PromotionEvaluationRecord]:
+    return [
+        promotion_evaluation_record(
+            evaluation_id="eval_source_family",
+            ad_experiment_id="adexp_source_family",
+            segment_id="seg_family_trip",
+        ),
+        promotion_evaluation_record(
+            evaluation_id="eval_source_mobile",
+            ad_experiment_id="adexp_source_mobile",
+            segment_id="seg_mobile_user",
+        ),
+    ]
+
+
+def canonical_ad_experiments(
+    run: PromotionRunRecord,
+) -> list[AdExperimentRecord]:
+    return [
+        ad_experiment_record(
+            ad_experiment_id="adexp_child_family",
+            promotion_run_id=run.promotion_run_id,
+            analysis_id=run.analysis_id,
+            generation_id=run.generation_id,
+            segment_id="seg_family_trip",
+            loop_count=run.loop_count,
+            parent_ad_experiment_id="adexp_source_family",
+            source_evaluation_id="eval_source_family",
+        ),
+        ad_experiment_record(
+            ad_experiment_id="adexp_child_mobile",
+            promotion_run_id=run.promotion_run_id,
+            analysis_id=run.analysis_id,
+            generation_id=run.generation_id,
+            segment_id="seg_mobile_user",
+            loop_count=run.loop_count,
+            parent_ad_experiment_id="adexp_source_mobile",
+            source_evaluation_id="eval_source_mobile",
+        ),
+        ad_experiment_record(
+            ad_experiment_id="adexp_child_fallback",
+            promotion_run_id=run.promotion_run_id,
+            analysis_id=run.analysis_id,
+            generation_id=run.generation_id,
+            segment_id=FALLBACK_SEGMENT_ID,
+            loop_count=run.loop_count,
+        ),
+    ]
+
+
+def make_preparation_activation_service(
+    *,
+    candidates: list[ContentCandidateRecord] | None = None,
+    source_run: PromotionRunRecord | None = None,
+    source_experiments: list[AdExperimentRecord] | None = None,
+    evaluations: list[PromotionEvaluationRecord] | None = None,
+    preparation: NextLoopPreparationRecord | None = None,
+    canonical_run: PromotionRunRecord | None = None,
+    canonical_experiments: list[AdExperimentRecord] | None = None,
+    manual_activation_enabled: bool = True,
+) -> tuple[PromotionRunService, FakeRepositoryBundle]:
+    resolved_source_run = source_run or source_promotion_run_record()
+    runs = [resolved_source_run]
+    if canonical_run is not None:
+        runs.append(canonical_run)
+    experiments = (
+        source_ad_experiments()
+        if source_experiments is None
+        else source_experiments
+    )
+    if canonical_experiments is not None:
+        experiments += canonical_experiments
+    return make_service(
+        analysis=analysis_record(analysis_id="analysis_banner_loop_2"),
+        generation=generation_record(
+            generation_id="generation_banner_loop_2",
+            analysis_id="analysis_banner_loop_2",
+            target_segment_ids=["seg_family_trip", "seg_mobile_user"],
+        ),
+        target_segments=[
+            target_segment_record(
+                analysis_id="analysis_banner_loop_2",
+                segment_id="seg_family_trip",
+                status="approved",
+            ),
+            target_segment_record(
+                analysis_id="analysis_banner_loop_2",
+                segment_id="seg_mobile_user",
+                status="approved",
+            ),
+        ],
+        candidates=activation_candidates() if candidates is None else candidates,
+        promotion_runs=runs,
+        ad_experiments=experiments,
+        evaluations=(
+            activation_evaluations() if evaluations is None else evaluations
+        ),
+        preparation=preparation or preparation_record(),
+        manual_activation_enabled=manual_activation_enabled,
+    )
+
+
+def test_preparation_activation_is_disabled_by_default_without_writes() -> None:
+    service, repos = make_preparation_activation_service(
+        manual_activation_enabled=False,
+    )
+
+    with pytest.raises(RunConflictError, match="activation is disabled"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.preparations.locked_calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_persists_segment_lineage_and_nullable_fallback() -> None:
+    candidates = activation_candidates() + [
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_family_trip",
+            content_id="content_family_draft",
+            status="draft",
+        ),
+        content_candidate_record(
+            analysis_id="analysis_banner_loop_2",
+            generation_id="generation_banner_loop_2",
+            segment_id="seg_mobile_user",
+            content_id="content_mobile_rejected",
+            status="rejected",
+        ),
+    ]
+    service, repos = make_preparation_activation_service(candidates=candidates)
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.loop_count == 2
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
+    assert [
+        experiment.is_fallback for experiment in response.ad_experiments
+    ] == [False, False, True]
+    experiments = repos.ad_experiments.inserted_batches[0]
+    lineage = {
+        experiment.segment_id: (
+            experiment.parent_ad_experiment_id,
+            experiment.source_evaluation_id,
+        )
+        for experiment in experiments
+    }
+    assert lineage == {
+        "seg_family_trip": ("adexp_source_family", "eval_source_family"),
+        "seg_mobile_user": ("adexp_source_mobile", "eval_source_mobile"),
+        FALLBACK_SEGMENT_ID: (None, None),
+    }
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", response.promotion_run_id)
+    ]
+    assert repos.runs.activation_lock_calls == [
+        (
+            "hotel-client-a",
+            "promo_banner_001",
+            "analysis_banner_loop_2",
+            "generation_banner_loop_2",
+            build_segment_scope_fingerprint(
+                ["seg_family_trip", "seg_mobile_user"]
+            ),
+            2,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["zero", "partial", "unexpected", "duplicate", "cross-generation"],
+)
+def test_preparation_activation_rejects_invalid_generation_candidate_scope(
+    case: str,
+) -> None:
+    candidates = activation_candidates()
+    if case == "zero":
+        candidates = []
+    elif case == "partial":
+        candidates = candidates[:1]
+    elif case == "unexpected":
+        candidates.append(
+            content_candidate_record(
+                analysis_id="analysis_banner_loop_2",
+                generation_id="generation_banner_loop_2",
+                segment_id="seg_unexpected",
+                content_id="content_unexpected",
+            )
+        )
+    elif case == "duplicate":
+        candidates.append(
+            content_candidate_record(
+                analysis_id="analysis_banner_loop_2",
+                generation_id="generation_banner_loop_2",
+                segment_id="seg_family_trip",
+                content_id="content_family_duplicate",
+            )
+        )
+    else:
+        candidates = [
+            replace(candidate, generation_id="generation_other")
+            for candidate in candidates
+        ]
+    service, repos = make_preparation_activation_service(candidates=candidates)
+
+    with pytest.raises(RunValidationError):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", "other-project"),
+        ("campaign_id", "other-campaign"),
+        ("promotion_id", "other-promotion"),
+        ("promotion_run_id", "other-run"),
+        ("segment_id", "seg_mobile_user"),
+        ("ad_experiment_id", "adexp_source_mobile"),
+        ("ad_experiment_id", None),
+        ("status", PromotionEvaluationStatus.GOAL_MET.value),
+        ("evaluation_id", "eval_stale_family"),
+    ],
+)
+def test_preparation_activation_rejects_invalid_segment_evaluation_lineage(
+    field: str,
+    value: str | None,
+) -> None:
+    evaluations = activation_evaluations()
+    evaluations[0] = replace(evaluations[0], **{field: value})
+    service, repos = make_preparation_activation_service(evaluations=evaluations)
+
+    with pytest.raises(RunValidationError):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("project_id", "other-project"),
+        ("campaign_id", "other-campaign"),
+        ("promotion_id", "other-promotion"),
+        ("promotion_run_id", "other-run"),
+        ("analysis_id", "other-analysis"),
+        ("generation_id", "other-generation"),
+        ("segment_id", "seg_mobile_user"),
+        ("loop_count", 7),
+    ],
+)
+def test_preparation_activation_rejects_invalid_parent_experiment_context(
+    field: str,
+    value: str | int,
+) -> None:
+    experiments = source_ad_experiments()
+    experiments[0] = replace(experiments[0], **{field: value})
+    service, repos = make_preparation_activation_service(
+        source_experiments=experiments,
+    )
+
+    with pytest.raises(RunValidationError):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("analysis_id", "other-analysis"),
+        ("generation_id", "other-generation"),
+        ("loop_count", 3),
+        ("segment_ids", ["seg_family_trip"]),
+    ],
+)
+def test_preparation_activation_rejects_request_context_mismatch(
+    field: str,
+    value: str | int | list[str],
+) -> None:
+    service, repos = make_preparation_activation_service()
+    request = activation_request().model_copy(update={field: value})
+
+    with pytest.raises(RunValidationError):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=request,
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+def test_preparation_activation_rejects_rejected_preparation_without_writes() -> None:
+    service, repos = make_preparation_activation_service(
+        preparation=preparation_record(status="rejected"),
+    )
+
+    with pytest.raises(RunValidationError, match="rejected"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.promotions.calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_rejects_foreign_source_run() -> None:
+    source_run = replace(source_promotion_run_record(), project_id="other-project")
+    service, repos = make_preparation_activation_service(source_run=source_run)
+
+    with pytest.raises(RunValidationError, match="source promotion run"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_activated_preparation_retry_returns_canonical_before_candidate_or_evaluation_reads() -> None:
+    canonical_run = canonical_promotion_run_record()
+    preparation = preparation_record(
+        status="activated",
+        activated_promotion_run_id=canonical_run.promotion_run_id,
+    )
+    service, repos = make_preparation_activation_service(
+        preparation=preparation,
+        canonical_run=canonical_run,
+        canonical_experiments=canonical_ad_experiments(canonical_run),
+        candidates=[],
+        evaluations=[],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.promotion_run_id == canonical_run.promotion_run_id
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
+    assert sum(
+        experiment.is_fallback for experiment in response.ad_experiments
+    ) == 1
+    assert repos.contents.calls == []
+    assert repos.evaluations.list_calls == []
+    assert repos.runs.inserted == []
+    assert repos.runs.activation_lock_calls == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+def test_activated_preparation_with_missing_canonical_run_is_conflict_without_writes() -> None:
+    preparation = preparation_record(
+        status="activated",
+        activated_promotion_run_id="prun_missing",
+    )
+    service, repos = make_preparation_activation_service(
+        preparation=preparation,
+    )
+
+    with pytest.raises(RunConflictError, match="canonical promotion run"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.contents.calls == []
+    assert repos.evaluations.list_calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_response_loss_retry_returns_same_canonical_result(
+) -> None:
+    service, repos = make_preparation_activation_service()
+
+    first = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+    repos.ad_experiments.records.sort(key=lambda experiment: experiment.segment_id)
+    retry = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert retry == first
+    assert len(repos.runs.inserted) == 1
+    assert len(repos.ad_experiments.inserted_batches) == 1
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", first.promotion_run_id)
+    ]
+    assert len(repos.runs.activation_lock_calls) == 1
+
+
+def test_preparation_activation_recovers_complete_unlinked_canonical_run() -> None:
+    canonical_run = canonical_promotion_run_record()
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=canonical_ad_experiments(canonical_run),
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.promotion_run_id == canonical_run.promotion_run_id
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == [
+        ("prep_loop_2", canonical_run.promotion_run_id)
+    ]
+
+
+def test_preparation_activation_rejects_incomplete_unlinked_canonical_run() -> None:
+    canonical_run = canonical_promotion_run_record()
+    incomplete_experiments = canonical_ad_experiments(canonical_run)[:-1]
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=incomplete_experiments,
+    )
+
+    with pytest.raises(RunConflictError, match="do not match its segment scope"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+    assert repos.preparations.activated_calls == []
+
+
+def test_preparation_activation_maps_foreign_preparation_canonical_conflict(
+) -> None:
+    canonical_run = canonical_promotion_run_record()
+    service, repos = make_preparation_activation_service(
+        canonical_run=canonical_run,
+        canonical_experiments=canonical_ad_experiments(canonical_run),
+    )
+
+    def reject_foreign_preparation(**_kwargs: str) -> None:
+        raise NextLoopPreparationConflictError(
+            "uq_next_loop_preparations_activated_run"
+        )
+
+    repos.preparations.mark_activated = (  # type: ignore[method-assign]
+        reject_foreign_preparation
+    )
+
+    with pytest.raises(
+        RunConflictError,
+        match="already activated by another next-loop preparation",
+    ):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_allows_same_promotion_loop_different_identity(
+) -> None:
+    foreign_run = replace(
+        canonical_promotion_run_record(),
+        promotion_run_id="prun_foreign_scope_loop_2",
+        analysis_id="analysis_foreign_loop_2",
+        generation_id="generation_foreign_loop_2",
+        segment_scope_json=("seg_foreign",),
+        segment_scope_fingerprint=build_segment_scope_fingerprint(
+            ["seg_foreign"]
+        ),
+    )
+    service, repos = make_preparation_activation_service(
+        canonical_run=foreign_run,
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.promotion_run_id != foreign_run.promotion_run_id
+    assert len(repos.runs.inserted) == 1
+    assert repos.runs.inserted[0].loop_count == foreign_run.loop_count
+    assert (
+        repos.runs.inserted[0].segment_scope_fingerprint
+        != foreign_run.segment_scope_fingerprint
+    )
+
+
 def test_bounded_decision_id_is_stable_and_under_contract_length() -> None:
     long_promotion_id = "promo_" + ("very_long_hotel_campaign_" * 10)
 
@@ -326,6 +1304,161 @@ def test_bounded_decision_id_is_stable_and_under_contract_length() -> None:
     assert first == second
     assert first.startswith("prun_")
     assert len(first) <= 100
+
+
+def test_promotion_run_id_preserves_scope_fingerprint_for_long_promotion_id() -> None:
+    long_promotion_id = "promo_" + ("very_long_hotel_campaign_" * 10)
+    fingerprint = "abcdef0123456789abcdef01" + ("2" * 40)
+
+    first = build_promotion_run_id(
+        project_id="hotel-client-a",
+        promotion_id=long_promotion_id,
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        loop_count=12,
+        segment_scope_fingerprint=fingerprint,
+    )
+    second = build_promotion_run_id(
+        project_id="hotel-client-a",
+        promotion_id=long_promotion_id,
+        analysis_id="analysis_banner_001",
+        generation_id="generation_banner_001",
+        loop_count=12,
+        segment_scope_fingerprint=fingerprint,
+    )
+
+    assert first == second
+    assert f"_loop_12_{fingerprint[:24]}_" in first
+    assert fingerprint[:24] in first
+    assert len(first) <= 100
+
+
+def test_segment_scope_fingerprint_is_order_and_duplicate_invariant() -> None:
+    assert build_segment_scope_fingerprint(
+        segment_ids=["seg_b", FALLBACK_SEGMENT_ID, "seg_a", "seg_a"],
+    ) == build_segment_scope_fingerprint(
+        segment_ids=["seg_a", "seg_b"],
+    )
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("analysis_id", "analysis_banner_002"),
+        ("generation_id", "generation_banner_002"),
+        ("loop_count", 2),
+    ],
+)
+def test_promotion_run_id_changes_with_non_segment_scope_fields(
+    changed_field: str,
+    changed_value: object,
+) -> None:
+    base: dict[str, object] = {
+        "project_id": "hotel-client-a",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "generation_id": "generation_banner_001",
+        "loop_count": 1,
+    }
+    changed = {**base, changed_field: changed_value}
+    fingerprint = build_segment_scope_fingerprint(segment_ids=["seg_a"])
+    assert build_promotion_run_id(
+        project_id=str(base["project_id"]),
+        promotion_id=str(base["promotion_id"]),
+        analysis_id=str(base["analysis_id"]),
+        generation_id=str(base["generation_id"]),
+        loop_count=int(base["loop_count"]),
+        segment_scope_fingerprint=fingerprint,
+    ) != build_promotion_run_id(
+        project_id=str(changed["project_id"]),
+        promotion_id=str(changed["promotion_id"]),
+        analysis_id=str(changed["analysis_id"]),
+        generation_id=str(changed["generation_id"]),
+        loop_count=int(changed["loop_count"]),
+        segment_scope_fingerprint=fingerprint,
+    )
+
+
+def test_segment_scope_fingerprint_and_run_id_change_with_segment_scope() -> None:
+    first_fingerprint = build_segment_scope_fingerprint(segment_ids=["seg_a"])
+    second_fingerprint = build_segment_scope_fingerprint(segment_ids=["seg_b"])
+    common = {
+        "project_id": "hotel-client-a",
+        "promotion_id": "promo_banner_001",
+        "analysis_id": "analysis_banner_001",
+        "generation_id": "generation_banner_001",
+        "loop_count": 1,
+    }
+
+    assert first_fingerprint != second_fingerprint
+    assert build_promotion_run_id(
+        **common,
+        segment_scope_fingerprint=first_fingerprint,
+    ) != build_promotion_run_id(
+        **common,
+        segment_scope_fingerprint=second_fingerprint,
+    )
+
+
+@pytest.mark.parametrize("segment_ids", [[], ["   "], ["seg_a", "  "]])
+def test_run_service_rejects_empty_or_blank_explicit_scope_without_writes(
+    segment_ids: list[str],
+) -> None:
+    service, repos = make_service()
+
+    with pytest.raises(RunSegmentScopeValidationError, match="segment_ids"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(segment_ids=segment_ids),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_rejects_fallback_in_explicit_scope_without_writes() -> None:
+    service, repos = make_service()
+
+    with pytest.raises(RunSegmentScopeValidationError, match="fallback"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(
+                segment_ids=["seg_family_trip", FALLBACK_SEGMENT_ID]
+            ),
+        )
+
+    assert repos.promotions.calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_rejects_preparation_activation_when_manual_switch_is_off() -> None:
+    service, repos = make_service()
+
+    with pytest.raises(
+        RunConflictError,
+        match="manual next-loop preparation activation is disabled",
+    ):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(next_loop_preparation_id="nlprep_001"),
+        )
+
+    assert repos.promotions.calls == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_segment_scope_fingerprint_is_stable_and_excludes_fallback() -> None:
+    first = build_segment_scope_fingerprint(
+        ["seg_mobile_user", FALLBACK_SEGMENT_ID, "seg_family_trip"]
+    )
+    second = build_segment_scope_fingerprint(
+        ["seg_family_trip", "seg_mobile_user"]
+    )
+
+    assert first == second
+    assert len(first) == 64
 
 
 class FakePromotionRepository:
@@ -390,6 +1523,7 @@ class FakePromotionTargetSegmentRepository:
     def __init__(self, segments: list[PromotionTargetSegmentRecord]) -> None:
         self.segments = segments
         self.calls: list[str] = []
+        self.approved_calls: list[tuple[str, list[str] | None]] = []
 
     def list_for_analysis(
         self,
@@ -397,6 +1531,23 @@ class FakePromotionTargetSegmentRepository:
     ) -> list[PromotionTargetSegmentRecord]:
         self.calls.append(analysis_id)
         return self.segments
+
+    def list_approved_for_analysis(
+        self,
+        analysis_id: str,
+        segment_ids: list[str] | None = None,
+    ) -> list[PromotionTargetSegmentRecord]:
+        self.approved_calls.append(
+            (analysis_id, list(segment_ids) if segment_ids is not None else None)
+        )
+        if segment_ids is None:
+            return [segment for segment in self.segments if segment.status == "approved"]
+        requested_ids = set(segment_ids)
+        return [
+            segment
+            for segment in self.segments
+            if segment.segment_id in requested_ids and segment.status == "approved"
+        ]
 
 
 class FakeContentCandidateRepository:
@@ -409,37 +1560,121 @@ class FakeContentCandidateRepository:
         generation_id: str,
     ) -> list[ContentCandidateRecord]:
         self.calls.append(generation_id)
-        return self.candidates
+        return [
+            candidate
+            for candidate in self.candidates
+            if candidate.generation_id == generation_id
+            and candidate.status in {"approved", "active"}
+        ]
 
 
 class FakePromotionRunRepository:
-    def __init__(self, *, exists: bool) -> None:
-        self.exists = exists
-        self.exists_calls: list[tuple[str, int]] = []
+    def __init__(
+        self,
+        *,
+        records: list[PromotionRunRecord] | None = None,
+    ) -> None:
+        self.get_calls: list[str] = []
+        self.activation_lock_calls: list[
+            tuple[str, str, str, str, str, int]
+        ] = []
         self.inserted: list[PromotionRunWrite] = []
+        self.records = list(records or [])
 
-    def insert(self, run: PromotionRunWrite) -> None:
+    def lock_activation_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> None:
+        self.activation_lock_calls.append(
+            (
+                project_id,
+                promotion_id,
+                analysis_id,
+                generation_id,
+                segment_scope_fingerprint,
+                loop_count,
+            )
+        )
+
+    def insert_if_absent(self, run: PromotionRunWrite) -> bool:
+        if self.get_by_scope(
+            project_id=run.project_id,
+            promotion_id=run.promotion_id,
+            analysis_id=run.analysis_id,
+            generation_id=run.generation_id,
+            segment_scope_fingerprint=run.segment_scope_fingerprint,
+            loop_count=run.loop_count,
+        ) is not None:
+            return False
         self.inserted.append(run)
+        self.records.append(PromotionRunRecord(**vars(run)))
+        return True
 
     def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
-        return None
+        self.get_calls.append(promotion_run_id)
+        return next(
+            (
+                run
+                for run in self.records
+                if run.promotion_run_id == promotion_run_id
+            ),
+            None,
+        )
 
-    def exists_for_promotion_loop(self, *, promotion_id: str, loop_count: int) -> bool:
-        self.exists_calls.append((promotion_id, loop_count))
-        return self.exists
+    def get_by_scope(
+        self,
+        *,
+        project_id: str,
+        promotion_id: str,
+        analysis_id: str,
+        generation_id: str,
+        segment_scope_fingerprint: str,
+        loop_count: int,
+    ) -> PromotionRunRecord | None:
+        return next(
+            (
+                run
+                for run in self.records
+                if run.project_id == project_id
+                and run.promotion_id == promotion_id
+                and run.analysis_id == analysis_id
+                and run.generation_id == generation_id
+                and run.segment_scope_fingerprint == segment_scope_fingerprint
+                and run.loop_count == loop_count
+            ),
+            None,
+        )
 
 
 class FakeAdExperimentRepository:
-    def __init__(self, existing_segments: set[str] | None = None) -> None:
+    def __init__(
+        self,
+        existing_segments: set[str] | None = None,
+        records: list[AdExperimentRecord] | None = None,
+    ) -> None:
         self.existing_segments = existing_segments or set()
+        self.records = list(records or [])
+        self.list_calls: list[str] = []
         self.exists_calls: list[tuple[str, str]] = []
         self.inserted_batches: list[list[AdExperimentWrite]] = []
 
     def insert_many(self, experiments: list[AdExperimentWrite]) -> None:
         self.inserted_batches.append(list(experiments))
+        self.records.extend(AdExperimentRecord(**vars(item)) for item in experiments)
 
     def list_by_run(self, promotion_run_id: str) -> list[AdExperimentRecord]:
-        return []
+        self.list_calls.append(promotion_run_id)
+        return [
+            experiment
+            for experiment in self.records
+            if experiment.promotion_run_id == promotion_run_id
+        ]
 
     def exists_for_run_segment(
         self,
@@ -449,6 +1684,81 @@ class FakeAdExperimentRepository:
     ) -> bool:
         self.exists_calls.append((promotion_run_id, segment_id))
         return segment_id in self.existing_segments
+
+
+class FakePromotionEvaluationRepository:
+    def __init__(
+        self,
+        records: list[PromotionEvaluationRecord] | None = None,
+    ) -> None:
+        self.records = list(records or [])
+        self.list_calls: list[str] = []
+
+    def list_latest_by_run_ad_experiments(
+        self,
+        promotion_run_id: str,
+    ) -> list[PromotionEvaluationRecord]:
+        self.list_calls.append(promotion_run_id)
+        return [
+            record
+            for record in self.records
+            if record.promotion_run_id == promotion_run_id
+        ]
+
+
+class FakeNextLoopPreparationRepository:
+    def __init__(
+        self,
+        record: NextLoopPreparationRecord | None = None,
+    ) -> None:
+        self.record = record
+        self.locked_calls: list[str] = []
+        self.activated_calls: list[tuple[str, str]] = []
+
+    def get_by_id_for_update(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        self.locked_calls.append(next_loop_preparation_id)
+        if (
+            self.record is None
+            or self.record.next_loop_preparation_id != next_loop_preparation_id
+        ):
+            return None
+        return self.record
+
+    def get_by_id(
+        self,
+        next_loop_preparation_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        if (
+            self.record is None
+            or self.record.next_loop_preparation_id != next_loop_preparation_id
+        ):
+            return None
+        return self.record
+
+    def mark_activated(
+        self,
+        *,
+        next_loop_preparation_id: str,
+        activated_promotion_run_id: str,
+    ) -> NextLoopPreparationRecord | None:
+        self.activated_calls.append(
+            (next_loop_preparation_id, activated_promotion_run_id)
+        )
+        if (
+            self.record is None
+            or self.record.next_loop_preparation_id != next_loop_preparation_id
+            or self.record.status != "awaiting_content_approval"
+        ):
+            return None
+        self.record = replace(
+            self.record,
+            status="activated",
+            activated_promotion_run_id=activated_promotion_run_id,
+        )
+        return self.record
 
 
 class FakeRepositoryBundle:
@@ -462,7 +1772,10 @@ class FakeRepositoryBundle:
         latest_generation: GenerationRunRecord | None | object = DEFAULT_LATEST,
         target_segments: list[PromotionTargetSegmentRecord] | None = None,
         candidates: list[ContentCandidateRecord] | None = None,
-        run_exists: bool = False,
+        promotion_runs: list[PromotionRunRecord] | None = None,
+        ad_experiments: list[AdExperimentRecord] | None = None,
+        evaluations: list[PromotionEvaluationRecord] | None = None,
+        preparation: NextLoopPreparationRecord | None = None,
     ) -> None:
         resolved_analysis = analysis if analysis is not None else analysis_record()
         resolved_generation = (
@@ -499,8 +1812,14 @@ class FakeRepositoryBundle:
                 content_candidate_record(),
             ],
         )
-        self.runs = FakePromotionRunRepository(exists=run_exists)
-        self.ad_experiments = FakeAdExperimentRepository()
+        self.runs = FakePromotionRunRepository(
+            records=promotion_runs,
+        )
+        self.ad_experiments = FakeAdExperimentRepository(
+            records=ad_experiments,
+        )
+        self.evaluations = FakePromotionEvaluationRepository(evaluations)
+        self.preparations = FakeNextLoopPreparationRepository(preparation)
 
 
 def make_service(
@@ -512,7 +1831,11 @@ def make_service(
     latest_generation: GenerationRunRecord | None | object = DEFAULT_LATEST,
     target_segments: list[PromotionTargetSegmentRecord] | None = None,
     candidates: list[ContentCandidateRecord] | None = None,
-    run_exists: bool = False,
+    promotion_runs: list[PromotionRunRecord] | None = None,
+    ad_experiments: list[AdExperimentRecord] | None = None,
+    evaluations: list[PromotionEvaluationRecord] | None = None,
+    preparation: NextLoopPreparationRecord | None = None,
+    manual_activation_enabled: bool = False,
 ) -> tuple[PromotionRunService, FakeRepositoryBundle]:
     repos = FakeRepositoryBundle(
         promotion=promotion,
@@ -522,7 +1845,10 @@ def make_service(
         latest_generation=latest_generation,
         target_segments=target_segments,
         candidates=candidates,
-        run_exists=run_exists,
+        promotion_runs=promotion_runs,
+        ad_experiments=ad_experiments,
+        evaluations=evaluations,
+        preparation=preparation,
     )
     return (
         PromotionRunService(
@@ -533,6 +1859,9 @@ def make_service(
             content_candidate_repository=repos.contents,
             promotion_run_repository=repos.runs,
             ad_experiment_repository=repos.ad_experiments,
+            promotion_evaluation_repository=repos.evaluations,
+            next_loop_preparation_repository=repos.preparations,
+            manual_activation_enabled=manual_activation_enabled,
         ),
         repos,
     )
@@ -575,8 +1904,12 @@ def generation_record(
     *,
     generation_id: str = "generation_banner_001",
     analysis_id: str = "analysis_banner_001",
+    target_segment_ids: list[str] | None = None,
     status: str = "completed",
 ) -> GenerationRunRecord:
+    input_json = {"analysis_id": analysis_id}
+    if target_segment_ids is not None:
+        input_json["target_segment_ids"] = target_segment_ids
     return GenerationRunRecord(
         generation_id=generation_id,
         analysis_id=analysis_id,
@@ -585,7 +1918,7 @@ def generation_record(
         promotion_id="promo_banner_001",
         content_option_count=2,
         operator_instruction=None,
-        input_json={"analysis_id": analysis_id},
+        input_json=input_json,
         output_json={"content_count": 1},
         generation_report_json={"status": "completed"},
         status=status,
@@ -597,6 +1930,7 @@ def target_segment_record(
     analysis_id: str = "analysis_banner_001",
     segment_id: str = "seg_family_trip",
     segment_name: str = "Family hotel trip",
+    status: str = "approved",
 ) -> PromotionTargetSegmentRecord:
     return PromotionTargetSegmentRecord(
         analysis_id=analysis_id,
@@ -612,7 +1946,7 @@ def target_segment_record(
         data_evidence_json={"event_count": 120},
         estimated_size=1200,
         priority="high",
-        status="planned",
+        status=status,
     )
 
 
@@ -637,4 +1971,68 @@ def content_candidate_record(
         segment_id=segment_id,
         channel=Channel.ONSITE_BANNER.value,
         status=status,
+    )
+
+
+def ad_experiment_record(
+    *,
+    ad_experiment_id: str | None = None,
+    promotion_run_id: str,
+    analysis_id: str = "analysis_banner_001",
+    generation_id: str = "generation_banner_001",
+    segment_id: str,
+    loop_count: int = 1,
+    parent_ad_experiment_id: str | None = None,
+    source_evaluation_id: str | None = None,
+) -> AdExperimentRecord:
+    return AdExperimentRecord(
+        ad_experiment_id=ad_experiment_id or f"adexp_{segment_id}",
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        promotion_run_id=promotion_run_id,
+        analysis_id=analysis_id,
+        generation_id=generation_id,
+        segment_id=segment_id,
+        segment_name=segment_id,
+        content_id=f"content_{segment_id}",
+        content_option_id=f"option_{segment_id}",
+        channel=Channel.ONSITE_BANNER.value,
+        loop_count=loop_count,
+        status=AdExperimentStatus.PLANNED.value,
+        goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+        goal_target_value=Decimal("0.030000"),
+        goal_basis=GoalBasis.ALL_SEGMENTS.value,
+        parent_ad_experiment_id=parent_ad_experiment_id,
+        source_evaluation_id=source_evaluation_id,
+    )
+
+
+def promotion_evaluation_record(
+    *,
+    evaluation_id: str,
+    ad_experiment_id: str | None,
+    segment_id: str | None,
+) -> PromotionEvaluationRecord:
+    return PromotionEvaluationRecord(
+        evaluation_id=evaluation_id,
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        promotion_run_id="prun_source_loop_1",
+        ad_experiment_id=ad_experiment_id,
+        segment_id=segment_id,
+        content_id="content_source",
+        content_option_id="option_source",
+        metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+        target_value=Decimal("0.030000"),
+        actual_value=Decimal("0.010000"),
+        numerator_count=10,
+        denominator_count=1000,
+        sample_size=1000,
+        basis="individual",
+        status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+        feedback=None,
+        next_loop_required=True,
+        result_json={},
     )

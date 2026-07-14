@@ -780,6 +780,13 @@ class UserBehaviorVectorRepository:
         season_months: Sequence[int] = (),
         limit: int = 1000,
     ) -> list[RawEventUserSignalRecord]:
+        # clickhouse-connect serializes Array(String) parameters from lists.
+        # Tuples are rendered as SQL tuples and fail at runtime for this placeholder.
+        cleaned_destination_terms = [
+            str(term).strip().lower()
+            for term in destination_terms
+            if str(term).strip()
+        ]
         result = self._client.query(
             """
             WITH
@@ -837,7 +844,24 @@ class UserBehaviorVectorRepository:
                 groupUniqArray(20)(ifNull(JSONExtractString(properties_json, 'hotel_cluster'), '')) AS hotel_cluster_values,
                 groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'age_group'), '')) AS age_group_values,
                 groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'gender'), '')) AS gender_values,
-                groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'preferred_category'), '')) AS preferred_category_values
+                groupUniqArray(10)(ifNull(JSONExtractString(properties_json, 'preferred_category'), '')) AS preferred_category_values,
+                countIf(
+                    arrayExists(
+                        term -> positionCaseInsensitiveUTF8(
+                            concat(
+                                ifNull(JSONExtractString(properties_json, 'destination_id'), ''),
+                                ' ',
+                                ifNull(JSONExtractString(properties_json, 'destination_name'), ''),
+                                ' ',
+                                ifNull(JSONExtractString(properties_json, 'hotel_city'), ''),
+                                ' ',
+                                ifNull(JSONExtractString(properties_json, 'hotel_country'), '')
+                            ),
+                            term
+                        ) > 0,
+                        {destination_terms:Array(String)}
+                    )
+                ) AS destination_match_count
             FROM raw_events
             WHERE project_id = {project_id:String}
               AND validation_status = 'valid'
@@ -864,13 +888,9 @@ class UserBehaviorVectorRepository:
                 "vector_dim": self.VECTOR_DIM,
                 "vector_version": vector_version,
                 "vector_source": self.RAW_EVENTS_SOURCE,
+                "destination_terms": cleaned_destination_terms,
                 "limit": limit,
             },
-        )
-        cleaned_destination_terms = tuple(
-            term.strip().lower()
-            for term in destination_terms
-            if str(term).strip()
         )
         cleaned_season_months = {
             int(month)
@@ -950,9 +970,8 @@ class UserBehaviorVectorRepository:
                     preferred_category_values=_clean_string_tuple(
                         _clickhouse_value(row, "preferred_category_values", 24)
                     ),
-                    destination_match_count=_destination_match_count(
-                        values=destination_values,
-                        terms=cleaned_destination_terms,
+                    destination_match_count=int(
+                        _clickhouse_value(row, "destination_match_count", 25) or 0
                     ),
                     season_match_count=_season_match_count(
                         values=checkin_dates,
@@ -1156,16 +1175,6 @@ def _clean_string_tuple(value: Any) -> tuple[str, ...]:
         if text and text not in cleaned:
             cleaned.append(text)
     return tuple(cleaned)
-
-
-def _destination_match_count(*, values: Sequence[str], terms: Sequence[str]) -> int:
-    if not terms:
-        return 0
-    return sum(
-        1
-        for value in values
-        if any(term in value.lower() for term in terms)
-    )
 
 
 def _season_match_count(*, values: Sequence[str], season_months: set[int]) -> int:

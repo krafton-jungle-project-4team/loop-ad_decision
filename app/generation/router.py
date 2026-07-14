@@ -1,33 +1,27 @@
 from collections.abc import Iterator
 from json import JSONDecodeError
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
 from pydantic import ValidationError
 
 from app.db import create_postgres_connection
 from app.dependencies import get_settings
-from app.generation.adapters import (
-    build_external_content_generator,
-    build_s3_creative_artifact_publisher,
-)
-from app.generation.image_tasks import (
-    ImageGenerationJobCollector,
-    dispatch_image_generation_jobs,
-)
+from app.generation.brand_context import BrandContextRepository
 from app.generation.repositories import (
-    ContentCandidateRepository,
     GenerationInputRepository,
     GenerationRunRepository,
 )
 from app.generation.schemas import (
+    GenerationAcceptedResponse,
     GenerationRequest,
-    GenerationResponse,
 )
-from app.generation.service import (
+from app.generation.submission import (
     GenerationInputUnavailable,
-    GenerationRequestHandler,
-    GenerationService,
+    GenerationIdempotencyConflict,
+    GenerationSubmissionService,
+    GenerationSubmissionUnavailable,
+    normalize_idempotency_key,
 )
 
 
@@ -37,34 +31,22 @@ router = APIRouter(
 )
 
 
-def get_generation_service(request: Request) -> Iterator[GenerationRequestHandler]:
+def get_generation_service(request: Request) -> Iterator[GenerationSubmissionService]:
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
-    content_generator = None
-    artifact_publisher = None
-    image_generation_scheduler = None
-    if settings.env != "test":
-        content_generator = build_external_content_generator(
-            settings,
-            generate_images=False,
-        )
-        artifact_publisher = build_s3_creative_artifact_publisher(settings)
-        image_generation_scheduler = ImageGenerationJobCollector()
     try:
-        yield GenerationService(
+        yield GenerationSubmissionService(
+            connection=connection,
             generation_run_repository=GenerationRunRepository(connection),
-            content_candidate_repository=ContentCandidateRepository(connection),
             generation_input_reader=GenerationInputRepository(connection),
-            content_generator=content_generator,
-            artifact_publisher=artifact_publisher,
-            image_generation_scheduler=image_generation_scheduler,
+            brand_context_repository=BrandContextRepository(connection),
+            model_version=settings.openai_content_model,
+            coordinator=getattr(
+                request.app.state,
+                "generation_coordinator",
+                None,
+            ),
         )
-        connection.commit()
-        if image_generation_scheduler is not None:
-            dispatch_image_generation_jobs(
-                settings=settings,
-                jobs=image_generation_scheduler.jobs,
-            )
     except Exception:
         connection.rollback()
         raise
@@ -74,14 +56,15 @@ def get_generation_service(request: Request) -> Iterator[GenerationRequestHandle
 
 @router.post(
     "/{promotion_id}/generation",
-    response_model=GenerationResponse,
-    status_code=status.HTTP_200_OK,
+    response_model=GenerationAcceptedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_generation(
     promotion_id: str,
     request: Request,
-    generation_service: GenerationRequestHandler = Depends(get_generation_service),
-) -> GenerationResponse:
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    generation_service: GenerationSubmissionService = Depends(get_generation_service),
+) -> GenerationAcceptedResponse:
     generation_request = await _parse_generation_request(request)
 
     if promotion_id != generation_request.promotion_id:
@@ -91,10 +74,31 @@ async def create_generation(
         )
 
     try:
-        return generation_service.generate(generation_request)
+        normalized_idempotency_key = normalize_idempotency_key(
+            idempotency_key or ""
+        )
+        return generation_service.submit(
+            generation_request,
+            idempotency_key=normalized_idempotency_key,
+        )
     except GenerationInputUnavailable as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except GenerationIdempotencyConflict as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(exc),
+        ) from exc
+    except GenerationSubmissionUnavailable as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
 

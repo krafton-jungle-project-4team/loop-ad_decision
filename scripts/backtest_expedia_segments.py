@@ -22,7 +22,6 @@ import argparse
 from datetime import UTC, date, datetime
 import os
 from pathlib import Path
-import subprocess
 import sys
 from typing import Any
 
@@ -33,7 +32,7 @@ REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 if str(REPOSITORY_ROOT) not in sys.path:
     sys.path.insert(0, str(REPOSITORY_ROOT))
 
-from app.analysis.expedia_backtest import (  # noqa: E402
+from offline_evaluation.expedia_backtest import (  # noqa: E402
     ClickHouseExpediaBacktestRepository,
     ExpediaBacktestConfig,
     ExpediaBacktestError,
@@ -44,8 +43,9 @@ from app.analysis.expedia_backtest import (  # noqa: E402
     write_backtest_artifacts,
     write_temporal_holdout_artifacts,
 )
-from app.analysis.expedia_final_test import (  # noqa: E402
+from offline_evaluation.expedia_final_test import (  # noqa: E402
     ExpediaFinalTestCriteria,
+    ExpediaSealedFinalTestManifest,
     build_sealed_final_test_manifest,
     load_sealed_final_test_manifest,
     reserve_sealed_final_test_execution,
@@ -66,6 +66,22 @@ from app.logging import (  # noqa: E402
     log,
     log_context_scope,
     now_ms,
+)
+from offline_evaluation.audience_selection import (  # noqa: E402
+    DEFAULT_SELECTION_RATIOS,
+    AudienceSelectionEvaluationConfig,
+)
+from offline_evaluation.git_state import (  # noqa: E402
+    inspect_clean_git_identity,
+)
+from offline_evaluation.sealed_execution import (  # noqa: E402
+    STATUS_RESULT_STAGED,
+    mark_execution_failure,
+    mark_outcomes_opened,
+    mark_result_staged,
+    prepare_staging_output,
+    publish_staged_result,
+    sealed_execution_attempt,
 )
 
 
@@ -165,6 +181,21 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
             config=config,
             training_cutoffs=training_cutoffs,
             holdout_cutoffs=validation_cutoffs,
+            audience_selection_config=AudienceSelectionEvaluationConfig(
+                ratios=args.audience_selection_ratios,
+                minimum_selected_user_count=(
+                    args.audience_selection_min_selected_users
+                ),
+                minimum_policy_applied_result_count=(
+                    args.audience_selection_min_applied_results
+                ),
+                minimum_positive_capture_rate=(
+                    args.audience_selection_min_positive_capture
+                ),
+                maximum_portfolio_success_rate_drop=(
+                    args.audience_selection_max_portfolio_success_rate_drop
+                ),
+            ),
         )
         output_dir = args.output_dir or default_output_dir(args.command)
         artifacts = write_temporal_holdout_artifacts(
@@ -182,6 +213,12 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
                 "reportPath": artifacts["report"],
                 "summaryPath": artifacts["summary"],
                 "modelPath": artifacts["model"],
+                "audienceSelectionPolicyPath": artifacts[
+                    "audience_selection_policy"
+                ],
+                "audienceSelectionReportPath": artifacts[
+                    "audience_selection_report"
+                ],
             },
         )
         log.info(
@@ -244,7 +281,7 @@ def seal_final_test(
     *,
     started_at: float,
 ) -> int:
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = sealing_git_identity()
     config = backtest_config(args)
     development_cutoffs = monthly_cutoffs(
         args.development_start_cutoff,
@@ -279,10 +316,21 @@ def seal_final_test(
         code_commit=code_commit,
         code_tree=code_tree,
         criteria=ExpediaFinalTestCriteria(
-            rank_one_beats_baseline_rate_min=(
-                args.min_rank_one_beats_baseline_rate
+            portfolio_candidate_beats_baseline_rate_min=(
+                args.min_portfolio_candidate_beats_baseline_rate
             ),
-            rank_one_is_best_rate_min=args.min_rank_one_is_best_rate,
+            portfolio_scenario_any_candidate_beats_baseline_rate_min=(
+                args.min_portfolio_scenario_any_candidate_beats_baseline_rate
+            ),
+            portfolio_scenario_all_candidates_beat_baseline_rate_min=(
+                args.min_portfolio_scenario_all_candidates_beat_baseline_rate
+            ),
+            portfolio_mean_candidate_lift_percentage_points_min=(
+                args.min_portfolio_mean_candidate_lift_percentage_points
+            ),
+            portfolio_mean_worst_candidate_lift_percentage_points_min=(
+                args.min_portfolio_mean_worst_candidate_lift_percentage_points
+            ),
             all_candidate_mae_percentage_points_max=(
                 args.max_all_candidate_mae_percentage_points
             ),
@@ -332,7 +380,7 @@ def execute_final_test(
             "final test confirmation does not match the sealed manifest; "
             f"use {manifest.required_confirmation!r} only after code freeze"
         )
-    code_commit, code_tree = frozen_git_identity()
+    code_commit, code_tree = execution_git_identity()
     model_path = args.model_path.expanduser().resolve()
     model = load_segment_performance_model(model_path)
     stats = repository.source_stats()
@@ -359,39 +407,66 @@ def execute_final_test(
         lookback_days=config.lookback_days,
         outcome_days=config.outcome_days,
     )
-    output_dir = args.output_dir or default_output_dir("sealed-final-test")
-    if output_dir.exists():
-        raise ExpediaBacktestError(
-            "sealed final test output already exists; choose a new empty path "
-            "before opening outcomes"
-        )
-    marker_path = reserve_sealed_final_test_execution(
+    output_dir = args.output_dir or default_final_test_output_dir(manifest)
+    execution = reserve_sealed_final_test_execution(
         args.manifest,
         manifest,
         code_commit=code_commit,
-    )
-    result = run_sealed_final_test(
-        repository,
-        manifest=manifest,
-        model=model,
-    )
-    artifacts = write_sealed_final_test_artifacts(
-        result,
-        manifest=manifest,
         output_dir=output_dir,
-        source_stats=stats,
+        resume_execution_id=args.resume_execution_id,
     )
+    log.assign_context({"executionId": execution.execution_id})
+    with sealed_execution_attempt(execution):
+        if execution.status == STATUS_RESULT_STAGED:
+            completed = publish_staged_result(execution)
+            log.info(
+                "sealed_result_publication_resumed",
+                {
+                    "outputDir": completed.output_dir,
+                    "executionJournalPath": completed.journal_path,
+                },
+            )
+            return 0
+        staging_dir = prepare_staging_output(execution)
+        try:
+            result = run_sealed_final_test(
+                repository,
+                manifest=manifest,
+                model=model,
+                on_outcomes_opened=lambda: mark_outcomes_opened(execution),
+            )
+            write_sealed_final_test_artifacts(
+                result,
+                manifest=manifest,
+                output_dir=staging_dir,
+                source_stats=stats,
+            )
+            mark_result_staged(execution)
+            completed = publish_staged_result(execution)
+        except Exception as exc:
+            failed = mark_execution_failure(execution, exc)
+            log.info(
+                "sealed_execution_state_updated",
+                {
+                    "executionStatus": failed.status,
+                    "executionJournalPath": failed.journal_path,
+                },
+            )
+            raise
     log.info(
         "sealed_final_test_completed",
         {
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "scenarioResultCount": len(result.run.results),
             "skippedScenarioCount": len(result.run.skipped_scenarios),
-            "executionMarkerPath": marker_path,
-            "outputDir": output_dir,
-            "reportPath": artifacts["report"],
-            "summaryPath": artifacts["summary"],
+            "executionJournalPath": completed.journal_path,
+            "outputDir": completed.output_dir,
+            "reportPath": completed.output_dir
+            / "sealed_final_test_report.md",
+            "summaryPath": completed.output_dir
+            / "sealed_final_test_summary.json",
         },
     )
     log.info(
@@ -399,6 +474,7 @@ def execute_final_test(
         {
             "mode": args.command,
             "manifestId": manifest.manifest_id,
+            "verdict": result.verdict,
             "passed": result.passed,
             "durationMs": duration_ms(started_at),
         },
@@ -479,6 +555,39 @@ def parse_args() -> argparse.Namespace:
         type=parse_date,
         default=date(2014, 12, 1),
     )
+    holdout.add_argument(
+        "--audience-selection-ratios",
+        type=parse_selection_ratios,
+        default=DEFAULT_SELECTION_RATIOS,
+        help="평가할 조건 일치자 상위 비율 목록입니다. 기본값: 0.2,0.4,0.6,0.8,1.0",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-selected-users",
+        type=positive_int,
+        default=30,
+        help="비율 적용 후 이 인원보다 작으면 조건 일치자 전체를 유지합니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-applied-results",
+        type=positive_int,
+        default=3,
+        help="비율 정책 판정에 필요한 최소 후보 결과 수입니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-min-positive-capture",
+        type=unit_interval,
+        default=0.8,
+        help="조건 일치 예약자를 유지해야 하는 최소 포착률입니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-max-portfolio-success-rate-drop",
+        type=unit_interval,
+        default=0.05,
+        help=(
+            "전체 조건 일치자를 사용할 때와 비교해 허용할 추천 후보 "
+            "기준선 초과율의 최대 하락폭입니다."
+        ),
+    )
 
     seal = subparsers.add_parser(
         "seal-final-test",
@@ -522,14 +631,29 @@ def parse_args() -> argparse.Namespace:
         default=date(2014, 12, 1),
     )
     seal.add_argument(
-        "--min-rank-one-beats-baseline-rate",
+        "--min-portfolio-candidate-beats-baseline-rate",
+        type=unit_interval,
+        default=0.60,
+    )
+    seal.add_argument(
+        "--min-portfolio-scenario-any-candidate-beats-baseline-rate",
         type=unit_interval,
         default=0.70,
     )
     seal.add_argument(
-        "--min-rank-one-is-best-rate",
+        "--min-portfolio-scenario-all-candidates-beat-baseline-rate",
         type=unit_interval,
         default=0.50,
+    )
+    seal.add_argument(
+        "--min-portfolio-mean-candidate-lift-percentage-points",
+        type=float,
+        default=0.0,
+    )
+    seal.add_argument(
+        "--min-portfolio-mean-worst-candidate-lift-percentage-points",
+        type=float,
+        default=0.0,
     )
     seal.add_argument(
         "--max-all-candidate-mae-percentage-points",
@@ -563,6 +687,13 @@ def parse_args() -> argparse.Namespace:
     final_test.add_argument("--model-path", type=Path, default=DEFAULT_MODEL_PATH)
     final_test.add_argument("--confirm", required=True)
     final_test.add_argument("--output-dir", type=Path, default=None)
+    final_test.add_argument(
+        "--resume-execution-id",
+        help=(
+            "Resume the same execution after a pre-outcome or publication "
+            "failure. The ID must match the execution journal."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -651,6 +782,16 @@ def default_output_dir(command: str) -> Path:
     return Path("artifacts") / "expedia-segment-backtest" / f"{command}-{run_at}"
 
 
+def default_final_test_output_dir(
+    manifest: ExpediaSealedFinalTestManifest,
+) -> Path:
+    return (
+        Path("artifacts")
+        / "expedia-segment-backtest"
+        / f"sealed-final-{manifest.manifest_id[:12]}"
+    )
+
+
 def parse_date(value: str) -> date:
     try:
         return date.fromisoformat(value)
@@ -686,41 +827,28 @@ def unit_interval(value: str) -> float:
     return parsed
 
 
-def frozen_git_identity() -> tuple[str, str]:
-    branch = _git_output("rev-parse", "--abbrev-ref", "HEAD")
-    if branch != "dev":
-        raise ValueError(
-            "sealed final test must be created and executed from the dev branch"
-        )
-    tracked_status = _git_output(
-        "status",
-        "--porcelain",
-        "--untracked-files=no",
-    )
-    if tracked_status:
-        raise ValueError(
-            "sealed final test requires a clean tracked working tree"
-        )
-    return (
-        _git_output("rev-parse", "HEAD"),
-        _git_output("rev-parse", "HEAD^{tree}"),
-    )
-
-
-def _git_output(*args: str) -> str:
+def parse_selection_ratios(value: str) -> tuple[float, ...]:
     try:
-        completed = subprocess.run(
-            ("git", *args),
-            cwd=REPOSITORY_ROOT,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise ValueError(
-            f"failed to inspect frozen git state: {' '.join(args)}"
+        parsed = tuple(float(item.strip()) for item in value.split(","))
+        AudienceSelectionEvaluationConfig(ratios=parsed)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            "ratios must be sorted unique values in (0, 1] and include 1.0"
         ) from exc
-    return completed.stdout.strip()
+    return parsed
+
+
+def sealing_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(
+        REPOSITORY_ROOT,
+        required_branch="dev",
+    )
+    return identity.commit, identity.tree
+
+
+def execution_git_identity() -> tuple[str, str]:
+    identity = inspect_clean_git_identity(REPOSITORY_ROOT)
+    return identity.commit, identity.tree
 
 
 def _logging_settings(connection: dict[str, str]) -> Settings:

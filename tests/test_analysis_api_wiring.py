@@ -6,7 +6,8 @@ from typing import Any
 
 from fastapi.testclient import TestClient
 
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.main import create_app
 
 
@@ -14,7 +15,7 @@ DEFAULT_ROW = object()
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
@@ -147,6 +148,13 @@ def test_segment_analysis_api_uses_existing_segment_without_recommending(
     executed_sql = [compact_sql(query) for query, _params in connection.executed]
     assert any("insert into promotion_analyses" in query for query in executed_sql)
     assert any("insert into promotion_target_segments" in query for query in executed_sql)
+    target_segment_insert_params = [
+        params
+        for query, params in connection.executed
+        if "insert into promotion_target_segments" in compact_sql(query)
+    ]
+    assert target_segment_insert_params
+    assert {params[-1] for params in target_segment_insert_params} == {"approved"}
     assert not any(
         "insert into promotion_segment_suggestions" in query
         for query in executed_sql
@@ -155,6 +163,103 @@ def test_segment_analysis_api_uses_existing_segment_without_recommending(
         compact_sql(query) for query, _parameters in clickhouse_clients[0].queries
     ]
     assert not any("from raw_events" in query for query in clickhouse_sql)
+
+
+def test_confirmed_segment_analysis_hands_approved_targets_to_generation(
+    monkeypatch,
+) -> None:
+    connection = RecordingConnection()
+    clickhouse_client = RecordingClickHouseClient()
+
+    monkeypatch.setattr(
+        "app.analysis.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    monkeypatch.setattr(
+        "app.analysis.router.create_clickhouse_client",
+        lambda _settings: clickhouse_client,
+    )
+    monkeypatch.setattr(
+        "app.generation.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+
+    connection.target_segment_rows.append(
+        generation_target_segment_row(
+            analysis_id="analysis_legacy_planned",
+            status="planned",
+        )
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app)
+
+    legacy_generation = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            **analysis_payload(),
+            "analysis_id": "analysis_legacy_planned",
+            "content_option_count": 1,
+        },
+        headers={"Idempotency-Key": "analysis-legacy-planned-generation"},
+    )
+
+    assert legacy_generation.status_code == 409
+    assert "promotion_target_segments" in legacy_generation.json()["detail"]
+
+    analysis = client.post(
+        "/decision/v1/promotions/promo_banner_001/analyses",
+        json={**analysis_payload(), "segment_ids": ["seg_family_trip"]},
+    )
+
+    assert analysis.status_code == 200
+    analysis_id = analysis.json()["analysis_id"]
+    persisted_targets = [
+        row
+        for row in connection.target_segment_rows
+        if row["analysis_id"] == analysis_id
+    ]
+    assert persisted_targets
+    assert {row["status"] for row in persisted_targets} == {"approved"}
+    connection.target_segment_rows.append(
+        generation_target_segment_row(
+            analysis_id=analysis_id,
+            project_id="other-project",
+            campaign_id="other-campaign",
+            promotion_id="other-promotion",
+            segment_id="seg_foreign_approved",
+            status="approved",
+        )
+    )
+
+    generation = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            **analysis_payload(),
+            "analysis_id": analysis_id,
+            "content_option_count": 1,
+        },
+        headers={"Idempotency-Key": "analysis-approved-target-generation"},
+    )
+
+    assert generation.status_code == 202
+    assert generation.json()["status"] == "requested"
+    insert_params = next(
+        params
+        for query, params in connection.executed
+        if "insert into generation_runs" in compact_sql(query)
+    )
+    snapshot = insert_params["input_json"].obj
+    assert [
+        target["segment_id"] for target in snapshot["target_segments"]
+    ] == ["seg_family_trip"]
+    assert sum(
+        "insert into generation_runs" in compact_sql(query)
+        for query, _params in connection.executed
+    ) == 1
+    assert not any(
+        "insert into content_candidates" in compact_sql(query)
+        for query, _params in connection.executed
+    )
 
 
 def test_analysis_api_rolls_back_when_promotion_is_missing(monkeypatch) -> None:
@@ -240,6 +345,7 @@ class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
         self._last_query = ""
+        self._last_params: Any = None
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -249,7 +355,23 @@ class RecordingCursor:
 
     def execute(self, query: str, params: Any = None) -> None:
         self._last_query = query
+        self._last_params = params
         self._connection.executed.append((query, params))
+        if "insert into promotion_target_segments" in compact_sql(query):
+            self._connection.target_segment_rows.append(
+                generation_target_segment_row(
+                    analysis_id=str(params[0]),
+                    promotion_id=str(params[3]),
+                    segment_id=str(params[4]),
+                    segment_name=str(params[5]),
+                    content_brief_json=params[8],
+                    data_evidence_json=params[9],
+                    segment_vector_id=str(params[10]),
+                    estimated_size=int(params[11]),
+                    priority=str(params[12]),
+                    status=str(params[13]),
+                )
+            )
 
     def fetchone(self) -> dict[str, object] | None:
         sql = compact_sql(self._last_query)
@@ -257,12 +379,37 @@ class RecordingCursor:
             return self._connection.promotion_row
         if "from segment_vectors" in sql:
             return None
-        return None
+        if "insert into generation_runs" in sql:
+            assert isinstance(self._last_params, dict)
+            return {
+                **self._last_params,
+                "input_json": self._last_params["input_json"].obj,
+                "generation_report_json": self._last_params[
+                    "generation_report_json"
+                ].obj,
+                "output_json": None,
+            }
+        return {"ok": True}
 
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
         if "from segment_definitions" in sql:
             return segment_definition_rows()
+        if "from promotion_target_segments" in sql:
+            params = self._connection.executed[-1][1]
+            rows = self._connection.target_segment_rows
+            if isinstance(params, dict):
+                rows = [
+                    row
+                    for row in rows
+                    if row["project_id"] == params["project_id"]
+                    and row["campaign_id"] == params["campaign_id"]
+                    and row["promotion_id"] == params["promotion_id"]
+                    and row["analysis_id"] == params["analysis_id"]
+                ]
+            if "pts.status = 'approved'" in self._last_query:
+                rows = [row for row in rows if row["status"] == "approved"]
+            return rows
         return []
 
 
@@ -276,6 +423,7 @@ class RecordingConnection:
             promotion_record_row() if promotion_row is DEFAULT_ROW else promotion_row
         )
         self.executed: list[tuple[str, Any]] = []
+        self.target_segment_rows: list[dict[str, object]] = []
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0
@@ -371,6 +519,47 @@ def segment_definition_row(segment_id: str, sample_size: int) -> dict[str, objec
         "total_eligible_user_count": 74200,
         "sample_ratio": Decimal("0.020000"),
         "status": "active",
+    }
+
+
+def generation_target_segment_row(
+    *,
+    analysis_id: str,
+    project_id: str = "hotel-client-a",
+    campaign_id: str = "camp_summer_2026",
+    promotion_id: str = "promo_banner_001",
+    segment_id: str = "seg_family_trip",
+    segment_name: str = "Family trip planners",
+    content_brief_json: object | None = None,
+    data_evidence_json: object | None = None,
+    segment_vector_id: str = "segvec_seg_family_trip_v1",
+    estimated_size: int = 3200,
+    priority: str = "high",
+    status: str,
+) -> dict[str, object]:
+    return {
+        "analysis_id": analysis_id,
+        "project_id": project_id,
+        "campaign_id": campaign_id,
+        "promotion_id": promotion_id,
+        "segment_id": segment_id,
+        "segment_name": segment_name,
+        "content_brief_json": content_brief_json
+        or {
+            "message_direction": "Promote family-friendly hotel stays.",
+            "keywords": ["family rooms", "breakfast included"],
+        },
+        "data_evidence_json": data_evidence_json or {"source": "system_default"},
+        "segment_vector_id": segment_vector_id,
+        "estimated_size": estimated_size,
+        "priority": priority,
+        "status": status,
+        "segment_source": "system_default",
+        "query_preview_id": None,
+        "natural_language_query": "family hotel trip planners",
+        "generated_sql": None,
+        "segment_sample_size": estimated_size,
+        "segment_sample_ratio": Decimal("0.020000"),
     }
 
 

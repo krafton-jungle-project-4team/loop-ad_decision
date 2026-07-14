@@ -1,19 +1,33 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Mapping
 
 import pytest
 
 from app.generation.adapters import (
-    DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL,
     ExternalContentGenerator,
     GeminiImageClient,
     ImageArtifact,
     OpenAIResponsesContentClient,
     S3AssetStorage,
 )
+from app.generation.artifacts import (
+    ArtifactIdentity,
+    S3CreativeArtifactPublisher,
+    StoredAsset,
+    image_prompt_sha256,
+    recovered_image_prompt,
+    render_banner_html,
+)
+from app.generation.errors import (
+    PermanentGenerationError,
+    RetryableGenerationError,
+)
+from app.generation.generator import GeneratedContent
 from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
@@ -21,12 +35,17 @@ from app.generation.prompt_builder import (
     PromptBuilder,
     TargetSegmentPromptInput,
 )
-from app.generation.schemas import ContentChannel, GenerationRequest
+from app.generation.schemas import ContentChannel, CreativeFormat, GenerationRequest
 
 
+IMAGE_SHA256 = hashlib.sha256(b"image-bytes").hexdigest()
+PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
+STORAGE_IMAGE_PROMPT = "hotel image prompt, no visible text"
+IMAGE_PROMPT_SHA256 = image_prompt_sha256(STORAGE_IMAGE_PROMPT)
 IMAGE_URL = (
-    "https://gen-ai.asset.dev.loop-ad.org/generated/"
-    "content_banner_repeat_hotel_001.png"
+    "https://gen-ai.asset.dev.loop-ad.org/hotel-client-a/promo_banner_001/"
+    "generation_banner_001/content_banner_repeat_hotel_001/"
+    f"image.{IMAGE_PROMPT_SHA256}.png"
 )
 PROMOTION_LANDING_URL = "https://demo-stay.example.com/summer"
 LLM_LANDING_URL = "https://yourhotelbookinglink.com/generated-by-model"
@@ -36,6 +55,17 @@ GEMINI_FIXTURE_KEY = "fixture-gemini-key"
 
 def provider_key_kwargs(value: str) -> dict[str, str]:
     return {"api" + "_key": value}
+
+
+def artifact_identity(
+    content_id: str = "content_banner_repeat_hotel_001",
+) -> ArtifactIdentity:
+    return ArtifactIdentity(
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        generation_id="generation_banner_001",
+        content_id=content_id,
+    )
 
 
 def test_external_content_generator_stores_banner_image_url() -> None:
@@ -59,6 +89,7 @@ def test_external_content_generator_stores_banner_image_url() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        artifact_identity=artifact_identity(),
     )
 
     assert content.title == "이번 주말 호텔 특가"
@@ -76,6 +107,159 @@ def test_external_content_generator_stores_banner_image_url() -> None:
             ImageArtifact(data=b"fake-image", content_type="image/png"),
         )
     ]
+
+
+def test_external_content_generator_does_not_reuse_image_from_different_prompt() -> None:
+    existing = StoredAsset(
+        storage_key=(
+            "genai/hotel-client-a/promo_banner_001/generation_banner_001/"
+            f"content_banner_repeat_hotel_001/image.{IMAGE_PROMPT_SHA256}.png"
+        ),
+        public_url=IMAGE_URL,
+        sha256=hashlib.sha256(b"existing-image").hexdigest(),
+        bytes=len(b"existing-image"),
+        content_type="image/png",
+    )
+    image_client = FakeImageClient()
+    asset_storage = FakeAssetStorage(existing=existing)
+    generator = ExternalContentGenerator(
+        content_client=FakeContentClient(
+            {
+                "title": "이번 주말 호텔 특가",
+                "body": "환불 가능한 객실을 객실 마감 전에 비교해보세요.",
+                "cta": "호텔 특가 보기",
+                "image_prompt": "bright hotel suite banner, no visible text",
+            }
+        ),
+        image_client=image_client,
+        asset_storage=asset_storage,
+    )
+
+    content = generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=artifact_identity(),
+    )
+
+    assert content.image_url == IMAGE_URL
+    assert content.image_artifact != existing
+    assert image_client.prompts == [content.image_prompt]
+    assert len(asset_storage.saved) == 1
+
+
+def test_external_content_generator_recovers_stored_creative_before_providers() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+    identity = artifact_identity()
+    original_image_prompt = "first hotel image prompt, no visible text"
+    stored_image = storage.store_image(
+        identity=identity,
+        image_prompt_sha256=image_prompt_sha256(original_image_prompt),
+        image=ImageArtifact(data=b"image-bytes", content_type="image/png"),
+    )
+    original_values = {
+        "subject": None,
+        "preheader": None,
+        "title": "처음 생성된 호텔 특가",
+        "body": "처음 생성된 객실 문구입니다.",
+        "cta": "처음 호텔 보기",
+        "message": None,
+        "image_prompt": original_image_prompt,
+        "image_url": stored_image.public_url,
+        "landing_url": PROMOTION_LANDING_URL,
+    }
+    storage.store_html(
+        identity=identity,
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=render_banner_html(original_values),
+    )
+    content_client = FakeContentClient(
+        {
+            "title": "재시도에서 달라진 문구",
+            "body": "이 문구는 사용되면 안 됩니다.",
+            "cta": "다른 CTA",
+            "image_prompt": "different prompt",
+        }
+    )
+    image_client = FakeImageClient()
+
+    content = ExternalContentGenerator(
+        content_client=content_client,
+        image_client=image_client,
+        asset_storage=storage,
+    ).generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=identity,
+    )
+
+    assert content.title == original_values["title"]
+    assert content.body == original_values["body"]
+    assert content.cta == original_values["cta"]
+    assert content.image_prompt == recovered_image_prompt(
+        image_prompt_sha256(original_image_prompt)
+    )
+    assert content.artifact_renderer_version == "generation.renderer.v1"
+    assert content.artifact_template_version == "banner.overlay.v1"
+    assert content.image_artifact == stored_image
+    assert content_client.calls == 0
+    assert image_client.prompts == []
+    reused_artifact = S3CreativeArtifactPublisher(storage).publish(
+        identity=identity,
+        channel=ContentChannel.ONSITE_BANNER,
+        content_values=content.to_record_values(ContentChannel.ONSITE_BANNER),
+    )
+    assert reused_artifact["sha256"] == hashlib.sha256(
+        render_banner_html(original_values).encode("utf-8")
+    ).hexdigest()
+    assert len(s3_client.put_objects) == 2
+
+
+def test_s3_asset_storage_rejects_tampered_creative_source() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+    identity = artifact_identity()
+    html_body = render_banner_html(
+        {
+            "title": "호텔 특가",
+            "body": "객실을 확인하세요.",
+            "cta": "호텔 보기",
+            "image_prompt": "hotel image, no visible text",
+            "image_url": IMAGE_URL,
+            "landing_url": PROMOTION_LANDING_URL,
+        }
+    )
+    stored = storage.store_html(
+        identity=identity,
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=html_body,
+    )
+    object_key = ("loop-ad-dev-data-storage", stored.storage_key)
+    s3_client.objects[object_key]["Body"] = html_body.replace(
+        "객실을 확인하세요.",
+        "변조된 문구입니다.",
+        1,
+    ).encode("utf-8")
+
+    with pytest.raises(PermanentGenerationError) as exc_info:
+        storage.find_creative_content(
+            identity=identity,
+            channel=ContentChannel.ONSITE_BANNER,
+        )
+
+    assert exc_info.value.code == "artifact_source_invalid"
 
 
 def test_external_content_generator_can_defer_banner_image_generation() -> None:
@@ -99,6 +283,7 @@ def test_external_content_generator_can_defer_banner_image_generation() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        artifact_identity=artifact_identity(),
     )
 
     assert content.title == "이번 주말 호텔 특가"
@@ -131,6 +316,7 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        artifact_identity=artifact_identity(),
     )
 
     assert content.image_prompt is not None
@@ -142,7 +328,7 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
     assert len(asset_storage.saved) == 1
 
 
-def test_external_content_generator_does_not_create_images_for_email() -> None:
+def test_external_content_generator_creates_images_for_email_contract() -> None:
     image_client = FakeImageClient()
     asset_storage = FakeAssetStorage()
     generator = ExternalContentGenerator(
@@ -162,13 +348,20 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
         prompt_input=prompt_input(ContentChannel.EMAIL),
         prompt_result=prompt_result(),
         option_index=1,
+        artifact_identity=artifact_identity("content_email_repeat_hotel_001"),
     )
 
     assert content.subject == "환불 가능한 호텔 객실을 만나보세요"
     assert content.landing_url == PROMOTION_LANDING_URL
-    assert content.image_url is None
-    assert image_client.prompts == []
-    assert asset_storage.saved == []
+    assert content.image_prompt is not None
+    assert content.image_url == IMAGE_URL
+    assert image_client.prompts == [content.image_prompt]
+    assert asset_storage.saved == [
+        (
+            "content_email_repeat_hotel_001",
+            ImageArtifact(data=b"fake-image", content_type="image/png"),
+        )
+    ]
 
 
 def test_external_content_generator_requires_promotion_landing_url() -> None:
@@ -190,6 +383,7 @@ def test_external_content_generator_requires_promotion_landing_url() -> None:
             prompt_input=prompt_input(ContentChannel.EMAIL, landing_url=None),
             prompt_result=prompt_result(),
             option_index=1,
+            artifact_identity=artifact_identity("content_email_repeat_hotel_001"),
         )
 
 
@@ -313,35 +507,381 @@ def test_gemini_image_client_extracts_base64_inline_data() -> None:
     assert image == ImageArtifact(data=b"image-bytes", content_type="image/webp")
 
 
+@pytest.mark.parametrize("inline_data", [b"", "", "not-valid-base64!"])
+def test_gemini_image_client_rejects_empty_or_invalid_image_data(
+    inline_data: bytes | str,
+) -> None:
+    client = GeminiImageClient(
+        **provider_key_kwargs(GEMINI_FIXTURE_KEY),
+        model="gemini-test",
+        client=FakeGeminiClient(inline_data=inline_data),
+    )
+
+    with pytest.raises(ValueError):
+        client.generate_image(image_prompt="bright hotel suite banner")
+
+
 def test_s3_asset_storage_uploads_under_genai_prefix_and_returns_public_url() -> None:
     s3_client = FakeS3Client()
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
 
-    image_url = storage.store_image(
-        content_id="content_banner_repeat_hotel_001",
+    stored_image = storage.store_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=IMAGE_PROMPT_SHA256,
         image=ImageArtifact(data=b"image-bytes", content_type="image/png"),
     )
 
-    assert image_url == IMAGE_URL
+    assert stored_image.public_url == IMAGE_URL
+    assert stored_image.sha256 == IMAGE_SHA256
     assert s3_client.put_objects == [
         {
             "Bucket": "loop-ad-dev-data-storage",
-            "Key": "genai/generated/content_banner_repeat_hotel_001.png",
+            "Key": (
+                "genai/hotel-client-a/promo_banner_001/generation_banner_001/"
+                f"content_banner_repeat_hotel_001/image.{IMAGE_PROMPT_SHA256}.png"
+            ),
             "Body": b"image-bytes",
             "ContentType": "image/png",
             "CacheControl": "public, max-age=31536000, immutable",
+            "Metadata": {"sha256": IMAGE_SHA256},
+            "IfNoneMatch": "*",
         }
     ]
-    assert image_url.startswith(DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL)
+    assert stored_image.public_url.startswith(PUBLIC_BASE_URL)
+
+
+def test_s3_asset_storage_reuses_images_and_rejects_changed_html() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+
+    first_image = storage.store_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=image_prompt_sha256("first prompt"),
+        image=ImageArtifact(data=b"first-image", content_type="image/png"),
+    )
+    repeated_image = storage.store_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=image_prompt_sha256("first prompt"),
+        image=ImageArtifact(data=b"first-image", content_type="image/png"),
+    )
+    assert repeated_image == first_image
+    assert len(s3_client.put_objects) == 1
+
+    independently_stored_image = storage.store_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=image_prompt_sha256("second prompt"),
+        image=ImageArtifact(data=b"second-image", content_type="image/png"),
+    )
+    assert independently_stored_image != first_image
+    assert storage.find_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=image_prompt_sha256("first prompt"),
+    ) == first_image
+    assert storage.find_image(
+        identity=artifact_identity(),
+        image_prompt_sha256=image_prompt_sha256("second prompt"),
+    ) == independently_stored_image
+    assert len(s3_client.put_objects) == 2
+
+    html_body = "<html><body>first</body></html>"
+    html_metadata = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=html_body,
+    )
+    repeated_html_metadata = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=html_body,
+    )
+    html_sha256 = hashlib.sha256(html_body.encode("utf-8")).hexdigest()
+    assert html_metadata.storage_key == (
+        "genai/hotel-client-a/promo_banner_001/generation_banner_001/"
+        "content_banner_repeat_hotel_001/creative.banner.html"
+    )
+    assert html_metadata.sha256 == html_sha256
+    assert repeated_html_metadata == html_metadata
+    assert len(s3_client.put_objects) == 3
+
+    with pytest.raises(RetryableGenerationError, match="immutable") as exc_info:
+        storage.store_html(
+            identity=artifact_identity(),
+            creative_format=CreativeFormat.BANNER_HTML,
+            html_body="<html><body>second</body></html>",
+        )
+    assert exc_info.value.code == "artifact_hash_conflict"
+    assert len(s3_client.put_objects) == 3
+
+
+def test_s3_asset_storage_reuses_same_source_across_renderer_changes() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+    values = {
+        "title": "호텔 특가",
+        "body": "객실을 확인하세요.",
+        "cta": "호텔 보기",
+        "image_prompt": "hotel image, no visible text",
+        "image_url": IMAGE_URL,
+        "renderer_version": "generation.renderer.old",
+        "template_version": "banner.overlay.old",
+    }
+    first_html = render_banner_html(values)
+    changed_template_html = render_banner_html(
+        {
+            **values,
+            "renderer_version": "generation.renderer.new",
+            "template_version": "banner.overlay.new",
+        }
+    ).replace(
+        "background:#072b63", "background:#082c64", 1
+    )
+
+    first = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=first_html,
+    )
+    reused = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=changed_template_html,
+    )
+
+    assert reused == first
+    assert reused.renderer_version == "generation.renderer.old"
+    assert reused.template_version == "banner.overlay.old"
+    assert len(s3_client.put_objects) == 1
+
+    publication = S3CreativeArtifactPublisher(storage).publish(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        content_values={
+            **values,
+            "renderer_version": "generation.renderer.new",
+            "template_version": "banner.overlay.new",
+        },
+    )
+
+    assert publication.renderer == {
+        "version": "generation.renderer.old",
+        "template_version": "banner.overlay.old",
+    }
+    assert len(s3_client.put_objects) == 1
+
+
+def test_s3_conditional_write_conflict_is_retryable() -> None:
+    s3_client = FakeS3Client(conditional_conflicts=1)
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+
+    with pytest.raises(RetryableGenerationError) as exc_info:
+        storage.store_image(
+            identity=artifact_identity(),
+            image_prompt_sha256=image_prompt_sha256("first prompt"),
+            image=ImageArtifact(data=b"first-image", content_type="image/png"),
+        )
+
+    assert exc_info.value.code == "artifact_write_conflict"
+    assert s3_client.put_objects == []
+
+
+def test_external_generator_reuses_private_source_and_image_after_crash() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    first_content_client = FakeContentClient(
+        {
+            "title": "최초 생성 제목",
+            "body": "최초 생성 본문",
+            "cta": "호텔 보기",
+            "image_prompt": "first canonical hotel image, no visible text",
+        }
+    )
+    first_image_client = FakeImageClient()
+    first_generator = ExternalContentGenerator(
+        content_client=first_content_client,
+        image_client=first_image_client,
+        asset_storage=storage,
+        source_manifest_storage=storage,
+    )
+
+    first = first_generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=artifact_identity(),
+    )
+
+    retry_content_client = FakeContentClient(
+        {
+            "title": "재시도에서 생성되면 안 되는 제목",
+            "body": "재시도에서 생성되면 안 되는 본문",
+            "cta": "다시 생성",
+            "image_prompt": "different retry image prompt",
+        }
+    )
+    retry_image_client = FakeImageClient()
+    retry_generator = ExternalContentGenerator(
+        content_client=retry_content_client,
+        image_client=retry_image_client,
+        asset_storage=storage,
+        source_manifest_storage=storage,
+    )
+
+    restored = retry_generator.generate(
+        prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
+        prompt_result=prompt_result(),
+        option_index=1,
+        artifact_identity=artifact_identity(),
+    )
+
+    assert first_content_client.calls == 1
+    assert len(first_image_client.prompts) == 1
+    assert retry_content_client.calls == 0
+    assert retry_image_client.prompts == []
+    assert restored.title == first.title
+    assert restored.body == first.body
+    assert restored.image_prompt == first.image_prompt
+    assert restored.image_url == first.image_url
+    assert len(s3_client.put_objects) == 2
+    assert str(s3_client.put_objects[0]["Key"]).startswith("genai-source/")
+    assert s3_client.put_objects[0]["CacheControl"] == "no-store"
+    assert str(s3_client.put_objects[1]["Key"]).startswith("genai/")
+
+
+def test_source_manifest_precondition_uses_first_canonical_source() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    first = GeneratedContent(
+        title="최초 제목",
+        body="최초 본문",
+        cta="호텔 보기",
+        image_prompt="first prompt, no visible text",
+        landing_url=PROMOTION_LANDING_URL,
+    )
+    second = replace(first, title="경합에서 폐기할 제목")
+
+    stored = storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=first,
+    )
+    reused = storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=second,
+    )
+
+    assert stored.title == "최초 제목"
+    assert reused == stored
+    assert len(s3_client.put_objects) == 1
+
+
+def test_source_manifest_rejects_different_request_fingerprint() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        source_manifest_prefix="genai-source/",
+        s3_client=s3_client,
+    )
+    storage.store_source_manifest(
+        identity=artifact_identity(),
+        channel=ContentChannel.ONSITE_BANNER,
+        request_fingerprint="a" * 64,
+        content=GeneratedContent(
+            title="최초 제목",
+            body="최초 본문",
+            cta="호텔 보기",
+            image_prompt="first prompt, no visible text",
+            landing_url=PROMOTION_LANDING_URL,
+        ),
+    )
+
+    with pytest.raises(PermanentGenerationError) as exc_info:
+        storage.find_source_manifest(
+            identity=artifact_identity(),
+            channel=ContentChannel.ONSITE_BANNER,
+            request_fingerprint="b" * 64,
+        )
+
+    assert exc_info.value.code == "source_manifest_identity_mismatch"
+
+
+def test_source_manifest_conditional_conflict_is_retryable() -> None:
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        source_manifest_prefix="genai-source/",
+        s3_client=FakeS3Client(conditional_conflicts=1),
+    )
+
+    with pytest.raises(RetryableGenerationError) as exc_info:
+        storage.store_source_manifest(
+            identity=artifact_identity(),
+            channel=ContentChannel.ONSITE_BANNER,
+            request_fingerprint="a" * 64,
+            content=GeneratedContent(
+                title="최초 제목",
+                body="최초 본문",
+                cta="호텔 보기",
+                image_prompt="first prompt, no visible text",
+                landing_url=PROMOTION_LANDING_URL,
+            ),
+        )
+
+    assert exc_info.value.code == "source_manifest_write_conflict"
+
+
+def test_s3_storage_rejects_source_manifest_inside_public_prefix() -> None:
+    with pytest.raises(ValueError, match="outside the public"):
+        S3AssetStorage(
+            bucket_name="loop-ad-dev-data-storage",
+            base_prefix="genai/",
+            public_base_url=PUBLIC_BASE_URL,
+            source_manifest_prefix="genai/source/",
+            s3_client=FakeS3Client(),
+        )
 
 
 class FakeContentClient:
     def __init__(self, values: Mapping[str, str | None]) -> None:
         self._values = values
+        self.calls = 0
 
     def generate_content(
         self,
@@ -351,6 +891,7 @@ class FakeContentClient:
         option_index: int,
     ) -> Mapping[str, str | None]:
         del prompt_input, prompt_result, option_index
+        self.calls += 1
         return self._values
 
 
@@ -364,12 +905,41 @@ class FakeImageClient:
 
 
 class FakeAssetStorage:
-    def __init__(self) -> None:
+    def __init__(self, *, existing: StoredAsset | None = None) -> None:
+        self.existing = existing
         self.saved: list[tuple[str, ImageArtifact]] = []
 
-    def store_image(self, *, content_id: str, image: ImageArtifact) -> str:
-        self.saved.append((content_id, image))
-        return IMAGE_URL
+    def find_image(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        image_prompt_sha256: str,
+        public_url: str | None = None,
+    ) -> StoredAsset | None:
+        del identity, public_url
+        if image_prompt_sha256 != IMAGE_PROMPT_SHA256:
+            return None
+        return self.existing
+
+    def store_image(
+        self,
+        *,
+        identity: ArtifactIdentity,
+        image_prompt_sha256: str,
+        image: ImageArtifact,
+    ) -> StoredAsset:
+        del image_prompt_sha256
+        self.saved.append((identity.content_id, image))
+        return StoredAsset(
+            storage_key=(
+                "genai/hotel-client-a/promo_banner_001/generation_banner_001/"
+                f"{identity.content_id}/image.png"
+            ),
+            public_url=IMAGE_URL,
+            sha256=hashlib.sha256(image.data).hexdigest(),
+            bytes=len(image.data),
+            content_type=image.content_type,
+        )
 
 
 class FakeGeminiClient:
@@ -397,15 +967,64 @@ class FakeGeminiClient:
         assert model == "gemini-test"
         assert contents == "bright hotel suite banner"
         assert config is not None
+        assert config.image_config.output_mime_type == "image/png"
         return self._response
 
 
 class FakeS3Client:
-    def __init__(self) -> None:
+    def __init__(self, *, conditional_conflicts: int = 0) -> None:
+        self.conditional_conflicts = conditional_conflicts
         self.put_objects: list[dict[str, object]] = []
+        self.objects: dict[tuple[object, object], dict[str, object]] = {}
 
     def put_object(self, **kwargs: object) -> None:
+        if self.conditional_conflicts > 0:
+            self.conditional_conflicts -= 1
+            raise FakeS3ConditionalConflict()
+        key = (kwargs["Bucket"], kwargs["Key"])
+        if kwargs.get("IfNoneMatch") == "*" and key in self.objects:
+            raise FakeS3PreconditionFailed()
         self.put_objects.append(kwargs)
+        body = bytes(kwargs["Body"])
+        self.objects[key] = {
+            "Body": body,
+            "ContentLength": len(body),
+            "ContentType": kwargs["ContentType"],
+            "Metadata": dict(kwargs.get("Metadata") or {}),
+        }
+
+    def head_object(self, **kwargs: object) -> dict[str, object]:
+        key = (kwargs["Bucket"], kwargs["Key"])
+        if key not in self.objects:
+            raise FakeS3NotFound()
+        return self.objects[key]
+
+    def get_object(self, **kwargs: object) -> dict[str, object]:
+        key = (kwargs["Bucket"], kwargs["Key"])
+        if key not in self.objects:
+            raise FakeS3NotFound()
+        return self.objects[key]
+
+
+class FakeS3NotFound(RuntimeError):
+    response = {
+        "ResponseMetadata": {"HTTPStatusCode": 404},
+        "Error": {"Code": "NoSuchKey"},
+    }
+
+
+class FakeS3PreconditionFailed(RuntimeError):
+    response = {
+        "ResponseMetadata": {"HTTPStatusCode": 412},
+        "Error": {"Code": "PreconditionFailed"},
+    }
+
+
+class FakeS3ConditionalConflict(RuntimeError):
+    response = {
+        "ResponseMetadata": {"HTTPStatusCode": 409},
+        "Error": {"Code": "ConditionalRequestConflict"},
+    }
 
 
 def prompt_input(

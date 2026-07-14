@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -11,14 +12,34 @@ from app.analysis.repositories import PromotionAnalysisWrite, PromotionTargetSeg
 from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
+from app.decision.router import _manual_next_loop_enabled
+from app.decision.schemas import (
+    AdExperimentCreateResponse,
+    NextLoopPreparationStatus,
+    NextLoopRequest,
+    NextLoopResponse,
+    RunCreateRequest,
+    RunCreateResponse,
+)
 from app.generation.artifacts import render_banner_html
 from app.generation.router import get_generation_service
-from app.generation.service import GenerationService
+from app.generation.schemas import (
+    GenerationAcceptedResponse,
+    GenerationRequest,
+    GenerationStatus,
+)
 from app.main import create_app
 
 
 README_PATH = Path(__file__).resolve().parents[1] / "README.md"
+RUN_RESPONSE_FIXTURE_PATH = (
+    Path(__file__).resolve().parents[1]
+    / "docs"
+    / "contracts"
+    / "decision-promotion-run-response.v1.json"
+)
 
 
 TERM_ARM_ID = "arm" + "_id"
@@ -62,7 +83,7 @@ FORBIDDEN_SHOPPING_PATTERNS = {
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
@@ -78,7 +99,9 @@ def valid_env() -> dict[str, str]:
 def make_client() -> TestClient:
     app = create_app(settings=load_settings(valid_env()))
     app.dependency_overrides[get_analysis_service] = lambda: FakeAnalysisService()
-    app.dependency_overrides[get_generation_service] = lambda: GenerationService()
+    app.dependency_overrides[get_generation_service] = (
+        lambda: FakeGenerationSubmissionService()
+    )
     return TestClient(app)
 
 
@@ -127,12 +150,166 @@ def test_public_outputs_do_not_use_shopping_terms() -> None:
         assert not pattern.search(payload_text), f"shopping term leaked: {label}"
 
 
+def test_manual_next_loop_contract_does_not_expose_forbidden_public_terms() -> None:
+    payload_text = json.dumps(
+        NextLoopResponse(
+            status=NextLoopPreparationStatus.AWAITING_CONTENT_APPROVAL,
+            content_approval_required=True,
+            next_loop_preparation_id="nlprep_banner_001_loop_2_attempt_1",
+            previous_promotion_run_id="prun_banner_001_loop_1",
+            next_promotion_run_id=None,
+            promotion_id="promo_banner_001",
+            loop_count=2,
+            segment_ids=["seg_luxury"],
+            next_analysis_id="analysis_banner_002",
+            next_generation_id="generation_banner_002_attempt_1",
+            pending_content_ids=["content_banner_002_option_1"],
+            next_ad_experiments=[],
+        ).model_dump(mode="json"),
+        ensure_ascii=False,
+    )
+
+    for label, pattern in {
+        **FORBIDDEN_PUBLIC_PATTERNS,
+        **FORBIDDEN_SHOPPING_PATTERNS,
+    }.items():
+        assert not pattern.search(payload_text), f"forbidden public term: {label}"
+
+
+def test_manual_next_loop_fields_are_additive_in_public_schemas() -> None:
+    request_schema = NextLoopRequest.model_json_schema()
+    run_request_schema = RunCreateRequest.model_json_schema()
+    openapi_schema = make_client().get("/openapi.json").json()
+    response_schema = openapi_schema["components"]["schemas"]["NextLoopResponse"]
+    preparation_status_schema = openapi_schema["components"]["schemas"][
+        "NextLoopPreparationStatus"
+    ]
+
+    assert request_schema["properties"]["content_approval_mode"]["default"] == (
+        "automatic"
+    )
+    assert set(request_schema["$defs"]["ContentApprovalMode"]["enum"]) == {
+        "automatic",
+        "manual",
+    }
+    assert "next_loop_preparation_id" in run_request_schema["properties"]
+    assert {
+        "status",
+        "content_approval_required",
+        "next_loop_preparation_id",
+        "pending_content_ids",
+    } <= response_schema["properties"].keys()
+    assert {
+        "status",
+        "content_approval_required",
+        "next_loop_preparation_id",
+        "pending_content_ids",
+    }.isdisjoint(response_schema.get("required", []))
+    assert set(preparation_status_schema["enum"]) == {
+        "awaiting_content_approval",
+        "activated",
+        "rejected",
+    }
+
+
+def test_automatic_next_loop_serialization_keeps_legacy_wire_shape() -> None:
+    response = NextLoopResponse(
+        previous_promotion_run_id="prun_banner_001_loop_1",
+        next_promotion_run_id="prun_banner_001_loop_2",
+        promotion_id="promo_banner_001",
+        loop_count=2,
+        segment_ids=["seg_luxury"],
+        next_analysis_id="analysis_banner_002",
+        next_generation_id="generation_banner_002",
+        next_ad_experiments=[],
+    )
+
+    assert set(response.model_dump(mode="json")) == {
+        "previous_promotion_run_id",
+        "next_promotion_run_id",
+        "promotion_id",
+        "loop_count",
+        "segment_ids",
+        "next_analysis_id",
+        "next_generation_id",
+        "next_ad_experiments",
+    }
+
+
+def test_manual_next_loop_switch_is_off_until_explicitly_enabled() -> None:
+    app = create_app(settings=load_settings(valid_env()))
+    request = SimpleNamespace(app=app)
+
+    assert _manual_next_loop_enabled(request) is False
+
+    app.state.manual_next_loop_enabled = True
+    assert _manual_next_loop_enabled(request) is True
+
+
+def test_decision_routes_exclude_dashboard_reads_and_hot_paths() -> None:
+    app = create_app(settings=load_settings(valid_env()))
+    routes = {
+        (method, route.path)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+
+    assert not {
+        path
+        for method, path in routes
+        if method == "GET" and path.startswith("/decision/v1")
+    }
+    assert ("POST", "/decision/v1/segments/query-preview") not in routes
+    assert ("POST", "/decision/v1/segments") not in routes
+    assert not {path for _method, path in routes if "/chatkit/" in path}
+    assert (
+        "POST",
+        "/decision/v1/promotion-runs/{promotion_run_id}/segment-match",
+    ) not in routes
+    assert (
+        "GET",
+        "/decision/v1/promotion-runs/{promotion_run_id}/active-contents",
+    ) not in routes
+
+
+def test_run_response_exposes_segment_scope_and_fallback_marker() -> None:
+    run_schema = RunCreateResponse.model_json_schema()
+    experiment_schema = AdExperimentCreateResponse.model_json_schema()
+    next_loop_schema = NextLoopResponse.model_json_schema()
+
+    assert "segment_ids" in run_schema["required"]
+    assert "is_fallback" in experiment_schema["required"]
+    assert "segment_ids" in next_loop_schema["required"]
+
+
+def test_dashboard_run_response_fixture_matches_public_contract() -> None:
+    response = RunCreateResponse.model_validate_json(
+        RUN_RESPONSE_FIXTURE_PATH.read_text(encoding="utf-8")
+    )
+    non_fallback_segment_ids = {
+        experiment.segment_id
+        for experiment in response.ad_experiments
+        if not experiment.is_fallback
+    }
+    fallback_experiments = [
+        experiment
+        for experiment in response.ad_experiments
+        if experiment.is_fallback
+    ]
+
+    assert response.segment_ids == ["segment-a", "segment-b"]
+    assert non_fallback_segment_ids == set(response.segment_ids)
+    assert len(fallback_experiments) == 1
+    assert fallback_experiments[0].segment_id == "seg_existing_all"
+
+
 def test_banner_artifact_html_uses_hotel_booking_language_not_shopping_terms() -> None:
     artifact_text = render_banner_html(
         {
             "title": "이번 주말 호텔 특가",
             "body": "환불 가능한 객실과 숙박 혜택을 지금 비교해보세요.",
             "cta": "호텔 특가 보기",
+            "image_url": "https://cdn.example.test/hotel-banner.png",
         }
     ).lower()
 
@@ -211,6 +388,21 @@ class FakeAnalysisService:
         )
 
 
+class FakeGenerationSubmissionService:
+    def submit(
+        self,
+        request: GenerationRequest,
+        *,
+        idempotency_key: str,
+    ) -> GenerationAcceptedResponse:
+        assert idempotency_key == "public-output-contract-001"
+        return GenerationAcceptedResponse(
+            generation_id="generation_banner_001_receipt",
+            promotion_id=request.promotion_id,
+            status=GenerationStatus.REQUESTED,
+        )
+
+
 def public_payload_text(client: TestClient) -> str:
     payloads: list[Any] = []
     health_response = client.get("/health")
@@ -239,8 +431,16 @@ def public_payload_text(client: TestClient) -> str:
             "content_option_count": 1,
             "operator_instruction": None,
         },
+        headers={"Idempotency-Key": "public-output-contract-001"},
     )
-    assert generation_response.status_code == 200
-    payloads.append(generation_response.json())
+    assert generation_response.status_code == 202
+    generation_receipt = generation_response.json()
+    assert generation_receipt == {
+        "generation_id": "generation_banner_001_receipt",
+        "promotion_id": "promo_banner_001",
+        "status": "requested",
+    }
+    assert "content_candidates" not in generation_receipt
+    payloads.append(generation_receipt)
 
     return json.dumps(payloads, ensure_ascii=False).lower()

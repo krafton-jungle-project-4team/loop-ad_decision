@@ -5,9 +5,14 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
-from app.analysis.expedia_backtest import (
+from app.analysis.segment_performance import (
+    CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION,
+    MODEL_CANDIDATE_TYPES,
+    LogisticSegmentPerformanceModel,
+)
+from offline_evaluation.expedia_backtest import (
     ExpediaBacktestConfig,
     ExpediaBacktestError,
     ExpediaBacktestRepository,
@@ -18,24 +23,43 @@ from app.analysis.expedia_backtest import (
     summarize_backtest,
     write_backtest_artifacts,
 )
-from app.analysis.segment_performance import LogisticSegmentPerformanceModel
+from offline_evaluation.rank_quality import (
+    CRITERION_EVIDENCE,
+    CRITERION_QUALITY,
+    VERDICT_PASSED,
+    criterion_result,
+    determine_final_verdict,
+)
+from offline_evaluation.sealed_execution import (
+    SealedExecution,
+    SealedExecutionError,
+    reserve_sealed_execution,
+)
 
 
-SEALED_FINAL_TEST_VERSION = "expedia.sealed-final-test.v1"
+SEALED_FINAL_TEST_VERSION = "expedia.sealed-final-test.v4"
 
 
 @dataclass(frozen=True, slots=True)
 class ExpediaFinalTestCriteria:
-    rank_one_beats_baseline_rate_min: float = 0.70
-    rank_one_is_best_rate_min: float = 0.50
+    portfolio_candidate_beats_baseline_rate_min: float = 0.60
+    portfolio_scenario_any_candidate_beats_baseline_rate_min: float = 0.70
+    portfolio_scenario_all_candidates_beat_baseline_rate_min: float = 0.50
+    portfolio_mean_candidate_lift_percentage_points_min: float = 0.0
+    portfolio_mean_worst_candidate_lift_percentage_points_min: float = 0.0
+    observed_outcome_scenario_count_min: int = 6
+    portfolio_candidate_result_count_min: int = 18
+    portfolio_multi_candidate_scenario_count_min: int = 6
+    portfolio_three_candidate_scenario_count_min: int = 6
     all_candidate_mae_percentage_points_max: float = 3.50
     absolute_prediction_bias_percentage_points_max: float = 1.50
     brier_skill_score_min_exclusive: float = 0.0
 
     def __post_init__(self) -> None:
         rates = (
-            self.rank_one_beats_baseline_rate_min,
-            self.rank_one_is_best_rate_min,
+            self.portfolio_candidate_beats_baseline_rate_min,
+            self.portfolio_scenario_any_candidate_beats_baseline_rate_min,
+            self.portfolio_scenario_all_candidates_beat_baseline_rate_min,
         )
         if any(not 0 <= value <= 1 for value in rates):
             raise ValueError("final test rate criteria must be between 0 and 1")
@@ -43,6 +67,14 @@ class ExpediaFinalTestCriteria:
             raise ValueError("final test MAE criterion must not be negative")
         if self.absolute_prediction_bias_percentage_points_max < 0:
             raise ValueError("final test bias criterion must not be negative")
+        counts = (
+            self.observed_outcome_scenario_count_min,
+            self.portfolio_candidate_result_count_min,
+            self.portfolio_multi_candidate_scenario_count_min,
+            self.portfolio_three_candidate_scenario_count_min,
+        )
+        if any(value <= 0 for value in counts):
+            raise ValueError("final test count criteria must be positive")
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +120,7 @@ class ExpediaSealedFinalTestResult:
     run: ExpediaBacktestRun
     metrics: Mapping[str, Any]
     criteria_results: Mapping[str, Any]
+    verdict: str
     passed: bool
 
 
@@ -168,6 +201,7 @@ def build_sealed_final_test_manifest(
             "training_end_cutoff"
         ),
         "training_target": model.training_metadata.get("target"),
+        "candidate_type_support": _candidate_type_support_payload(model),
     }
     criteria_payload = asdict(criteria or ExpediaFinalTestCriteria())
     base_payload: dict[str, Any] = {
@@ -294,6 +328,12 @@ def verify_sealed_final_test_runtime(
         raise ValueError("sealed final test model changed after sealing")
     if model.version != manifest.model.get("version"):
         raise ValueError("sealed final test model version changed after sealing")
+    if _candidate_type_support_payload(model) != manifest.model.get(
+        "candidate_type_support"
+    ):
+        raise ValueError(
+            "sealed final test candidate type support changed after sealing"
+        )
     if code_commit != manifest.code_commit or code_tree != manifest.code_tree:
         raise ValueError("sealed final test code changed after sealing")
 
@@ -303,27 +343,20 @@ def reserve_sealed_final_test_execution(
     manifest: ExpediaSealedFinalTestManifest,
     *,
     code_commit: str,
-) -> Path:
-    marker_path = manifest_path.with_name(
-        f"{manifest_path.stem}.execution-started.json"
-    )
-    marker_payload = {
-        "manifest_id": manifest.manifest_id,
-        "manifest_integrity_sha256": manifest.integrity_sha256,
-        "code_commit": code_commit,
-        "started_at": datetime.now(UTC).isoformat(),
-        "status": "started_outcomes_unsealed",
-    }
+    output_dir: Path,
+    resume_execution_id: str | None = None,
+) -> SealedExecution:
     try:
-        with marker_path.open("x", encoding="utf-8") as destination:
-            json.dump(marker_payload, destination, ensure_ascii=False, indent=2)
-            destination.write("\n")
-    except FileExistsError as exc:
-        raise ExpediaBacktestError(
-            "sealed final test was already started; create a new manifest instead "
-            "of reusing the exposed test set"
-        ) from exc
-    return marker_path
+        return reserve_sealed_execution(
+            manifest_path,
+            manifest_id=manifest.manifest_id,
+            manifest_integrity_sha256=manifest.integrity_sha256,
+            code_commit=code_commit,
+            output_dir=output_dir,
+            resume_execution_id=resume_execution_id,
+        )
+    except SealedExecutionError as exc:
+        raise ExpediaBacktestError(str(exc)) from exc
 
 
 def run_sealed_final_test(
@@ -331,6 +364,7 @@ def run_sealed_final_test(
     *,
     manifest: ExpediaSealedFinalTestManifest,
     model: LogisticSegmentPerformanceModel,
+    on_outcomes_opened: Callable[[], None] | None = None,
 ) -> ExpediaSealedFinalTestResult:
     scenarios = _manifest_scenarios(manifest)
     config = _config_from_payload(manifest.config)
@@ -338,7 +372,10 @@ def run_sealed_final_test(
         repository,
         config=config,
         performance_predictor=model,
-    ).run_scenarios(scenarios)
+    ).run_scenarios(
+        scenarios,
+        on_outcomes_opened=on_outcomes_opened,
+    )
     metrics = dict(summarize_backtest(run))
     training_rate = float(
         model.training_metadata.get(
@@ -357,13 +394,13 @@ def run_sealed_final_test(
         metrics,
         manifest.acceptance_criteria,
     )
+    verdict = determine_final_verdict(criteria_results)
     return ExpediaSealedFinalTestResult(
         run=run,
         metrics=metrics,
         criteria_results=criteria_results,
-        passed=all(
-            bool(value.get("passed")) for value in criteria_results.values()
-        ),
+        verdict=verdict,
+        passed=verdict == VERDICT_PASSED,
     )
 
 
@@ -392,6 +429,7 @@ def write_sealed_final_test_artifacts(
         "manifest_id": manifest.manifest_id,
         "manifest_integrity_sha256": manifest.integrity_sha256,
         "scope": "internal_sealed_destination_holdout",
+        "verdict": result.verdict,
         "passed": result.passed,
         "metrics": dict(result.metrics),
         "criteria_results": dict(result.criteria_results),
@@ -521,37 +559,98 @@ def _evaluate_criteria(
     metrics: Mapping[str, Any],
     criteria: Mapping[str, Any],
 ) -> dict[str, Any]:
-    checks = {
-        "rank_one_beats_baseline_rate": (
-            float(metrics.get("rank_one_beats_baseline_rate", 0.0) or 0.0),
+    return {
+        "observed_outcome_scenario_count": criterion_result(
+            _int_metric(metrics, "observed_outcome_scenario_count"),
             ">=",
-            float(criteria["rank_one_beats_baseline_rate_min"]),
+            int(criteria["observed_outcome_scenario_count_min"]),
+            category=CRITERION_EVIDENCE,
         ),
-        "rank_one_is_best_rate": (
-            float(metrics.get("rank_one_is_best_rate", 0.0) or 0.0),
+        "portfolio_candidate_result_count": criterion_result(
+            _int_metric(metrics, "portfolio_candidate_result_count"),
             ">=",
-            float(criteria["rank_one_is_best_rate_min"]),
+            int(criteria["portfolio_candidate_result_count_min"]),
+            category=CRITERION_EVIDENCE,
         ),
-        "all_candidate_mean_absolute_error_percentage_points": (
+        "portfolio_multi_candidate_scenario_count": criterion_result(
+            _int_metric(metrics, "portfolio_multi_candidate_scenario_count"),
+            ">=",
+            int(criteria["portfolio_multi_candidate_scenario_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "portfolio_three_candidate_scenario_count": criterion_result(
+            _int_metric(metrics, "portfolio_three_candidate_scenario_count"),
+            ">=",
+            int(criteria["portfolio_three_candidate_scenario_count_min"]),
+            category=CRITERION_EVIDENCE,
+        ),
+        "portfolio_candidate_beats_baseline_rate": criterion_result(
+            _float_metric(metrics, "portfolio_candidate_beats_baseline_rate"),
+            ">=",
+            float(criteria["portfolio_candidate_beats_baseline_rate_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "portfolio_scenario_any_candidate_beats_baseline_rate": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_scenario_any_candidate_beats_baseline_rate",
+            ),
+            ">=",
             float(
-                metrics.get(
-                    "all_candidate_mean_absolute_error_percentage_points",
-                    0.0,
-                )
-                or 0.0
+                criteria[
+                    "portfolio_scenario_any_candidate_beats_baseline_rate_min"
+                ]
+            ),
+            category=CRITERION_QUALITY,
+        ),
+        "portfolio_scenario_all_candidates_beat_baseline_rate": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_scenario_all_candidates_beat_baseline_rate",
+            ),
+            ">=",
+            float(
+                criteria[
+                    "portfolio_scenario_all_candidates_beat_baseline_rate_min"
+                ]
+            ),
+            category=CRITERION_QUALITY,
+        ),
+        "portfolio_mean_candidate_lift_percentage_points": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_mean_candidate_lift_percentage_points",
+            ),
+            ">=",
+            float(criteria["portfolio_mean_candidate_lift_percentage_points_min"]),
+            category=CRITERION_QUALITY,
+        ),
+        "portfolio_mean_worst_candidate_lift_percentage_points": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_mean_worst_candidate_lift_percentage_points",
+            ),
+            ">=",
+            float(
+                criteria[
+                    "portfolio_mean_worst_candidate_lift_percentage_points_min"
+                ]
+            ),
+            category=CRITERION_QUALITY,
+        ),
+        "all_candidate_mean_absolute_error_percentage_points": criterion_result(
+            _float_metric(
+                metrics,
+                "all_candidate_mean_absolute_error_percentage_points",
             ),
             "<=",
             float(criteria["all_candidate_mae_percentage_points_max"]),
+            category=CRITERION_QUALITY,
         ),
-        "absolute_prediction_bias_percentage_points": (
-            abs(
-                float(
-                    metrics.get(
-                        "all_candidate_prediction_bias_percentage_points",
-                        0.0,
-                    )
-                    or 0.0
-                )
+        "absolute_prediction_bias_percentage_points": criterion_result(
+            _absolute_float_metric(
+                metrics,
+                "all_candidate_prediction_bias_percentage_points",
             ),
             "<=",
             float(
@@ -559,27 +658,14 @@ def _evaluate_criteria(
                     "absolute_prediction_bias_percentage_points_max"
                 ]
             ),
+            category=CRITERION_QUALITY,
         ),
-        "all_candidate_brier_skill_score": (
-            float(
-                metrics.get("all_candidate_brier_skill_score", 0.0) or 0.0
-            ),
+        "all_candidate_brier_skill_score": criterion_result(
+            _float_metric(metrics, "all_candidate_brier_skill_score"),
             ">",
             float(criteria["brier_skill_score_min_exclusive"]),
+            category=CRITERION_QUALITY,
         ),
-    }
-    return {
-        name: {
-            "actual": actual,
-            "operator": operator,
-            "threshold": threshold,
-            "passed": actual >= threshold
-            if operator == ">="
-            else actual <= threshold
-            if operator == "<="
-            else actual > threshold,
-        }
-        for name, (actual, operator, threshold) in checks.items()
     }
 
 
@@ -590,15 +676,27 @@ def _sealed_final_test_report(summary: Mapping[str, Any]) -> str:
         "# Expedia 봉인 최종 테스트",
         "",
         f"- Manifest ID: `{summary['manifest_id']}`",
-        f"- 최종 판정: {'PASS' if summary['passed'] else 'FAIL'}",
+        f"- 최종 판정: {_verdict_label(str(summary['verdict']))}",
         "- 범위: 기존 개발 검증에서 제외한 목적지 기반 내부 봉인 테스트",
         "",
         "## 핵심 지표",
         "",
-        "- Rank 1 기준선 승률: "
-        f"{metrics['rank_one_beats_baseline_rate'] * 100:.2f}%",
-        "- Rank 1 실제 최고 후보 비율: "
-        f"{metrics['rank_one_is_best_rate'] * 100:.2f}%",
+        "- 전체 추천 후보 기준선 초과율: "
+        f"{_format_optional_percent(metrics['portfolio_candidate_beats_baseline_rate'])}",
+        "- 유용한 후보가 하나 이상인 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+        "- 모든 후보가 기준선을 넘은 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
+        "- 추천 후보 평균 lift: "
+        f"{_format_optional_percentage_points(metrics['portfolio_mean_candidate_lift_percentage_points'])}",
+        "- 시나리오별 최저 성과 후보의 평균 lift: "
+        f"{_format_optional_percentage_points(metrics['portfolio_mean_worst_candidate_lift_percentage_points'])}",
+        "- 결과를 확인한 추천 후보: "
+        f"{metrics['portfolio_candidate_result_count']}개",
+        "- 후보가 2개 이상 생성된 시나리오: "
+        f"{metrics['portfolio_multi_candidate_scenario_count']}개",
+        "- 후보가 3개 생성된 시나리오: "
+        f"{metrics['portfolio_three_candidate_scenario_count']}개",
         "- 전체 후보 평균 절대 오차: "
         f"{metrics['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
         "- 전체 후보 예측 편향: "
@@ -612,8 +710,9 @@ def _sealed_final_test_report(summary: Mapping[str, Any]) -> str:
     for name, result in criteria.items():
         status = "PASS" if result["passed"] else "FAIL"
         lines.append(
-            f"- {name}: {result['actual']:.6f} {result['operator']} "
-            f"{result['threshold']:.6f} · {status}"
+            f"- [{result['category']}] {name}: "
+            f"{_format_criterion_value(result['actual'])} "
+            f"{result['operator']} {result['threshold']} · {status}"
         )
     lines.extend(
         [
@@ -632,11 +731,130 @@ def _sealed_final_test_report(summary: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _float_metric(metrics: Mapping[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    return float(value) if value is not None else None
+
+
+def _int_metric(metrics: Mapping[str, Any], key: str) -> int:
+    return int(metrics.get(key, 0) or 0)
+
+
+def _absolute_float_metric(
+    metrics: Mapping[str, Any],
+    key: str,
+) -> float | None:
+    value = _float_metric(metrics, key)
+    return abs(value) if value is not None else None
+
+
+def _verdict_label(verdict: str) -> str:
+    return {
+        "passed": "PASS",
+        "failed": "FAIL",
+        "inconclusive": "INCONCLUSIVE (근거 부족)",
+    }.get(verdict, verdict.upper())
+
+
+def _format_optional_percent(value: Any) -> str:
+    return "N/A" if value is None else f"{float(value) * 100:.2f}%"
+
+
+def _format_optional_percentage_points(value: Any) -> str:
+    return "N/A" if value is None else f"{float(value):.2f}%p"
+
+
+def _format_criterion_value(value: Any) -> str:
+    if value is None:
+        return "N/A"
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    return str(value)
+
+
 def _mapping(payload: Mapping[str, Any], key: str) -> Mapping[str, Any]:
     value = payload.get(key)
     if not isinstance(value, Mapping):
         raise ValueError(f"sealed final test manifest field {key!r} must be an object")
     return dict(value)
+
+
+def _candidate_type_support_payload(
+    model: LogisticSegmentPerformanceModel,
+) -> dict[str, Any]:
+    metadata = model.training_metadata
+    contract_version = str(
+        metadata.get("candidate_type_support_contract_version", "")
+    )
+    if contract_version != CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION:
+        raise ValueError(
+            "segment performance model candidate type support contract is missing "
+            "or unsupported"
+        )
+
+    training_example_counts = _candidate_type_counts(
+        metadata,
+        "training_candidate_type_example_counts",
+    )
+    training_user_observation_counts = _candidate_type_counts(
+        metadata,
+        "training_candidate_type_user_observation_counts",
+    )
+    supported_candidate_types = [
+        candidate_type
+        for candidate_type in MODEL_CANDIDATE_TYPES
+        if training_example_counts[candidate_type] > 0
+    ]
+    declared_supported = metadata.get("supported_candidate_types")
+    if not isinstance(declared_supported, Sequence) or isinstance(
+        declared_supported,
+        (str, bytes),
+    ):
+        raise ValueError(
+            "segment performance model supported candidate types are missing"
+        )
+    if set(str(value) for value in declared_supported) != set(
+        supported_candidate_types
+    ):
+        raise ValueError(
+            "segment performance model candidate type support metadata is inconsistent"
+        )
+
+    return {
+        "contract_version": contract_version,
+        "training_example_counts": training_example_counts,
+        "training_user_observation_counts": training_user_observation_counts,
+        "supported_candidate_types": supported_candidate_types,
+    }
+
+
+def _candidate_type_counts(
+    metadata: Mapping[str, Any],
+    key: str,
+) -> dict[str, int]:
+    raw_counts = metadata.get(key)
+    if not isinstance(raw_counts, Mapping):
+        raise ValueError(f"segment performance model metadata {key!r} is missing")
+
+    counts: dict[str, int] = {}
+    for candidate_type in MODEL_CANDIDATE_TYPES:
+        raw_value = raw_counts.get(candidate_type)
+        if isinstance(raw_value, bool):
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            )
+        try:
+            count = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            ) from exc
+        if count < 0:
+            raise ValueError(
+                f"segment performance model metadata {key!r} is invalid"
+            )
+        counts[candidate_type] = count
+    return counts
 
 
 def _file_sha256(path: Path) -> str:
