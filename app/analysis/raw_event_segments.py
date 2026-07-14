@@ -1970,7 +1970,30 @@ def _expected_goal_performance(
             performance_features,
             sample_size=len(profiles),
         )
-        return _clamp01(prediction.value), prediction.metadata()
+        prediction_metadata = prediction.metadata()
+        adjustment = prediction_metadata.get("prediction_adjustment")
+        if isinstance(adjustment, Mapping) and adjustment.get("applied"):
+            log.info(
+                "segment_performance_prediction_adjusted",
+                {
+                    "candidateType": performance_features.candidate_type,
+                    "goalMetric": promotion.goal_metric,
+                    "modelVersion": performance_predictor.version,
+                    "candidateSampleSize": len(profiles),
+                    "rawModelValue": adjustment.get("raw_model_value"),
+                    "adjustedValue": adjustment.get("adjusted_value"),
+                    "outOfDistributionFeatureCount": adjustment.get(
+                        "out_of_distribution_feature_count"
+                    ),
+                    "influentialOutOfDistributionFeatureCount": adjustment.get(
+                        "influential_out_of_distribution_feature_count"
+                    ),
+                    "maxAbsStandardizedValue": adjustment.get(
+                        "max_abs_standardized_value"
+                    ),
+                },
+            )
+        return _clamp01(prediction.value), prediction_metadata
     if promotion.goal_metric == "inflow_rate":
         return (
             _smoothed_user_rate(
@@ -2269,53 +2292,28 @@ def _performance_confidence(
     calibration_status = str(model_metadata.get("calibration_status", ""))
     adjustment = model_metadata.get("prediction_adjustment")
     if calibration_status == "calibrated" and isinstance(adjustment, Mapping):
-        policy_version = adjustment.get("policy_version")
         sample_size = int(adjustment.get("candidate_sample_size", 0) or 0)
         prior_user_count = float(adjustment.get("prior_user_count", 0.0) or 0.0)
-        ood_feature_count = int(
-            adjustment.get("out_of_distribution_feature_count", 0) or 0
-        )
-        influential_ood_feature_count = int(
-            adjustment.get(
-                "influential_out_of_distribution_feature_count",
-                0,
-            )
-            or 0
-        )
         is_small_sample = prior_user_count > 0 and sample_size < prior_user_count
-        if policy_version and is_small_sample and ood_feature_count > 0:
+        if is_small_sample:
             return (
                 "low",
-                "후보 표본이 적고 학습 범위를 벗어난 행동 분포가 있어 "
-                "학습 기준률로 보수적으로 보정했습니다.",
-            )
-        if policy_version and is_small_sample:
-            return (
-                "low",
-                "후보 표본이 제한적이어서 학습 기준률을 함께 반영해 "
-                "보수적으로 추정했습니다.",
-            )
-        if policy_version and ood_feature_count > 0:
-            if influential_ood_feature_count > 0:
-                return (
-                    "medium",
-                    "표본은 충분하지만 예측에 영향을 주는 일부 행동 신호가 "
-                    "학습 범위를 벗어나 분포 제한을 적용했습니다.",
-                )
-            return (
-                "medium",
-                "표본은 충분하며 학습 범위 밖의 보조 신호는 "
-                "예측값에 직접 반영하지 않았습니다.",
+                "대표 표본이 제한적이어서 전체 고객의 행동 기준률을 함께 "
+                "반영했습니다.",
             )
     if calibration_status == "calibrated":
         if candidate.sample_reliability >= 0.75:
-            return "high", "충분한 표본과 검증된 예약 예측 모델을 사용했습니다."
-        return "medium", "검증된 예약 예측 모델을 사용했지만 표본 규모가 제한적입니다."
+            return "high", "충분한 행동 표본과 검증된 예약 예측 모델을 사용했습니다."
+        return (
+            "medium",
+            "검증된 예약 예측 모델을 사용했으며 대표 표본 규모를 함께 "
+            "고려했습니다.",
+        )
     if calibration_status == "historical_signal_estimate":
         if candidate.sample_reliability >= 0.75:
             return "medium", "충분한 표본의 최근 행동 신호를 전체 고객 기준으로 보정했습니다."
         return "low", "최근 행동 신호를 사용했지만 표본 규모가 제한적입니다."
-    return "low", "현재 데이터에 적용 가능한 검증 모델이 없어 보수적인 추정식을 사용했습니다."
+    return "low", "현재 데이터에서는 최근 행동 신호를 중심으로 추정했습니다."
 
 
 def _positive_int(value: object) -> int | None:

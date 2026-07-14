@@ -164,9 +164,12 @@ def test_openai_segment_report_replaces_unverified_sample_caution() -> None:
 
     assert report["confidence_label"] == "medium"
     assert report["caution"] == (
-        f"{confidence_reason} 첫 발송 후 실제 전환 지표와 함께 확인하세요."
+        "예상값은 과거 행동을 바탕으로 한 참고 지표이며 실제 캠페인 "
+        "성과와 함께 활용하세요."
     )
     assert "표본 수가 160명으로 작아" not in report["caution"]
+    assert "학습 범위" not in report["caution"]
+    assert "분포 제한" not in report["caution"]
 
 
 def _report_input() -> SegmentSuggestionReportInput:

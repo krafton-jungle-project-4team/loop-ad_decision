@@ -1032,9 +1032,56 @@ def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> N
     assert estimate["value"] == adjustment["adjusted_value"]
     assert estimate["value"] < 0.2
     assert estimate["confidence_label"] == "low"
+    assert "학습 범위" not in estimate["confidence_reason"]
+    assert "분포" not in estimate["confidence_reason"]
     assert segments[0].profile_json["recommendation_tier"] == "small_high_intent"
     assert segments[0].profile_json["minimum_primary_sample_size"] == 30
     assert segments[0].profile_json["recommendation_rank"] is None
+
+
+def test_supported_candidate_keeps_internal_distribution_diagnostics_out_of_user_copy() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"supported_extreme_{index}",
+            hotel_search_count=20,
+            hotel_detail_view_count=20,
+            booking_start_count=5,
+            booking_complete_count=4,
+            deal_event_count=10,
+            destination_match_count=30,
+            season_match_count=1,
+            destination_values=("jeju",),
+            checkin_dates=("2026-07-15",),
+        )
+        for index in range(40)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        performance_predictor=build_segment_performance_predictor(),
+    )
+
+    destination_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "target_destination_affinity"
+    )
+    estimate = destination_segment.profile_json["performance_estimate"]
+    adjustment = estimate["prediction_adjustment"]
+    assert adjustment["candidate_sample_size"] == 40
+    assert adjustment["out_of_distribution_feature_count"] > 0
+    assert estimate["confidence_label"] == "high"
+    assert "학습 범위" not in estimate["confidence_reason"]
+    assert "분포" not in estimate["confidence_reason"]
 
 
 def test_booking_model_excludes_candidate_type_without_training_examples() -> None:

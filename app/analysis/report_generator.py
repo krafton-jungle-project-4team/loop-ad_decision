@@ -198,13 +198,6 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
     evidence = report_input.target_segment.data_evidence_json
     signal_chips = display_copy.get("signal_chips", [])
     performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
-    prediction_adjustment = _mapping_value(
-        performance_estimate.get("prediction_adjustment")
-    )
-    prior_user_count = prediction_adjustment.get("prior_user_count")
-    small_sample_criterion = (
-        f"{prior_user_count}명 미만" if prior_user_count else "별도 기준 없음"
-    )
     rank_comparison = _mapping_value(display_copy.get("rank_comparison"))
     return "\n".join(
         [
@@ -223,11 +216,9 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             f"- 표본 수: {evidence.get('sample_size', report_input.target_segment.estimated_size)}",
             f"- 전체 분석 대상 수: {evidence.get('total_eligible_user_count', '-')}",
             f"- 예상 목표 성과: {performance_estimate.get('label', '-')} {performance_estimate.get('formatted', '-')}",
-            f"- 예상 목표 달성 인원: {performance_estimate.get('expected_count_label', '-')} {performance_estimate.get('expected_count_formatted', '-')}",
             f"- 예상 기준: {performance_estimate.get('window_label', performance_estimate.get('basis_label', '-'))}",
             f"- 예측 신뢰도: {performance_estimate.get('confidence_label', '-')}",
             f"- 예측 신뢰도 근거: {performance_estimate.get('confidence_reason', '-')}",
-            f"- 소표본 판단 기준: {small_sample_criterion}",
             f"- Rank 비교 사실: {rank_comparison.get('summary', display_copy.get('difference_summary', '-'))}",
             "",
             "JSON 필드 설명:",
@@ -439,20 +430,18 @@ def _verified_caution(report_input: SegmentSuggestionReportInput) -> str:
     performance_estimate = _mapping_value(
         report_input.display_copy.get("performance_estimate")
     )
-    confidence_reason = _safe_text(
-        performance_estimate.get("confidence_reason")
-    )
     confidence_label = _confidence_label(
         performance_estimate.get("confidence_label")
     )
-    if confidence_reason:
-        if confidence_label == "low":
-            return (
-                f"{confidence_reason} 예상값은 참고 지표로 사용하고 첫 발송 결과를 "
-                "확인하세요."
-            )
+    if confidence_label == "low":
         return (
-            f"{confidence_reason} 첫 발송 후 실제 전환 지표와 함께 확인하세요."
+            "대표 표본이 제한적인 후보이므로 실제 캠페인 성과와 함께 "
+            "비교해 활용하세요."
+        )
+    if confidence_label in {"high", "medium"}:
+        return (
+            "예상값은 과거 행동을 바탕으로 한 참고 지표이며 실제 캠페인 "
+            "성과와 함께 활용하세요."
         )
 
     evidence = report_input.target_segment.data_evidence_json
