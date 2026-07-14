@@ -70,6 +70,44 @@ artifacts/external-datasets/
 
 빠른 smoke test에서 전체 사용자를 쓰려면 `--sample-modulo 1`을 지정할 수 있다. 비교 가능한 기록에는 원본 checksum을 남기며 `--skip-checksum`은 로컬 smoke test에서만 사용한다.
 
+### 추천 대상 선택 비율 진단
+
+`development` 명령은 일반 추천 품질과 함께 조건 일치 사용자 중 행동 강도 상위
+`20/40/60/80/100%`를 추천 대상으로 삼았을 때의 결과를 비교한다. 별도 옵션 없이 위 명령을
+그대로 실행하면 현재 운영 비율인 80%를 강조하여 다음 항목을 진단한다.
+
+- 선택 표본의 실제 외부 outcome rate와 전체 조건 일치자 대비 lift
+- 전체 조건 일치 positive 중 선택 표본이 보존한 비율
+- 조건 일치자 대비 reach와 최소 표본 안정성
+- Rank pairwise 정확도, 후보 수, 후순위 후보 사용자 중복도
+
+비율 표는 데이터셋별로 따로 해석한다. Booking.com의 다음 도시, Airbnb의 정적 첫 예약,
+Synerise의 향후 카테고리 구매를 하나의 절대 전환율로 합치지 않는다. 외부 진단은 80%가
+다른 데이터에서도 선별력을 유지하는지 확인하는 자료일 뿐 다음 작업을 수행하지 않는다.
+
+- Expedia 예상 성과 모델 재학습 또는 보정
+- 운영 추천 대상 비율 자동 변경
+- 봉인된 외부 final partition 접근
+
+비율 격자나 현재 운영 비율을 명시적으로 재현하려면 다음처럼 실행한다.
+
+```bash
+.venv/bin/python scripts/backtest_external_segments.py development booking-com \
+  --audience-selection-ratios 0.2,0.4,0.6,0.8,1.0 \
+  --current-runtime-ratio 0.8 \
+  --audience-selection-min-selected-users 30
+```
+
+`assessment.status`는 다음 의미다.
+
+- `supported`: 적용 가능한 후보에서 lift와 positive 포착률 기준을 통과하고 Rank 정확도가 악화되지 않음
+- `caution`: 비교 근거는 있으나 lift, 포착률 또는 Rank 정확도 중 하나 이상이 기준 미달
+- `insufficient_evidence`: 비율 제한이 실제 적용된 후보나 관측 positive가 부족해 판단할 수 없음
+
+외부 데이터에서 `caution`이 나오더라도 이 명령이 정책 파일을 생성하거나 덮어쓰지는 않는다.
+원인을 후보 타입·데이터셋별로 분석한 뒤 Expedia development/validation에서도 확인되는
+일반화 가능한 수정만 별도 PR로 반영한다.
+
 ## 2. 외부 최종 평가 봉인
 
 추천 로직과 예상 예약률 모델 수정이 끝난 뒤 PR을 `dev`에 병합한다. manifest 봉인은
@@ -184,6 +222,10 @@ artifacts/external-segment-backtest/<dataset>/development-<timestamp>/
 ├── results.csv
 ├── summary.json
 ├── report.md
+├── audience-selection/
+│   ├── ratio_results.csv
+│   ├── ratio_summary.json
+│   └── report.md
 └── development_diagnostic_summary.json
 ```
 
