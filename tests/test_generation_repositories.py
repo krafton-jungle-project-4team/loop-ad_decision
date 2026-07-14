@@ -534,6 +534,60 @@ def test_content_candidate_repository_create_executes_insert() -> None:
     assert params["artifact_public_url"] is None
 
 
+@pytest.mark.parametrize(
+    ("channel", "source", "record_overrides"),
+    (
+        (
+            ContentChannel.EMAIL,
+            {
+                "creative_format": "email_html",
+                "subject": "이번 주말 호텔 특가를 확인해보세요",
+                "preheader": "원하는 일정에 맞는 숙소를 비교해보세요.",
+                "text_body": "환불 가능한 객실을 지금 확인해보세요.",
+                "html_body": "<!doctype html><html><body>legacy</body></html>",
+                "required_placeholders": [
+                    "{{redirect_url}}",
+                    "{{open_pixel_url}}",
+                ],
+            },
+            {
+                "subject": "이번 주말 호텔 특가를 확인해보세요",
+                "preheader": "원하는 일정에 맞는 숙소를 비교해보세요.",
+            },
+        ),
+        (
+            ContentChannel.ONSITE_BANNER,
+            {
+                "creative_format": "banner_html",
+                "width": 320,
+                "height": 100,
+                "click_protocol": "post_message",
+                "allowed_message_type": "loopad:click",
+                "html_body": "<!doctype html><html><body>legacy</body></html>",
+            },
+            {},
+        ),
+    ),
+)
+def test_content_candidate_public_values_omit_legacy_html_body(
+    channel: ContentChannel,
+    source: dict[str, object],
+    record_overrides: dict[str, object],
+) -> None:
+    metadata = {"creative": {"source": source}}
+    candidate = content_candidate_record(
+        channel=channel,
+        metadata_json=metadata,
+        **record_overrides,
+    )
+
+    public_values = candidate.to_public_values()
+
+    assert "html_body" not in public_values["source"]
+    assert public_values["source"]["creative_format"] == source["creative_format"]
+    assert metadata["creative"]["source"]["html_body"]
+
+
 def test_content_candidate_repository_upserts_all_contract_fields_with_fencing() -> None:
     stored_row = {
         "content_id": "content_banner_001",

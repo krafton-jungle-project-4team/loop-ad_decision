@@ -1029,8 +1029,11 @@ class ContentCandidateRecord:
                 channel=self.channel,
                 target_url=str(self.landing_url or ""),
             ),
-            "source": creative.get("source")
-            or source_for_channel(channel=self.channel, content_values=content_values),
+            "source": _public_source_metadata(
+                channel=self.channel,
+                content_values=content_values,
+                creative=creative,
+            ),
             "artifact": creative.get("artifact") or default_artifact(self.channel),
         }
 
@@ -1686,6 +1689,21 @@ def _optional_text(value: object) -> str | None:
 def _creative_metadata(value: Mapping[str, Any]) -> Mapping[str, Any]:
     creative = value.get("creative") if isinstance(value, Mapping) else None
     return creative if isinstance(creative, Mapping) else {}
+
+
+def _public_source_metadata(
+    *,
+    channel: ContentChannel,
+    content_values: Mapping[str, Any],
+    creative: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    source = creative.get("source")
+    if isinstance(source, Mapping):
+        public_source = dict(source)
+        public_source.pop("html_body", None)
+        if public_source:
+            return public_source
+    return source_for_channel(channel=channel, content_values=content_values)
 
 
 def _positive_int(value: object, *, fallback: int = 0) -> int:
