@@ -28,6 +28,7 @@ class AudienceSelectionEvaluationConfig:
     minimum_selected_user_count: int = 30
     minimum_policy_applied_result_count: int = 3
     minimum_positive_capture_rate: float = 0.8
+    maximum_pairwise_rank_accuracy_drop: float = 0.05
     goal_metric: str = "booking_conversion_rate"
 
     def __post_init__(self) -> None:
@@ -47,6 +48,10 @@ class AudienceSelectionEvaluationConfig:
             )
         if not 0.0 <= self.minimum_positive_capture_rate <= 1.0:
             raise ValueError("minimum_positive_capture_rate must be in [0, 1]")
+        if not 0.0 <= self.maximum_pairwise_rank_accuracy_drop <= 1.0:
+            raise ValueError(
+                "maximum_pairwise_rank_accuracy_drop must be in [0, 1]"
+            )
         if not self.goal_metric.strip():
             raise ValueError("goal_metric must not be empty")
 
@@ -180,6 +185,9 @@ def build_audience_selection_policy_evaluation(
             ),
             "minimum_policy_applied_result_count": (
                 config.minimum_policy_applied_result_count
+            ),
+            "maximum_pairwise_rank_accuracy_drop": (
+                config.maximum_pairwise_rank_accuracy_drop
             ),
         },
         "development_metrics": development_choice,
@@ -408,7 +416,9 @@ def _validation_criteria(
         "rank_accuracy_not_materially_worse": (
             selected_pairwise is None
             or all_pairwise is None
-            or selected_pairwise + 0.05 >= all_pairwise
+            or selected_pairwise
+            + config.maximum_pairwise_rank_accuracy_drop
+            >= all_pairwise
         ),
     }
 

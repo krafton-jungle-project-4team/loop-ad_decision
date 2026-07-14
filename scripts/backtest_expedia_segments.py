@@ -192,6 +192,9 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
                 minimum_positive_capture_rate=(
                     args.audience_selection_min_positive_capture
                 ),
+                maximum_pairwise_rank_accuracy_drop=(
+                    args.audience_selection_max_rank_accuracy_drop
+                ),
             ),
         )
         output_dir = args.output_dir or default_output_dir(args.command)
@@ -564,6 +567,15 @@ def parse_args() -> argparse.Namespace:
         type=unit_interval,
         default=0.8,
         help="조건 일치 예약자를 유지해야 하는 최소 포착률입니다.",
+    )
+    holdout.add_argument(
+        "--audience-selection-max-rank-accuracy-drop",
+        type=unit_interval,
+        default=0.05,
+        help=(
+            "전체 조건 일치자 대비 허용할 Rank pairwise 정확도의 최대 "
+            "하락폭입니다."
+        ),
     )
 
     seal = subparsers.add_parser(

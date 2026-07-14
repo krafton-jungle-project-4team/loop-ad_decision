@@ -35,7 +35,7 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v5"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v6"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
@@ -1052,7 +1052,7 @@ def _apply_audience_selection(
         for user_id in candidate.candidate_user_ids[: decision.selected_user_count]
         if (profile := profiles_by_user_id.get(user_id)) is not None
     ]
-    if len(selected_profiles) < min_sample_size:
+    if len(selected_profiles) != decision.selected_user_count:
         return replace(
             candidate,
             audience_selection=all_matching_audience_selection_policy(
