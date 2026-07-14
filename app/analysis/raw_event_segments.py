@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from decimal import Decimal
@@ -35,10 +36,11 @@ from app.generation.adapters import (
 from app.logging import duration_ms, log, log_context_scope
 
 
-RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v6"
+RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v7"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
 INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
+PRIMARY_RECOMMENDATION_MIN_RELIABILITY = 0.75
 MAX_RANK_USER_OVERLAP = 0.70
 RANK_RATE_TIE_TOLERANCE = 0.001
 
@@ -1187,7 +1189,9 @@ def _rank_candidates(
         next_candidate = max(
             distinct_candidates,
             key=lambda candidate: (
+                _recommendation_tier_priority(candidate),
                 _final_score(candidate),
+                _expected_goal_achievement_count(candidate),
                 -CANDIDATE_TYPE_ORDER.index(candidate.candidate_type),
                 candidate.sample_size,
             ),
@@ -1308,6 +1312,7 @@ def _segment_definition_from_candidate(
         matching_user_count,
     )
     selection_decision = candidate.audience_selection
+    recommendation_tier = _recommendation_tier(candidate)
     audience = {
         "total_eligible_user_count": total_eligible_user_count,
         "matching_user_count": matching_user_count,
@@ -1342,6 +1347,10 @@ def _segment_definition_from_candidate(
     display_copy = {
         "title": candidate.title,
         "rank_role": candidate.rank_role,
+        **recommendation_tier,
+        "recommendation_rank": (
+            rank + 1 if recommendation_tier["rank_eligible"] else None
+        ),
         "audience_summary": audience_summary,
         "audience": audience,
         "performance_estimate": performance_estimate,
@@ -1366,6 +1375,10 @@ def _segment_definition_from_candidate(
         "source": "raw_event_intent",
         "rank_role": candidate.rank_role,
         "candidate_type": candidate.candidate_type,
+        **recommendation_tier,
+        "recommendation_rank": (
+            rank + 1 if recommendation_tier["rank_eligible"] else None
+        ),
         "score_components": score_components,
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
@@ -1383,10 +1396,13 @@ def _segment_definition_from_candidate(
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
         "ranking_basis": {
-            "primary_component": "expected_goal_performance",
+            "primary_component": "recommendation_tier",
             "metric": promotion.goal_metric,
             "metric_label": performance_estimate["label"],
-            "method": "goal_performance_weighted_rerank",
+            "method": "tier_guarded_goal_performance_rerank",
+            "expected_goal_achievement_count": performance_estimate[
+                "expected_count"
+            ],
         },
     }
     primary_signals = [
@@ -2061,9 +2077,69 @@ def _sample_reliability(*, sample_size: int, min_sample_size: int) -> float:
     return _clamp01(sample_size / max(min_sample_size * 3, 1))
 
 
+def _prediction_prior_user_count(candidate: _RawEventCandidate) -> int | None:
+    adjustment = candidate.performance_model_metadata.get("prediction_adjustment")
+    if not isinstance(adjustment, Mapping):
+        return None
+    try:
+        prior_user_count = float(adjustment.get("prior_user_count", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if prior_user_count <= 0:
+        return None
+    return max(1, math.ceil(prior_user_count))
+
+
+def _is_small_sample_candidate(candidate: _RawEventCandidate) -> bool:
+    prior_user_count = _prediction_prior_user_count(candidate)
+    if prior_user_count is not None:
+        return candidate.sample_size < prior_user_count
+    return candidate.sample_reliability < PRIMARY_RECOMMENDATION_MIN_RELIABILITY
+
+
+def _recommendation_tier(candidate: _RawEventCandidate) -> dict[str, Any]:
+    prior_user_count = _prediction_prior_user_count(candidate)
+    if _is_small_sample_candidate(candidate):
+        if prior_user_count is not None:
+            reason = (
+                f"행동 신호는 확인됐지만 추천 대상 {candidate.sample_size}명이 "
+                f"예측 기준 표본 {prior_user_count}명보다 적어 별도 후보로 분류했습니다."
+            )
+        else:
+            reason = (
+                "행동 신호는 확인됐지만 표본 신뢰도가 주요 추천 기준에 "
+                "미치지 않아 별도 후보로 분류했습니다."
+            )
+        return {
+            "recommendation_tier": "small_high_intent",
+            "recommendation_tier_label": "소규모 고의도 후보",
+            "recommendation_tier_reason": reason,
+            "rank_eligible": False,
+            "minimum_primary_sample_size": prior_user_count,
+        }
+    return {
+        "recommendation_tier": "primary",
+        "recommendation_tier_label": "주요 추천",
+        "recommendation_tier_reason": (
+            "주요 추천에 필요한 표본 수준을 충족해 캠페인 집행 후보로 분류했습니다."
+        ),
+        "rank_eligible": True,
+        "minimum_primary_sample_size": prior_user_count,
+    }
+
+
+def _recommendation_tier_priority(candidate: _RawEventCandidate) -> int:
+    return 1 if _recommendation_tier(candidate)["rank_eligible"] else 0
+
+
+def _expected_goal_achievement_count(candidate: _RawEventCandidate) -> float:
+    return max(candidate.predicted_goal_rate, 0.0) * candidate.sample_size
+
+
 def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
     final_score = _final_score(candidate)
     weights = _score_weights(candidate)
+    recommendation_tier = _recommendation_tier(candidate)
     return {
         "promotion_condition_match": round(candidate.promotion_condition_match, 6),
         "predicted_goal_rate": round(candidate.predicted_goal_rate, 6),
@@ -2072,6 +2148,12 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
         "sample_reliability": round(candidate.sample_reliability, 6),
         "rank_distinctiveness": round(candidate.rank_distinctiveness, 6),
         "final_score": round(final_score, 6),
+        "expected_goal_achievement_count": round(
+            _expected_goal_achievement_count(candidate),
+            6,
+        ),
+        "recommendation_tier": recommendation_tier["recommendation_tier"],
+        "rank_eligible": recommendation_tier["rank_eligible"],
         "weights": dict(weights),
         "destination_context_required": candidate.destination_context_required,
         "primary_component": "expected_goal_performance",
@@ -2100,6 +2182,7 @@ def _performance_estimate(
         model_metadata=model_metadata,
     )
     window_days = _positive_int(model_metadata.get("outcome_days"))
+    expected_count = _expected_goal_achievement_count(candidate)
     estimate = {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
@@ -2107,6 +2190,11 @@ def _performance_estimate(
         "unit": "rate",
         "value": round(value, 6),
         "formatted": _format_percent(value),
+        "expected_count": round(expected_count, 6),
+        "expected_count_formatted": _format_expected_count(expected_count),
+        "expected_count_label": _performance_expected_count_label(
+            promotion.goal_metric
+        ),
         "observed_value": round(observed_value, 6),
         "basis_label": _performance_basis_label(promotion.goal_metric),
         "window_days": window_days,
@@ -2147,6 +2235,16 @@ def _performance_estimate_label(goal_metric: str) -> str:
     if goal_metric == "funnel_step_rate":
         return "예상 예약 시작 전환율"
     return "예상 성과"
+
+
+def _performance_expected_count_label(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return "예상 예약 인원"
+    if goal_metric == "inflow_rate":
+        return "예상 유입 인원"
+    if goal_metric == "funnel_step_rate":
+        return "예상 다음 단계 진입 인원"
+    return "예상 목표 달성 인원"
 
 
 def _performance_basis_label(goal_metric: str) -> str:
@@ -2240,6 +2338,10 @@ def _format_percent(value: float) -> str:
     return f"{_clamp01(value) * 100:.1f}%"
 
 
+def _format_expected_count(value: float) -> str:
+    return f"약 {max(value, 0.0):.1f}명"
+
+
 def _final_score(candidate: _RawEventCandidate) -> float:
     weights = _score_weights(candidate)
     return (
@@ -2299,11 +2401,21 @@ def _rank_comparison(
     ranked_candidates: Sequence[_RawEventCandidate] | None,
     rank: int,
 ) -> dict[str, Any] | None:
-    if not ranked_candidates or len(ranked_candidates) < 2 or rank >= len(ranked_candidates):
+    if not ranked_candidates or rank >= len(ranked_candidates):
         return None
-    reference_index = 1 if rank == 0 else rank - 1
     candidate = ranked_candidates[rank]
-    reference = ranked_candidates[reference_index]
+    if not _recommendation_tier(candidate)["rank_eligible"]:
+        return None
+    primary_candidates = [
+        ranked_candidate
+        for ranked_candidate in ranked_candidates
+        if _recommendation_tier(ranked_candidate)["rank_eligible"]
+    ]
+    if len(primary_candidates) < 2:
+        return None
+    primary_rank = primary_candidates.index(candidate)
+    reference_index = 1 if primary_rank == 0 else primary_rank - 1
+    reference = primary_candidates[reference_index]
     rate_delta = candidate.predicted_goal_rate - reference.predicted_goal_rate
     if abs(rate_delta) <= RANK_RATE_TIE_TOLERANCE:
         direction = "similar"
