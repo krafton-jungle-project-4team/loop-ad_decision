@@ -87,8 +87,14 @@ from app.decision.service import (
 )
 from app.dependencies import get_settings
 from app.generation.adapters import (
+    DEFAULT_OPENAI_CONTENT_MODEL,
     build_external_content_generator,
     build_s3_creative_artifact_publisher,
+)
+from app.generation.brand_context import (
+    BrandContextRepository,
+    BrandContextRetrievalService,
+    OpenAIEmbeddingClient,
 )
 from app.generation.repositories import (
     ContentCandidateRepository as GenerationContentCandidateRepository,
@@ -303,9 +309,20 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
         )
         content_generator = None
         artifact_publisher = None
+        brand_context_snapshot_reader = None
+        brand_context_provider = None
         if settings.env != "test":
             content_generator = build_external_content_generator(settings)
             artifact_publisher = build_s3_creative_artifact_publisher(settings)
+            brand_context_repository = BrandContextRepository(connection)
+            brand_context_snapshot_reader = brand_context_repository
+            brand_context_provider = BrandContextRetrievalService(
+                repository=brand_context_repository,
+                embedding_client=OpenAIEmbeddingClient(
+                    api_key=settings.openai_api_key,
+                    timeout_seconds=settings.generation_provider_timeout_seconds,
+                ),
+            )
         generation_run_repository = GenerationGenerationRunRepository(connection)
         generation_content_candidate_repository = (
             GenerationContentCandidateRepository(connection)
@@ -314,7 +331,14 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             generation_run_repository=generation_run_repository,
             content_candidate_repository=generation_content_candidate_repository,
             generation_input_reader=GenerationInputRepository(connection),
+            brand_context_snapshot_reader=brand_context_snapshot_reader,
+            brand_context_provider=brand_context_provider,
             content_generator=content_generator,
+            generation_model_version=(
+                settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL
+                if settings.env != "test"
+                else None
+            ),
             artifact_publisher=artifact_publisher,
         )
         run_creator = PromotionRunService(

@@ -19,6 +19,13 @@ from app.generation.artifacts import (
     pending_creative_metadata,
     safe_error_code,
 )
+from app.generation.brand_context import (
+    BRAND_CONTEXT_PROMPT_VERSION,
+    BrandContextProvider,
+    BrandContextSnapshot,
+    retrieval_snapshot_from_candidate_metadata,
+    validate_brand_guardrails,
+)
 from app.generation.generator import (
     CONTENT_GENERATOR_VERSION,
     ContentGenerator,
@@ -115,6 +122,11 @@ class GenerationInputUnavailable(RuntimeError):
     """Raised when confirmed generation input rows are not ready yet."""
 
 
+class BrandContextSnapshotReader(Protocol):
+    def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot | None:
+        ...
+
+
 DEMO_PROJECT_ID = "demo_project"
 DEMO_DEFAULT_LANDING_URL = (
     "https://demo-shoppingmall.dev.loop-ad.org/hotel/jeju-ocean-breeze-006"
@@ -172,11 +184,14 @@ class GenerationService:
         generation_run_repository: GenerationRunWriter | None = None,
         content_candidate_repository: ContentCandidateWriter | None = None,
         generation_input_reader: GenerationInputReader | None = None,
+        brand_context_snapshot_reader: BrandContextSnapshotReader | None = None,
+        brand_context_provider: BrandContextProvider | None = None,
         generation_input_builder: GenerationInputBuilder | None = None,
         generation_context_builder: GenerationContextBuilder | None = None,
         generation_strategy_planner: GenerationStrategyPlanner | None = None,
         prompt_builder: PromptBuilder | None = None,
         content_generator: ContentGenerator | None = None,
+        generation_model_version: str | None = None,
         artifact_publisher: CreativeArtifactPublisher | None = None,
         image_generation_scheduler: ImageGenerationScheduler | None = None,
         generation_report_builder: GenerationReportBuilder | None = None,
@@ -184,6 +199,8 @@ class GenerationService:
         self._generation_run_repository = generation_run_repository
         self._content_candidate_repository = content_candidate_repository
         self._generation_input_reader = generation_input_reader
+        self._brand_context_snapshot_reader = brand_context_snapshot_reader
+        self._brand_context_provider = brand_context_provider
         self._generation_input_builder = (
             generation_input_builder or GenerationInputBuilder()
         )
@@ -198,6 +215,10 @@ class GenerationService:
         self._artifact_publisher = artifact_publisher or StaticCreativeArtifactPublisher()
         self._content_generator_version = _content_generator_version(
             self._content_generator
+        )
+        self._generation_model_version = (
+            str(generation_model_version or "").strip()
+            or self._content_generator_version
         )
         self._image_generation_scheduler = image_generation_scheduler
         self._generation_report_builder = (
@@ -439,6 +460,12 @@ class GenerationService:
             ],
             error_code=error_code,
         )
+        if any(prompt_input.brand_context is not None for prompt_input in prompt_inputs):
+            output_json["retrieval_snapshot"] = (
+                retrieval_snapshot_from_candidate_metadata(
+                    [candidate.metadata_json for candidate in content_candidates]
+                )
+            )
 
         generation_report_json: dict[str, Any] = {
             "status": status.value,
@@ -462,6 +489,8 @@ class GenerationService:
             target_segments=[
                 prompt_input.target_segment for prompt_input in prompt_inputs
             ],
+            brand_context=prompt_inputs[0].brand_context,
+            model_version=self._generation_model_version,
         )
         input_json.update(
             {
@@ -533,13 +562,13 @@ class GenerationService:
                 target_segments=target_segments,
             )
 
-            return self._generation_input_builder.build(
+            return self._build_generation_prompt_inputs(
                 request=request,
                 promotion=promotion,
                 target_segments=target_segments,
             )
 
-        return self._generation_input_builder.build(
+        return self._build_generation_prompt_inputs(
             request=request,
             promotion=_fixture_promotion_prompt_input(request),
             target_segments=[_fixture_target_segment_prompt_input(request)],
@@ -590,13 +619,44 @@ class GenerationService:
             log.warn("focus_segments_invalid", {"missingSegmentIds": missing_segment_ids})
             raise ValueError("focus_segment_ids must match promotion_target_segments")
 
-        return self._generation_input_builder.build(
+        return self._build_generation_prompt_inputs(
             request=request,
             promotion=promotion,
             target_segments=[
                 target_segments_by_id[segment_id]
                 for segment_id in focus_ids
             ],
+        )
+
+    def _build_generation_prompt_inputs(
+        self,
+        *,
+        request: GenerationRequest,
+        promotion: PromotionPromptInput,
+        target_segments: Sequence[TargetSegmentPromptInput],
+    ) -> list[GenerationPromptInput]:
+        brand_context = self._resolve_brand_context_snapshot(request)
+        if brand_context is None:
+            return self._generation_input_builder.build(
+                request=request,
+                promotion=promotion,
+                target_segments=target_segments,
+            )
+        return self._generation_input_builder.build(
+            request=request,
+            promotion=promotion,
+            target_segments=target_segments,
+            brand_context=brand_context,
+        )
+
+    def _resolve_brand_context_snapshot(
+        self,
+        request: GenerationRequest,
+    ) -> BrandContextSnapshot | None:
+        if self._brand_context_snapshot_reader is None:
+            return None
+        return self._brand_context_snapshot_reader.resolve_snapshot(
+            project_id=request.project_id,
         )
 
     def _build_content_candidate_records(
@@ -616,6 +676,18 @@ class GenerationService:
         for raw_prompt_input in prompt_inputs:
             prompt_input = _prompt_input_with_resolved_landing_url(raw_prompt_input)
             generation_context = self._generation_context_builder.build(prompt_input)
+            if prompt_input.brand_context is not None:
+                if self._brand_context_provider is None:
+                    raise ValueError(
+                        "brand context provider is required for a snapshotted context"
+                    )
+                generation_context = replace(
+                    generation_context,
+                    brand_context=self._brand_context_provider.retrieve(
+                        prompt_input,
+                        generation_context,
+                    ),
+                )
             for index in range(1, request.content_option_count + 1):
                 strategy_plan = self._generation_strategy_planner.build(
                     generation_context,
@@ -734,6 +806,10 @@ class GenerationService:
                 artifact_identity=identity,
             )
         content_values = generated_content.to_record_values(channel)
+        validate_brand_guardrails(
+            generation_context.brand_context,
+            content_values=content_values,
+        )
         candidate_report = self._generation_report_builder.build_candidate_report(
             prompt_input=prompt_input,
             prompt_result=prompt_result,
@@ -763,6 +839,19 @@ class GenerationService:
                 generated_content,
             ),
         )
+        creative_metadata["model"] = {
+            "provider": _content_generator_provider(self._content_generator),
+            "model_version": self._generation_model_version,
+            "prompt_version": BRAND_CONTEXT_PROMPT_VERSION,
+        }
+        if generation_context.brand_context is not None:
+            creative_metadata["lineage"] = generation_context.brand_context.lineage(
+                provider_request_id=_provider_request_id(
+                    generation_id=generation_id,
+                    content_id=content_id,
+                    generation_prompt=prompt_result.generation_prompt,
+                )
+            )
         image_metadata = _canonical_image_metadata(generated_content)
         if image_metadata is not None:
             creative_metadata["image"] = image_metadata
@@ -1101,6 +1190,8 @@ def _fixture_promotion_prompt_input(
         goal_basis="all_segments",
         message_brief="Drive hotel booking conversion for summer stays.",
         landing_url="https://demo-stay.example.com/summer",
+        offer_type="hotel_deal",
+        landing_type="hotel_detail_page",
     )
 
 
@@ -1223,6 +1314,24 @@ def _prompt_input_with_resolved_landing_url(
 def _content_generator_version(content_generator: ContentGenerator) -> str:
     version = str(getattr(content_generator, "version", CONTENT_GENERATOR_VERSION))
     return version.strip() or CONTENT_GENERATOR_VERSION
+
+
+def _content_generator_provider(content_generator: ContentGenerator) -> str:
+    if "external" in type(content_generator).__name__.lower():
+        return "openai"
+    return "deterministic"
+
+
+def _provider_request_id(
+    *,
+    generation_id: str,
+    content_id: str,
+    generation_prompt: str,
+) -> str:
+    digest = hashlib.sha256(
+        f"{generation_id}\x1f{content_id}\x1f{generation_prompt}".encode("utf-8")
+    ).hexdigest()[:24]
+    return f"loopad:{generation_id}:{digest}"
 
 
 def _canonical_image_metadata(

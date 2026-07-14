@@ -9,8 +9,13 @@ from uuid import UUID
 from app.config import Settings
 from app.db import create_postgres_connection
 from app.generation.adapters import (
+    DEFAULT_OPENAI_CONTENT_MODEL,
     build_external_content_generator,
     build_s3_creative_artifact_publisher,
+)
+from app.generation.brand_context import (
+    ManagedBrandContextProvider,
+    OpenAIEmbeddingClient,
 )
 from app.generation.errors import (
     PermanentGenerationError,
@@ -270,7 +275,20 @@ class GenerationJobProcessor:
                 self._settings,
                 generate_images=True,
             ),
+            generation_model_version=(
+                self._settings.openai_content_model
+                or DEFAULT_OPENAI_CONTENT_MODEL
+            ),
             artifact_publisher=build_s3_creative_artifact_publisher(self._settings),
+            brand_context_provider=ManagedBrandContextProvider(
+                connection_factory=lambda: self._connection_factory(self._settings),
+                embedding_client=OpenAIEmbeddingClient(
+                    api_key=self._settings.openai_api_key,
+                    timeout_seconds=(
+                        self._settings.generation_provider_timeout_seconds
+                    ),
+                ),
+            ),
         )
 
 
