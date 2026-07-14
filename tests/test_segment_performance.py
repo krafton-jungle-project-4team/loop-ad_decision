@@ -165,6 +165,18 @@ def test_non_booking_metric_does_not_use_booking_candidate_support_contract() ->
     assert support.training_example_count is None
 
 
+def test_booking_metric_blocks_responsive_candidate_without_training_contract() -> None:
+    support = candidate_type_prediction_support(
+        ContextualBookingHeuristicPredictor(),
+        goal_metric="booking_conversion_rate",
+        candidate_type="promotion_responsive",
+    )
+
+    assert support.supported is False
+    assert support.training_example_count is None
+    assert support.reason == "booking_outcome_training_support_unavailable"
+
+
 def test_logistic_calibration_json_round_trip_preserves_prediction() -> None:
     example_features = features(
         destination_match_user_rate=1.0,

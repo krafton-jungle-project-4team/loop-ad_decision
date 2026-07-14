@@ -640,6 +640,7 @@ class ExpediaSegmentBacktestService:
                         profiles=profiles,
                         min_sample_size=self._config.min_sample_size,
                         performance_predictor=self._performance_predictor,
+                        enforce_prediction_support=False,
                     )
                 else:
                     segments = generate_raw_event_segment_definitions(

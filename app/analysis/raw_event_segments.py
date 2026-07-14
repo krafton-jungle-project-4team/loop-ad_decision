@@ -500,6 +500,7 @@ def generate_raw_event_segment_definitions(
         min_sample_size=min_sample_size,
         performance_predictor=performance_predictor,
         audience_selection_policy=audience_selection_policy,
+        enforce_prediction_support=True,
     )
     if not candidates:
         return []
@@ -530,8 +531,9 @@ def generate_raw_event_segment_candidate_pool(
     profiles: Sequence[RawEventUserSignalRecord],
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None = None,
+    enforce_prediction_support: bool = True,
 ) -> list[SegmentDefinitionRecord]:
-    """Return every eligible candidate type for offline model calibration."""
+    """Return every eligible candidate before overlap and rank pruning."""
     candidates = _generate_raw_event_candidates(
         promotion=promotion,
         intent=intent,
@@ -540,6 +542,7 @@ def generate_raw_event_segment_candidate_pool(
         min_sample_size=min_sample_size,
         performance_predictor=performance_predictor,
         audience_selection_policy=None,
+        enforce_prediction_support=enforce_prediction_support,
     )
     total_eligible_user_count = len(profiles)
     return [
@@ -565,6 +568,7 @@ def _generate_raw_event_candidates(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor | None,
     audience_selection_policy: AudienceSelectionPolicyProtocol | None,
+    enforce_prediction_support: bool,
 ) -> list[_RawEventCandidate]:
     if len(profiles) < min_sample_size:
         return []
@@ -589,23 +593,24 @@ def _generate_raw_event_candidates(
     )
     raw_candidates: list[_RawEventCandidate | None] = []
     for candidate_type, candidate_factory in candidate_factories:
-        support = candidate_type_prediction_support(
-            predictor,
-            goal_metric=promotion.goal_metric,
-            candidate_type=candidate_type,
-        )
-        if not support.supported:
-            log.info(
-                "candidate_type_prediction_unsupported",
-                {
-                    "candidateType": candidate_type,
-                    "goalMetric": promotion.goal_metric,
-                    "modelVersion": predictor.version,
-                    "trainingExampleCount": support.training_example_count,
-                    "reason": support.reason,
-                },
+        if enforce_prediction_support:
+            support = candidate_type_prediction_support(
+                predictor,
+                goal_metric=promotion.goal_metric,
+                candidate_type=candidate_type,
             )
-            continue
+            if not support.supported:
+                log.info(
+                    "candidate_type_prediction_unsupported",
+                    {
+                        "candidateType": candidate_type,
+                        "goalMetric": promotion.goal_metric,
+                        "modelVersion": predictor.version,
+                        "trainingExampleCount": support.training_example_count,
+                        "reason": support.reason,
+                    },
+                )
+                continue
         raw_candidates.append(
             candidate_factory(
                 promotion=promotion,

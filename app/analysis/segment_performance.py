@@ -475,6 +475,12 @@ def candidate_type_prediction_support(
             training_example_count=None,
         )
     if not isinstance(predictor, LogisticSegmentPerformanceModel):
+        if candidate_type == "promotion_responsive":
+            return CandidateTypePredictionSupport(
+                supported=False,
+                training_example_count=None,
+                reason="booking_outcome_training_support_unavailable",
+            )
         return CandidateTypePredictionSupport(
             supported=True,
             training_example_count=None,

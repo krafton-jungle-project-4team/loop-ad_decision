@@ -896,7 +896,8 @@ def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -
 
     segments = suggester.suggest_segments(
         promotion=promotion_record(
-            message_brief="여름 제주 숙소 예약 전환을 높이는 프로모션",
+            message_brief="여름 제주 숙소 랜딩 유입을 높이는 프로모션",
+            goal_metric="inflow_rate",
         )
     )
 
@@ -909,14 +910,18 @@ def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -
     assert primary_profile["recommendation_tier"] == "primary"
     assert primary_profile["rank_eligible"] is True
     assert primary_profile["recommendation_rank"] == 1
-    assert primary_profile["performance_estimate"]["expected_count"] == 2.0
+    assert primary_profile["performance_estimate"]["expected_count"] == pytest.approx(
+        primary_profile["performance_estimate"]["value"] * 40
+    )
     assert primary_profile["performance_estimate"]["expected_count_label"] == (
-        "예상 예약 인원"
+        "예상 유입 인원"
     )
     assert small_profile["recommendation_tier"] == "small_high_intent"
     assert small_profile["rank_eligible"] is False
     assert small_profile["recommendation_rank"] is None
-    assert small_profile["performance_estimate"]["expected_count"] == 0.36
+    assert small_profile["performance_estimate"]["expected_count"] == pytest.approx(
+        small_profile["performance_estimate"]["value"] * 4
+    )
     assert "표본 신뢰도" in small_profile["recommendation_tier_reason"]
     assert "rank_comparison" not in small_profile["display_copy"]
 
@@ -1110,6 +1115,45 @@ def test_booking_model_excludes_candidate_type_without_training_examples() -> No
     )
 
     assert segments == []
+
+
+def test_booking_fallback_blocks_responsive_candidate_but_calibration_can_collect_it() -> None:
+    promotion = promotion_record(
+        message_brief="여름 제주 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"responsive_fallback_{index}",
+            promotion_impression_count=5,
+            promotion_click_count=2,
+            campaign_landing_count=1,
+        )
+        for index in range(20)
+    ]
+
+    ranked = generate_raw_event_segment_definitions(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        max_suggested_segments=3,
+        min_sample_size=2,
+    )
+    calibration_pool = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        enforce_prediction_support=False,
+    )
+
+    assert ranked == []
+    assert [
+        segment.rule_json["candidate_type"] for segment in calibration_pool
+    ] == ["promotion_responsive"]
 
 
 def test_inflow_metric_keeps_promotion_responsive_candidate() -> None:
