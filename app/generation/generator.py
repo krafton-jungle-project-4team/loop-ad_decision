@@ -51,6 +51,7 @@ class ContentGenerator(Protocol):
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
         ...
 
@@ -64,7 +65,9 @@ class DeterministicContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
+        del content_id
         channel = prompt_input.promotion.channel
         landing_url = prompt_input.promotion.landing_url
         if not landing_url:
@@ -143,6 +146,7 @@ def _email_content(
             max_length=280,
         ),
         cta="호텔 정보 보기",
+        image_prompt=RichImagePromptBuilder().build(prompt_result),
         landing_url=landing_url,
     )
 

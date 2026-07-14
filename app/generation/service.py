@@ -3,12 +3,14 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Protocol, Sequence
 
 from app.generation.artifacts import (
     CreativeArtifactPublisher,
     StaticCreativeArtifactPublisher,
     build_creative_metadata,
+    creative_format_for_channel,
 )
 from app.generation.generator import (
     CONTENT_GENERATOR_VERSION,
@@ -43,6 +45,7 @@ from app.generation.schemas import (
     GenerationRequest,
     GenerationResponse,
     GenerationStatus,
+    ImageGenerationStatus,
 )
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -127,6 +130,14 @@ class NextLoopFocusGenerationResult:
     generation_id: str
     generated_segment_ids: list[str]
     status: GenerationStatus
+
+
+@dataclass(frozen=True)
+class DurableGenerationResult:
+    generation_id: str
+    content_candidates: tuple[ContentCandidateRecord, ...]
+    output_json: dict[str, Any]
+    generation_report_json: dict[str, Any]
 
 
 class GenerationService:
@@ -233,6 +244,47 @@ class GenerationService:
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
         return response
+
+    def execute_durable(
+        self,
+        *,
+        generation_id: str,
+        prompt_inputs: Sequence[GenerationPromptInput],
+    ) -> DurableGenerationResult:
+        """Run provider and artifact work without mutating durable job state.
+
+        The job processor persists these deterministic candidates with a lease
+        fence and is the only component allowed to move the parent run to a
+        terminal state.
+        """
+
+        if not prompt_inputs:
+            raise ValueError("generation input snapshot has no target segments")
+        request = prompt_inputs[0].request
+        if any(prompt_input.request != request for prompt_input in prompt_inputs):
+            raise ValueError("generation input snapshot contains mixed requests")
+
+        content_candidates = self._build_content_candidate_records(
+            request=request,
+            generation_id=generation_id,
+            prompt_inputs=prompt_inputs,
+        )
+        for candidate in content_candidates:
+            _validate_durable_candidate_ready(candidate)
+
+        generation_run = self._build_generation_run_record(
+            request=request,
+            generation_id=generation_id,
+            prompt_inputs=prompt_inputs,
+            content_candidates=content_candidates,
+            status=GenerationStatus.COMPLETED,
+        )
+        return DurableGenerationResult(
+            generation_id=generation_id,
+            content_candidates=tuple(content_candidates),
+            output_json=dict(generation_run.output_json or {}),
+            generation_report_json=dict(generation_run.generation_report_json),
+        )
 
     @log_context_scope
     def generate_focus(
@@ -390,6 +442,16 @@ class GenerationService:
             output_json=output_json,
             generation_report_json=generation_report_json,
             status=status.value,
+            started_at=(
+                datetime.now(timezone.utc)
+                if status in (GenerationStatus.COMPLETED, GenerationStatus.FAILED)
+                else None
+            ),
+            finished_at=(
+                datetime.now(timezone.utc)
+                if status in (GenerationStatus.COMPLETED, GenerationStatus.FAILED)
+                else None
+            ),
         )
 
     def _build_prompt_inputs(
@@ -549,6 +611,7 @@ class GenerationService:
             prompt_input=prompt_input,
             prompt_result=prompt_result,
             option_index=index,
+            content_id=content_id,
         )
         content_values = generated_content.to_record_values(channel)
         candidate_report = self._generation_report_builder.build_candidate_report(
@@ -565,6 +628,17 @@ class GenerationService:
             content_id=content_id,
             content_values=content_values,
             artifact_publisher=self._artifact_publisher,
+        )
+        artifact = creative_metadata["artifact"]
+        artifact_status = str(artifact["artifact_status"])
+        image_generation_status = (
+            ImageGenerationStatus.NOT_REQUIRED.value
+            if channel == ContentChannel.SMS
+            else (
+                ImageGenerationStatus.COMPLETED.value
+                if content_values["image_url"]
+                else ImageGenerationStatus.PENDING.value
+            )
         )
 
         return ContentCandidateRecord(
@@ -595,6 +669,19 @@ class GenerationService:
                 "creative": creative_metadata,
             },
             status=status.value,
+            creative_format=creative_format_for_channel(channel).value,
+            image_generation_status=image_generation_status,
+            artifact_status=artifact_status,
+            artifact_storage_key=_optional_artifact_text(artifact, "storage_key"),
+            artifact_public_url=_optional_artifact_text(artifact, "public_url"),
+            artifact_sha256=_optional_artifact_text(artifact, "sha256"),
+            artifact_content_type=_optional_artifact_text(artifact, "content_type"),
+            artifact_error_code=_optional_artifact_text(artifact, "error_code"),
+            artifact_published_at=(
+                datetime.now(timezone.utc)
+                if artifact_status == "published"
+                else None
+            ),
         )
 
     def _save_generation_run(self, generation_run: GenerationRunRecord) -> None:
@@ -706,15 +793,24 @@ def _general_generation_attempt_slug(
     promotion_id: str,
 ) -> str | None:
     base_generation_id = _generation_id_from_promotion(promotion_id)
-    prefix = f"{base_generation_id}_"
-    if not generation_id.startswith(prefix):
+    if generation_id == base_generation_id:
         return None
-    attempt_slug = generation_id.removeprefix(prefix)
-    if re.fullmatch(
-        r"(?:run_[2-9][0-9]*|loop_[2-9][0-9]*(?:(?:_[0-9a-f]{12})?(?:_attempt_[1-9][0-9]*)?)?)",
-        attempt_slug,
-    ):
-        return attempt_slug
+    prefix = f"{base_generation_id}_"
+    if generation_id.startswith(prefix):
+        attempt_slug = generation_id.removeprefix(prefix)
+        if re.fullmatch(
+            r"(?:run_[2-9][0-9]*|loop_[2-9][0-9]*(?:(?:_[0-9a-f]{12})?(?:_attempt_[1-9][0-9]*)?)?)",
+            attempt_slug,
+        ):
+            return attempt_slug
+
+    # Durable submission IDs end in the request digest. Their promotion slug is
+    # bounded independently, so a long promotion_id may no longer match the
+    # unbounded legacy prefix above. Preserve the digest in candidate IDs to
+    # keep content_id globally unique across idempotent generation requests.
+    durable_digest = re.search(r"_([0-9a-f]{16})$", generation_id)
+    if durable_digest is not None:
+        return durable_digest.group(1)
     return None
 
 
@@ -894,3 +990,35 @@ def _prompt_input_with_resolved_landing_url(
 def _content_generator_version(content_generator: ContentGenerator) -> str:
     version = str(getattr(content_generator, "version", CONTENT_GENERATOR_VERSION))
     return version.strip() or CONTENT_GENERATOR_VERSION
+
+
+def _optional_artifact_text(value: dict[str, Any], key: str) -> str | None:
+    item = value.get(key)
+    if item is None:
+        return None
+    text = str(item).strip()
+    return text or None
+
+
+def _validate_durable_candidate_ready(candidate: ContentCandidateRecord) -> None:
+    if candidate.channel == ContentChannel.SMS:
+        if (
+            not candidate.message
+            or candidate.creative_format != "sms_text"
+            or candidate.image_generation_status != "not_required"
+            or candidate.artifact_status != "not_required"
+        ):
+            raise ValueError("SMS candidate is not ready for completion")
+        return
+
+    if (
+        candidate.image_generation_status != "completed"
+        or not candidate.image_url
+        or candidate.artifact_status != "published"
+        or not candidate.artifact_storage_key
+        or not candidate.artifact_public_url
+        or not candidate.artifact_sha256
+        or not candidate.artifact_content_type
+        or candidate.artifact_published_at is None
+    ):
+        raise ValueError("HTML candidate artifact is not ready for completion")

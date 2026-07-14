@@ -8,6 +8,7 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
+DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
 
 
 class SettingsError(RuntimeError):
@@ -40,6 +41,18 @@ class Settings:
     openai_content_model: str | None = None
     gemini_image_model: str | None = None
     segment_performance_model_path: str | None = None
+    generation_worker_max_concurrency: int = 2
+    generation_poll_interval_seconds: int = 1
+    generation_idle_poll_interval_seconds: int = 30
+    generation_lease_seconds: int = 180
+    generation_heartbeat_seconds: int = 30
+    generation_max_retries: int = 3
+    generation_retry_backoff_seconds: tuple[int, ...] = (
+        DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS
+    )
+    generation_provider_timeout_seconds: int = 30
+    generation_db_operation_timeout_seconds: int = 5
+    generation_shutdown_grace_seconds: int = 20
 
 
 REQUIRED_ENV_NAMES = (
@@ -77,7 +90,7 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             f"LOOPAD_SERVICE_ID must be {DECISION_SERVICE_ID!r}, got {service_id!r}"
         )
 
-    return Settings(
+    settings = Settings(
         env=_read_required(source, "LOOPAD_ENV"),
         service_id=service_id,
         port=_read_positive_int(source, "PORT"),
@@ -104,7 +117,59 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
             source,
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
         ),
+        generation_worker_max_concurrency=_read_optional_positive_int(
+            source,
+            "GENERATION_WORKER_MAX_CONCURRENCY",
+            default=2,
+        ),
+        generation_poll_interval_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_POLL_INTERVAL_SECONDS",
+            default=1,
+        ),
+        generation_idle_poll_interval_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_IDLE_POLL_INTERVAL_SECONDS",
+            default=30,
+        ),
+        generation_lease_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_LEASE_SECONDS",
+            default=180,
+        ),
+        generation_heartbeat_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_HEARTBEAT_SECONDS",
+            default=30,
+        ),
+        generation_max_retries=_read_optional_non_negative_int(
+            source,
+            "GENERATION_MAX_RETRIES",
+            default=3,
+        ),
+        generation_retry_backoff_seconds=_read_optional_positive_int_tuple(
+            source,
+            "GENERATION_RETRY_BACKOFF_SECONDS",
+            default=DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS,
+        ),
+        generation_provider_timeout_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_PROVIDER_TIMEOUT_SECONDS",
+            default=30,
+        ),
+        generation_db_operation_timeout_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_DB_OPERATION_TIMEOUT_SECONDS",
+            default=5,
+        ),
+        generation_shutdown_grace_seconds=_read_optional_positive_int(
+            source,
+            "GENERATION_SHUTDOWN_GRACE_SECONDS",
+            default=20,
+        ),
     )
+    _validate_generation_settings(settings)
+    return settings
 
 
 def load_local_dotenv() -> None:
@@ -131,3 +196,86 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
     if value <= 0:
         raise SettingsError(f"{name} must be a positive integer")
     return value
+
+
+def _read_optional_positive_int(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    default: int,
+) -> int:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a positive integer") from exc
+    if value <= 0:
+        raise SettingsError(f"{name} must be a positive integer")
+    return value
+
+
+def _read_optional_non_negative_int(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    default: int,
+) -> int:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError as exc:
+        raise SettingsError(f"{name} must be a non-negative integer") from exc
+    if value < 0:
+        raise SettingsError(f"{name} must be a non-negative integer")
+    return value
+
+
+def _read_optional_positive_int_tuple(
+    source: Mapping[str, str],
+    name: str,
+    *,
+    default: tuple[int, ...],
+) -> tuple[int, ...]:
+    raw_value = _read_optional(source, name)
+    if raw_value is None:
+        return default
+    raw_items = raw_value.split(",")
+    try:
+        values = tuple(int(item.strip()) for item in raw_items)
+    except ValueError as exc:
+        raise SettingsError(
+            f"{name} must be a comma-separated list of positive integers"
+        ) from exc
+    if not values or any(value <= 0 for value in values):
+        raise SettingsError(
+            f"{name} must be a comma-separated list of positive integers"
+        )
+    return values
+
+
+def _validate_generation_settings(settings: Settings) -> None:
+    if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:
+        raise SettingsError(
+            "GENERATION_HEARTBEAT_SECONDS must be less than "
+            "GENERATION_LEASE_SECONDS"
+        )
+    if len(settings.generation_retry_backoff_seconds) < settings.generation_max_retries:
+        raise SettingsError(
+            "GENERATION_RETRY_BACKOFF_SECONDS must provide at least "
+            "GENERATION_MAX_RETRIES entries"
+        )
+    heartbeat_budget = (
+        settings.generation_heartbeat_seconds
+        + 2
+        * (settings.generation_worker_max_concurrency + 1)
+        * settings.generation_db_operation_timeout_seconds
+    )
+    if heartbeat_budget >= settings.generation_lease_seconds:
+        raise SettingsError(
+            "GENERATION_HEARTBEAT_SECONDS plus coordinator DB timeout budget "
+            "must be less than GENERATION_LEASE_SECONDS"
+        )

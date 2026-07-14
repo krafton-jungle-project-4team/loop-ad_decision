@@ -38,8 +38,23 @@ class ArtifactStatus(StrEnum):
     FAILED = "failed"
 
 
+class ImageGenerationStatus(StrEnum):
+    NOT_REQUIRED = "not_required"
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+
 CHANNEL_REQUIRED_FIELDS: dict[ContentChannel, tuple[str, ...]] = {
-    ContentChannel.EMAIL: ("subject", "preheader", "body", "cta", "landing_url"),
+    ContentChannel.EMAIL: (
+        "subject",
+        "preheader",
+        "body",
+        "cta",
+        "image_prompt",
+        "landing_url",
+    ),
     ContentChannel.SMS: ("message", "landing_url"),
     ContentChannel.ONSITE_BANNER: (
         "title",
@@ -151,6 +166,16 @@ class GenerationResponse(BaseModel):
     promotion_id: str = Field(min_length=1)
     status: GenerationStatus
     content_candidates: list[ContentCandidateResponse]
+
+
+class GenerationAcceptedResponse(BaseModel):
+    """Durable submission receipt returned before provider work starts."""
+
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    generation_id: str = Field(min_length=1)
+    promotion_id: str = Field(min_length=1)
+    status: GenerationStatus
 
 
 def missing_channel_fields(channel: ContentChannel, values: dict[str, Any]) -> list[str]:

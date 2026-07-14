@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -21,12 +22,13 @@ from app.generation.prompt_builder import (
     PromptBuilder,
     TargetSegmentPromptInput,
 )
-from app.generation.schemas import ContentChannel, GenerationRequest
+from app.generation.schemas import ContentChannel, CreativeFormat, GenerationRequest
 
 
+IMAGE_SHA256 = hashlib.sha256(b"image-bytes").hexdigest()
 IMAGE_URL = (
     "https://gen-ai.asset.dev.loop-ad.org/generated/"
-    "content_banner_repeat_hotel_001.png"
+    f"content_banner_repeat_hotel_001/{IMAGE_SHA256}.png"
 )
 PROMOTION_LANDING_URL = "https://demo-stay.example.com/summer"
 LLM_LANDING_URL = "https://yourhotelbookinglink.com/generated-by-model"
@@ -59,6 +61,7 @@ def test_external_content_generator_stores_banner_image_url() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        content_id="content_banner_repeat_hotel_001",
     )
 
     assert content.title == "이번 주말 호텔 특가"
@@ -99,6 +102,7 @@ def test_external_content_generator_can_defer_banner_image_generation() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        content_id="content_banner_repeat_hotel_001",
     )
 
     assert content.title == "이번 주말 호텔 특가"
@@ -131,6 +135,7 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
         prompt_input=prompt_input(ContentChannel.ONSITE_BANNER),
         prompt_result=prompt_result(),
         option_index=1,
+        content_id="content_banner_repeat_hotel_001",
     )
 
     assert content.image_prompt is not None
@@ -142,7 +147,7 @@ def test_external_content_generator_fills_missing_banner_image_prompt() -> None:
     assert len(asset_storage.saved) == 1
 
 
-def test_external_content_generator_does_not_create_images_for_email() -> None:
+def test_external_content_generator_creates_images_for_email_contract() -> None:
     image_client = FakeImageClient()
     asset_storage = FakeAssetStorage()
     generator = ExternalContentGenerator(
@@ -162,13 +167,20 @@ def test_external_content_generator_does_not_create_images_for_email() -> None:
         prompt_input=prompt_input(ContentChannel.EMAIL),
         prompt_result=prompt_result(),
         option_index=1,
+        content_id="content_email_repeat_hotel_001",
     )
 
     assert content.subject == "환불 가능한 호텔 객실을 만나보세요"
     assert content.landing_url == PROMOTION_LANDING_URL
-    assert content.image_url is None
-    assert image_client.prompts == []
-    assert asset_storage.saved == []
+    assert content.image_prompt is not None
+    assert content.image_url == IMAGE_URL
+    assert image_client.prompts == [content.image_prompt]
+    assert asset_storage.saved == [
+        (
+            "content_email_repeat_hotel_001",
+            ImageArtifact(data=b"fake-image", content_type="image/png"),
+        )
+    ]
 
 
 def test_external_content_generator_requires_promotion_landing_url() -> None:
@@ -190,6 +202,7 @@ def test_external_content_generator_requires_promotion_landing_url() -> None:
             prompt_input=prompt_input(ContentChannel.EMAIL, landing_url=None),
             prompt_result=prompt_result(),
             option_index=1,
+            content_id="content_email_repeat_hotel_001",
         )
 
 
@@ -330,13 +343,66 @@ def test_s3_asset_storage_uploads_under_genai_prefix_and_returns_public_url() ->
     assert s3_client.put_objects == [
         {
             "Bucket": "loop-ad-dev-data-storage",
-            "Key": "genai/generated/content_banner_repeat_hotel_001.png",
+            "Key": (
+                "genai/generated/content_banner_repeat_hotel_001/"
+                f"{IMAGE_SHA256}.png"
+            ),
             "Body": b"image-bytes",
             "ContentType": "image/png",
             "CacheControl": "public, max-age=31536000, immutable",
         }
     ]
     assert image_url.startswith(DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL)
+
+
+def test_s3_asset_storage_uses_content_addressed_immutable_keys() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        s3_client=s3_client,
+    )
+
+    first_url = storage.store_image(
+        content_id="content_banner_repeat_hotel_001",
+        image=ImageArtifact(data=b"first-image", content_type="image/png"),
+    )
+    second_url = storage.store_image(
+        content_id="content_banner_repeat_hotel_001",
+        image=ImageArtifact(data=b"second-image", content_type="image/png"),
+    )
+    repeated_first_url = storage.store_image(
+        content_id="content_banner_repeat_hotel_001",
+        image=ImageArtifact(data=b"first-image", content_type="image/png"),
+    )
+    html_body = "<html><body>first</body></html>"
+    html_metadata = storage.store_html(
+        content_id="content_banner_repeat_hotel_001",
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=html_body,
+    )
+    repeated_html_metadata = storage.store_html(
+        content_id="content_banner_repeat_hotel_001",
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=html_body,
+    )
+    changed_html_metadata = storage.store_html(
+        content_id="content_banner_repeat_hotel_001",
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body="<html><body>second</body></html>",
+    )
+
+    assert first_url != second_url
+    assert repeated_first_url == first_url
+    assert s3_client.put_objects[0]["Key"] != s3_client.put_objects[1]["Key"]
+    html_sha256 = hashlib.sha256(html_body.encode("utf-8")).hexdigest()
+    assert html_metadata["storage_key"] == (
+        "genai/generated/content_banner_repeat_hotel_001/"
+        f"{html_sha256}.banner_html.html"
+    )
+    assert html_metadata["sha256"] == html_sha256
+    assert repeated_html_metadata["storage_key"] == html_metadata["storage_key"]
+    assert changed_html_metadata["storage_key"] != html_metadata["storage_key"]
 
 
 class FakeContentClient:

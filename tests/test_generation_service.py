@@ -28,6 +28,7 @@ from app.generation.service import (
     NextLoopFocusGenerationRequest,
     _next_loop_generation_id,
 )
+from app.generation.submission import generation_id_for_request
 
 
 class FakeGenerationRunRepository:
@@ -143,7 +144,6 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "content_generator": "dec-c3.deterministic.v4",
         "report_builder": "dec-c4.v3",
     }
-
     assert len(content_candidate_repository.saved) == 2
     first_candidate = content_candidate_repository.saved[0]
     assert first_candidate.content_id == "content_banner_repeat_hotel_001"
@@ -201,6 +201,128 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.metadata_json["image_url"] is None
     assert first_candidate.metadata_json["source_query_preview_id"] is None
     assert first_candidate.metadata_json["generated_sql_summary"] is None
+
+
+def test_durable_execution_requires_and_returns_ready_artifact_fields() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generation_id = "generation_banner_001_0123456789abcdef"
+
+    result = GenerationService(
+        content_generator=ReadyImageContentGenerator()
+    ).execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    )
+
+    candidate = result.content_candidates[0]
+    assert candidate.generation_id == generation_id
+    assert candidate.content_id == (
+        "content_banner_repeat_hotel_0123456789abcdef_001"
+    )
+    assert candidate.status == "draft"
+    assert candidate.image_generation_status == "completed"
+    assert candidate.image_url == "https://assets.example.test/banner.png"
+    assert candidate.artifact_status == "published"
+    assert candidate.artifact_public_url
+    assert candidate.artifact_sha256
+    assert candidate.artifact_content_type == "text/html; charset=utf-8"
+    assert candidate.artifact_published_at is not None
+    assert result.generation_report_json["status"] == "completed"
+
+
+def test_durable_execution_keeps_candidate_ids_unique_for_long_promotion_ids() -> None:
+    promotion_id = "promo_" + ("a" * 80)
+    request = GenerationRequest(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id=promotion_id,
+        analysis_id="analysis_banner_001",
+        content_option_count=1,
+    )
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=replace(
+            target_segment_input(),
+            promotion_id=promotion_id,
+        ),
+    )
+    service = GenerationService(content_generator=ReadyImageContentGenerator())
+    first_generation_id = generation_id_for_request(
+        promotion_id=promotion_id,
+        project_id=request.project_id,
+        idempotency_key="first-request",
+    )
+    second_generation_id = generation_id_for_request(
+        promotion_id=promotion_id,
+        project_id=request.project_id,
+        idempotency_key="second-request",
+    )
+
+    first = service.execute_durable(
+        generation_id=first_generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    second = service.execute_durable(
+        generation_id=second_generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+
+    assert first_generation_id != second_generation_id
+    assert first.content_id != second.content_id
+    assert first.content_option_id != second.content_option_id
+    assert len(first.content_id) <= 100
+    assert len(second.content_id) <= 100
+
+
+def test_durable_execution_rejects_html_without_generated_image() -> None:
+    request = generation_request(content_option_count=1)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+
+    with pytest.raises(ValueError, match="artifact is not ready"):
+        GenerationService().execute_durable(
+            generation_id="generation_banner_001_0123456789abcdef",
+            prompt_inputs=[prompt_input],
+        )
 
 
 def test_generation_service_can_generate_response_without_repositories() -> None:
@@ -1239,9 +1361,32 @@ class FailingContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index
+        del prompt_input, prompt_result, option_index, content_id
         raise RuntimeError("provider failed with secret-token-value")
+
+
+class ReadyImageContentGenerator:
+    version = "ready-image-test.v1"
+
+    def generate(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        content_id: str,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, option_index, content_id
+        return GeneratedContent(
+            title="이번 주말 호텔 특가",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt="hotel room, no visible text",
+            image_url="https://assets.example.test/banner.png",
+            landing_url="https://demo-stay.example.com/summer",
+        )
 
 
 class MissingImagePromptContentGenerator:
@@ -1251,8 +1396,9 @@ class MissingImagePromptContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index
+        del prompt_input, prompt_result, option_index, content_id
         return GeneratedContent(
             title="Hotel rooms ready this weekend",
             body="Compare refundable hotel stays before rooms run out.",

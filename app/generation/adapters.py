@@ -207,14 +207,19 @@ class GeminiImageClient:
         *,
         api_key: str,
         model: str = DEFAULT_GEMINI_IMAGE_MODEL,
+        timeout_seconds: float = 30.0,
         client: Any | None = None,
     ) -> None:
         self._api_key = api_key
         self._model = model
+        self._timeout_seconds = timeout_seconds
         self._client = client
 
     def generate_image(self, *, image_prompt: str) -> ImageArtifact:
-        client = self._client or _create_gemini_client(self._api_key)
+        client = self._client or _create_gemini_client(
+            self._api_key,
+            timeout_seconds=self._timeout_seconds,
+        )
         started_at = perf_counter()
         log.info("provider_request_prepared", {"provider": "gemini", "model": self._model, "request": {"imagePrompt": image_prompt}})
         try:
@@ -260,10 +265,12 @@ class S3AssetStorage:
         content_id: str,
         image: ImageArtifact,
     ) -> str:
+        content_sha256 = hashlib.sha256(image.data).hexdigest()
         key = _asset_key(
             base_prefix=self._base_prefix,
             content_id=content_id,
             content_type=image.content_type,
+            content_sha256=content_sha256,
         )
         started_at = perf_counter()
         log.info(
@@ -321,12 +328,14 @@ class S3AssetStorage:
         creative_format: CreativeFormat,
         html_body: str,
     ) -> Mapping[str, Any]:
+        body = html_body.encode("utf-8")
+        content_sha256 = hashlib.sha256(body).hexdigest()
         key = html_artifact_key(
             base_prefix=self._base_prefix,
             content_id=content_id,
             creative_format=creative_format,
+            content_sha256=content_sha256,
         )
-        body = html_body.encode("utf-8")
         started_at = perf_counter()
         log.info(
             "provider_request_prepared",
@@ -377,7 +386,7 @@ class S3AssetStorage:
         metadata: dict[str, Any] = {
             "storage_key": key,
             "public_url": public_url,
-            "sha256": hashlib.sha256(body).hexdigest(),
+            "sha256": content_sha256,
             "bytes": len(body),
             "content_type": HTML_CONTENT_TYPE,
         }
@@ -409,6 +418,7 @@ class ExternalContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
         channel = prompt_input.promotion.channel
         values = dict(
@@ -425,7 +435,7 @@ class ExternalContentGenerator:
             prompt_result=prompt_result,
         )
 
-        if channel != ContentChannel.ONSITE_BANNER or not self._generate_images:
+        if channel == ContentChannel.SMS or not self._generate_images:
             return content
 
         image_prompt = content.image_prompt
@@ -434,7 +444,7 @@ class ExternalContentGenerator:
 
         image = self._image_client.generate_image(image_prompt=image_prompt)
         image_url = self._asset_storage.store_image(
-            content_id=_content_id(prompt_input, option_index),
+            content_id=content_id,
             image=image,
         )
         return replace(content, image_url=image_url)
@@ -449,10 +459,12 @@ def build_external_content_generator(
         content_client=OpenAIResponsesContentClient(
             api_key=settings.openai_api_key,
             model=settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL,
+            timeout_seconds=settings.generation_provider_timeout_seconds,
         ),
         image_client=GeminiImageClient(
             api_key=settings.gemini_api_key,
             model=settings.gemini_image_model or DEFAULT_GEMINI_IMAGE_MODEL,
+            timeout_seconds=settings.generation_provider_timeout_seconds,
         ),
         asset_storage=S3AssetStorage(
             bucket_name=settings.data_storage_bucket,
@@ -492,10 +504,14 @@ def _post_json(
         raise RuntimeError("openai content generation failed") from exc
 
 
-def _create_gemini_client(api_key: str) -> Any:
+def _create_gemini_client(api_key: str, *, timeout_seconds: float) -> Any:
     from google import genai
+    from google.genai import types
 
-    return genai.Client(api_key=api_key)
+    return genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=int(timeout_seconds * 1000)),
+    )
 
 
 def _gemini_image_config() -> Any:
@@ -561,7 +577,7 @@ def _generated_content_from_values(
 ) -> GeneratedContent:
     if not landing_url:
         raise ValueError("promotion.landing_url is required to generate content")
-    values = _values_with_banner_image_prompt(
+    values = _values_with_visual_image_prompt(
         channel=channel,
         values=values,
         prompt_result=prompt_result,
@@ -595,13 +611,13 @@ def _values_with_sms_redirect_placeholder(
     return {**values, "message": f"{message} {{{{redirect_url}}}}"}
 
 
-def _values_with_banner_image_prompt(
+def _values_with_visual_image_prompt(
     *,
     channel: ContentChannel,
     values: Mapping[str, str | None],
     prompt_result: PromptBuildResult,
 ) -> Mapping[str, str | None]:
-    if channel != ContentChannel.ONSITE_BANNER:
+    if channel == ContentChannel.SMS:
         return values
 
     image_prompt = RichImagePromptBuilder().build(
@@ -685,11 +701,15 @@ def _asset_key(
     base_prefix: str,
     content_id: str,
     content_type: str,
+    content_sha256: str,
 ) -> str:
     prefix = base_prefix.strip("/")
     extension = _image_extension(content_type)
-    filename = f"{_safe_asset_name(content_id)}.{extension}"
-    path = f"generated/{filename}"
+    digest = str(content_sha256).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", digest):
+        raise ValueError("content_sha256 must be 64 lowercase hexadecimal characters")
+    filename = f"{digest}.{extension}"
+    path = f"generated/{_safe_asset_name(content_id)}/{filename}"
     return f"{prefix}/{path}" if prefix else path
 
 
@@ -712,15 +732,6 @@ def _image_extension(content_type: str) -> str:
     if content_type == "image/webp":
         return "webp"
     return "png"
-
-
-def _content_id(prompt_input: GenerationPromptInput, option_index: int) -> str:
-    channel = prompt_input.promotion.channel
-    channel_slug = "banner" if channel == ContentChannel.ONSITE_BANNER else channel.value
-    segment_slug = prompt_input.target_segment.content_slug or _safe_asset_name(
-        prompt_input.target_segment.segment_id.removeprefix("seg_")
-    )
-    return f"content_{channel_slug}_{segment_slug}_{option_index:03d}"
 
 
 def _safe_asset_name(value: str) -> str:

@@ -18,7 +18,12 @@ from app.generation.repositories import (
     GenerationRunRecord,
 )
 from app.generation.router import get_generation_service
-from app.generation.schemas import ContentChannel, GenerationRequest
+from app.generation.schemas import (
+    ContentChannel,
+    GenerationAcceptedResponse,
+    GenerationRequest,
+    GenerationStatus,
+)
 from app.generation.service import GenerationService
 from app.main import create_app
 
@@ -27,7 +32,6 @@ GENERATION_RESPONSE_KEYS = {
     "generation_id",
     "promotion_id",
     "status",
-    "content_candidates",
 }
 
 CONTENT_CANDIDATE_RESPONSE_KEYS = {
@@ -50,6 +54,18 @@ GENERATION_RUN_DB_PARAM_KEYS = {
     "output_json",
     "generation_report_json",
     "status",
+    "started_at",
+    "finished_at",
+    "retry_count",
+    "next_retry_at",
+    "last_error_code",
+    "last_error_message",
+    "worker_id",
+    "lease_token",
+    "heartbeat_at",
+    "lease_expires_at",
+    "idempotency_key",
+    "request_fingerprint",
 }
 
 CONTENT_CANDIDATE_DB_PARAM_KEYS = {
@@ -77,6 +93,15 @@ CONTENT_CANDIDATE_DB_PARAM_KEYS = {
     "message_strategy",
     "metadata_json",
     "status",
+    "creative_format",
+    "image_generation_status",
+    "artifact_status",
+    "artifact_storage_key",
+    "artifact_public_url",
+    "artifact_sha256",
+    "artifact_content_type",
+    "artifact_error_code",
+    "artifact_published_at",
 }
 
 CANDIDATE_METADATA_KEYS = {
@@ -140,39 +165,21 @@ IMAGE_URL = (
 )
 
 
-def test_generation_api_response_contract_for_dashboard() -> None:
-    client = _generation_client(GenerationService())
+def test_generation_api_returns_durable_submission_receipt() -> None:
+    client = _generation_client(StaticSubmissionService())
 
     response = client.post(
         "/decision/v1/promotions/promo_banner_001/generation",
         json=_generation_request_payload(content_option_count=2),
+        headers={"Idempotency-Key": "generation-contract-001"},
     )
 
-    assert response.status_code == 200
+    assert response.status_code == 202
     payload = response.json()
     assert set(payload) == GENERATION_RESPONSE_KEYS
-    assert payload["generation_id"] == "generation_banner_001"
+    assert payload["generation_id"] == "generation_banner_001_contract"
     assert payload["promotion_id"] == "promo_banner_001"
-    assert payload["status"] == "completed"
-    assert len(payload["content_candidates"]) == 2
-
-    candidate = payload["content_candidates"][0]
-    assert set(candidate) == CONTENT_CANDIDATE_RESPONSE_KEYS
-    assert candidate["channel"] == "onsite_banner"
-    assert candidate["creative_format"] == "banner_html"
-    assert candidate["attribution"]["content_id"] == "content_banner_repeat_hotel_001"
-    assert candidate["attribution"]["content_option_id"] == "banner_repeat_hotel_option_001"
-    assert candidate["attribution"]["segment_id"] == "seg_repeat_hotel_no_booking"
-    assert candidate["attribution"]["target_url"] == "https://demo-stay.example.com/summer"
-    assert candidate["source"] == {
-        "creative_format": "banner_html",
-        "width": 320,
-        "height": 100,
-        "click_protocol": "post_message",
-        "allowed_message_type": "loopad:click",
-    }
-    assert candidate["artifact"]["creative_format"] == "banner_html"
-    assert candidate["artifact"]["artifact_status"] in {"pending", "published", "failed"}
+    assert payload["status"] == "requested"
 
     _assert_no_forbidden_terms(payload)
 
@@ -264,8 +271,8 @@ def test_generation_storage_contract_includes_report_and_image_url() -> None:
     (
         (
             ContentChannel.EMAIL,
-            ("subject", "preheader", "body", "cta", "landing_url"),
-            ("title", "message", "image_prompt"),
+            ("subject", "preheader", "body", "cta", "image_prompt", "landing_url"),
+            ("title", "message"),
         ),
         (
             ContentChannel.SMS,
@@ -327,10 +334,25 @@ def test_service_repo_does_not_duplicate_data_source_schema() -> None:
     assert schema_files == []
 
 
-def _generation_client(service: GenerationService) -> TestClient:
+def _generation_client(service: Any) -> TestClient:
     app = create_app()
     app.dependency_overrides[get_generation_service] = lambda: service
     return TestClient(app)
+
+
+class StaticSubmissionService:
+    def submit(
+        self,
+        request: GenerationRequest,
+        *,
+        idempotency_key: str,
+    ) -> GenerationAcceptedResponse:
+        assert idempotency_key == "generation-contract-001"
+        return GenerationAcceptedResponse(
+            generation_id="generation_banner_001_contract",
+            promotion_id=request.promotion_id,
+            status=GenerationStatus.REQUESTED,
+        )
 
 
 def _generation_request_payload(*, content_option_count: int) -> dict[str, object]:
@@ -443,8 +465,9 @@ class ImageUrlContentGenerator:
         prompt_input: GenerationPromptInput,
         prompt_result: PromptBuildResult,
         option_index: int,
+        content_id: str,
     ) -> GeneratedContent:
-        del prompt_input, prompt_result, option_index
+        del prompt_input, prompt_result, option_index, content_id
         return GeneratedContent(
             title="Hotel rooms ready this weekend",
             body="Compare refundable hotel stays before rooms run out.",

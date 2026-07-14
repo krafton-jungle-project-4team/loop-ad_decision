@@ -61,3 +61,101 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.openai_content_model == "gpt-test"
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
     assert settings.segment_performance_model_path == "/models/segment.json"
+
+
+def test_load_settings_uses_safe_generation_defaults() -> None:
+    settings = load_settings(valid_env())
+
+    assert settings.generation_worker_max_concurrency == 2
+    assert settings.generation_poll_interval_seconds == 1
+    assert settings.generation_idle_poll_interval_seconds == 30
+    assert settings.generation_lease_seconds == 180
+    assert settings.generation_heartbeat_seconds == 30
+    assert settings.generation_max_retries == 3
+    assert settings.generation_retry_backoff_seconds == (60, 300, 900)
+    assert settings.generation_provider_timeout_seconds == 30
+    assert settings.generation_db_operation_timeout_seconds == 5
+    assert settings.generation_shutdown_grace_seconds == 20
+
+
+def test_load_settings_collects_generation_overrides() -> None:
+    env = valid_env()
+    env.update(
+        {
+            "GENERATION_WORKER_MAX_CONCURRENCY": "4",
+            "GENERATION_POLL_INTERVAL_SECONDS": "2",
+            "GENERATION_IDLE_POLL_INTERVAL_SECONDS": "45",
+            "GENERATION_LEASE_SECONDS": "240",
+            "GENERATION_HEARTBEAT_SECONDS": "20",
+            "GENERATION_MAX_RETRIES": "2",
+            "GENERATION_RETRY_BACKOFF_SECONDS": "10, 20, 30",
+            "GENERATION_PROVIDER_TIMEOUT_SECONDS": "40",
+            "GENERATION_DB_OPERATION_TIMEOUT_SECONDS": "4",
+            "GENERATION_SHUTDOWN_GRACE_SECONDS": "15",
+        }
+    )
+
+    settings = load_settings(env)
+
+    assert settings.generation_worker_max_concurrency == 4
+    assert settings.generation_poll_interval_seconds == 2
+    assert settings.generation_idle_poll_interval_seconds == 45
+    assert settings.generation_lease_seconds == 240
+    assert settings.generation_heartbeat_seconds == 20
+    assert settings.generation_max_retries == 2
+    assert settings.generation_retry_backoff_seconds == (10, 20, 30)
+    assert settings.generation_provider_timeout_seconds == 40
+    assert settings.generation_db_operation_timeout_seconds == 4
+    assert settings.generation_shutdown_grace_seconds == 15
+
+
+def test_load_settings_requires_heartbeat_shorter_than_lease() -> None:
+    env = valid_env()
+    env["GENERATION_HEARTBEAT_SECONDS"] = "180"
+
+    with pytest.raises(SettingsError, match="HEARTBEAT.*less than.*LEASE"):
+        load_settings(env)
+
+
+def test_load_settings_requires_backoff_for_each_retry() -> None:
+    env = valid_env()
+    env["GENERATION_MAX_RETRIES"] = "3"
+    env["GENERATION_RETRY_BACKOFF_SECONDS"] = "60,300"
+
+    with pytest.raises(SettingsError, match="BACKOFF.*MAX_RETRIES"):
+        load_settings(env)
+
+
+def test_load_settings_requires_coordinator_db_budget_shorter_than_lease() -> None:
+    env = valid_env()
+    env.update(
+        {
+            "GENERATION_WORKER_MAX_CONCURRENCY": "2",
+            "GENERATION_HEARTBEAT_SECONDS": "3",
+            "GENERATION_DB_OPERATION_TIMEOUT_SECONDS": "2",
+            "GENERATION_LEASE_SECONDS": "10",
+        }
+    )
+
+    with pytest.raises(SettingsError, match="DB timeout budget.*less than.*LEASE"):
+        load_settings(env)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("GENERATION_WORKER_MAX_CONCURRENCY", "0"),
+        ("GENERATION_MAX_RETRIES", "-1"),
+        ("GENERATION_DB_OPERATION_TIMEOUT_SECONDS", "0"),
+        ("GENERATION_RETRY_BACKOFF_SECONDS", "60,,900"),
+    ],
+)
+def test_load_settings_rejects_invalid_generation_values(
+    name: str,
+    value: str,
+) -> None:
+    env = valid_env()
+    env[name] = value
+
+    with pytest.raises(SettingsError, match=name):
+        load_settings(env)

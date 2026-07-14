@@ -199,6 +199,7 @@ def test_confirmed_segment_analysis_hands_approved_targets_to_generation(
             "analysis_id": "analysis_legacy_planned",
             "content_option_count": 1,
         },
+        headers={"Idempotency-Key": "analysis-legacy-planned-generation"},
     )
 
     assert legacy_generation.status_code == 409
@@ -236,15 +237,25 @@ def test_confirmed_segment_analysis_hands_approved_targets_to_generation(
             "analysis_id": analysis_id,
             "content_option_count": 1,
         },
+        headers={"Idempotency-Key": "analysis-approved-target-generation"},
     )
 
-    assert generation.status_code == 200
-    assert generation.json()["content_candidates"]
-    assert {
-        candidate["attribution"]["segment_id"]
-        for candidate in generation.json()["content_candidates"]
-    } == {"seg_family_trip"}
-    assert any(
+    assert generation.status_code == 202
+    assert generation.json()["status"] == "requested"
+    insert_params = next(
+        params
+        for query, params in connection.executed
+        if "insert into generation_runs" in compact_sql(query)
+    )
+    snapshot = insert_params["input_json"].obj
+    assert [
+        target["segment_id"] for target in snapshot["target_segments"]
+    ] == ["seg_family_trip"]
+    assert sum(
+        "insert into generation_runs" in compact_sql(query)
+        for query, _params in connection.executed
+    ) == 1
+    assert not any(
         "insert into content_candidates" in compact_sql(query)
         for query, _params in connection.executed
     )
@@ -333,6 +344,7 @@ class RecordingCursor:
     def __init__(self, connection: "RecordingConnection") -> None:
         self._connection = connection
         self._last_query = ""
+        self._last_params: Any = None
 
     def __enter__(self) -> "RecordingCursor":
         return self
@@ -342,6 +354,7 @@ class RecordingCursor:
 
     def execute(self, query: str, params: Any = None) -> None:
         self._last_query = query
+        self._last_params = params
         self._connection.executed.append((query, params))
         if "insert into promotion_target_segments" in compact_sql(query):
             self._connection.target_segment_rows.append(
@@ -365,6 +378,16 @@ class RecordingCursor:
             return self._connection.promotion_row
         if "from segment_vectors" in sql:
             return None
+        if "insert into generation_runs" in sql:
+            assert isinstance(self._last_params, dict)
+            return {
+                **self._last_params,
+                "input_json": self._last_params["input_json"].obj,
+                "generation_report_json": self._last_params[
+                    "generation_report_json"
+                ].obj,
+                "output_json": None,
+            }
         return {"ok": True}
 
     def fetchall(self) -> list[dict[str, object]]:

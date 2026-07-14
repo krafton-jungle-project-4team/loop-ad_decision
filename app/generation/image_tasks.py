@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import threading
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -44,29 +43,6 @@ class AssetStorageClient(Protocol):
 
 ConnectionFactory = Callable[[Settings], Any]
 MAX_IMAGE_GENERATION_WORKERS = 3
-
-
-def dispatch_image_generation_jobs(
-    *,
-    settings: Settings,
-    jobs: Sequence[ImageGenerationJob],
-) -> None:
-    job_list = list(jobs)
-    if not job_list:
-        return
-
-    thread = threading.Thread(
-        target=run_image_generation_jobs,
-        kwargs={"settings": settings, "jobs": job_list},
-        name="loop-ad-image-generation",
-        daemon=True,
-    )
-    try:
-        thread.start()
-    except Exception:
-        log.error("image_generation_dispatch_failed", {"jobCount": len(job_list)})
-    else:
-        log.info("image_generation_dispatched", {"jobCount": len(job_list)})
 
 
 @log_context_scope
