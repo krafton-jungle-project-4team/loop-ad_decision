@@ -8,9 +8,17 @@ from dotenv import find_dotenv, load_dotenv
 
 
 DECISION_SERVICE_ID = "decision-api"
-DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
-DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
-DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
+GENAI_SOURCE_MANIFEST_PREFIX = "genai-source/"
+GENERATION_WORKER_MAX_CONCURRENCY = 2
+GENERATION_POLL_INTERVAL_SECONDS = 1
+GENERATION_IDLE_POLL_INTERVAL_SECONDS = 30
+GENERATION_LEASE_SECONDS = 180
+GENERATION_HEARTBEAT_SECONDS = 30
+GENERATION_MAX_RETRIES = 3
+GENERATION_RETRY_BACKOFF_SECONDS = (60, 300, 900)
+GENERATION_PROVIDER_TIMEOUT_SECONDS = 30
+GENERATION_DB_OPERATION_TIMEOUT_SECONDS = 5
+GENERATION_SHUTDOWN_GRACE_SECONDS = 20
 
 
 class SettingsError(RuntimeError):
@@ -40,23 +48,24 @@ class Settings:
     genai_assets_base_prefix: str
     openai_api_key: str
     gemini_api_key: str
-    genai_assets_public_base_url: str = DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
-    genai_source_manifest_prefix: str = DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX
-    openai_content_model: str | None = None
-    gemini_image_model: str | None = None
-    segment_performance_model_path: str | None = None
-    generation_worker_max_concurrency: int = 2
-    generation_poll_interval_seconds: int = 1
-    generation_idle_poll_interval_seconds: int = 30
-    generation_lease_seconds: int = 180
-    generation_heartbeat_seconds: int = 30
-    generation_max_retries: int = 3
+    genai_assets_public_base_url: str
+    openai_content_model: str
+    gemini_image_model: str
+    generation_worker_max_concurrency: int = GENERATION_WORKER_MAX_CONCURRENCY
+    generation_poll_interval_seconds: int = GENERATION_POLL_INTERVAL_SECONDS
+    generation_idle_poll_interval_seconds: int = GENERATION_IDLE_POLL_INTERVAL_SECONDS
+    generation_lease_seconds: int = GENERATION_LEASE_SECONDS
+    generation_heartbeat_seconds: int = GENERATION_HEARTBEAT_SECONDS
+    generation_max_retries: int = GENERATION_MAX_RETRIES
     generation_retry_backoff_seconds: tuple[int, ...] = (
-        DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS
+        GENERATION_RETRY_BACKOFF_SECONDS
     )
-    generation_provider_timeout_seconds: int = 30
-    generation_db_operation_timeout_seconds: int = 5
-    generation_shutdown_grace_seconds: int = 20
+    generation_provider_timeout_seconds: int = GENERATION_PROVIDER_TIMEOUT_SECONDS
+    generation_db_operation_timeout_seconds: int = (
+        GENERATION_DB_OPERATION_TIMEOUT_SECONDS
+    )
+    generation_shutdown_grace_seconds: int = GENERATION_SHUTDOWN_GRACE_SECONDS
+    segment_performance_model_path: str | None = None
 
 
 REQUIRED_ENV_NAMES = (
@@ -75,8 +84,11 @@ REQUIRED_ENV_NAMES = (
     "LOOPAD_CLICKHOUSE_PASSWORD",
     "LOOPAD_DATA_STORAGE_BUCKET",
     "LOOPAD_GENAI_ASSETS_BASE_PREFIX",
+    "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
     "LOOPAD_OPENAI_API_KEY",
+    "LOOPAD_OPENAI_CONTENT_MODEL",
     "LOOPAD_GEMINI_API_KEY",
+    "LOOPAD_GEMINI_IMAGE_MODEL",
 )
 
 
@@ -115,69 +127,18 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         ),
         openai_api_key=_read_required(source, "LOOPAD_OPENAI_API_KEY"),
         gemini_api_key=_read_required(source, "LOOPAD_GEMINI_API_KEY"),
-        genai_assets_public_base_url=(
-            _read_optional(source, "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL")
-            or DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL
+        genai_assets_public_base_url=_read_required(
+            source,
+            "LOOPAD_GENAI_ASSETS_PUBLIC_BASE_URL",
         ),
-        genai_source_manifest_prefix=(
-            _read_optional(source, "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX")
-            or DEFAULT_GENAI_SOURCE_MANIFEST_PREFIX
+        openai_content_model=_read_required(
+            source,
+            "LOOPAD_OPENAI_CONTENT_MODEL",
         ),
-        openai_content_model=_read_optional(source, "LOOPAD_OPENAI_CONTENT_MODEL"),
-        gemini_image_model=_read_optional(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
+        gemini_image_model=_read_required(source, "LOOPAD_GEMINI_IMAGE_MODEL"),
         segment_performance_model_path=_read_optional(
             source,
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
-        ),
-        generation_worker_max_concurrency=_read_optional_positive_int(
-            source,
-            "GENERATION_WORKER_MAX_CONCURRENCY",
-            default=2,
-        ),
-        generation_poll_interval_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_POLL_INTERVAL_SECONDS",
-            default=1,
-        ),
-        generation_idle_poll_interval_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_IDLE_POLL_INTERVAL_SECONDS",
-            default=30,
-        ),
-        generation_lease_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_LEASE_SECONDS",
-            default=180,
-        ),
-        generation_heartbeat_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_HEARTBEAT_SECONDS",
-            default=30,
-        ),
-        generation_max_retries=_read_optional_non_negative_int(
-            source,
-            "GENERATION_MAX_RETRIES",
-            default=3,
-        ),
-        generation_retry_backoff_seconds=_read_optional_positive_int_tuple(
-            source,
-            "GENERATION_RETRY_BACKOFF_SECONDS",
-            default=DEFAULT_GENERATION_RETRY_BACKOFF_SECONDS,
-        ),
-        generation_provider_timeout_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_PROVIDER_TIMEOUT_SECONDS",
-            default=30,
-        ),
-        generation_db_operation_timeout_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_DB_OPERATION_TIMEOUT_SECONDS",
-            default=5,
-        ),
-        generation_shutdown_grace_seconds=_read_optional_positive_int(
-            source,
-            "GENERATION_SHUTDOWN_GRACE_SECONDS",
-            default=20,
         ),
     )
     _validate_generation_settings(settings)
@@ -210,68 +171,9 @@ def _read_positive_int(source: Mapping[str, str], name: str) -> int:
     return value
 
 
-def _read_optional_positive_int(
-    source: Mapping[str, str],
-    name: str,
-    *,
-    default: int,
-) -> int:
-    raw_value = _read_optional(source, name)
-    if raw_value is None:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise SettingsError(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise SettingsError(f"{name} must be a positive integer")
-    return value
-
-
-def _read_optional_non_negative_int(
-    source: Mapping[str, str],
-    name: str,
-    *,
-    default: int,
-) -> int:
-    raw_value = _read_optional(source, name)
-    if raw_value is None:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise SettingsError(f"{name} must be a non-negative integer") from exc
-    if value < 0:
-        raise SettingsError(f"{name} must be a non-negative integer")
-    return value
-
-
-def _read_optional_positive_int_tuple(
-    source: Mapping[str, str],
-    name: str,
-    *,
-    default: tuple[int, ...],
-) -> tuple[int, ...]:
-    raw_value = _read_optional(source, name)
-    if raw_value is None:
-        return default
-    raw_items = raw_value.split(",")
-    try:
-        values = tuple(int(item.strip()) for item in raw_items)
-    except ValueError as exc:
-        raise SettingsError(
-            f"{name} must be a comma-separated list of positive integers"
-        ) from exc
-    if not values or any(value <= 0 for value in values):
-        raise SettingsError(
-            f"{name} must be a comma-separated list of positive integers"
-        )
-    return values
-
-
 def _validate_generation_settings(settings: Settings) -> None:
     public_prefix = settings.genai_assets_base_prefix.strip("/")
-    source_prefix = settings.genai_source_manifest_prefix.strip("/")
+    source_prefix = GENAI_SOURCE_MANIFEST_PREFIX.strip("/")
     if (
         not public_prefix
         or not source_prefix
@@ -279,7 +181,7 @@ def _validate_generation_settings(settings: Settings) -> None:
         or source_prefix.startswith(f"{public_prefix}/")
     ):
         raise SettingsError(
-            "LOOPAD_GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
+            "GENAI_SOURCE_MANIFEST_PREFIX must be outside the public "
             "LOOPAD_GENAI_ASSETS_BASE_PREFIX"
         )
     if settings.generation_heartbeat_seconds >= settings.generation_lease_seconds:

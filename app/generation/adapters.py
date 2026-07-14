@@ -12,7 +12,7 @@ from typing import Any, Callable, Mapping, Protocol
 
 import boto3
 
-from app.config import Settings
+from app.config import GENAI_SOURCE_MANIFEST_PREFIX, Settings
 from app.generation.artifacts import (
     ArtifactIdentity,
     ArtifactRenderError,
@@ -50,9 +50,6 @@ from app.logging import log, duration_ms
 
 
 EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v3"
-DEFAULT_OPENAI_CONTENT_MODEL = "gpt-4o-mini"
-DEFAULT_GEMINI_IMAGE_MODEL = "gemini-3.1-flash-image"
-DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 MAX_HTML_ARTIFACT_BYTES = 1_000_000
 
@@ -155,7 +152,7 @@ class OpenAIResponsesContentClient:
         self,
         *,
         api_key: str,
-        model: str = DEFAULT_OPENAI_CONTENT_MODEL,
+        model: str,
         endpoint: str = OPENAI_RESPONSES_URL,
         timeout_seconds: float = 30.0,
         transport: JsonTransport | None = None,
@@ -266,7 +263,7 @@ class GeminiImageClient:
         self,
         *,
         api_key: str,
-        model: str = DEFAULT_GEMINI_IMAGE_MODEL,
+        model: str,
         timeout_seconds: float = 30.0,
         client: Any | None = None,
     ) -> None:
@@ -311,7 +308,7 @@ class S3AssetStorage:
         *,
         bucket_name: str,
         base_prefix: str,
-        public_base_url: str = DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL,
+        public_base_url: str,
         source_manifest_prefix: str | None = None,
         s3_client: Any | None = None,
     ) -> None:
@@ -1066,17 +1063,17 @@ def build_external_content_generator(
         bucket_name=settings.data_storage_bucket,
         base_prefix=settings.genai_assets_base_prefix,
         public_base_url=settings.genai_assets_public_base_url,
-        source_manifest_prefix=settings.genai_source_manifest_prefix,
+        source_manifest_prefix=GENAI_SOURCE_MANIFEST_PREFIX,
     )
     return ExternalContentGenerator(
         content_client=OpenAIResponsesContentClient(
             api_key=settings.openai_api_key,
-            model=settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL,
+            model=settings.openai_content_model,
             timeout_seconds=settings.generation_provider_timeout_seconds,
         ),
         image_client=GeminiImageClient(
             api_key=settings.gemini_api_key,
-            model=settings.gemini_image_model or DEFAULT_GEMINI_IMAGE_MODEL,
+            model=settings.gemini_image_model,
             timeout_seconds=settings.generation_provider_timeout_seconds,
         ),
         asset_storage=storage,

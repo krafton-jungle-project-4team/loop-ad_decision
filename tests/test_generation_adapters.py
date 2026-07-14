@@ -9,7 +9,6 @@ from typing import Any, Mapping
 import pytest
 
 from app.generation.adapters import (
-    DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL,
     ExternalContentGenerator,
     GeminiImageClient,
     ImageArtifact,
@@ -40,6 +39,7 @@ from app.generation.schemas import ContentChannel, CreativeFormat, GenerationReq
 
 
 IMAGE_SHA256 = hashlib.sha256(b"image-bytes").hexdigest()
+PUBLIC_BASE_URL = "https://gen-ai.asset.dev.loop-ad.org"
 STORAGE_IMAGE_PROMPT = "hotel image prompt, no visible text"
 IMAGE_PROMPT_SHA256 = image_prompt_sha256(STORAGE_IMAGE_PROMPT)
 IMAGE_URL = (
@@ -153,6 +153,7 @@ def test_external_content_generator_recovers_stored_creative_before_providers() 
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
     identity = artifact_identity()
@@ -226,6 +227,7 @@ def test_s3_asset_storage_rejects_tampered_creative_source() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
     identity = artifact_identity()
@@ -524,6 +526,7 @@ def test_s3_asset_storage_uploads_under_genai_prefix_and_returns_public_url() ->
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
 
@@ -549,7 +552,7 @@ def test_s3_asset_storage_uploads_under_genai_prefix_and_returns_public_url() ->
             "IfNoneMatch": "*",
         }
     ]
-    assert stored_image.public_url.startswith(DEFAULT_GENAI_ASSETS_PUBLIC_BASE_URL)
+    assert stored_image.public_url.startswith(PUBLIC_BASE_URL)
 
 
 def test_s3_asset_storage_reuses_images_and_rejects_changed_html() -> None:
@@ -557,6 +560,7 @@ def test_s3_asset_storage_reuses_images_and_rejects_changed_html() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
 
@@ -624,6 +628,7 @@ def test_s3_asset_storage_reuses_same_source_across_renderer_changes() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
     values = {
@@ -684,6 +689,7 @@ def test_s3_conditional_write_conflict_is_retryable() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         s3_client=s3_client,
     )
 
@@ -703,6 +709,7 @@ def test_external_generator_reuses_private_source_and_image_after_crash() -> Non
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         source_manifest_prefix="genai-source/",
         s3_client=s3_client,
     )
@@ -771,6 +778,7 @@ def test_source_manifest_precondition_uses_first_canonical_source() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         source_manifest_prefix="genai-source/",
         s3_client=s3_client,
     )
@@ -806,6 +814,7 @@ def test_source_manifest_rejects_different_request_fingerprint() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         source_manifest_prefix="genai-source/",
         s3_client=s3_client,
     )
@@ -836,6 +845,7 @@ def test_source_manifest_conditional_conflict_is_retryable() -> None:
     storage = S3AssetStorage(
         bucket_name="loop-ad-dev-data-storage",
         base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
         source_manifest_prefix="genai-source/",
         s3_client=FakeS3Client(conditional_conflicts=1),
     )
@@ -862,6 +872,7 @@ def test_s3_storage_rejects_source_manifest_inside_public_prefix() -> None:
         S3AssetStorage(
             bucket_name="loop-ad-dev-data-storage",
             base_prefix="genai/",
+            public_base_url=PUBLIC_BASE_URL,
             source_manifest_prefix="genai/source/",
             s3_client=FakeS3Client(),
         )

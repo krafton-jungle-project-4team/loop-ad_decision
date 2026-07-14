@@ -39,6 +39,7 @@ def test_openai_segment_report_rejects_technical_terms() -> None:
 
     generator = OpenAISegmentSuggestionReportGenerator(
         api_key="test-key",
+        model="gpt-test",
         transport=transport,
     )
 
@@ -95,6 +96,7 @@ def test_openai_segment_report_preserves_computed_candidate_facts() -> None:
     )
     generator = OpenAISegmentSuggestionReportGenerator(
         api_key="test-key",
+        model="gpt-test",
         transport=transport,
     )
 
@@ -163,6 +165,7 @@ def test_openai_segment_report_replaces_unverified_sample_caution() -> None:
     )
     generator = OpenAISegmentSuggestionReportGenerator(
         api_key="test-key",
+        model="gpt-test",
         transport=transport,
     )
 

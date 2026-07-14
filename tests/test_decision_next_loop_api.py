@@ -13,7 +13,8 @@ from fastapi.testclient import TestClient
 from psycopg import errors
 from psycopg import sql
 
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.decision.next_loop_service import (
     NextLoopConflictError,
     NextLoopGenerationFailedError,
@@ -72,7 +73,7 @@ class UniqueViolationWithConstraint(errors.UniqueViolation):
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",

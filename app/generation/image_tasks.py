@@ -8,7 +8,6 @@ from typing import Any, Protocol
 from app.config import Settings
 from app.db import create_postgres_connection
 from app.generation.adapters import (
-    DEFAULT_GEMINI_IMAGE_MODEL,
     GeminiImageClient,
     ImageClient,
     ImageArtifact,
@@ -136,7 +135,7 @@ def _run_image_generation_job_with_connection(
         repository = ContentCandidateRepository(connection)
         resolved_image_client = image_client or GeminiImageClient(
             api_key=settings.gemini_api_key,
-            model=settings.gemini_image_model or DEFAULT_GEMINI_IMAGE_MODEL,
+            model=settings.gemini_image_model,
         )
         resolved_asset_storage = asset_storage or S3AssetStorage(
             bucket_name=settings.data_storage_bucket,

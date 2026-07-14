@@ -7,7 +7,6 @@ from pydantic import ValidationError
 
 from app.db import create_postgres_connection
 from app.dependencies import get_settings
-from app.generation.adapters import DEFAULT_OPENAI_CONTENT_MODEL
 from app.generation.brand_context import BrandContextRepository
 from app.generation.repositories import (
     GenerationInputRepository,
@@ -41,9 +40,7 @@ def get_generation_service(request: Request) -> Iterator[GenerationSubmissionSer
             generation_run_repository=GenerationRunRepository(connection),
             generation_input_reader=GenerationInputRepository(connection),
             brand_context_repository=BrandContextRepository(connection),
-            model_version=(
-                settings.openai_content_model or DEFAULT_OPENAI_CONTENT_MODEL
-            ),
+            model_version=settings.openai_content_model,
             coordinator=getattr(
                 request.app.state,
                 "generation_coordinator",

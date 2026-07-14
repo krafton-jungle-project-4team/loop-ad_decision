@@ -9,7 +9,6 @@ from uuid import UUID
 from app.config import Settings
 from app.db import create_postgres_connection
 from app.generation.adapters import (
-    DEFAULT_OPENAI_CONTENT_MODEL,
     build_external_content_generator,
     build_s3_creative_artifact_publisher,
 )
@@ -275,10 +274,7 @@ class GenerationJobProcessor:
                 self._settings,
                 generate_images=True,
             ),
-            generation_model_version=(
-                self._settings.openai_content_model
-                or DEFAULT_OPENAI_CONTENT_MODEL
-            ),
+            generation_model_version=self._settings.openai_content_model,
             artifact_publisher=build_s3_creative_artifact_publisher(self._settings),
             brand_context_provider=ManagedBrandContextProvider(
                 connection_factory=lambda: self._connection_factory(self._settings),

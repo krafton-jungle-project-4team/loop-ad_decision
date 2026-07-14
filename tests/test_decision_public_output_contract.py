@@ -12,7 +12,8 @@ from app.analysis.repositories import PromotionAnalysisWrite, PromotionTargetSeg
 from app.analysis.router import get_analysis_service
 from app.analysis.schemas import AnalysisStatus
 from app.analysis.service import PromotionAnalysisResult
-from app.config import REQUIRED_ENV_NAMES, load_settings
+from app.config import load_settings
+from tests.config_env import required_env_values
 from app.decision.router import _manual_next_loop_enabled
 from app.decision.schemas import (
     AdExperimentCreateResponse,
@@ -82,7 +83,7 @@ FORBIDDEN_SHOPPING_PATTERNS = {
 
 
 def valid_env() -> dict[str, str]:
-    values = {name: f"value-for-{name.lower()}" for name in REQUIRED_ENV_NAMES}
+    values = required_env_values()
     values.update(
         {
             "LOOPAD_ENV": "test",
