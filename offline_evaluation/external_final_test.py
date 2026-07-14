@@ -37,7 +37,7 @@ from offline_evaluation.sealed_execution import (
 )
 
 
-EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v2"
+EXTERNAL_SEALED_FINAL_TEST_VERSION = "external.sealed-final-test.v3"
 EXTERNAL_COHORT_MODULO = 5
 EXTERNAL_DEVELOPMENT_REMAINDERS = (0, 1, 2, 3)
 EXTERNAL_FINAL_REMAINDERS = (4,)
@@ -50,47 +50,34 @@ SYNERISE_FINAL_CUTOFF = datetime(2022, 11, 10, tzinfo=UTC)
 
 @dataclass(frozen=True, slots=True)
 class ExternalFinalTestCriteria:
-    rank_one_beats_baseline_rate_min: float = 0.50
-    mean_rank_one_lift_percentage_points_min: float = 0.0
-    rank_one_is_best_rate_min: float = 0.50
-    rank_two_beats_baseline_rate_min: float = 0.50
-    mean_rank_two_lift_percentage_points_min: float = 0.0
-    rank_three_beats_baseline_rate_min: float = 0.50
-    mean_rank_three_lift_percentage_points_min: float = 0.0
-    pairwise_rank_accuracy_min: float = 0.55
+    portfolio_candidate_beats_baseline_rate_min: float = 0.50
+    portfolio_scenario_any_candidate_beats_baseline_rate_min: float = 0.50
+    portfolio_scenario_all_candidates_beat_baseline_rate_min: float = 0.50
+    portfolio_mean_candidate_lift_percentage_points_min: float = 0.0
+    portfolio_mean_worst_candidate_lift_percentage_points_min: float = 0.0
     scenario_with_observed_outcome_count_min: int = 3
-    rank_comparable_scenario_count_min: int = 3
-    rank_comparable_scenario_rate_min: float = 0.80
-    rank_two_result_count_min: int = 3
-    rank_three_result_count_min: int = 3
-    three_rank_scenario_count_min: int = 3
-    pairwise_rank_comparison_count_min: int = 6
-    pairwise_rank_tie_rate_max: float = 0.50
+    portfolio_candidate_result_count_min: int = 9
+    portfolio_multi_candidate_scenario_count_min: int = 3
+    portfolio_three_candidate_scenario_count_min: int = 3
     candidate_type_count_min: int = 2
-    mean_non_first_rank_overlap_max: float = 0.90
-    maximum_non_first_rank_overlap_max: float = 0.95
+    mean_portfolio_candidate_overlap_max: float = 0.90
+    maximum_portfolio_candidate_overlap_max: float = 0.95
 
     def __post_init__(self) -> None:
         rates = (
-            self.rank_one_beats_baseline_rate_min,
-            self.rank_one_is_best_rate_min,
-            self.rank_two_beats_baseline_rate_min,
-            self.rank_three_beats_baseline_rate_min,
-            self.pairwise_rank_accuracy_min,
-            self.rank_comparable_scenario_rate_min,
-            self.pairwise_rank_tie_rate_max,
-            self.mean_non_first_rank_overlap_max,
-            self.maximum_non_first_rank_overlap_max,
+            self.portfolio_candidate_beats_baseline_rate_min,
+            self.portfolio_scenario_any_candidate_beats_baseline_rate_min,
+            self.portfolio_scenario_all_candidates_beat_baseline_rate_min,
+            self.mean_portfolio_candidate_overlap_max,
+            self.maximum_portfolio_candidate_overlap_max,
         )
         if any(not 0 <= value <= 1 for value in rates):
             raise ValueError("external final rate criteria must be between 0 and 1")
         counts = (
             self.scenario_with_observed_outcome_count_min,
-            self.rank_comparable_scenario_count_min,
-            self.rank_two_result_count_min,
-            self.rank_three_result_count_min,
-            self.three_rank_scenario_count_min,
-            self.pairwise_rank_comparison_count_min,
+            self.portfolio_candidate_result_count_min,
+            self.portfolio_multi_candidate_scenario_count_min,
+            self.portfolio_three_candidate_scenario_count_min,
             self.candidate_type_count_min,
         )
         if any(value <= 0 for value in counts):
@@ -250,15 +237,13 @@ def build_external_sealed_final_test_manifest(
         ),
         "external_data_updates_model_parameters": False,
         "primary_metrics": [
-            "rank_one_beats_baseline_rate",
-            "mean_rank_one_lift_percentage_points",
-            "rank_one_is_best_rate",
-            "rank_two_beats_baseline_rate",
-            "rank_three_beats_baseline_rate",
-            "pairwise_rank_accuracy",
-            "pairwise_rank_tie_rate",
+            "portfolio_candidate_beats_baseline_rate",
+            "portfolio_scenario_any_candidate_beats_baseline_rate",
+            "portfolio_scenario_all_candidates_beat_baseline_rate",
+            "portfolio_mean_candidate_lift_percentage_points",
+            "portfolio_mean_worst_candidate_lift_percentage_points",
             "candidate_type_count",
-            "mean_non_first_rank_overlap",
+            "mean_portfolio_candidate_overlap",
         ],
     }
     criteria_payload = asdict(criteria or ExternalFinalTestCriteria())
@@ -518,94 +503,76 @@ def _evaluate_criteria(
             int(criteria["scenario_with_observed_outcome_count_min"]),
             category=CRITERION_EVIDENCE,
         ),
-        "rank_comparable_scenario_count": criterion_result(
-            _int_metric(metrics, "rank_comparable_scenario_count"),
+        "portfolio_candidate_result_count": criterion_result(
+            _int_metric(metrics, "portfolio_candidate_result_count"),
             ">=",
-            int(criteria["rank_comparable_scenario_count_min"]),
+            int(criteria["portfolio_candidate_result_count_min"]),
             category=CRITERION_EVIDENCE,
         ),
-        "rank_comparable_scenario_rate": criterion_result(
-            _float_metric(metrics, "rank_comparable_scenario_rate"),
+        "portfolio_multi_candidate_scenario_count": criterion_result(
+            _int_metric(metrics, "portfolio_multi_candidate_scenario_count"),
             ">=",
-            float(criteria["rank_comparable_scenario_rate_min"]),
+            int(criteria["portfolio_multi_candidate_scenario_count_min"]),
             category=CRITERION_EVIDENCE,
         ),
-        "rank_two_result_count": criterion_result(
-            _int_metric(metrics, "rank_two_result_count"),
+        "portfolio_three_candidate_scenario_count": criterion_result(
+            _int_metric(metrics, "portfolio_three_candidate_scenario_count"),
             ">=",
-            int(criteria["rank_two_result_count_min"]),
+            int(criteria["portfolio_three_candidate_scenario_count_min"]),
             category=CRITERION_EVIDENCE,
         ),
-        "rank_three_result_count": criterion_result(
-            _int_metric(metrics, "rank_three_result_count"),
+        "portfolio_candidate_beats_baseline_rate": criterion_result(
+            _float_metric(metrics, "portfolio_candidate_beats_baseline_rate"),
             ">=",
-            int(criteria["rank_three_result_count_min"]),
-            category=CRITERION_EVIDENCE,
-        ),
-        "three_rank_scenario_count": criterion_result(
-            _int_metric(metrics, "three_rank_scenario_count"),
-            ">=",
-            int(criteria["three_rank_scenario_count_min"]),
-            category=CRITERION_EVIDENCE,
-        ),
-        "pairwise_rank_comparison_count": criterion_result(
-            _int_metric(metrics, "pairwise_rank_comparison_count"),
-            ">=",
-            int(criteria["pairwise_rank_comparison_count_min"]),
-            category=CRITERION_EVIDENCE,
-        ),
-        "pairwise_rank_tie_rate": criterion_result(
-            _float_metric(metrics, "pairwise_rank_tie_rate"),
-            "<=",
-            float(criteria["pairwise_rank_tie_rate_max"]),
-            category=CRITERION_EVIDENCE,
-        ),
-        "rank_one_beats_baseline_rate": criterion_result(
-            _float_metric(metrics, "rank_one_beats_baseline_rate"),
-            ">=",
-            float(criteria["rank_one_beats_baseline_rate_min"]),
+            float(criteria["portfolio_candidate_beats_baseline_rate_min"]),
             category=CRITERION_QUALITY,
         ),
-        "mean_rank_one_lift_percentage_points": criterion_result(
-            _float_metric(metrics, "mean_rank_one_lift_percentage_points"),
+        "portfolio_scenario_any_candidate_beats_baseline_rate": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_scenario_any_candidate_beats_baseline_rate",
+            ),
             ">=",
-            float(criteria["mean_rank_one_lift_percentage_points_min"]),
+            float(
+                criteria[
+                    "portfolio_scenario_any_candidate_beats_baseline_rate_min"
+                ]
+            ),
             category=CRITERION_QUALITY,
         ),
-        "rank_one_is_best_rate": criterion_result(
-            _float_metric(metrics, "rank_one_is_best_rate"),
+        "portfolio_scenario_all_candidates_beat_baseline_rate": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_scenario_all_candidates_beat_baseline_rate",
+            ),
             ">=",
-            float(criteria["rank_one_is_best_rate_min"]),
+            float(
+                criteria[
+                    "portfolio_scenario_all_candidates_beat_baseline_rate_min"
+                ]
+            ),
             category=CRITERION_QUALITY,
         ),
-        "rank_two_beats_baseline_rate": criterion_result(
-            _float_metric(metrics, "rank_two_beats_baseline_rate"),
+        "portfolio_mean_candidate_lift_percentage_points": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_mean_candidate_lift_percentage_points",
+            ),
             ">=",
-            float(criteria["rank_two_beats_baseline_rate_min"]),
+            float(criteria["portfolio_mean_candidate_lift_percentage_points_min"]),
             category=CRITERION_QUALITY,
         ),
-        "mean_rank_two_lift_percentage_points": criterion_result(
-            _float_metric(metrics, "mean_rank_two_lift_percentage_points"),
+        "portfolio_mean_worst_candidate_lift_percentage_points": criterion_result(
+            _float_metric(
+                metrics,
+                "portfolio_mean_worst_candidate_lift_percentage_points",
+            ),
             ">=",
-            float(criteria["mean_rank_two_lift_percentage_points_min"]),
-            category=CRITERION_QUALITY,
-        ),
-        "rank_three_beats_baseline_rate": criterion_result(
-            _float_metric(metrics, "rank_three_beats_baseline_rate"),
-            ">=",
-            float(criteria["rank_three_beats_baseline_rate_min"]),
-            category=CRITERION_QUALITY,
-        ),
-        "mean_rank_three_lift_percentage_points": criterion_result(
-            _float_metric(metrics, "mean_rank_three_lift_percentage_points"),
-            ">=",
-            float(criteria["mean_rank_three_lift_percentage_points_min"]),
-            category=CRITERION_QUALITY,
-        ),
-        "pairwise_rank_accuracy": criterion_result(
-            _float_metric(metrics, "pairwise_rank_accuracy"),
-            ">=",
-            float(criteria["pairwise_rank_accuracy_min"]),
+            float(
+                criteria[
+                    "portfolio_mean_worst_candidate_lift_percentage_points_min"
+                ]
+            ),
             category=CRITERION_QUALITY,
         ),
         "candidate_type_count": criterion_result(
@@ -614,16 +581,16 @@ def _evaluate_criteria(
             int(criteria["candidate_type_count_min"]),
             category=CRITERION_QUALITY,
         ),
-        "mean_non_first_rank_overlap": criterion_result(
-            _float_metric(metrics, "mean_non_first_rank_overlap"),
+        "mean_portfolio_candidate_overlap": criterion_result(
+            _float_metric(metrics, "mean_portfolio_candidate_overlap"),
             "<=",
-            float(criteria["mean_non_first_rank_overlap_max"]),
+            float(criteria["mean_portfolio_candidate_overlap_max"]),
             category=CRITERION_QUALITY,
         ),
-        "maximum_non_first_rank_overlap": criterion_result(
-            _float_metric(metrics, "maximum_non_first_rank_overlap"),
+        "maximum_portfolio_candidate_overlap": criterion_result(
+            _float_metric(metrics, "maximum_portfolio_candidate_overlap"),
             "<=",
-            float(criteria["maximum_non_first_rank_overlap_max"]),
+            float(criteria["maximum_portfolio_candidate_overlap_max"]),
             category=CRITERION_QUALITY,
         ),
     }
@@ -664,24 +631,22 @@ def _sealed_report(summary: Mapping[str, Any]) -> str:
         "",
         "## 핵심 지표",
         "",
-        "- Rank 1 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
-        "- Rank 1 평균 lift: "
-        f"{_format_optional_percentage_points(metrics['mean_rank_one_lift_percentage_points'])}",
-        "- Rank 2 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
-        "- Rank 3 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
-        "- Rank 1 엄격한 실제 최고 비율: "
-        f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
-        "- 후보 쌍 순서 적중률: "
-        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
-        "- 후보 쌍 동률 비율: "
-        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
-        "- 비교 가능한 시나리오: "
-        f"{metrics['rank_comparable_scenario_count']}개",
-        "- Rank 1·2·3이 모두 생성된 시나리오: "
-        f"{metrics['three_rank_scenario_count']}개",
+        "- 전체 추천 후보 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['portfolio_candidate_beats_baseline_rate'])}",
+        "- 유용한 후보가 하나 이상인 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+        "- 모든 후보가 baseline을 넘은 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
+        "- 추천 후보 평균 lift: "
+        f"{_format_optional_percentage_points(metrics['portfolio_mean_candidate_lift_percentage_points'])}",
+        "- 시나리오별 최저 성과 후보의 평균 lift: "
+        f"{_format_optional_percentage_points(metrics['portfolio_mean_worst_candidate_lift_percentage_points'])}",
+        "- 결과를 확인한 추천 후보: "
+        f"{metrics['portfolio_candidate_result_count']}개",
+        "- 후보가 2개 이상 생성된 시나리오: "
+        f"{metrics['portfolio_multi_candidate_scenario_count']}개",
+        "- 후보가 3개 생성된 시나리오: "
+        f"{metrics['portfolio_three_candidate_scenario_count']}개",
         "- 비교 가능한 예상값 오차: N/A",
         "",
         "## 사전 등록 기준",

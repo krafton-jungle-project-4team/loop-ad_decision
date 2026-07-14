@@ -26,9 +26,13 @@ def summarize_rank_quality(
     scenarios: Sequence[Sequence[RankedOutcome]],
 ) -> dict[str, Any]:
     observed_scenarios: list[list[RankedOutcome]] = []
+    portfolio_outcomes: list[RankedOutcome] = []
     by_rank: dict[int, list[RankedOutcome]] = {1: [], 2: [], 3: []}
     multi_candidate_count = 0
     three_rank_count = 0
+    portfolio_any_candidate_beats_baseline_count = 0
+    portfolio_all_candidates_beat_baseline_count = 0
+    portfolio_worst_candidate_lifts: list[float] = []
     comparable_scenario_count = 0
     rank_one_strict_best_count = 0
     rank_one_tied_best_count = 0
@@ -45,6 +49,22 @@ def summarize_rank_quality(
         if not ordered or ordered[0].baseline_rate <= 0:
             continue
         observed_scenarios.append(ordered)
+        portfolio_outcomes.extend(ordered)
+        scenario_beats_baseline = [
+            outcome.actual_rate > outcome.baseline_rate for outcome in ordered
+        ]
+        portfolio_any_candidate_beats_baseline_count += int(
+            any(scenario_beats_baseline)
+        )
+        portfolio_all_candidates_beat_baseline_count += int(
+            all(scenario_beats_baseline)
+        )
+        portfolio_worst_candidate_lifts.append(
+            min(
+                (outcome.actual_rate - outcome.baseline_rate) * 100.0
+                for outcome in ordered
+            )
+        )
         outcomes_by_rank = {outcome.rank: outcome for outcome in ordered}
         for rank, outcome in outcomes_by_rank.items():
             by_rank[rank].append(outcome)
@@ -90,6 +110,42 @@ def summarize_rank_quality(
     total_pair_count = directional_pair_count + tied_pair_count
     metrics: dict[str, Any] = {
         "observed_outcome_scenario_count": observed_count,
+        "portfolio_candidate_result_count": len(portfolio_outcomes),
+        "portfolio_mean_candidate_count_per_scenario": (
+            _mean(len(scenario) for scenario in observed_scenarios)
+            if observed_scenarios
+            else 0.0
+        ),
+        "portfolio_candidate_beats_baseline_rate": _optional_rate(
+            sum(
+                outcome.actual_rate > outcome.baseline_rate
+                for outcome in portfolio_outcomes
+            ),
+            len(portfolio_outcomes),
+        ),
+        "portfolio_mean_candidate_lift_percentage_points": (
+            _mean(
+                (outcome.actual_rate - outcome.baseline_rate) * 100.0
+                for outcome in portfolio_outcomes
+            )
+            if portfolio_outcomes
+            else None
+        ),
+        "portfolio_scenario_any_candidate_beats_baseline_rate": _optional_rate(
+            portfolio_any_candidate_beats_baseline_count,
+            observed_count,
+        ),
+        "portfolio_scenario_all_candidates_beat_baseline_rate": _optional_rate(
+            portfolio_all_candidates_beat_baseline_count,
+            observed_count,
+        ),
+        "portfolio_mean_worst_candidate_lift_percentage_points": (
+            _mean(portfolio_worst_candidate_lifts)
+            if portfolio_worst_candidate_lifts
+            else None
+        ),
+        "portfolio_multi_candidate_scenario_count": multi_candidate_count,
+        "portfolio_three_candidate_scenario_count": three_rank_count,
         "multi_candidate_scenario_count": multi_candidate_count,
         "three_rank_scenario_count": three_rank_count,
         "rank_comparable_scenario_count": comparable_scenario_count,

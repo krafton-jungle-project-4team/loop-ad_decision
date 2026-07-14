@@ -57,43 +57,63 @@ def test_rank_quality_treats_all_ties_as_insufficient_ordering_evidence() -> Non
     assert metrics["pairwise_rank_tie_rate"] == 1.0
 
 
-def test_external_final_criteria_pass_only_with_top_three_ordering_quality() -> None:
+def test_rank_quality_reports_portfolio_usefulness_independent_of_order() -> None:
+    metrics = summarize_rank_quality(
+        [
+            [_outcome(1, 0.14), _outcome(2, 0.18), _outcome(3, 0.11)],
+            [_outcome(1, 0.09), _outcome(2, 0.12), _outcome(3, 0.08)],
+        ]
+    )
+
+    assert metrics["portfolio_candidate_result_count"] == 6
+    assert metrics["portfolio_candidate_beats_baseline_rate"] == pytest.approx(4 / 6)
+    assert metrics[
+        "portfolio_scenario_any_candidate_beats_baseline_rate"
+    ] == 1.0
+    assert metrics[
+        "portfolio_scenario_all_candidates_beat_baseline_rate"
+    ] == 0.5
+    assert metrics["portfolio_multi_candidate_scenario_count"] == 2
+    assert metrics["portfolio_three_candidate_scenario_count"] == 2
+
+
+def test_external_final_criteria_require_useful_candidate_portfolio() -> None:
     criteria = ExternalFinalTestCriteria()
     results = _evaluate_criteria(_passing_external_metrics(), asdict(criteria))
 
     assert determine_final_verdict(results) == VERDICT_PASSED
 
-    wrong_order_metrics = {
+    weak_candidate_set_metrics = {
         **_passing_external_metrics(),
-        "rank_one_is_best_rate": 0.0,
-        "pairwise_rank_accuracy": 0.40,
+        "portfolio_candidate_beats_baseline_rate": 0.40,
+        "portfolio_mean_candidate_lift_percentage_points": -1.0,
     }
-    wrong_order_results = _evaluate_criteria(
-        wrong_order_metrics,
+    weak_candidate_set_results = _evaluate_criteria(
+        weak_candidate_set_metrics,
         asdict(criteria),
     )
 
-    assert determine_final_verdict(wrong_order_results) == VERDICT_FAILED
+    assert determine_final_verdict(weak_candidate_set_results) == VERDICT_FAILED
 
-    weak_rank_three_metrics = {
+    weak_scenario_coverage_metrics = {
         **_passing_external_metrics(),
-        "rank_three_beats_baseline_rate": 0.0,
-        "mean_rank_three_lift_percentage_points": -2.0,
+        "portfolio_scenario_all_candidates_beat_baseline_rate": 0.20,
+        "portfolio_mean_worst_candidate_lift_percentage_points": -2.0,
     }
-    weak_rank_three_results = _evaluate_criteria(
-        weak_rank_three_metrics,
+    weak_scenario_coverage_results = _evaluate_criteria(
+        weak_scenario_coverage_metrics,
         asdict(criteria),
     )
 
-    assert determine_final_verdict(weak_rank_three_results) == VERDICT_FAILED
+    assert determine_final_verdict(weak_scenario_coverage_results) == VERDICT_FAILED
 
 
-def test_external_final_criteria_are_inconclusive_without_rank_three() -> None:
+def test_external_final_criteria_are_inconclusive_without_three_candidates() -> None:
     criteria = ExternalFinalTestCriteria()
     metrics = {
         **_passing_external_metrics(),
-        "rank_three_result_count": 0,
-        "three_rank_scenario_count": 0,
+        "portfolio_candidate_result_count": 6,
+        "portfolio_three_candidate_scenario_count": 0,
     }
 
     results = _evaluate_criteria(metrics, asdict(criteria))
@@ -141,22 +161,15 @@ def _outcome(rank: int, actual_rate: float) -> RankedOutcome:
 def _passing_external_metrics() -> dict[str, int | float]:
     return {
         "scenario_with_observed_outcome_count": 3,
-        "rank_comparable_scenario_count": 3,
-        "rank_comparable_scenario_rate": 1.0,
-        "rank_two_result_count": 3,
-        "rank_three_result_count": 3,
-        "three_rank_scenario_count": 3,
-        "pairwise_rank_comparison_count": 9,
-        "pairwise_rank_tie_rate": 0.0,
-        "rank_one_beats_baseline_rate": 1.0,
-        "mean_rank_one_lift_percentage_points": 5.0,
-        "rank_one_is_best_rate": 1.0,
-        "rank_two_beats_baseline_rate": 1.0,
-        "mean_rank_two_lift_percentage_points": 3.0,
-        "rank_three_beats_baseline_rate": 1.0,
-        "mean_rank_three_lift_percentage_points": 1.0,
-        "pairwise_rank_accuracy": 1.0,
+        "portfolio_candidate_result_count": 9,
+        "portfolio_multi_candidate_scenario_count": 3,
+        "portfolio_three_candidate_scenario_count": 3,
+        "portfolio_candidate_beats_baseline_rate": 0.75,
+        "portfolio_scenario_any_candidate_beats_baseline_rate": 1.0,
+        "portfolio_scenario_all_candidates_beat_baseline_rate": 0.75,
+        "portfolio_mean_candidate_lift_percentage_points": 3.0,
+        "portfolio_mean_worst_candidate_lift_percentage_points": 1.0,
         "candidate_type_count": 3,
-        "mean_non_first_rank_overlap": 0.20,
-        "maximum_non_first_rank_overlap": 0.30,
+        "mean_portfolio_candidate_overlap": 0.20,
+        "maximum_portfolio_candidate_overlap": 0.30,
     }

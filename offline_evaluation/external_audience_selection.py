@@ -208,20 +208,22 @@ def _assess_current_runtime_ratio(
         applied.get("lift_vs_all_matching_percentage_points")
     )
     capture = _optional_float(applied.get("positive_capture_rate"))
-    selected_rank_quality = _mapping(selected.get("rank_quality"))
-    all_matching_rank_quality = _mapping(all_matching.get("rank_quality"))
-    selected_pairwise = _optional_float(
-        selected_rank_quality.get("pairwise_rank_accuracy")
+    selected_portfolio_quality = _mapping(selected.get("rank_quality"))
+    all_matching_portfolio_quality = _mapping(all_matching.get("rank_quality"))
+    selected_success_rate = _optional_float(
+        selected_portfolio_quality.get("portfolio_candidate_beats_baseline_rate")
     )
-    all_matching_pairwise = _optional_float(
-        all_matching_rank_quality.get("pairwise_rank_accuracy")
+    all_matching_success_rate = _optional_float(
+        all_matching_portfolio_quality.get(
+            "portfolio_candidate_beats_baseline_rate"
+        )
     )
-    rank_check = (
+    portfolio_check = (
         None
-        if selected_pairwise is None or all_matching_pairwise is None
-        else selected_pairwise
-        + config.maximum_pairwise_rank_accuracy_drop
-        >= all_matching_pairwise
+        if selected_success_rate is None or all_matching_success_rate is None
+        else selected_success_rate
+        + config.maximum_portfolio_success_rate_drop
+        >= all_matching_success_rate
     )
     checks: dict[str, bool | None] = {
         "minimum_policy_applied_results": (
@@ -236,7 +238,7 @@ def _assess_current_runtime_ratio(
             if capture is None
             else capture >= config.minimum_positive_capture_rate
         ),
-        "rank_accuracy_not_materially_worse": rank_check,
+        "portfolio_success_rate_not_materially_worse": portfolio_check,
     }
     mandatory = (
         checks["minimum_policy_applied_results"],
@@ -260,8 +262,8 @@ def _assess_current_runtime_ratio(
             config.minimum_policy_applied_result_count
         ),
         "minimum_positive_capture_rate": config.minimum_positive_capture_rate,
-        "maximum_pairwise_rank_accuracy_drop": (
-            config.maximum_pairwise_rank_accuracy_drop
+        "maximum_portfolio_success_rate_drop": (
+            config.maximum_portfolio_success_rate_drop
         ),
         "selected_ratio_metrics": dict(selected),
         "all_matching_metrics": dict(all_matching),
@@ -301,17 +303,17 @@ def _markdown_report(
         "",
         f"- 비교 비율: {diagnostic.current_runtime_ratio * 100:g}%",
         f"- 판정: `{diagnostic.assessment['status']}`",
-        "- Rank 순서 판정: `"
+        "- 후보 묶음 품질 판정: `"
         + (
             "not_evaluable"
             if diagnostic.assessment["checks"][
-                "rank_accuracy_not_materially_worse"
+                "portfolio_success_rate_not_materially_worse"
             ]
             is None
             else (
                 "supported"
                 if diagnostic.assessment["checks"][
-                    "rank_accuracy_not_materially_worse"
+                    "portfolio_success_rate_not_materially_worse"
                 ]
                 else "caution"
             )
@@ -321,7 +323,7 @@ def _markdown_report(
         "",
         "## 비율별 결과",
         "",
-        "| 비율 | 적용 후보 | 선택/조건 일치 | 실제 outcome | 전체 일치 outcome | lift | positive 포착률 | reach | 안정 표본 | 후보/시나리오 | Rank pairwise 정확도 | 후순위 중복도 |",
+        "| 비율 | 적용 후보 | 선택/조건 일치 | 실제 outcome | 전체 일치 outcome | lift | positive 포착률 | reach | 안정 표본 | 후보/시나리오 | 후보 baseline 초과율 | 후보 중복도 |",
         "| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for summary in diagnostic.summaries:
@@ -350,7 +352,11 @@ def _markdown_report(
                     _percent(displayed_metrics.get("reach_within_matching")),
                     _percent(summary.get("sample_stable_result_rate")),
                     _number(summary.get("mean_candidate_count_per_scenario")),
-                    _percent(rank_quality.get("pairwise_rank_accuracy")),
+                    _percent(
+                        rank_quality.get(
+                            "portfolio_candidate_beats_baseline_rate"
+                        )
+                    ),
                     _percent(summary.get("mean_non_first_rank_overlap")),
                 ]
             )

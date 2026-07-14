@@ -192,8 +192,8 @@ def run_command(args: argparse.Namespace, connection: dict[str, Any]) -> int:
                 minimum_positive_capture_rate=(
                     args.audience_selection_min_positive_capture
                 ),
-                maximum_pairwise_rank_accuracy_drop=(
-                    args.audience_selection_max_rank_accuracy_drop
+                maximum_portfolio_success_rate_drop=(
+                    args.audience_selection_max_portfolio_success_rate_drop
                 ),
             ),
         )
@@ -316,10 +316,21 @@ def seal_final_test(
         code_commit=code_commit,
         code_tree=code_tree,
         criteria=ExpediaFinalTestCriteria(
-            rank_one_beats_baseline_rate_min=(
-                args.min_rank_one_beats_baseline_rate
+            portfolio_candidate_beats_baseline_rate_min=(
+                args.min_portfolio_candidate_beats_baseline_rate
             ),
-            rank_one_is_best_rate_min=args.min_rank_one_is_best_rate,
+            portfolio_scenario_any_candidate_beats_baseline_rate_min=(
+                args.min_portfolio_scenario_any_candidate_beats_baseline_rate
+            ),
+            portfolio_scenario_all_candidates_beat_baseline_rate_min=(
+                args.min_portfolio_scenario_all_candidates_beat_baseline_rate
+            ),
+            portfolio_mean_candidate_lift_percentage_points_min=(
+                args.min_portfolio_mean_candidate_lift_percentage_points
+            ),
+            portfolio_mean_worst_candidate_lift_percentage_points_min=(
+                args.min_portfolio_mean_worst_candidate_lift_percentage_points
+            ),
             all_candidate_mae_percentage_points_max=(
                 args.max_all_candidate_mae_percentage_points
             ),
@@ -569,12 +580,12 @@ def parse_args() -> argparse.Namespace:
         help="조건 일치 예약자를 유지해야 하는 최소 포착률입니다.",
     )
     holdout.add_argument(
-        "--audience-selection-max-rank-accuracy-drop",
+        "--audience-selection-max-portfolio-success-rate-drop",
         type=unit_interval,
         default=0.05,
         help=(
-            "전체 조건 일치자 대비 허용할 Rank pairwise 정확도의 최대 "
-            "하락폭입니다."
+            "전체 조건 일치자를 사용할 때와 비교해 허용할 추천 후보 "
+            "기준선 초과율의 최대 하락폭입니다."
         ),
     )
 
@@ -620,14 +631,29 @@ def parse_args() -> argparse.Namespace:
         default=date(2014, 12, 1),
     )
     seal.add_argument(
-        "--min-rank-one-beats-baseline-rate",
+        "--min-portfolio-candidate-beats-baseline-rate",
+        type=unit_interval,
+        default=0.60,
+    )
+    seal.add_argument(
+        "--min-portfolio-scenario-any-candidate-beats-baseline-rate",
         type=unit_interval,
         default=0.70,
     )
     seal.add_argument(
-        "--min-rank-one-is-best-rate",
+        "--min-portfolio-scenario-all-candidates-beat-baseline-rate",
         type=unit_interval,
         default=0.50,
+    )
+    seal.add_argument(
+        "--min-portfolio-mean-candidate-lift-percentage-points",
+        type=float,
+        default=0.0,
+    )
+    seal.add_argument(
+        "--min-portfolio-mean-worst-candidate-lift-percentage-points",
+        type=float,
+        default=0.0,
     )
     seal.add_argument(
         "--max-all-candidate-mae-percentage-points",

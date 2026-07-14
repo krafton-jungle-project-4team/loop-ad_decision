@@ -54,7 +54,7 @@ def test_policy_evaluation_selects_development_ratio_confirmed_by_validation(
     assert decision.selected_user_count == 60
     assert artifacts["development_results"].exists()
     assert artifacts["validation_results"].exists()
-    assert "Rank pairwise 정확도" in artifacts["report"].read_text(
+    assert "후보 baseline 초과율" in artifacts["report"].read_text(
         encoding="utf-8"
     )
 

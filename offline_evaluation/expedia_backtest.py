@@ -1028,6 +1028,21 @@ def summarize_backtest(run: ExpediaBacktestRun) -> dict[str, Any]:
             for result in calibration_rank_one
         ),
         "rank_one_brier_score": _brier_score(calibration_rank_one),
+        "all_candidate_mean_predicted_conversion_rate": _mean(
+            result.predicted_conversion_rate for result in calibration_results
+        ),
+        "all_candidate_mean_actual_contextual_conversion_rate": _mean(
+            result.actual_contextual_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_baseline_contextual_conversion_rate": _mean(
+            result.baseline_contextual_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_actual_any_conversion_rate": _mean(
+            result.actual_any_conversion_rate for result in evaluable_results
+        ),
+        "all_candidate_mean_baseline_any_conversion_rate": _mean(
+            result.baseline_any_conversion_rate for result in evaluable_results
+        ),
         "all_candidate_mean_absolute_error_percentage_points": _mean(
             result.calibration_error_percentage_points
             for result in calibration_results
@@ -1510,42 +1525,36 @@ def _markdown_report(
         "- 미래 목적지 예약이 있어 평가 가능한 시나리오: "
         f"{metrics['evaluable_scenario_count']}개",
         f"- 추천 후보 결과: {metrics['candidate_result_count']}개",
-        "- Rank 1 실제 전환율: "
-        f"{_format_percent(metrics['rank_one_mean_actual_contextual_conversion_rate'])}",
+        "- 추천 후보 평균 실제 전환율: "
+        f"{_format_percent(metrics['all_candidate_mean_actual_contextual_conversion_rate'])}",
         "- 전체 기준 실제 전환율: "
-        f"{_format_percent(metrics['rank_one_mean_baseline_contextual_conversion_rate'])}",
-        "- Rank 1 평균 절대 향상: "
-        f"{metrics['rank_one_mean_absolute_lift_percentage_points']:.2f}%p",
-        "- Rank 1 목적지 무관 예약률: "
-        f"{_format_percent(metrics['rank_one_mean_actual_any_conversion_rate'])}",
+        f"{_format_percent(metrics['all_candidate_mean_baseline_contextual_conversion_rate'])}",
+        "- 추천 후보 평균 절대 향상: "
+        f"{metrics['portfolio_mean_candidate_lift_percentage_points']:.2f}%p",
+        "- 추천 후보 평균 목적지 무관 예약률: "
+        f"{_format_percent(metrics['all_candidate_mean_actual_any_conversion_rate'])}",
         "- 전체 기준 목적지 무관 예약률: "
-        f"{_format_percent(metrics['rank_one_mean_baseline_any_conversion_rate'])}",
-        "- Rank 1이 기준선을 이긴 비율: "
-        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
-        "- Rank 1이 엄격하게 실제 최고 후보였던 비율: "
-        f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
-        "- Rank 2가 기준선을 이긴 비율: "
-        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
-        "- Rank 3이 기준선을 이긴 비율: "
-        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
-        "- 후보 쌍 순서 적중률: "
-        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
-        "- 후보 쌍 동률 비율: "
-        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
+        f"{_format_percent(metrics['all_candidate_mean_baseline_any_conversion_rate'])}",
+        "- 전체 추천 후보가 기준선을 이긴 비율: "
+        f"{_format_optional_percent(metrics['portfolio_candidate_beats_baseline_rate'])}",
+        "- 유용한 후보가 하나 이상인 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+        "- 모든 후보가 기준선을 이긴 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
         "- 예상값 평균 절대 오차: "
-        f"{metrics['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
+        f"{metrics['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
         "",
         "## 후보별 결과",
         "",
-        "| 기준일 | 목적지 | Rank | 후보 유형 | 예상 전환율 | "
+        "| 기준일 | 목적지 | 후보 유형 | 예상 전환율 | "
         "미래 실제 전환율 | 기준 전환율 | 향상(%p) | 표본 |",
-        "| --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in run.results:
         lines.append(
             "| "
             f"{result.cutoff.date().isoformat()} | {result.target_destination_id} | "
-            f"{result.rank} | {result.candidate_type} | "
+            f"{result.candidate_type} | "
             f"{_format_percent(result.predicted_conversion_rate)} | "
             f"{_format_percent(result.actual_contextual_conversion_rate)} | "
             f"{_format_percent(result.baseline_contextual_conversion_rate)} | "
@@ -1588,15 +1597,14 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 2014년 개발 검증 결과",
             "",
             f"- 평가 시나리오: {validation['scenario_count']}개",
-            "- Rank 1이 엄격하게 실제 최고 후보였던 비율: "
-            f"{_format_optional_percent(validation['rank_one_is_best_rate'])}",
-            "- 후보 쌍 순서 적중률: "
-            f"{_format_optional_percent(validation['pairwise_rank_accuracy'])}",
-            "- Rank 1이 기준선을 이긴 비율: "
-            f"{_format_optional_percent(validation['rank_one_beats_baseline_rate'])}",
-            "- Rank 1 평균 절대 오차: "
-            f"{validation['rank_one_mean_calibration_error_percentage_points']:.2f}%p",
-            f"- Rank 1 Brier score: {validation['rank_one_brier_score']:.6f}",
+            "- 전체 추천 후보가 기준선을 이긴 비율: "
+            f"{_format_optional_percent(validation['portfolio_candidate_beats_baseline_rate'])}",
+            "- 유용한 후보가 하나 이상인 시나리오 비율: "
+            f"{_format_optional_percent(validation['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+            "- 모든 후보가 기준선을 이긴 시나리오 비율: "
+            f"{_format_optional_percent(validation['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
+            "- 추천 후보 평균 lift: "
+            f"{validation['portfolio_mean_candidate_lift_percentage_points']:.2f}%p",
             "- 전체 후보 평균 절대 오차: "
             f"{validation['all_candidate_mean_absolute_error_percentage_points']:.2f}%p",
             f"- 전체 후보 Brier score: {validation['all_candidate_brier_score']:.6f}",
@@ -1606,8 +1614,8 @@ def _temporal_holdout_markdown_report(summary: Mapping[str, Any]) -> str:
             "## 학습 구간 참고 지표",
             "",
             f"- 학습 시나리오: {training['scenario_count']}개",
-            "- 학습 Rank 1 엄격한 실제 최고 후보 비율: "
-            f"{_format_optional_percent(training['rank_one_is_best_rate'])}",
+            "- 학습 구간 전체 추천 후보 기준선 초과율: "
+            f"{_format_optional_percent(training['portfolio_candidate_beats_baseline_rate'])}",
             "",
             "## 해석 주의사항",
             "",

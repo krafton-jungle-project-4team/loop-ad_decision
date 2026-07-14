@@ -200,7 +200,7 @@ def test_backtest_calculates_user_level_future_rates_and_lift() -> None:
     assert intent_result.calibration_error_percentage_points >= 0
 
 
-def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
+def test_backtest_summary_measures_candidate_portfolio_against_outcomes() -> None:
     repository = FakeExpediaBacktestRepository()
     run = ExpediaSegmentBacktestService(
         repository,
@@ -215,6 +215,15 @@ def test_backtest_summary_measures_rank_one_against_actual_outcomes() -> None:
 
     assert summary["scenario_count"] == 1
     assert summary["candidate_result_count"] == len(run.results)
+    assert summary["portfolio_candidate_result_count"] == len(run.results)
+    assert 0 <= summary["portfolio_candidate_beats_baseline_rate"] <= 1
+    assert summary[
+        "portfolio_scenario_any_candidate_beats_baseline_rate"
+    ] == 1.0
+    assert summary[
+        "portfolio_scenario_all_candidates_beat_baseline_rate"
+    ] == 0.0
+    # Stored order diagnostics remain available for offline debugging only.
     assert 0 <= summary["rank_one_beats_baseline_rate"] <= 1
     assert summary["rank_one_is_best_rate"] == 0.0
     assert summary["rank_one_tied_best_rate"] == 1.0
@@ -392,7 +401,8 @@ def test_backtest_writes_csv_json_and_markdown_artifacts(tmp_path: Path) -> None
         encoding="utf-8"
     )
     report = artifacts["report"].read_text(encoding="utf-8")
-    assert "Rank 1 실제 전환율" in report
+    assert "추천 후보 평균 실제 전환율" in report
+    assert "Rank 1" not in report
     assert "광고의 인과적 증분 효과" in report
 
 
