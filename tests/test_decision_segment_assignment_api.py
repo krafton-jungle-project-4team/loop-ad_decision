@@ -65,6 +65,9 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "page_count": 1,
         "processed_user_count": 1,
         "assignment_count": 1,
+        "run_assignment_count": 1,
+        "run_has_fallback": False,
+        "run_fallback_count": 0,
         "insert_conflict_count": 0,
         "segment_assignment_counts": {"seg_family_trip": 1},
         "batch_has_fallback": False,
@@ -80,7 +83,6 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "invalid_user_vector_fallback_count": 0,
         "similarity_score_buckets": {
             "not_available": 0,
-            "lt_0_00": 0,
             "0_00_to_0_50": 0,
             "0_50_to_0_65": 0,
             "0_65_to_0_80": 0,
@@ -88,6 +90,7 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
             "gte_0_90": 1,
         },
         "ann_underfilled_user_count": 0,
+        "exact_rescue_user_count": 0,
         "ann_applied": True,
         "ann_not_applied_reason": None,
         "skipped_existing_count": 0,
@@ -108,6 +111,15 @@ def test_segment_assignment_response_marks_insufficient_count_deprecated() -> No
 
     assert property_schema["deprecated"] is True
     assert property_schema["const"] == 0
+
+
+def test_segment_assignment_response_documents_persisted_similarity_score_range() -> None:
+    property_schema = SegmentAssignmentBuildResponse.model_json_schema()[
+        "properties"
+    ]["similarity_score_buckets"]
+
+    assert "persisted similarity scores" in property_schema["description"]
+    assert "[0, 1]" in property_schema["description"]
 
 
 def test_segment_assignment_api_allows_empty_json_body_to_reach_service() -> None:
@@ -188,6 +200,48 @@ def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> N
     assert any("set_config('hnsw.max_scan_tuples'" in query for query in executed_sql)
     assert any("order by embedding <=>" in query for query in executed_sql)
     assert any("insert into user_segment_assignments" in query for query in executed_sql)
+
+
+def test_segment_assignment_api_does_not_return_success_when_commit_fails(
+    monkeypatch,
+) -> None:
+    connections: list[RecordingConnection] = []
+    clickhouse_clients: list[RecordingClickHouseClient] = []
+
+    def fake_create_postgres_connection(_settings) -> RecordingConnection:
+        connection = RecordingConnection(commit_error=RuntimeError("commit failed"))
+        connections.append(connection)
+        return connection
+
+    def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
+        client = RecordingClickHouseClient()
+        clickhouse_clients.append(client)
+        return client
+
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        fake_create_postgres_connection,
+    )
+    monkeypatch.setattr(
+        "app.decision.router.create_clickhouse_client",
+        fake_create_clickhouse_client,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
+        json={"user_ids": ["user_001"]},
+    )
+
+    assert response.status_code == 500
+    assert len(connections) == 1
+    assert len(clickhouse_clients) == 1
+    connection = connections[0]
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+    assert clickhouse_clients[0].close_count == 1
 
 
 def test_segment_assignment_api_rolls_back_and_closes_on_failure(monkeypatch) -> None:
@@ -303,6 +357,9 @@ class FakeAssignmentService:
             page_count=1,
             processed_user_count=1,
             assignment_count=1,
+            run_assignment_count=1,
+            run_has_fallback=False,
+            run_fallback_count=0,
             insert_conflict_count=0,
             segment_assignment_counts={"seg_family_trip": 1},
             batch_has_fallback=False,
@@ -318,7 +375,6 @@ class FakeAssignmentService:
             invalid_user_vector_fallback_count=0,
             similarity_score_buckets={
                 "not_available": 0,
-                "lt_0_00": 0,
                 "0_00_to_0_50": 0,
                 "0_50_to_0_65": 0,
                 "0_65_to_0_80": 0,
@@ -326,6 +382,7 @@ class FakeAssignmentService:
                 "gte_0_90": 1,
             },
             ann_underfilled_user_count=0,
+            exact_rescue_user_count=0,
             ann_applied=True,
             ann_not_applied_reason=None,
             skipped_existing_count=0,
@@ -356,6 +413,8 @@ class RecordingCursor:
         sql = compact_sql(self._last_query)
         if "from promotion_runs" in sql:
             return self._connection.run_row
+        if "count(*) as assignment_count" in sql:
+            return {"assignment_count": 1, "fallback_count": 0}
         return None
 
     def fetchall(self) -> list[dict[str, object]]:
@@ -425,8 +484,10 @@ class RecordingConnection:
     def __init__(
         self,
         run_row: dict[str, object] | None | object = DEFAULT_RUN_ROW,
+        commit_error: Exception | None = None,
     ) -> None:
         self.run_row = promotion_run_row() if run_row is DEFAULT_RUN_ROW else run_row
+        self.commit_error = commit_error
         self.executed: list[tuple[str, Any]] = []
         self.commit_count = 0
         self.rollback_count = 0
@@ -437,6 +498,8 @@ class RecordingConnection:
 
     def commit(self) -> None:
         self.commit_count += 1
+        if self.commit_error is not None:
+            raise self.commit_error
 
     def rollback(self) -> None:
         self.rollback_count += 1
