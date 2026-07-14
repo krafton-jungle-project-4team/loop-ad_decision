@@ -291,6 +291,8 @@ def summarize_external_backtest(
         and result.absolute_prediction_error_percentage_points is not None
     ]
     prediction_error_comparable = bool(comparable_errors)
+    mean_portfolio_candidate_overlap = _mean(non_first_overlaps)
+    maximum_portfolio_candidate_overlap = max(non_first_overlaps, default=0.0)
     return {
         "version": EXTERNAL_BACKTEST_VERSION,
         "scenario_count": len(grouped),
@@ -309,8 +311,11 @@ def summarize_external_backtest(
         "mean_absolute_prediction_error_percentage_points": (
             _mean(comparable_errors) if comparable_errors else None
         ),
-        "mean_non_first_rank_overlap": _mean(non_first_overlaps),
-        "maximum_non_first_rank_overlap": max(non_first_overlaps, default=0.0),
+        "mean_portfolio_candidate_overlap": mean_portfolio_candidate_overlap,
+        "maximum_portfolio_candidate_overlap": maximum_portfolio_candidate_overlap,
+        # Deprecated diagnostic aliases retained for existing artifacts.
+        "mean_non_first_rank_overlap": mean_portfolio_candidate_overlap,
+        "maximum_non_first_rank_overlap": maximum_portfolio_candidate_overlap,
         "candidate_type_count": len(candidate_types),
         "candidate_type_diversity_rate": _safe_rate(
             len(candidate_types),
@@ -417,29 +422,26 @@ def _markdown_report(
         "",
         f"- 평가 시나리오: {metrics['scenario_count']}",
         f"- 후보 결과: {metrics['candidate_result_count']}",
-        "- Rank 1 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_one_beats_baseline_rate'])}",
-        f"- Rank 비교 가능 시나리오: {metrics['rank_comparable_scenario_count']}",
-        "- Rank 1 실제 최고 성과 비율: "
-        f"{_format_optional_percent(metrics['rank_one_is_best_rate'])}",
-        "- Rank 1 실제 최고 동률 비율: "
-        f"{_format_optional_percent(metrics['rank_one_tied_best_rate'])}",
-        "- Rank 1 평균 lift: "
-        f"{_format_optional_lift(metrics['mean_rank_one_lift_percentage_points'])}",
-        "- Rank 2 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_two_beats_baseline_rate'])}",
-        "- Rank 3 baseline 초과 비율: "
-        f"{_format_optional_percent(metrics['rank_three_beats_baseline_rate'])}",
-        "- 후보 쌍 순서 적중률: "
-        f"{_format_optional_percent(metrics['pairwise_rank_accuracy'])}",
-        "- 후보 쌍 동률 비율: "
-        f"{_format_optional_percent(metrics['pairwise_rank_tie_rate'])}",
+        "- 전체 추천 후보 baseline 초과 비율: "
+        f"{_format_optional_percent(metrics['portfolio_candidate_beats_baseline_rate'])}",
+        "- 유용한 후보가 하나 이상인 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_any_candidate_beats_baseline_rate'])}",
+        "- 모든 후보가 baseline을 넘은 시나리오 비율: "
+        f"{_format_optional_percent(metrics['portfolio_scenario_all_candidates_beat_baseline_rate'])}",
+        "- 추천 후보 평균 lift: "
+        f"{_format_optional_lift(metrics['portfolio_mean_candidate_lift_percentage_points'])}",
+        "- 시나리오별 최저 성과 후보의 평균 lift: "
+        f"{_format_optional_lift(metrics['portfolio_mean_worst_candidate_lift_percentage_points'])}",
+        "- 후보가 2개 이상인 시나리오: "
+        f"{metrics['portfolio_multi_candidate_scenario_count']}",
+        "- 후보가 3개인 시나리오: "
+        f"{metrics['portfolio_three_candidate_scenario_count']}",
         "- 예상값과 외부 outcome의 평균 절대 차이: "
         f"{_format_optional_percentage_points(metrics['mean_absolute_prediction_error_percentage_points'])}",
         "- 예상값 오차 비교 가능 여부: "
         f"{'yes' if metrics['prediction_error_comparable'] else 'no'}",
-        "- 후순위 평균 사용자 중복도: "
-        f"{_format_percent(metrics['mean_non_first_rank_overlap'])}",
+        "- 후보 간 평균 사용자 중복도: "
+        f"{_format_percent(metrics['mean_portfolio_candidate_overlap'])}",
         "",
         "## 이 데이터로 평가할 수 있는 항목",
         "",

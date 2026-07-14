@@ -253,8 +253,12 @@ def test_final_test_uses_fixed_scenarios_and_writes_verdict(tmp_path) -> None:
     assert summary["manifest_id"] == manifest.manifest_id
     assert summary["verdict"] == "inconclusive"
     assert summary["passed"] is False
-    assert "pairwise_rank_accuracy" in summary["criteria_results"]
-    assert "rank_three_beats_baseline_rate" in summary["criteria_results"]
+    assert "portfolio_candidate_beats_baseline_rate" in summary[
+        "criteria_results"
+    ]
+    assert "portfolio_three_candidate_scenario_count" in summary[
+        "criteria_results"
+    ]
     assert "새로운 연도" in artifacts["report"].read_text(encoding="utf-8")
 
 

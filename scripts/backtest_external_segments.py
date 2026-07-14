@@ -519,7 +519,7 @@ def parse_args() -> argparse.Namespace:
         default=3,
     )
     development.add_argument(
-        "--audience-selection-max-rank-accuracy-drop",
+        "--audience-selection-max-portfolio-success-rate-drop",
         type=unit_interval,
         default=0.05,
     )
@@ -686,8 +686,8 @@ def _audience_selection_config(
         minimum_positive_capture_rate=(
             args.audience_selection_min_positive_capture
         ),
-        maximum_pairwise_rank_accuracy_drop=(
-            args.audience_selection_max_rank_accuracy_drop
+        maximum_portfolio_success_rate_drop=(
+            args.audience_selection_max_portfolio_success_rate_drop
         ),
     )
     if args.current_runtime_ratio not in config.ratios:

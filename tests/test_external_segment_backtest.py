@@ -198,7 +198,7 @@ def test_external_development_diagnostic_compares_audience_selection_ratios(
     assert contract["accesses_sealed_final_partition"] is False
     assert contract["ratio_grid"] == [0.5, 1.0]
     assert contract["ratio_summaries"][0]["candidate_type_count"] >= 1
-    assert "Rank pairwise 정확도" in artifacts["report"].read_text(
+    assert "후보 baseline 초과율" in artifacts["report"].read_text(
         encoding="utf-8"
     )
     assert not (artifacts["summary"].parent / "audience_selection_policy_v1.json").exists()

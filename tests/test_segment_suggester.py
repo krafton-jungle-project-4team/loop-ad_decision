@@ -306,7 +306,8 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
     assert all(segment.rule_json["source"] == "raw_event_intent" for segment in segments)
     assert all(segment.profile_json["source"] == "raw_event_intent" for segment in segments)
-    assert all("rank_role" in segment.profile_json for segment in segments)
+    assert all("strategy_role" in segment.profile_json for segment in segments)
+    assert all("rank_role" not in segment.profile_json for segment in segments)
     assert all("display_copy" in segment.profile_json for segment in segments)
     assert all("performance_estimate" in segment.profile_json for segment in segments)
     assert all(
@@ -771,7 +772,7 @@ def test_raw_event_suggester_labels_inflow_performance_estimate() -> None:
     )
 
 
-def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() -> None:
+def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> None:
     profiles = [
         *[
             raw_signal(
@@ -850,13 +851,19 @@ def test_raw_event_suggester_ranks_by_goal_performance_and_exposes_comparison() 
             "fallback_reason": "artifact_missing",
         },
     }
-    assert display_copy["rank_comparison"]["reference_rank"] == 2
-    assert display_copy["rank_comparison"]["direction"] == "higher"
-    assert display_copy["rank_comparison"]["delta_percentage_points"] == 24.0
-    assert "24.0%p 높고" in display_copy["difference_summary"]
+    assert display_copy["strategy_role"] == "예약 이탈 회수형"
+    assert display_copy["strength_summary"]
+    assert display_copy["tradeoff_summary"]
+    assert "recommendation_rank" not in display_copy
+    assert "rank_comparison" not in display_copy
+    assert "difference_summary" not in display_copy
+    assert first_profile["portfolio_position"] == 1
+    assert first_profile["selection_basis"]["method"] == (
+        "diversified_candidate_portfolio"
+    )
 
 
-def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -> None:
+def test_raw_event_suggester_keeps_tier_as_candidate_context_not_rank() -> None:
     profiles = [
         *[
             raw_signal(
@@ -909,7 +916,8 @@ def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -
     small_profile = segments[1].profile_json
     assert primary_profile["recommendation_tier"] == "primary"
     assert primary_profile["rank_eligible"] is True
-    assert primary_profile["recommendation_rank"] == 1
+    assert primary_profile["portfolio_position"] == 1
+    assert "recommendation_rank" not in primary_profile
     assert primary_profile["performance_estimate"]["expected_count"] == pytest.approx(
         primary_profile["performance_estimate"]["value"] * 40
     )
@@ -918,12 +926,14 @@ def test_raw_event_suggester_ranks_primary_audience_before_small_high_intent() -
     )
     assert small_profile["recommendation_tier"] == "small_high_intent"
     assert small_profile["rank_eligible"] is False
-    assert small_profile["recommendation_rank"] is None
+    assert small_profile["portfolio_position"] == 2
+    assert "recommendation_rank" not in small_profile
     assert small_profile["performance_estimate"]["expected_count"] == pytest.approx(
         small_profile["performance_estimate"]["value"] * 4
     )
     assert "표본 신뢰도" in small_profile["recommendation_tier_reason"]
     assert "rank_comparison" not in small_profile["display_copy"]
+    assert small_profile["display_copy"]["tradeoff_summary"]
 
 
 def test_raw_event_suggester_uses_destination_context_for_expected_conversion_rate() -> None:
@@ -1041,7 +1051,8 @@ def test_raw_event_suggester_adjusts_small_out_of_distribution_prediction() -> N
     assert "분포" not in estimate["confidence_reason"]
     assert segments[0].profile_json["recommendation_tier"] == "small_high_intent"
     assert segments[0].profile_json["minimum_primary_sample_size"] == 30
-    assert segments[0].profile_json["recommendation_rank"] is None
+    assert segments[0].profile_json["portfolio_position"] == 1
+    assert "recommendation_rank" not in segments[0].profile_json
 
 
 def test_supported_candidate_keeps_internal_distribution_diagnostics_out_of_user_copy() -> None:

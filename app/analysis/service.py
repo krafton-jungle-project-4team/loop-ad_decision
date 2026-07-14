@@ -1054,7 +1054,7 @@ class PromotionAnalysisService:
             "cluster_quality_score",
             "sample_size_score",
             "candidate_type",
-            "rank_role",
+            "strategy_role",
             "performance_estimate",
             "matched_conditions",
             "missing_conditions",
@@ -1362,9 +1362,12 @@ def _display_copy(
     if isinstance(raw_display_copy, Mapping):
         display_copy = dict(raw_display_copy)
         display_copy.setdefault("title", target_segment.segment_name)
-        rank_role = target_segment.profile_json.get("rank_role")
-        if rank_role:
-            display_copy.setdefault("rank_role", rank_role)
+        strategy_role = target_segment.profile_json.get(
+            "strategy_role",
+            target_segment.profile_json.get("rank_role"),
+        )
+        if strategy_role:
+            display_copy.setdefault("strategy_role", strategy_role)
         display_copy.setdefault(
             "audience_summary",
             f"분석 대상 {total_users}명 중 {sample_size}명 · {sample_ratio}",
@@ -1400,9 +1403,12 @@ def _display_copy(
             "프로모션 메시지의 우선 타겟으로 적합합니다.",
         ),
     }
-    rank_role = target_segment.profile_json.get("rank_role")
-    if rank_role:
-        display_copy["rank_role"] = rank_role
+    strategy_role = target_segment.profile_json.get(
+        "strategy_role",
+        target_segment.profile_json.get("rank_role"),
+    )
+    if strategy_role:
+        display_copy["strategy_role"] = strategy_role
     return display_copy
 
 
@@ -1427,10 +1433,19 @@ def _display_copy_from_report(
     elif summary := _text_value(report.get("summary")):
         enhanced["reason"] = summary
     if (
-        "difference_summary" not in enhanced
-        and (difference := _text_list(report.get("difference_from_other_ranks")))
+        "strength_summary" not in enhanced
+        and (strengths := _text_list(report.get("candidate_strengths")))
     ):
-        enhanced["difference_summary"] = difference[0]
+        enhanced["strength_summary"] = strengths[0]
+    if (
+        "tradeoff_summary" not in enhanced
+        and (
+            considerations := _text_list(
+                report.get("selection_considerations")
+            )
+        )
+    ):
+        enhanced["tradeoff_summary"] = considerations[0]
     if action_hint := _text_value(report.get("action_hint")):
         enhanced["action_hint"] = action_hint
     return enhanced
@@ -1508,14 +1523,15 @@ def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
         "cluster_quality_score",
         "sample_size_score",
         "candidate_type",
-        "rank_role",
+        "strategy_role",
         "recommendation_tier",
         "recommendation_tier_label",
         "recommendation_tier_reason",
-        "recommendation_rank",
         "rank_eligible",
         "minimum_primary_sample_size",
         "performance_estimate",
+        "portfolio_position",
+        "selection_basis",
     ):
         value = segment.profile_json.get(key)
         if value is not None:

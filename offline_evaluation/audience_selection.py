@@ -26,10 +26,10 @@ from offline_evaluation.rank_quality import RankedOutcome, summarize_rank_qualit
 
 DEFAULT_SELECTION_RATIOS = (0.2, 0.4, 0.6, 0.8, 1.0)
 AUDIENCE_SELECTION_EVALUATION_VERSION = (
-    "offline.expedia-audience-selection.v1"
+    "offline.expedia-audience-selection.v2"
 )
 AUDIENCE_SELECTION_RATIO_EVALUATION_VERSION = (
-    "offline.audience-selection-ratio.v1"
+    "offline.audience-selection-ratio.v2"
 )
 
 
@@ -39,7 +39,7 @@ class AudienceSelectionEvaluationConfig:
     minimum_selected_user_count: int = 30
     minimum_policy_applied_result_count: int = 3
     minimum_positive_capture_rate: float = 0.8
-    maximum_pairwise_rank_accuracy_drop: float = 0.05
+    maximum_portfolio_success_rate_drop: float = 0.05
     goal_metric: str = "booking_conversion_rate"
 
     def __post_init__(self) -> None:
@@ -59,9 +59,9 @@ class AudienceSelectionEvaluationConfig:
             )
         if not 0.0 <= self.minimum_positive_capture_rate <= 1.0:
             raise ValueError("minimum_positive_capture_rate must be in [0, 1]")
-        if not 0.0 <= self.maximum_pairwise_rank_accuracy_drop <= 1.0:
+        if not 0.0 <= self.maximum_portfolio_success_rate_drop <= 1.0:
             raise ValueError(
-                "maximum_pairwise_rank_accuracy_drop must be in [0, 1]"
+                "maximum_portfolio_success_rate_drop must be in [0, 1]"
             )
         if not self.goal_metric.strip():
             raise ValueError("goal_metric must not be empty")
@@ -335,8 +335,8 @@ def build_audience_selection_policy_evaluation(
             "minimum_policy_applied_result_count": (
                 config.minimum_policy_applied_result_count
             ),
-            "maximum_pairwise_rank_accuracy_drop": (
-                config.maximum_pairwise_rank_accuracy_drop
+            "maximum_portfolio_success_rate_drop": (
+                config.maximum_portfolio_success_rate_drop
             ),
         },
         "development_metrics": development_choice,
@@ -573,12 +573,14 @@ def _validation_criteria(
     applied = _mapping(selected.get("applied_only"))
     lift = _optional_float(applied.get("lift_vs_all_matching_percentage_points"))
     capture = _optional_float(applied.get("positive_capture_rate"))
-    selected_rank_quality = _mapping(selected.get("rank_quality"))
-    all_rank_quality = _mapping(all_matching.get("rank_quality"))
-    selected_pairwise = _optional_float(
-        selected_rank_quality.get("pairwise_rank_accuracy")
+    selected_portfolio_quality = _mapping(selected.get("rank_quality"))
+    all_portfolio_quality = _mapping(all_matching.get("rank_quality"))
+    selected_success_rate = _optional_float(
+        selected_portfolio_quality.get("portfolio_candidate_beats_baseline_rate")
     )
-    all_pairwise = _optional_float(all_rank_quality.get("pairwise_rank_accuracy"))
+    all_success_rate = _optional_float(
+        all_portfolio_quality.get("portfolio_candidate_beats_baseline_rate")
+    )
     return {
         "development_selected_reduction": True,
         "minimum_applied_results": int(
@@ -588,12 +590,12 @@ def _validation_criteria(
         "nonnegative_lift_vs_all_matching": lift is not None and lift >= 0.0,
         "minimum_positive_capture": capture is not None
         and capture >= config.minimum_positive_capture_rate,
-        "rank_accuracy_not_materially_worse": (
-            selected_pairwise is None
-            or all_pairwise is None
-            or selected_pairwise
-            + config.maximum_pairwise_rank_accuracy_drop
-            >= all_pairwise
+        "portfolio_success_rate_not_materially_worse": (
+            selected_success_rate is None
+            or all_success_rate is None
+            or selected_success_rate
+            + config.maximum_portfolio_success_rate_drop
+            >= all_success_rate
         ),
     }
 
@@ -650,7 +652,7 @@ def _selection_markdown_report(
         "",
         "## 비율별 결과",
         "",
-        "| 구간 | 비율 | 실제 성과율 | 전체 일치자 대비 lift | positive 포착률 | reach | Rank pairwise 정확도 |",
+        "| 구간 | 비율 | 실제 성과율 | 전체 일치자 대비 lift | positive 포착률 | reach | 후보 baseline 초과율 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for split_label, summaries in (
@@ -673,7 +675,11 @@ def _selection_markdown_report(
                         ),
                         _percent(summary.get("positive_capture_rate")),
                         _percent(summary.get("reach_within_matching")),
-                        _percent(rank_quality.get("pairwise_rank_accuracy")),
+                        _percent(
+                            rank_quality.get(
+                                "portfolio_candidate_beats_baseline_rate"
+                            )
+                        ),
                     ]
                 )
                 + " |"

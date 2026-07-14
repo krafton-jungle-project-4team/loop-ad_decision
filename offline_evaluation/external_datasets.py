@@ -199,7 +199,7 @@ def load_booking_com_dataset(
         supported_claims=(
             "이전 숙박 도시 이력으로 다음 여행 도시와 맞는 세그먼트를 찾는 능력",
             "목적지 반복 관심 후보의 외부 숙박 데이터 일반화",
-            "후보 Rank별 다음 도시 적중률과 baseline 대비 lift",
+            "추천 후보별 다음 도시 적중률과 baseline 대비 lift",
         ),
         unsupported_claims=(
             "검색 또는 호텔 상세 조회 이후의 예약 전환율",
@@ -313,7 +313,7 @@ def load_booking_com_final_dataset(
         supported_claims=(
             "공식 test 여행 이력으로 다음 여행 도시와 맞는 세그먼트를 찾는 능력",
             "개발용 train_set과 분리된 사용자에서의 baseline 대비 lift",
-            "후보 Rank별 다음 도시 적중률",
+            "추천 후보별 다음 도시 적중률",
         ),
         unsupported_claims=(
             "검색 또는 호텔 상세 조회 이후의 예약 전환율",
@@ -854,7 +854,7 @@ def load_synerise_dataset(
         supports_temporal_holdout=True,
         supported_claims=(
             "검색·장바구니·구매 이력으로 미래 구매 가능성이 높은 후보를 찾는 능력",
-            "퍼널 이탈형·가격 민감형·카테고리 반복 관심형 후보의 Rank 품질",
+            "퍼널 이탈형·가격 민감형·카테고리 반복 관심형 후보 묶음의 품질",
             "시간 분리된 미래 구매율과 예상값의 차이 및 baseline 대비 lift",
         ),
         unsupported_claims=(
