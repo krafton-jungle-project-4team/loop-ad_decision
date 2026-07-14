@@ -14,6 +14,14 @@ import pyarrow.parquet as pq
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
 from app.analysis.segment_performance import ContextualBookingHeuristicPredictor
+from offline_evaluation.audience_selection import (
+    AudienceSelectionEvaluationConfig,
+)
+from offline_evaluation.external_audience_selection import (
+    build_external_audience_selection_diagnostic,
+    evaluate_external_audience_selection_cases,
+    write_external_audience_selection_diagnostic_artifacts,
+)
 from offline_evaluation.external_backtest import (
     ExternalBacktestConfig,
     ExternalDatasetManifest,
@@ -83,6 +91,86 @@ def test_external_backtest_uses_production_candidates_and_future_outcomes(
     assert paths["results"].is_file()
     summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
     assert summary["metrics"]["scenario_count"] == 1
+
+
+def test_external_development_diagnostic_compares_audience_selection_ratios(
+    tmp_path: Path,
+) -> None:
+    profiles = (
+        _profile("u1", search=3, starts=2, destination_match=2),
+        _profile("u2", search=2, starts=1, destination_match=1),
+        _profile("u3", search=1, prices=2, destination_match=1),
+        _profile("u4", search=1),
+    )
+    case = _case(profiles=profiles, positive_user_ids=frozenset({"u1", "u2"}))
+    backtest_config = ExternalBacktestConfig(
+        max_suggested_segments=3,
+        min_sample_size=1,
+    )
+    selection_config = AudienceSelectionEvaluationConfig(
+        ratios=(0.5, 1.0),
+        minimum_selected_user_count=1,
+        minimum_positive_capture_rate=0.5,
+    )
+    predictor = ContextualBookingHeuristicPredictor()
+
+    outcomes = evaluate_external_audience_selection_cases(
+        (case,),
+        evaluation_key="development-fixture",
+        backtest_config=backtest_config,
+        selection_config=selection_config,
+        performance_predictor=predictor,
+    )
+
+    assert {outcome.selection_ratio for outcome in outcomes} == {0.5, 1.0}
+    limited = [
+        outcome
+        for outcome in outcomes
+        if outcome.selection_ratio == 0.5 and outcome.policy_applied
+    ]
+    assert limited
+    assert all(
+        outcome.selected_user_count < outcome.matching_user_count
+        for outcome in limited
+    )
+
+    diagnostic = build_external_audience_selection_diagnostic(
+        dataset_id="fixture",
+        outcome_name=case.outcome_name,
+        evaluation_designs=(case.evaluation_design,),
+        outcomes=outcomes,
+        selection_config=selection_config,
+        current_runtime_ratio=0.5,
+    )
+    manifest = ExternalDatasetManifest(
+        dataset_id="fixture",
+        source_version="fixture.v1",
+        evaluation_design=case.evaluation_design,
+        outcome_name=case.outcome_name,
+        supports_temporal_holdout=True,
+        supported_claims=("audience selection robustness",),
+        unsupported_claims=("causal lift",),
+        signal_mappings={},
+        source_files=(),
+    )
+    artifacts = write_external_audience_selection_diagnostic_artifacts(
+        diagnostic,
+        manifest=manifest,
+        model_metadata=predictor.metadata(),
+        output_dir=tmp_path / "audience-selection",
+    )
+
+    payload = json.loads(artifacts["summary"].read_text(encoding="utf-8"))
+    contract = payload["diagnostic"]
+    assert contract["updates_model_parameters"] is False
+    assert contract["updates_runtime_policy"] is False
+    assert contract["accesses_sealed_final_partition"] is False
+    assert contract["ratio_grid"] == [0.5, 1.0]
+    assert contract["ratio_summaries"][0]["candidate_type_count"] >= 1
+    assert "Rank pairwise 정확도" in artifacts["report"].read_text(
+        encoding="utf-8"
+    )
+    assert not (artifacts["summary"].parent / "audience_selection_policy_v1.json").exists()
 
 
 def test_booking_adapter_hides_last_trip_city_from_profiles(tmp_path: Path) -> None:

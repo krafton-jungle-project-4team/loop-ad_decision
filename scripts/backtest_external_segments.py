@@ -33,6 +33,15 @@ from offline_evaluation.external_backtest import (  # noqa: E402
     run_external_backtest,
     write_external_backtest_artifacts,
 )
+from offline_evaluation.audience_selection import (  # noqa: E402
+    DEFAULT_SELECTION_RATIOS,
+    AudienceSelectionEvaluationConfig,
+)
+from offline_evaluation.external_audience_selection import (  # noqa: E402
+    build_external_audience_selection_diagnostic,
+    evaluate_external_audience_selection_cases,
+    write_external_audience_selection_diagnostic_artifacts,
+)
 from offline_evaluation.external_datasets import (  # noqa: E402
     EXTERNAL_DEVELOPMENT_ROLE,
     EXTERNAL_SEALED_FINAL_ROLE,
@@ -117,6 +126,7 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
     predictor = build_segment_performance_predictor(args.model_path)
     cutoffs = _development_cutoffs(args)
     base_config = _development_adapter_config(args)
+    selection_config = _audience_selection_config(args)
     log.assign_context(
         {
             "datasetId": dataset_id,
@@ -131,10 +141,15 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
             "sampleModulo": base_config.sample_modulo,
             "sampleRemainders": base_config.effective_sample_remainders,
             "cutoffCount": len(cutoffs),
+            "audienceSelectionRatios": selection_config.ratios,
+            "currentRuntimeRatio": args.current_runtime_ratio,
         },
     )
 
     entries: list[dict[str, Any]] = []
+    audience_selection_outcomes = []
+    evaluation_designs: list[str] = []
+    diagnostic_manifest = None
     for cutoff in cutoffs:
         adapter_config = replace(base_config, cutoff=cutoff)
         bundle = load_external_dataset(
@@ -164,6 +179,18 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
             output_dir=run_output_dir,
             model_metadata=predictor.metadata(),
         )
+        audience_selection_outcomes.extend(
+            evaluate_external_audience_selection_cases(
+                bundle.cases,
+                evaluation_key=cutoff.isoformat(),
+                backtest_config=backtest_config,
+                selection_config=selection_config,
+                performance_predictor=predictor,
+            )
+        )
+        evaluation_designs.append(bundle.manifest.evaluation_design)
+        if diagnostic_manifest is None:
+            diagnostic_manifest = bundle.manifest
         entries.append(
             {
                 "cutoff": cutoff.isoformat(),
@@ -173,6 +200,28 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
             }
         )
 
+    if diagnostic_manifest is None:
+        raise ExternalBacktestError(
+            "external development diagnostic did not load a dataset manifest"
+        )
+    audience_selection_diagnostic = (
+        build_external_audience_selection_diagnostic(
+            dataset_id=dataset_id,
+            outcome_name=diagnostic_manifest.outcome_name,
+            evaluation_designs=evaluation_designs,
+            outcomes=audience_selection_outcomes,
+            selection_config=selection_config,
+            current_runtime_ratio=args.current_runtime_ratio,
+        )
+    )
+    audience_selection_artifacts = (
+        write_external_audience_selection_diagnostic_artifacts(
+            audience_selection_diagnostic,
+            manifest=diagnostic_manifest,
+            model_metadata=predictor.metadata(),
+            output_dir=output_dir / "audience-selection",
+        )
+    )
     aggregate_path = output_dir / "development_diagnostic_summary.json"
     output_dir.mkdir(parents=True, exist_ok=True)
     aggregate_path.write_text(
@@ -182,7 +231,22 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
                 "dataset_id": dataset_id,
                 "repeatable": True,
                 "updates_model_parameters": False,
+                "accesses_sealed_final_partition": False,
                 "runs": entries,
+                "audience_selection": {
+                    "assessment": dict(
+                        audience_selection_diagnostic.assessment
+                    ),
+                    "summary_path": str(
+                        audience_selection_artifacts["summary"]
+                    ),
+                    "report_path": str(
+                        audience_selection_artifacts["report"]
+                    ),
+                    "results_path": str(
+                        audience_selection_artifacts["results"]
+                    ),
+                },
             },
             ensure_ascii=False,
             indent=2,
@@ -198,6 +262,12 @@ def run_development_diagnostic(args: argparse.Namespace) -> int:
             "runCount": len(entries),
             "outputDir": output_dir,
             "summaryPath": aggregate_path,
+            "audienceSelectionStatus": (
+                audience_selection_diagnostic.assessment["status"]
+            ),
+            "audienceSelectionSummaryPath": (
+                audience_selection_artifacts["summary"]
+            ),
             "durationMs": duration_ms(started_at),
         },
     )
@@ -427,6 +497,38 @@ def parse_args() -> argparse.Namespace:
     development.add_argument("--lookback-days", type=positive_int, default=90)
     development.add_argument("--outcome-days", type=positive_int, default=28)
     development.add_argument("--skip-checksum", action="store_true")
+    development.add_argument(
+        "--audience-selection-ratios",
+        type=parse_selection_ratios,
+        default=DEFAULT_SELECTION_RATIOS,
+        help="Comma-separated development ratio grid. Must include 1.0.",
+    )
+    development.add_argument(
+        "--audience-selection-min-selected-users",
+        type=positive_int,
+        default=30,
+    )
+    development.add_argument(
+        "--audience-selection-min-positive-capture",
+        type=unit_interval,
+        default=0.8,
+    )
+    development.add_argument(
+        "--audience-selection-min-applied-results",
+        type=positive_int,
+        default=3,
+    )
+    development.add_argument(
+        "--audience-selection-max-rank-accuracy-drop",
+        type=unit_interval,
+        default=0.05,
+    )
+    development.add_argument(
+        "--current-runtime-ratio",
+        type=positive_unit_interval,
+        default=0.8,
+        help="Runtime ratio to highlight; this command never changes it.",
+    )
 
     seal = subparsers.add_parser(
         "seal-final-test",
@@ -570,6 +672,31 @@ def _backtest_config(
     )
 
 
+def _audience_selection_config(
+    args: argparse.Namespace,
+) -> AudienceSelectionEvaluationConfig:
+    config = AudienceSelectionEvaluationConfig(
+        ratios=args.audience_selection_ratios,
+        minimum_selected_user_count=(
+            args.audience_selection_min_selected_users
+        ),
+        minimum_policy_applied_result_count=(
+            args.audience_selection_min_applied_results
+        ),
+        minimum_positive_capture_rate=(
+            args.audience_selection_min_positive_capture
+        ),
+        maximum_pairwise_rank_accuracy_drop=(
+            args.audience_selection_max_rank_accuracy_drop
+        ),
+    )
+    if args.current_runtime_ratio not in config.ratios:
+        raise ValueError(
+            "current_runtime_ratio must be included in audience_selection_ratios"
+        )
+    return config
+
+
 def _prediction_reason(dataset_id: str) -> str:
     reasons = {
         "booking-com": (
@@ -589,6 +716,36 @@ def positive_int(value: str) -> int:
     parsed = int(value)
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be positive")
+    return parsed
+
+
+def unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return parsed
+
+
+def positive_unit_interval(value: str) -> float:
+    parsed = float(value)
+    if not 0.0 < parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be greater than 0 and at most 1")
+    return parsed
+
+
+def parse_selection_ratios(value: str) -> tuple[float, ...]:
+    try:
+        parsed = tuple(float(item.strip()) for item in value.split(","))
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "must be comma-separated numbers"
+        ) from exc
+    if not parsed or any(not 0.0 < item <= 1.0 for item in parsed):
+        raise argparse.ArgumentTypeError("ratios must be in (0, 1]")
+    if tuple(sorted(set(parsed))) != parsed:
+        raise argparse.ArgumentTypeError("ratios must be sorted and unique")
+    if parsed[-1] != 1.0:
+        raise argparse.ArgumentTypeError("ratios must include 1.0")
     return parsed
 
 
