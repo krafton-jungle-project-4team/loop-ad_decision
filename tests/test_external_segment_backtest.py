@@ -13,7 +13,10 @@ import pyarrow.parquet as pq
 
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import PromotionRecord, RawEventUserSignalRecord
-from app.analysis.segment_performance import ContextualBookingHeuristicPredictor
+from app.analysis.segment_performance import (
+    ContextualBookingHeuristicPredictor,
+    build_segment_performance_predictor,
+)
 from offline_evaluation.audience_selection import (
     AudienceSelectionEvaluationConfig,
 )
@@ -91,6 +94,34 @@ def test_external_backtest_uses_production_candidates_and_future_outcomes(
     assert paths["results"].is_file()
     summary = json.loads(paths["summary"].read_text(encoding="utf-8"))
     assert summary["metrics"]["scenario_count"] == 1
+
+
+def test_external_backtest_uses_booking_model_candidate_support_contract() -> None:
+    profiles = (
+        _profile("u1", search=3, starts=2, completes=0, destination_match=2),
+        _profile("u2", search=2, starts=1, completes=0, destination_match=1),
+        _profile("u3", search=1, prices=2, destination_match=1),
+        _profile("u4", search=1, destination_match=1),
+    )
+    case = _case(profiles=profiles, positive_user_ids=frozenset({"u1", "u2"}))
+    predictor = build_segment_performance_predictor()
+
+    run = run_external_backtest(
+        (case,),
+        config=ExternalBacktestConfig(
+            max_suggested_segments=3,
+            min_sample_size=1,
+        ),
+        performance_predictor=predictor,
+    )
+
+    supported_candidate_types = set(
+        predictor.metadata()["supported_candidate_types"]
+    )
+    assert run.results
+    assert {result.candidate_type for result in run.results} <= (
+        supported_candidate_types
+    )
 
 
 def test_external_development_diagnostic_compares_audience_selection_ratios(

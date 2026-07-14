@@ -115,6 +115,11 @@ python3 scripts/backtest_expedia_segments.py validation
 선택 편향을 막기 위해서다. 사용자에게 노출되는 개발 검증 결과에는 운영과 동일하게
 사용자 중복 제한과 Rank 점수를 적용한 최대 3개 후보만 기록한다.
 
+학습된 모델 파일에는 후보 타입별 학습 사례 수와 사용자 관측 수를 함께 저장한다.
+2014 개발 검증, 봉인 최종 평가, 운영 추천에서는 학습 사례 수가 0인 후보 타입을 예상
+예약 전환율 계산 전에 제외한다. 따라서 학습용 전체 후보 풀 수집은 유지하되, 실제로
+학습되지 않은 후보에 다른 타입의 계수를 빌려 예상 전환율을 표시하지 않는다.
+
 Expedia 원본에는 무료 취소와 조식 포함 속성이 없다. 따라서 백테스트의 혜택 신호는
 실제 `is_package=1`만 `deal_event_count`로 사용하며, `free_cancellation_count`와
 `breakfast_included_count`는 0으로 둔다. 관찰할 수 없는 혜택을 체류 기간이나 예약
@@ -386,7 +391,7 @@ artifacts/expedia-segment-backtest/<mode>-<timestamp>/
 
 봉인 최종 테스트는 관측 outcome과 Rank 2·3 후보가 부족하면 `FAIL` 대신 `INCONCLUSIVE`로 기록한다. 충분한 근거가 있을 때만 예상값 보정, Top 3 유용성, 전체 순위 정확성을 함께 사용해 `PASS` 또는 `FAIL`을 결정한다.
 
-이 기준은 `expedia.sealed-final-test.v2` manifest에 사전 등록된다. 아직 결과를 열지 않은 v1 manifest가 있다면 새 코드와 모델을 동결한 뒤 v2 manifest를 다시 생성해야 한다.
+이 기준과 후보 타입별 학습 지원 계약은 `expedia.sealed-final-test.v3` manifest에 사전 등록된다. manifest에는 후보 타입별 학습 사례 수와 지원 목록이 함께 기록되며, 봉인 후 이 계약이 달라지면 최종 평가를 시작하지 않는다. 아직 결과를 열지 않은 v1 또는 v2 manifest가 있다면 새 코드와 모델을 동결한 뒤 v3 manifest를 다시 생성해야 한다.
 
 ## 시간 누수 방지
 
@@ -407,8 +412,10 @@ cutoff <= date_time < cutoff + outcome_days
 ## 원본에 없는 신호
 
 Expedia에는 `promotion_impression`, `promotion_click`, `campaign_landing`이 없다. 해당 값은
-0으로 유지하며 임의 생성하지 않는다. 따라서 `promotion_responsive` 후보는 생성되지 않을
-수 있다.
+0으로 유지하며 임의 생성하지 않는다. 이 때문에 Expedia 예약 전환 모델의
+`promotion_responsive` 학습 사례 수는 0이고, 예약 전환율 목표의 개발 검증·봉인 평가·운영
+추천에서는 이 후보를 자동으로 제외한다. 유입률처럼 프로모션 반응 자체가 목표인 경우에는
+Expedia 예약 전환 모델을 사용하지 않으므로 별도의 최근 클릭·랜딩 신호 추정 경로를 쓴다.
 
 가격도 원본에 없으므로 임의 가격은 사용하지 않는다. 패키지 여부, 검색 시점과 체크인
 사이 기간, 숙박 기간처럼 원본 행동에서 결정적으로 유도할 수 있는 혜택 신호만 참고한다.

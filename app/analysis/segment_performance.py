@@ -8,6 +8,9 @@ from typing import Any, Mapping, Protocol, Sequence
 
 
 CONTEXTUAL_BOOKING_MODEL_VERSION = "dec.contextual-booking-calibration.v2"
+CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION = (
+    "dec.segment-performance-candidate-support.v1"
+)
 # Runtime candidates can be much smaller and narrower than calibration cohorts.
 PREDICTION_POLICY_VERSION = "dec.segment-performance-serving.v1"
 STANDARDIZED_FEATURE_LIMIT = 3.0
@@ -217,6 +220,17 @@ class SegmentPerformancePredictor(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class CandidateTypePredictionSupport:
+    supported: bool
+    training_example_count: int | None
+    reason: str | None = None
+
+
+class UnsupportedCandidateTypeError(ValueError):
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class CalibrationTrainingExample:
     features: SegmentPerformanceFeatures
     success_count: int
@@ -256,6 +270,7 @@ class LogisticSegmentPerformanceModel:
             raise ValueError("calibration feature scales must be positive")
 
     def predict(self, features: SegmentPerformanceFeatures) -> float:
+        self.require_candidate_type_support(features.candidate_type)
         raw_values = features.model_values()
         linear = self.intercept
         for index, feature_name in enumerate(self.feature_names):
@@ -271,6 +286,7 @@ class LogisticSegmentPerformanceModel:
         *,
         sample_size: int,
     ) -> SegmentPerformancePrediction:
+        self.require_candidate_type_support(features.candidate_type)
         raw_values = features.model_values()
         raw_linear = self.intercept
         guarded_linear = self.intercept
@@ -358,6 +374,25 @@ class LogisticSegmentPerformanceModel:
             **dict(self.training_metadata),
         }
 
+    def candidate_type_training_example_count(self, candidate_type: str) -> int:
+        counts = self.training_metadata.get(
+            "training_candidate_type_example_counts"
+        )
+        if not isinstance(counts, Mapping):
+            return 0
+        return _nonnegative_int(counts.get(candidate_type))
+
+    def supports_candidate_type(self, candidate_type: str) -> bool:
+        return self.candidate_type_training_example_count(candidate_type) > 0
+
+    def require_candidate_type_support(self, candidate_type: str) -> None:
+        if self.supports_candidate_type(candidate_type):
+            return
+        raise UnsupportedCandidateTypeError(
+            "calibration model has no training examples for candidate type: "
+            f"{candidate_type}"
+        )
+
     def to_json(self) -> dict[str, Any]:
         return {
             "version": self.version,
@@ -428,6 +463,43 @@ class ContextualBookingHeuristicPredictor:
         }
 
 
+def candidate_type_prediction_support(
+    predictor: SegmentPerformancePredictor,
+    *,
+    goal_metric: str,
+    candidate_type: str,
+) -> CandidateTypePredictionSupport:
+    if goal_metric != "booking_conversion_rate":
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=None,
+        )
+    if not isinstance(predictor, LogisticSegmentPerformanceModel):
+        if candidate_type == "promotion_responsive":
+            return CandidateTypePredictionSupport(
+                supported=False,
+                training_example_count=None,
+                reason="booking_outcome_training_support_unavailable",
+            )
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=None,
+        )
+    training_example_count = predictor.candidate_type_training_example_count(
+        candidate_type
+    )
+    if training_example_count > 0:
+        return CandidateTypePredictionSupport(
+            supported=True,
+            training_example_count=training_example_count,
+        )
+    return CandidateTypePredictionSupport(
+        supported=False,
+        training_example_count=training_example_count,
+        reason="candidate_type_not_observed_in_model_training",
+    )
+
+
 def predict_segment_performance(
     predictor: SegmentPerformancePredictor,
     features: SegmentPerformanceFeatures,
@@ -475,6 +547,23 @@ def fit_logistic_segment_performance_model(
         raise ValueError("at least two calibration examples are required")
     if iterations <= 0 or learning_rate <= 0 or l2_penalty < 0:
         raise ValueError("invalid calibration optimizer settings")
+
+    candidate_type_example_counts = {
+        candidate_type: 0 for candidate_type in MODEL_CANDIDATE_TYPES
+    }
+    candidate_type_user_observation_counts = {
+        candidate_type: 0 for candidate_type in MODEL_CANDIDATE_TYPES
+    }
+    for example in valid:
+        candidate_type = example.features.candidate_type
+        if candidate_type not in candidate_type_example_counts:
+            raise ValueError(
+                f"unsupported calibration candidate type: {candidate_type!r}"
+            )
+        candidate_type_example_counts[candidate_type] += 1
+        candidate_type_user_observation_counts[candidate_type] += (
+            example.sample_size
+        )
 
     rows = [example.features.model_values() for example in valid]
     sample_weights = [math.sqrt(example.sample_size) for example in valid]
@@ -543,13 +632,27 @@ def fit_logistic_segment_performance_model(
             coefficients[index] -= step * regularized_gradient
 
     metadata = {
+        **dict(training_metadata or {}),
         "training_example_count": len(valid),
         "training_candidate_user_observation_count": total_sample,
         "training_contextual_booking_observation_count": total_success,
         "training_contextual_booking_observation_rate": _clamp01(
             total_success / max(total_sample, 1)
         ),
-        **dict(training_metadata or {}),
+        "candidate_type_support_contract_version": (
+            CANDIDATE_TYPE_SUPPORT_CONTRACT_VERSION
+        ),
+        "training_candidate_type_example_counts": (
+            candidate_type_example_counts
+        ),
+        "training_candidate_type_user_observation_counts": (
+            candidate_type_user_observation_counts
+        ),
+        "supported_candidate_types": [
+            candidate_type
+            for candidate_type, count in candidate_type_example_counts.items()
+            if count > 0
+        ],
         "optimizer": {
             "iterations": iterations,
             "learning_rate": learning_rate,
@@ -622,3 +725,11 @@ def _optional_rate(value: object) -> float | None:
     if not math.isfinite(parsed) or not 0.0 <= parsed <= 1.0:
         return None
     return parsed
+
+
+def _nonnegative_int(value: object) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return max(parsed, 0)

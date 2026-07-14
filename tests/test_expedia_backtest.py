@@ -286,6 +286,22 @@ def test_temporal_holdout_trains_on_2013_and_predicts_2014() -> None:
     assert temporal_run.calibration_model.training_metadata[
         "training_example_count"
     ] > len(temporal_run.training_run.results)
+    candidate_type_counts = temporal_run.calibration_model.training_metadata[
+        "training_candidate_type_example_counts"
+    ]
+    assert sum(candidate_type_counts.values()) == (
+        temporal_run.calibration_model.training_metadata[
+            "training_example_count"
+        ]
+    )
+    supported_candidate_types = {
+        candidate_type
+        for candidate_type, count in candidate_type_counts.items()
+        if count > 0
+    }
+    assert {
+        result.candidate_type for result in temporal_run.holdout_run.results
+    } <= supported_candidate_types
     assert all(
         result.cutoff.year == 2013
         for result in temporal_run.training_run.results
