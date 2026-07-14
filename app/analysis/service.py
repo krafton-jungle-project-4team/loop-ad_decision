@@ -1499,6 +1499,12 @@ def _ai_score_details(segment: SegmentDefinitionRecord) -> dict[str, Any]:
         "sample_size_score",
         "candidate_type",
         "rank_role",
+        "recommendation_tier",
+        "recommendation_tier_label",
+        "recommendation_tier_reason",
+        "recommendation_rank",
+        "rank_eligible",
+        "minimum_primary_sample_size",
         "performance_estimate",
     ):
         value = segment.profile_json.get(key)
