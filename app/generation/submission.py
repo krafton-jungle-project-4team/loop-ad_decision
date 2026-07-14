@@ -266,6 +266,7 @@ def build_generation_input_snapshot(
         "operator_instruction": request.operator_instruction,
         "channel": promotion.channel.value,
         "promotion": _promotion_snapshot(promotion),
+        "target_segment_ids": [target.segment_id for target in targets],
         "target_segments": [_target_segment_snapshot(item) for item in targets],
         "placement": _placement_snapshot(promotion.channel),
         "offer": {
