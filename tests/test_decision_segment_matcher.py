@@ -69,8 +69,8 @@ def test_segment_candidate_reranker_falls_back_below_threshold() -> None:
     assert result.similarity_score == pytest.approx(0.0)
 
 
-def test_segment_candidate_reranker_assigns_zero_score_with_zero_threshold() -> None:
-    reranker = SegmentCandidateReranker(threshold=0.0)
+def test_segment_candidate_reranker_assigns_zero_score_with_default_threshold() -> None:
+    reranker = SegmentCandidateReranker()
     user_vector = reranker.normalize_user_vector(
         UserVector("user_001", 64, unit_vector(0))
     )
@@ -88,7 +88,7 @@ def test_segment_candidate_reranker_assigns_zero_score_with_zero_threshold() -> 
 
 
 def test_segment_candidate_reranker_falls_back_for_negative_score() -> None:
-    reranker = SegmentCandidateReranker(threshold=0.0)
+    reranker = SegmentCandidateReranker()
     user_vector = reranker.normalize_user_vector(
         UserVector("user_001", 64, unit_vector(0))
     )

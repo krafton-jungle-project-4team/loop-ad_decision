@@ -11,7 +11,6 @@ from app.decision.assignment_service import (
     SegmentAssignmentValidationError,
 )
 from app.decision.matcher import (
-    FALLBACK_REASON_BELOW_THRESHOLD,
     FALLBACK_REASON_INVALID_USER_VECTOR,
     FALLBACK_REASON_NO_CANDIDATE,
     SegmentCandidateReranker,
@@ -50,7 +49,7 @@ def user_vector_records(count: int) -> list[UserBehaviorVectorRecord]:
     ]
 
 
-def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> None:
+def test_assignment_service_assigns_non_negative_scores_to_target() -> None:
     service, repos = make_service(
         user_vectors=[
             user_vector_record("user_family", vector(0)),
@@ -68,22 +67,21 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
     assert response.processed_user_count == 2
     assert response.insert_conflict_count == 0
     assert response.segment_assignment_counts == {
-        "seg_existing_all": 1,
-        "seg_family_trip": 1,
+        "seg_family_trip": 2,
     }
     assert response.matching_mode == "pgvector_hnsw_rerank"
     assert response.ann_candidate_limit == 50
     assert response.ann_candidate_count == 2
     assert response.exact_reranked_pair_count == 2
-    assert response.batch_has_fallback is True
-    assert response.fallback_count == 1
-    assert response.fallback_rate == 0.5
+    assert response.batch_has_fallback is False
+    assert response.fallback_count == 0
+    assert response.fallback_rate == 0.0
     assert response.fallback_reason_counts == {
-        "below_threshold": 1,
+        "below_threshold": 0,
         "no_candidate": 0,
         "invalid_user_vector": 0,
     }
-    assert response.below_threshold_fallback_count == 1
+    assert response.below_threshold_fallback_count == 0
     assert response.no_candidate_fallback_count == 0
     assert response.invalid_user_vector_fallback_count == 0
     assert response.ann_underfilled_user_count == 0
@@ -106,20 +104,20 @@ def test_assignment_service_builds_ann_reranked_and_fallback_assignments() -> No
         assignment.user_id: assignment for assignment in repos.assignments.inserted
     }
     regular = assignments_by_user["user_family"]
-    fallback = assignments_by_user["user_fallback"]
+    zero_score = assignments_by_user["user_fallback"]
     assert regular.segment_id == "seg_family_trip"
     assert regular.ad_experiment_id == "adexp_seg_family_trip"
     assert regular.content_id == "content_seg_family_trip"
     assert regular.content_option_id == "option_seg_family_trip"
     assert regular.assignment_source == AssignmentSource.DECISION_BATCH.value
     assert regular.fallback is False
-    assert fallback.segment_id == "seg_existing_all"
-    assert fallback.ad_experiment_id == "adexp_seg_existing_all"
-    assert fallback.content_id == "content_seg_existing_all"
-    assert fallback.content_option_id == "option_seg_existing_all"
-    assert fallback.assignment_source == AssignmentSource.FALLBACK.value
-    assert fallback.fallback is True
-    assert fallback.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
+    assert zero_score.segment_id == "seg_family_trip"
+    assert zero_score.ad_experiment_id == "adexp_seg_family_trip"
+    assert zero_score.content_id == "content_seg_family_trip"
+    assert zero_score.content_option_id == "option_seg_family_trip"
+    assert zero_score.assignment_source == AssignmentSource.DECISION_BATCH.value
+    assert zero_score.fallback is False
+    assert zero_score.fallback_reason is None
     assert repos.segment_vectors.configure_ann_search_count == 1
     assert len(repos.segment_vectors.ann_calls) == 1
 
@@ -129,6 +127,7 @@ def test_assignment_service_requires_fallback_experiment_before_writes() -> None
         experiments=[
             ad_experiment_record(segment_id="seg_family_trip"),
         ],
+        ann_candidates=[],
         user_vectors=[
             user_vector_record("user_fallback", vector(1)),
         ],

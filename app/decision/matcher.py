@@ -8,7 +8,9 @@ from typing import Any, Sequence
 
 
 VECTOR_DIM = 64
-SIMILARITY_THRESHOLD = 0.65
+# Temporary rollout policy: assign every non-negative top candidate while
+# preserving the threshold hook for later calibration with production data.
+SIMILARITY_THRESHOLD = 0.0
 FALLBACK_SEGMENT_ID = "seg_existing_all"
 ANN_CANDIDATE_LIMIT = 50
 ANN_QUERY_USER_BATCH_SIZE = 256
