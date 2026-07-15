@@ -79,6 +79,15 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "below_threshold_fallback_count": 0,
         "no_candidate_fallback_count": 0,
         "invalid_user_vector_fallback_count": 0,
+        "unassigned_count": 0,
+        "unassigned_reason_counts": {
+            "below_threshold": 0,
+            "no_candidate": 0,
+            "invalid_user_vector": 0,
+        },
+        "below_threshold_unassigned_count": 0,
+        "no_candidate_unassigned_count": 0,
+        "invalid_user_vector_unassigned_count": 0,
         "similarity_score_buckets": {
             "not_available": 0,
             "lt_0_00": 0,
@@ -317,6 +326,15 @@ class FakeAssignmentService:
             below_threshold_fallback_count=0,
             no_candidate_fallback_count=0,
             invalid_user_vector_fallback_count=0,
+            unassigned_count=0,
+            unassigned_reason_counts={
+                "below_threshold": 0,
+                "no_candidate": 0,
+                "invalid_user_vector": 0,
+            },
+            below_threshold_unassigned_count=0,
+            no_candidate_unassigned_count=0,
+            invalid_user_vector_unassigned_count=0,
             similarity_score_buckets={
                 "not_available": 0,
                 "lt_0_00": 0,

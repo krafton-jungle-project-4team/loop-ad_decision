@@ -131,6 +131,10 @@ class _BuildDiagnostics:
     fallback_reason_counts: dict[str, int] = field(
         default_factory=lambda: {reason: 0 for reason in FALLBACK_REASON_KEYS}
     )
+    unassigned_count: int = 0
+    unassigned_reason_counts: dict[str, int] = field(
+        default_factory=lambda: {reason: 0 for reason in FALLBACK_REASON_KEYS}
+    )
     similarity_score_buckets: dict[str, int] = field(
         default_factory=lambda: {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
     )
@@ -179,6 +183,18 @@ class _BuildDiagnostics:
             bucket = _similarity_score_bucket(record.similarity_score)
             self.similarity_score_buckets[bucket] += 1
 
+    def accumulate_unassigned(self, matches: Mapping[str, MatchResult]) -> None:
+        for result in matches.values():
+            if not result.fallback:
+                continue
+            self.unassigned_count += 1
+            if result.fallback_reason in self.unassigned_reason_counts:
+                self.unassigned_reason_counts[result.fallback_reason] += 1
+            bucket = _similarity_score_bucket(
+                _score_to_decimal(result.similarity_score)
+            )
+            self.similarity_score_buckets[bucket] += 1
+
     @property
     def fallback_rate(self) -> float | None:
         if self.assignment_count == 0:
@@ -198,6 +214,7 @@ class _BuildDiagnostics:
             self.skipped_existing_count
             + self.assignment_count
             + self.insert_conflict_count
+            + self.unassigned_count
         )
         if self.processed_user_count != expected_processed_count:
             raise SegmentAssignmentValidationError(
@@ -331,24 +348,28 @@ class SegmentAssignmentService:
                 log.warn("segment_matching_invalid", {"err": exc})
                 raise SegmentAssignmentValidationError(str(exc)) from exc
 
-            fallback_needed = build_result.fallback_count > 0
-            if fallback_needed and experiments.fallback is None:
-                log.warn(
-                    "fallback_ad_experiment_missing",
-                    {
-                        "pageNumber": page_number,
-                        "fallbackCount": build_result.fallback_count,
-                    },
-                )
-                raise SegmentAssignmentValidationError(
-                    "fallback ad experiment is required when fallback assignments exist"
-                )
+            assignment_matches = build_result.matches
+            if experiments.fallback is None:
+                unassigned_matches = {
+                    user_id: result
+                    for user_id, result in build_result.matches.items()
+                    if result.fallback
+                }
+                diagnostics.accumulate_unassigned(unassigned_matches)
+                assignment_matches = {
+                    user_id: result
+                    for user_id, result in build_result.matches.items()
+                    if not result.fallback
+                }
             log.info(
                 "segment_matches_created",
                 {
                     "pageNumber": page_number,
                     "matchCount": len(build_result.matches),
                     "fallbackCount": build_result.fallback_count,
+                    "unassignedCount": len(unassigned_matches)
+                    if experiments.fallback is None
+                    else 0,
                     "annCandidateCount": build_result.ann_candidate_count,
                     "exactRerankedPairCount": build_result.exact_reranked_pair_count,
                 },
@@ -357,7 +378,7 @@ class SegmentAssignmentService:
             assignments = _build_assignment_writes(
                 project_id=run.project_id,
                 promotion_run_id=run.promotion_run_id,
-                matches=build_result.matches,
+                matches=assignment_matches,
                 experiments=experiments,
                 assigned_at=assigned_at,
                 expires_in_days=request.expires_in_days,
@@ -412,6 +433,21 @@ class SegmentAssignmentService:
             ],
             invalid_user_vector_fallback_count=(
                 diagnostics.fallback_reason_counts[
+                    FALLBACK_REASON_INVALID_USER_VECTOR
+                ]
+            ),
+            unassigned_count=diagnostics.unassigned_count,
+            unassigned_reason_counts=diagnostics.unassigned_reason_counts,
+            below_threshold_unassigned_count=(
+                diagnostics.unassigned_reason_counts[
+                    FALLBACK_REASON_BELOW_THRESHOLD
+                ]
+            ),
+            no_candidate_unassigned_count=diagnostics.unassigned_reason_counts[
+                FALLBACK_REASON_NO_CANDIDATE
+            ],
+            invalid_user_vector_unassigned_count=(
+                diagnostics.unassigned_reason_counts[
                     FALLBACK_REASON_INVALID_USER_VECTOR
                 ]
             ),

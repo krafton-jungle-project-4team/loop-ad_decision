@@ -12,6 +12,7 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
 )
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import (
     AdExperimentRecord,
     PromotionEvaluationWrite,
@@ -108,6 +109,50 @@ def test_promotion_run_evaluation_reevaluates_every_experiment_without_latest_re
     assert repos.evaluations.latest_calls == []
     assert response.status == PromotionRunStatus.GOAL_MET
     assert repos.evaluations.inserted[0].status == PromotionRunStatus.GOAL_MET.value
+
+
+def test_promotion_run_evaluation_ignores_legacy_fallback_experiment() -> None:
+    fallback_experiment_id = "adexp_existing_all_001"
+    repos = FakeRunEvaluationRepos(
+        experiments=[
+            *default_experiments(),
+            ad_experiment_record(
+                ad_experiment_id=fallback_experiment_id,
+                segment_id=FALLBACK_SEGMENT_ID,
+            ),
+        ],
+        evaluations=[
+            evaluation_record(
+                ad_experiment_id="adexp_family_trip_001",
+                segment_id="seg_family_trip",
+                status=PromotionEvaluationStatus.GOAL_MET.value,
+            ),
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.GOAL_MET.value,
+            ),
+            evaluation_record(
+                ad_experiment_id=fallback_experiment_id,
+                segment_id=FALLBACK_SEGMENT_ID,
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+            ),
+        ],
+    )
+    service = make_service(repos)
+
+    response = service.evaluate(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=PromotionRunEvaluateRequest(),
+    )
+
+    assert repos.ad_evaluation_service.calls == [
+        "adexp_family_trip_001",
+        "adexp_luxury_001",
+    ]
+    assert response.status == PromotionRunStatus.GOAL_MET
+    assert response.failed_segment_ids == []
+    assert response.failed_ad_experiment_ids == []
 
 
 def test_promotion_run_failed_arrays_use_current_individual_results_only() -> None:

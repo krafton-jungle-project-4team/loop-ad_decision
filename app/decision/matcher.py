@@ -8,7 +8,10 @@ from typing import Any, Sequence
 
 
 VECTOR_DIM = 64
-SIMILARITY_THRESHOLD = 0.65
+# Dev score distribution on 2026-07-15 retained 628 of 10,000 eligible users
+# at this boundary. Scores below it remain observable but are not assigned in
+# new runs that do not have a fallback ad experiment.
+SIMILARITY_THRESHOLD = 0.5
 FALLBACK_SEGMENT_ID = "seg_existing_all"
 ANN_CANDIDATE_LIMIT = 50
 ANN_QUERY_USER_BATCH_SIZE = 256
