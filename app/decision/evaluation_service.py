@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping
 
+from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
@@ -327,7 +328,13 @@ class PromotionRunEvaluationService:
         )
         log.info("promotion_run_loaded", {"promotionRun": run})
 
-        experiments = self._ad_experiment_repository.list_by_run(promotion_run_id)
+        experiments = [
+            experiment
+            for experiment in self._ad_experiment_repository.list_by_run(
+                promotion_run_id
+            )
+            if experiment.segment_id != FALLBACK_SEGMENT_ID
+        ]
         if not experiments:
             log.warn("ad_experiments_empty", {"promotionRunId": promotion_run_id})
             raise PromotionRunEvaluationValidationError(

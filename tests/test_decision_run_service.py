@@ -222,11 +222,7 @@ def test_run_service_rejects_corrupted_existing_scope() -> None:
     service, repos = make_service()
     request = RunCreateRequest()
     service.create_run(promotion_id="promo_banner_001", request=request)
-    repos.ad_experiments.records = [
-        experiment
-        for experiment in repos.ad_experiments.records
-        if experiment.segment_id != FALLBACK_SEGMENT_ID
-    ]
+    repos.ad_experiments.records = []
 
     with pytest.raises(RunConflictError, match="do not match its segment scope"):
         service.create_run(promotion_id="promo_banner_001", request=request)
@@ -325,7 +321,7 @@ def test_run_service_rejects_content_candidate_context_mismatch() -> None:
     assert repos.ad_experiments.inserted_batches == []
 
 
-def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
+def test_run_service_creates_only_target_ad_experiments() -> None:
     target_segments = [
         target_segment_record(
             segment_id="seg_family_trip",
@@ -370,7 +366,6 @@ def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
     assert [experiment.segment_id for experiment in experiments] == [
         "seg_family_trip",
         "seg_mobile_user",
-        FALLBACK_SEGMENT_ID,
     ]
     assert all(experiment.loop_count == run.loop_count for experiment in experiments)
     assert all(
@@ -379,19 +374,15 @@ def test_run_service_creates_run_and_fallback_ad_experiment() -> None:
     )
     assert experiments[0].content_id == "content_family_001"
     assert experiments[1].content_option_id == "mobile_option_a"
-    assert experiments[2].content_id == "content_family_001"
-    assert experiments[2].content_option_id == "family_option_a"
     assert response.promotion_run_id == run.promotion_run_id
     assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
     assert [item.segment_id for item in response.ad_experiments] == [
         "seg_family_trip",
         "seg_mobile_user",
-        FALLBACK_SEGMENT_ID,
     ]
     assert [item.is_fallback for item in response.ad_experiments] == [
         False,
         False,
-        True,
     ]
 
 
@@ -440,7 +431,6 @@ def test_run_service_creates_experiments_only_for_requested_approved_segments() 
     ]
     assert [experiment.segment_id for experiment in response.ad_experiments] == [
         "seg_mobile_user",
-        FALLBACK_SEGMENT_ID,
     ]
 
 
@@ -507,7 +497,6 @@ def test_run_service_omitted_segment_ids_uses_generation_snapshot_scope() -> Non
     ]
     assert [experiment.segment_id for experiment in response.ad_experiments] == [
         "seg_family_trip",
-        FALLBACK_SEGMENT_ID,
     ]
 
 
@@ -536,7 +525,6 @@ def test_run_service_explicit_scope_uses_legacy_target_segments_snapshot() -> No
     ]
     assert [experiment.segment_id for experiment in response.ad_experiments] == [
         "seg_mobile_user",
-        FALLBACK_SEGMENT_ID,
     ]
 
 
@@ -618,7 +606,6 @@ def test_run_service_excludes_fallback_from_snapshot_scope_and_fingerprint() -> 
     )
     assert [item.segment_id for item in response.ad_experiments] == [
         "seg_family_trip",
-        FALLBACK_SEGMENT_ID,
     ]
 
 
@@ -638,7 +625,7 @@ def test_run_service_omitted_segment_ids_requires_snapshot_segments_to_be_approv
     assert repos.ad_experiments.inserted_batches == []
 
 
-def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
+def test_run_service_ignores_dedicated_fallback_content() -> None:
     service, repos = make_service(
         target_segments=[
             target_segment_record(
@@ -668,10 +655,9 @@ def test_run_service_uses_dedicated_fallback_content_when_available() -> None:
     experiments = repos.ad_experiments.inserted_batches[0]
     assert [experiment.segment_id for experiment in experiments] == [
         "seg_family_trip",
-        FALLBACK_SEGMENT_ID,
     ]
-    assert experiments[1].content_id == "content_existing_all_001"
-    assert experiments[1].content_option_id == "existing_all_option_a"
+    assert experiments[0].content_id == "content_family_001"
+    assert experiments[0].content_option_id == "family_option_a"
 
 
 def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> None:
@@ -719,10 +705,8 @@ def test_run_service_creates_next_loop_run_from_approved_focus_candidate() -> No
     experiments = repos.ad_experiments.inserted_batches[0]
     assert [experiment.segment_id for experiment in experiments] == [
         "seg_luxury",
-        FALLBACK_SEGMENT_ID,
     ]
     assert experiments[0].content_id == "content_luxury_approved_001"
-    assert experiments[1].content_id == "content_luxury_approved_001"
 
 
 def source_promotion_run_record() -> PromotionRunRecord:
@@ -1002,7 +986,7 @@ def test_preparation_activation_persists_segment_lineage_and_nullable_fallback()
     assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
     assert [
         experiment.is_fallback for experiment in response.ad_experiments
-    ] == [False, False, True]
+    ] == [False, False]
     experiments = repos.ad_experiments.inserted_batches[0]
     lineage = {
         experiment.segment_id: (
@@ -1014,7 +998,6 @@ def test_preparation_activation_persists_segment_lineage_and_nullable_fallback()
     assert lineage == {
         "seg_family_trip": ("adexp_source_family", "eval_source_family"),
         "seg_mobile_user": ("adexp_source_mobile", "eval_source_mobile"),
-        FALLBACK_SEGMENT_ID: (None, None),
     }
     assert repos.preparations.activated_calls == [
         ("prep_loop_2", response.promotion_run_id)
@@ -1327,7 +1310,8 @@ def test_preparation_activation_recovers_complete_unlinked_canonical_run() -> No
 
 def test_preparation_activation_rejects_incomplete_unlinked_canonical_run() -> None:
     canonical_run = canonical_promotion_run_record()
-    incomplete_experiments = canonical_ad_experiments(canonical_run)[:-1]
+    canonical_experiments = canonical_ad_experiments(canonical_run)
+    incomplete_experiments = [canonical_experiments[0], canonical_experiments[2]]
     service, repos = make_preparation_activation_service(
         canonical_run=canonical_run,
         canonical_experiments=incomplete_experiments,
