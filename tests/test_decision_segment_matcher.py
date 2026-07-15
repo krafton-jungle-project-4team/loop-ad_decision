@@ -52,7 +52,7 @@ def test_segment_candidate_reranker_selects_best_exact_score() -> None:
 
 
 def test_segment_candidate_reranker_falls_back_below_threshold() -> None:
-    reranker = SegmentCandidateReranker()
+    reranker = SegmentCandidateReranker(threshold=0.65)
     user_vector = reranker.normalize_user_vector(
         UserVector("user_001", 64, unit_vector(0))
     )
@@ -67,6 +67,42 @@ def test_segment_candidate_reranker_falls_back_below_threshold() -> None:
     assert result.fallback is True
     assert result.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
     assert result.similarity_score == pytest.approx(0.0)
+
+
+def test_segment_candidate_reranker_assigns_zero_score_with_zero_threshold() -> None:
+    reranker = SegmentCandidateReranker(threshold=0.0)
+    user_vector = reranker.normalize_user_vector(
+        UserVector("user_001", 64, unit_vector(0))
+    )
+    assert user_vector is not None
+
+    result = reranker.rerank(
+        normalized_user_vector=user_vector,
+        candidates=[segment_vector("seg_mobile_user", unit_vector(1))],
+    )
+
+    assert result.segment_id == "seg_mobile_user"
+    assert result.fallback is False
+    assert result.fallback_reason is None
+    assert result.similarity_score == pytest.approx(0.0)
+
+
+def test_segment_candidate_reranker_falls_back_for_negative_score() -> None:
+    reranker = SegmentCandidateReranker(threshold=0.0)
+    user_vector = reranker.normalize_user_vector(
+        UserVector("user_001", 64, unit_vector(0))
+    )
+    assert user_vector is not None
+
+    result = reranker.rerank(
+        normalized_user_vector=user_vector,
+        candidates=[segment_vector("seg_mobile_user", unit_vector(0, -1.0))],
+    )
+
+    assert result.segment_id == FALLBACK_SEGMENT_ID
+    assert result.fallback is True
+    assert result.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
+    assert result.similarity_score == pytest.approx(-1.0)
 
 
 def test_segment_candidate_reranker_falls_back_for_no_candidates() -> None:
