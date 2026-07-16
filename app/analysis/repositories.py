@@ -151,6 +151,7 @@ class PromotionTargetSegmentWrite:
     estimated_size: int
     priority: str | None
     status: str
+    audience_snapshot_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +168,15 @@ class PromotionSegmentSuggestionWrite:
     score_json: Mapping[str, Any]
     reason_json: Mapping[str, Any]
     metadata_json: Mapping[str, Any]
+    audience_snapshot_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SegmentSuggestionAudienceBindingRecord:
+    suggestion_id: str
+    analysis_id: str
+    segment_id: str
+    audience_snapshot_id: str | None
 
 
 @dataclass(frozen=True)
@@ -223,6 +233,18 @@ class RawEventUserSignalRecord:
     preferred_category_values: tuple[str, ...]
     destination_match_count: int
     season_match_count: int
+    page_view_count: int = 0
+    hotel_search_recency_days: int | None = None
+    hotel_detail_recency_days: int | None = None
+    booking_start_recency_days: int | None = None
+    deal_recency_days: int | None = None
+    promotion_response_recency_days: int | None = None
+    lead_time_0_7_count: int = 0
+    lead_time_8_30_count: int = 0
+    lead_time_gt_30_count: int = 0
+    weekend_checkin_count: int = 0
+    budget_price_count: int = 0
+    premium_price_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -426,6 +448,48 @@ class PromotionAnalysisRepository:
             ),
         )
 
+    def get_latest_audience_bindings(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[SegmentSuggestionAudienceBindingRecord]:
+        if not segment_ids:
+            return []
+        rows = self._db.fetchall(
+            """
+            WITH ranked AS (
+                SELECT
+                    suggestion_id,
+                    analysis_id,
+                    segment_id,
+                    audience_snapshot_id,
+                    row_number() OVER (
+                        PARTITION BY segment_id
+                        ORDER BY created_at DESC, suggestion_id DESC
+                    ) AS row_rank
+                FROM promotion_segment_suggestions
+                WHERE project_id = %s
+                  AND campaign_id = %s
+                  AND promotion_id = %s
+                  AND segment_id = ANY(%s)
+                  AND status = 'suggested'
+            )
+            SELECT
+                suggestion_id,
+                analysis_id,
+                segment_id,
+                audience_snapshot_id
+            FROM ranked
+            WHERE row_rank = 1
+            ORDER BY segment_id ASC
+            """,
+            (project_id, campaign_id, promotion_id, list(segment_ids)),
+        )
+        return [SegmentSuggestionAudienceBindingRecord(**row) for row in rows]
+
     def save_segment_suggestions(
         self,
         suggestions: Sequence[PromotionSegmentSuggestionWrite],
@@ -445,9 +509,10 @@ class PromotionAnalysisRepository:
                     status,
                     score_json,
                     reason_json,
-                    metadata_json
+                    metadata_json,
+                    audience_snapshot_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     suggestion.suggestion_id,
@@ -462,6 +527,7 @@ class PromotionAnalysisRepository:
                     suggestion.score_json,
                     suggestion.reason_json,
                     suggestion.metadata_json,
+                    suggestion.audience_snapshot_id,
                 ),
             )
 
@@ -486,9 +552,10 @@ class PromotionAnalysisRepository:
                     segment_vector_id,
                     estimated_size,
                     priority,
-                    status
+                    status,
+                    audience_snapshot_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     segment.analysis_id,
@@ -505,6 +572,7 @@ class PromotionAnalysisRepository:
                     segment.estimated_size,
                     segment.priority,
                     segment.status,
+                    segment.audience_snapshot_id,
                 ),
             )
 

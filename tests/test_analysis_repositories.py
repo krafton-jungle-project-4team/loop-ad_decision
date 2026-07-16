@@ -373,6 +373,7 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
             "segment_name": "Repeat hotel viewers without booking",
             "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
         },
+        None,
     )
 
 
