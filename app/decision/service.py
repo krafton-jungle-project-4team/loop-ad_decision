@@ -4,8 +4,19 @@ import hashlib
 import json
 import re
 from collections import defaultdict
-from decimal import Decimal
-from typing import Mapping, Sequence
+from decimal import Decimal, InvalidOperation
+from typing import Any, Mapping, Sequence
+
+from app.audience_contract import (
+    LEGACY_AUDIENCE_CONTRACT,
+    SEGMENT_AUDIENCE_CONTRACT,
+    SegmentAudienceContractError,
+    SegmentDefinitionAudienceAdapter,
+)
+from app.analysis.semantic_selection import (
+    compile_registered_segment_audience,
+    semantic_query_vector_hash,
+)
 
 from app.decision.repositories import (
     AdExperimentRecord,
@@ -60,6 +71,21 @@ class RunSegmentScopeValidationError(RunValidationError):
 
 class RunConflictError(Exception):
     pass
+
+
+class RunAudienceContractError(RunConflictError):
+    def __init__(self, *, code: str, segment_id: str, reason: str) -> None:
+        self.code = code
+        self.segment_id = segment_id
+        self.reason = reason
+        super().__init__(reason)
+
+    def to_detail(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "segment_id": self.segment_id,
+            "reason": self.reason,
+        }
 
 
 class PromotionRunService:
@@ -159,6 +185,7 @@ class PromotionRunService:
             promotion,
             segment_ids=effective_segment_ids,
         )
+        _require_uniform_target_audience_contract(target_segments)
         segment_ids = tuple(
             sorted({target_segment.segment_id for target_segment in target_segments})
         )
@@ -1308,8 +1335,8 @@ def _build_goal_snapshot(
     analysis: PromotionAnalysisRecord,
     generation: GenerationRunRecord,
     loop_count: int,
-) -> dict[str, str | int]:
-    return {
+) -> dict[str, Any]:
+    snapshot: dict[str, Any] = {
         "source": "promotions",
         "promotion_id": promotion.promotion_id,
         "channel": promotion.channel,
@@ -1322,6 +1349,173 @@ def _build_goal_snapshot(
         "generation_id": generation.generation_id,
         "loop_count": loop_count,
     }
+    return snapshot
+
+
+def _require_uniform_target_audience_contract(
+    target_segments: Sequence[PromotionTargetSegmentRecord],
+) -> str:
+    adapter = SegmentDefinitionAudienceAdapter()
+    contracts: list[str] = []
+    for target in target_segments:
+        try:
+            resolution = adapter.resolve(
+                segment_id=target.segment_id,
+                rule_json=target.rule_json,
+            )
+        except SegmentAudienceContractError as exc:
+            raise RunAudienceContractError(
+                code=exc.code,
+                segment_id=exc.segment_id,
+                reason=exc.reason,
+            ) from exc
+        contract = (
+            SEGMENT_AUDIENCE_CONTRACT
+            if resolution.is_v2
+            else LEGACY_AUDIENCE_CONTRACT
+        )
+        if contract == SEGMENT_AUDIENCE_CONTRACT:
+            if target.audience_snapshot_id is None:
+                raise RunAudienceContractError(
+                    code="segment_audience_snapshot_binding_missing",
+                    segment_id=target.segment_id,
+                    reason="segment_audience.v1 target requires audience_snapshot_id",
+                )
+            if (
+                target.audience_snapshot_status != "completed"
+                or target.audience_generation_status
+                not in {"activated", "superseded"}
+                or target.audience_identity_matches is not True
+                or target.audience_final_user_count is None
+                or target.audience_actual_member_count is None
+                or target.audience_final_user_count
+                != target.audience_actual_member_count
+            ):
+                raise RunAudienceContractError(
+                    code="segment_audience_snapshot_invalid",
+                    segment_id=target.segment_id,
+                    reason=(
+                        "snapshot identity, generation, status, or member count "
+                        "does not match the target segment"
+                    ),
+                )
+            try:
+                compiled = compile_registered_segment_audience(
+                    segment_id=target.segment_id,
+                    rule_json=target.rule_json,
+                )
+            except SegmentAudienceContractError as exc:
+                raise RunAudienceContractError(
+                    code=exc.code,
+                    segment_id=exc.segment_id,
+                    reason=exc.reason,
+                ) from exc
+            if not _target_snapshot_matches_compiled(target, compiled=compiled):
+                raise RunAudienceContractError(
+                    code="segment_audience_snapshot_semantic_mismatch",
+                    segment_id=target.segment_id,
+                    reason=(
+                        "target template, query, predicate, threshold, or semantic "
+                        "artifact does not match the immutable snapshot"
+                    ),
+                )
+            if (
+                target.audience_final_user_count <= 0
+                or target.audience_status == "no_eligible_audience"
+            ):
+                raise RunAudienceContractError(
+                    code="segment_audience_not_targetable",
+                    segment_id=target.segment_id,
+                    reason="no_eligible_audience snapshot cannot start an experiment",
+                )
+        elif target.audience_snapshot_id is not None:
+            raise RunAudienceContractError(
+                code="legacy_audience_snapshot_mismatch",
+                segment_id=target.segment_id,
+                reason="legacy target must not bind an audience snapshot",
+            )
+        contracts.append(contract)
+    if len(set(contracts)) != 1:
+        raise RunAudienceContractError(
+            code="mixed_audience_resolution_contracts",
+            segment_id=",".join(target.segment_id for target in target_segments),
+            reason="legacy and segment_audience.v1 targets cannot be mixed in one run",
+        )
+    return contracts[0]
+
+
+def _target_snapshot_matches_compiled(
+    target: PromotionTargetSegmentRecord,
+    *,
+    compiled: Any,
+) -> bool:
+    metadata = target.audience_metadata_json
+    if not isinstance(metadata, Mapping):
+        return False
+    expected_predicate_parameters = {
+        key: list(value)
+        for key, value in compiled.predicate_parameters.items()
+    }
+    expected = (
+        compiled.schema_version,
+        compiled.vector_version,
+        compiled.manifest_hash,
+        compiled.calibration_version,
+        compiled.calibration_hash,
+        compiled.audience_resolution_contract,
+        compiled.segment_audience_spec_hash,
+        semantic_query_vector_hash(compiled),
+        compiled.query_compiler_version,
+        compiled.query_compiler_hash,
+        Decimal(str(compiled.score_threshold)),
+        compiled.template_id,
+        compiled.template_version,
+        compiled.template_semantic_hash,
+        list(compiled.hard_predicate_keys),
+        expected_predicate_parameters,
+        compiled.semantic_selection_policy_id,
+        compiled.semantic_anchor_policy_id,
+        compiled.semantic_anchor_hash,
+        Decimal(str(compiled.semantic_margin)),
+        compiled.semantic_selection_status,
+        compiled.business_lift_status,
+        compiled.user_vectorizer_version,
+        compiled.user_vectorizer_semantic_hash,
+    )
+    actual = (
+        target.audience_schema_version,
+        target.audience_vector_version,
+        target.audience_manifest_hash,
+        target.audience_calibration_version,
+        target.audience_calibration_hash,
+        target.audience_resolution_contract,
+        target.audience_segment_spec_hash,
+        target.audience_query_vector_hash,
+        target.audience_query_compiler_version,
+        target.audience_query_compiler_hash,
+        target.audience_score_threshold,
+        metadata.get("template_id"),
+        metadata.get("template_version"),
+        metadata.get("template_semantic_hash"),
+        metadata.get("hard_predicate_keys"),
+        metadata.get("predicate_parameters"),
+        metadata.get("semantic_selection_policy_id"),
+        metadata.get("semantic_anchor_policy_id"),
+        metadata.get("semantic_anchor_hash"),
+        _optional_decimal(metadata.get("semantic_margin")),
+        metadata.get("semantic_selection_status"),
+        metadata.get("business_lift_status"),
+        metadata.get("user_vectorizer_version"),
+        metadata.get("user_vectorizer_semantic_hash"),
+    )
+    return actual == expected
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    try:
+        return Decimal(str(value)) if value is not None else None
+    except (InvalidOperation, ValueError):
+        return None
 
 
 def _decimal_to_snapshot_string(value: Decimal) -> str:

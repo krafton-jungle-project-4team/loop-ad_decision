@@ -21,6 +21,7 @@ from app.decision.schemas import (
 )
 from app.decision.service import (
     PromotionNotFoundError,
+    RunAudienceContractError,
     PromotionRunService,
     RunConflictError,
     RunValidationError,
@@ -190,6 +191,30 @@ def test_run_api_maps_service_errors() -> None:
         )
 
         assert response.status_code == expected_status
+
+
+def test_run_api_returns_structured_audience_contract_conflict() -> None:
+    client = make_client(
+        FakeRunService(
+            exc=RunAudienceContractError(
+                code="segment_audience_snapshot_semantic_mismatch",
+                segment_id="seg_v2",
+                reason="target binding differs from immutable snapshot",
+            )
+        )
+    )
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/runs",
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "segment_audience_snapshot_semantic_mismatch",
+        "segment_id": "seg_v2",
+        "reason": "target binding differs from immutable snapshot",
+    }
 
 
 def test_run_api_wires_repositories_and_commits(monkeypatch) -> None:

@@ -165,6 +165,25 @@ class PromotionTargetSegmentRecord:
     estimated_size: int
     priority: str | None
     status: str
+    audience_snapshot_id: str | None = None
+    audience_snapshot_status: str | None = None
+    audience_status: str | None = None
+    audience_final_user_count: int | None = None
+    audience_actual_member_count: int | None = None
+    audience_generation_status: str | None = None
+    audience_identity_matches: bool | None = None
+    audience_schema_version: str | None = None
+    audience_vector_version: str | None = None
+    audience_manifest_hash: str | None = None
+    audience_calibration_version: str | None = None
+    audience_calibration_hash: str | None = None
+    audience_resolution_contract: str | None = None
+    audience_segment_spec_hash: str | None = None
+    audience_query_vector_hash: str | None = None
+    audience_query_compiler_version: str | None = None
+    audience_query_compiler_hash: str | None = None
+    audience_score_threshold: Decimal | None = None
+    audience_metadata_json: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -797,23 +816,55 @@ class PromotionTargetSegmentRepository:
         rows = self._db.fetchall(
             """
             SELECT
-                analysis_id,
-                project_id,
-                campaign_id,
-                promotion_id,
-                segment_id,
-                segment_name,
-                segment_vector_id,
-                rule_json,
-                profile_json,
-                content_brief_json,
-                data_evidence_json,
-                estimated_size,
-                priority,
-                status
-            FROM promotion_target_segments
-            WHERE analysis_id = %s
-            ORDER BY id ASC
+                target.analysis_id,
+                target.project_id,
+                target.campaign_id,
+                target.promotion_id,
+                target.segment_id,
+                target.segment_name,
+                target.segment_vector_id,
+                target.rule_json,
+                target.profile_json,
+                target.content_brief_json,
+                target.data_evidence_json,
+                target.estimated_size,
+                target.priority,
+                target.status,
+                target.audience_snapshot_id,
+                snapshot.status AS audience_snapshot_status,
+                snapshot.audience_status,
+                snapshot.final_user_count AS audience_final_user_count,
+                snapshot.schema_version AS audience_schema_version,
+                snapshot.vector_version AS audience_vector_version,
+                snapshot.manifest_hash AS audience_manifest_hash,
+                snapshot.calibration_version AS audience_calibration_version,
+                snapshot.calibration_hash AS audience_calibration_hash,
+                snapshot.audience_resolution_contract,
+                snapshot.segment_audience_spec_hash
+                    AS audience_segment_spec_hash,
+                snapshot.query_vector_hash AS audience_query_vector_hash,
+                snapshot.query_compiler_version
+                    AS audience_query_compiler_version,
+                snapshot.query_compiler_hash AS audience_query_compiler_hash,
+                snapshot.score_threshold AS audience_score_threshold,
+                snapshot.metadata_json AS audience_metadata_json,
+                generation.status AS audience_generation_status,
+                snapshot.project_id = target.project_id
+                    AND snapshot.campaign_id = target.campaign_id
+                    AND snapshot.promotion_id = target.promotion_id
+                    AND snapshot.segment_id = target.segment_id
+                    AS audience_identity_matches,
+                (SELECT count(*)
+                 FROM segment_audience_members AS member
+                 WHERE member.snapshot_id = snapshot.snapshot_id)
+                    AS audience_actual_member_count
+            FROM promotion_target_segments AS target
+            LEFT JOIN segment_audience_snapshots AS snapshot
+              ON snapshot.snapshot_id = target.audience_snapshot_id
+            LEFT JOIN user_behavior_vector_search_generations AS generation
+              ON generation.vector_generation_id = snapshot.vector_generation_id
+            WHERE target.analysis_id = %s
+            ORDER BY target.id ASC
             """,
             (analysis_id,),
         )
@@ -827,30 +878,62 @@ class PromotionTargetSegmentRepository:
         segment_filter = ""
         params: Sequence[Any] = (analysis_id,)
         if segment_ids is not None:
-            segment_filter = "AND segment_id = ANY(%s)"
+            segment_filter = "AND target.segment_id = ANY(%s)"
             params = (analysis_id, list(segment_ids))
         rows = self._db.fetchall(
             f"""
             SELECT
-                analysis_id,
-                project_id,
-                campaign_id,
-                promotion_id,
-                segment_id,
-                segment_name,
-                segment_vector_id,
-                rule_json,
-                profile_json,
-                content_brief_json,
-                data_evidence_json,
-                estimated_size,
-                priority,
-                status
-            FROM promotion_target_segments
-            WHERE analysis_id = %s
-              AND status = 'approved'
+                target.analysis_id,
+                target.project_id,
+                target.campaign_id,
+                target.promotion_id,
+                target.segment_id,
+                target.segment_name,
+                target.segment_vector_id,
+                target.rule_json,
+                target.profile_json,
+                target.content_brief_json,
+                target.data_evidence_json,
+                target.estimated_size,
+                target.priority,
+                target.status,
+                target.audience_snapshot_id,
+                snapshot.status AS audience_snapshot_status,
+                snapshot.audience_status,
+                snapshot.final_user_count AS audience_final_user_count,
+                snapshot.schema_version AS audience_schema_version,
+                snapshot.vector_version AS audience_vector_version,
+                snapshot.manifest_hash AS audience_manifest_hash,
+                snapshot.calibration_version AS audience_calibration_version,
+                snapshot.calibration_hash AS audience_calibration_hash,
+                snapshot.audience_resolution_contract,
+                snapshot.segment_audience_spec_hash
+                    AS audience_segment_spec_hash,
+                snapshot.query_vector_hash AS audience_query_vector_hash,
+                snapshot.query_compiler_version
+                    AS audience_query_compiler_version,
+                snapshot.query_compiler_hash AS audience_query_compiler_hash,
+                snapshot.score_threshold AS audience_score_threshold,
+                snapshot.metadata_json AS audience_metadata_json,
+                generation.status AS audience_generation_status,
+                snapshot.project_id = target.project_id
+                    AND snapshot.campaign_id = target.campaign_id
+                    AND snapshot.promotion_id = target.promotion_id
+                    AND snapshot.segment_id = target.segment_id
+                    AS audience_identity_matches,
+                (SELECT count(*)
+                 FROM segment_audience_members AS member
+                 WHERE member.snapshot_id = snapshot.snapshot_id)
+                    AS audience_actual_member_count
+            FROM promotion_target_segments AS target
+            LEFT JOIN segment_audience_snapshots AS snapshot
+              ON snapshot.snapshot_id = target.audience_snapshot_id
+            LEFT JOIN user_behavior_vector_search_generations AS generation
+              ON generation.vector_generation_id = snapshot.vector_generation_id
+            WHERE target.analysis_id = %s
+              AND target.status = 'approved'
               {segment_filter}
-            ORDER BY id ASC
+            ORDER BY target.id ASC
             """,
             params,
         )

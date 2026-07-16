@@ -61,6 +61,7 @@ class PromotionEvaluationStatus(StrEnum):
 
 class AssignmentSource(StrEnum):
     DECISION_BATCH = "decision_batch"
+    ANALYSIS_SNAPSHOT = "analysis_snapshot"
     FALLBACK = "fallback"
     MANUAL = "manual"
     FIXTURE = "fixture"
@@ -135,9 +136,12 @@ class SegmentAssignmentBuildResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
     promotion_run_id: str = Field(min_length=1)
-    matching_mode: Literal["pgvector_hnsw_rerank"] = "pgvector_hnsw_rerank"
+    matching_mode: Literal[
+        "pgvector_hnsw_rerank",
+        "analysis_snapshot_reuse",
+    ] = "pgvector_hnsw_rerank"
     vector_version: str = Field(min_length=1)
-    ann_candidate_limit: int = Field(ge=1)
+    ann_candidate_limit: int = Field(ge=0)
     ann_candidate_count: int = Field(ge=0)
     exact_reranked_pair_count: int = Field(ge=0)
     page_count: int = Field(ge=0)
@@ -163,6 +167,7 @@ class SegmentAssignmentBuildResponse(BaseModel):
     ann_not_applied_reason: Literal[
         "no_users_to_match",
         "no_valid_user_vectors",
+        "analysis_snapshot_reuse",
     ] | None = None
     skipped_existing_count: int = Field(ge=0)
     insufficient_segment_count: Literal[0] = Field(
@@ -174,8 +179,12 @@ class SegmentAssignmentBuildResponse(BaseModel):
         ),
     )
     completion_scope: Literal["current_request"] = "current_request"
-    assignment_mode: Literal["live_keyset", "explicit_user_ids"]
-    input_stability: Literal["not_snapshotted"] = "not_snapshotted"
+    assignment_mode: Literal[
+        "live_keyset",
+        "explicit_user_ids",
+        "analysis_snapshot",
+    ]
+    input_stability: Literal["not_snapshotted", "snapshotted"] = "not_snapshotted"
     status: Literal["completed"] = "completed"
 
 

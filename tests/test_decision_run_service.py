@@ -6,6 +6,13 @@ from decimal import Decimal
 
 import pytest
 
+from app.analysis.semantic_selection import (
+    compile_registered_segment_audience,
+    semantic_query_vector_hash,
+)
+from app.analysis.segment_audience_templates import (
+    RegisteredSegmentAudienceBinder,
+)
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWrite,
@@ -80,6 +87,74 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
     assert repos.runs.inserted[0].segment_scope_fingerprint == (
         build_segment_scope_fingerprint(["seg_family_trip"])
     )
+
+
+def test_run_service_uses_target_contract_and_ignores_analysis_audience_mode() -> None:
+    analysis = analysis_record(
+        output_json={
+            "target_segment_count": 1,
+            "audience_mode": "analysis_snapshot_v2",
+            "vector_version": "hotel_behavior.v2",
+        }
+    )
+    service, repos = make_service(
+        latest_analysis=analysis,
+        target_segments=[
+            target_segment_record(
+                audience_snapshot_id="snapshot_family",
+                rule_json=segment_audience_rule_json(),
+            )
+        ],
+    )
+
+    service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(),
+    )
+
+    assert "audience_scope" not in repos.runs.inserted[0].goal_snapshot_json
+
+
+def test_run_service_rejects_invalid_v2_snapshot_before_writes() -> None:
+    invalid_target = replace(
+        target_segment_record(
+            audience_snapshot_id="snapshot_family",
+            rule_json=segment_audience_rule_json(),
+        ),
+        audience_actual_member_count=11,
+    )
+    service, repos = make_service(target_segments=[invalid_target])
+
+    with pytest.raises(RunConflictError, match="member count"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_run_service_rejects_zero_member_v2_snapshot_before_writes() -> None:
+    zero_target = replace(
+        target_segment_record(
+            audience_snapshot_id="snapshot_family",
+            rule_json=segment_audience_rule_json(),
+        ),
+        audience_status="no_eligible_audience",
+        audience_final_user_count=0,
+        audience_actual_member_count=0,
+    )
+    service, repos = make_service(target_segments=[zero_target])
+
+    with pytest.raises(RunConflictError, match="no_eligible_audience"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=RunCreateRequest(),
+        )
+
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
 
 
 def test_run_service_rejects_generation_for_different_analysis_without_writes() -> None:
@@ -1978,6 +2053,7 @@ def analysis_record(
     *,
     analysis_id: str = "analysis_banner_001",
     status: str = "completed",
+    output_json: dict[str, object] | None = None,
 ) -> PromotionAnalysisRecord:
     return PromotionAnalysisRecord(
         analysis_id=analysis_id,
@@ -1988,7 +2064,7 @@ def analysis_record(
         operator_instruction=None,
         input_snapshot_json={"promotion_id": "promo_banner_001"},
         profile_summary_json={"selected_segment_count": 1},
-        output_json={"target_segment_count": 1},
+        output_json=output_json or {"target_segment_count": 1},
         status=status,
     )
 
@@ -2027,7 +2103,20 @@ def target_segment_record(
     segment_id: str = "seg_family_trip",
     segment_name: str = "Family hotel trip",
     status: str = "approved",
+    audience_snapshot_id: str | None = None,
+    rule_json: dict[str, object] | None = None,
 ) -> PromotionTargetSegmentRecord:
+    resolved_rule_json = rule_json or {"segment_id": segment_id}
+    compiled = (
+        compile_registered_segment_audience(
+            segment_id=segment_id,
+            rule_json=resolved_rule_json,
+        )
+        if audience_snapshot_id is not None
+        and resolved_rule_json.get("audience_resolution_contract")
+        == "segment_audience.v1"
+        else None
+    )
     return PromotionTargetSegmentRecord(
         analysis_id=analysis_id,
         project_id="hotel-client-a",
@@ -2036,14 +2125,93 @@ def target_segment_record(
         segment_id=segment_id,
         segment_name=segment_name,
         segment_vector_id=f"segvec_{segment_id}_v1",
-        rule_json={"segment_id": segment_id},
+        rule_json=resolved_rule_json,
         profile_json={"segment_id": segment_id},
         content_brief_json={"message_direction": "Highlight hotel benefits."},
         data_evidence_json={"event_count": 120},
         estimated_size=1200,
         priority="high",
         status=status,
+        audience_snapshot_id=audience_snapshot_id,
+        audience_snapshot_status=(
+            "completed" if audience_snapshot_id is not None else None
+        ),
+        audience_status=("targetable" if audience_snapshot_id is not None else None),
+        audience_final_user_count=(
+            12 if audience_snapshot_id is not None else None
+        ),
+        audience_actual_member_count=(
+            12 if audience_snapshot_id is not None else None
+        ),
+        audience_generation_status=(
+            "superseded" if audience_snapshot_id is not None else None
+        ),
+        audience_identity_matches=(
+            True if audience_snapshot_id is not None else None
+        ),
+        audience_schema_version=compiled.schema_version if compiled else None,
+        audience_vector_version=compiled.vector_version if compiled else None,
+        audience_manifest_hash=compiled.manifest_hash if compiled else None,
+        audience_calibration_version=(
+            compiled.calibration_version if compiled else None
+        ),
+        audience_calibration_hash=compiled.calibration_hash if compiled else None,
+        audience_resolution_contract=(
+            compiled.audience_resolution_contract if compiled else None
+        ),
+        audience_segment_spec_hash=(
+            compiled.segment_audience_spec_hash if compiled else None
+        ),
+        audience_query_vector_hash=(
+            semantic_query_vector_hash(compiled) if compiled else None
+        ),
+        audience_query_compiler_version=(
+            compiled.query_compiler_version if compiled else None
+        ),
+        audience_query_compiler_hash=(
+            compiled.query_compiler_hash if compiled else None
+        ),
+        audience_score_threshold=(
+            Decimal(str(compiled.score_threshold)) if compiled else None
+        ),
+        audience_metadata_json=(
+            _audience_metadata(compiled) if compiled else None
+        ),
     )
+
+
+def segment_audience_rule_json() -> dict[str, object]:
+    return {
+        "audience_resolution_contract": "segment_audience.v1",
+        "segment_audience_spec": dict(
+            RegisteredSegmentAudienceBinder().bind(
+                candidate_type="intent_matched"
+            )
+        ),
+    }
+
+
+def _audience_metadata(compiled: object) -> dict[str, object]:
+    return {
+        "template_id": compiled.template_id,
+        "template_version": compiled.template_version,
+        "template_semantic_hash": compiled.template_semantic_hash,
+        "hard_predicate_keys": list(compiled.hard_predicate_keys),
+        "predicate_parameters": {
+            key: list(value)
+            for key, value in compiled.predicate_parameters.items()
+        },
+        "semantic_selection_policy_id": compiled.semantic_selection_policy_id,
+        "semantic_anchor_policy_id": compiled.semantic_anchor_policy_id,
+        "semantic_anchor_hash": compiled.semantic_anchor_hash,
+        "semantic_margin": compiled.semantic_margin,
+        "semantic_selection_status": compiled.semantic_selection_status,
+        "business_lift_status": compiled.business_lift_status,
+        "user_vectorizer_version": compiled.user_vectorizer_version,
+        "user_vectorizer_semantic_hash": (
+            compiled.user_vectorizer_semantic_hash
+        ),
+    }
 
 
 def content_candidate_record(

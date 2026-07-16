@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 from app.config import load_settings
 from tests.config_env import required_env_values
 from app.decision.assignment_service import (
+    SegmentAssignmentAudienceContractError,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentValidationError,
 )
@@ -150,6 +151,31 @@ def test_segment_assignment_api_maps_service_errors() -> None:
         )
 
         assert response.status_code == expected_status
+
+
+def test_segment_assignment_api_returns_structured_audience_contract_conflict(
+) -> None:
+    client = make_client(
+        FakeAssignmentService(
+            exc=SegmentAssignmentAudienceContractError(
+                code="segment_audience_snapshot_binding_invalid",
+                segment_id="seg_v2",
+                reason="snapshot member count is inconsistent",
+            )
+        )
+    )
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/segment-assignments/build",
+        json={},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "segment_audience_snapshot_binding_invalid",
+        "segment_id": "seg_v2",
+        "reason": "snapshot member count is inconsistent",
+    }
 
 
 def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> None:
@@ -379,6 +405,14 @@ class RecordingCursor:
 
     def fetchall(self) -> list[dict[str, object]]:
         sql = compact_sql(self._last_query)
+        if "from promotion_target_segments" in sql:
+            return [
+                {
+                    "segment_id": "seg_family_trip",
+                    "rule_json": {},
+                    "audience_snapshot_id": None,
+                }
+            ]
         if "insert into user_segment_assignments" in sql:
             return [
                 {
