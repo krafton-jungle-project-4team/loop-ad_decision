@@ -4,11 +4,15 @@ import re
 from decimal import Decimal
 from typing import Any
 
+import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
+from app.analysis.router import _raise_analysis_http_error
+from app.analysis.vector_service import SegmentVectorConflictError
 from app.config import load_settings
-from tests.config_env import required_env_values
 from app.main import create_app
+from tests.config_env import required_env_values
 
 
 DEFAULT_ROW = object()
@@ -34,6 +38,29 @@ def analysis_payload() -> dict[str, Any]:
         "campaign_id": "camp_summer_2026",
         "promotion_id": "promo_banner_001",
         "operator_instruction": None,
+    }
+
+
+def test_app_bootstrap_has_no_audience_feature_switch_or_calibration_path() -> None:
+    app = create_app(settings=load_settings(valid_env()))
+    assert not hasattr(app.state, "analysis_audience_v2_enabled")
+    assert not hasattr(app.state, "analysis_audience_v2_calibration_path")
+
+
+def test_analysis_router_maps_segment_vector_conflict_to_structured_409() -> None:
+    with pytest.raises(HTTPException) as error:
+        _raise_analysis_http_error(
+            SegmentVectorConflictError(
+                "stored behavior query vector differs",
+                segment_id="seg_conflict",
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail == {
+        "code": "segment_vector_semantic_conflict",
+        "segment_id": "seg_conflict",
+        "reason": "stored behavior query vector differs",
     }
 
 
@@ -154,7 +181,8 @@ def test_segment_analysis_api_uses_existing_segment_without_recommending(
         if "insert into promotion_target_segments" in compact_sql(query)
     ]
     assert target_segment_insert_params
-    assert {params[-1] for params in target_segment_insert_params} == {"approved"}
+    assert {params[-2] for params in target_segment_insert_params} == {"approved"}
+    assert {params[-1] for params in target_segment_insert_params} == {None}
     assert not any(
         "insert into promotion_segment_suggestions" in query
         for query in executed_sql

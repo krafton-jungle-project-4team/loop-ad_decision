@@ -4,7 +4,16 @@ from typing import NoReturn
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from psycopg import IntegrityError, errors
 
+from app.audience_contract import SegmentAudienceContractError
 from app.analysis.audience_selection import build_audience_selection_policy
+from app.analysis.audience_search_repository import (
+    PgClickHouseAudienceVectorSearchRepository,
+)
+from app.analysis.audience_snapshot_repository import (
+    AudienceSnapshotBindingError,
+    AudienceSnapshotRepository,
+)
+from app.analysis.audience_v2 import AudienceV2Coordinator
 from app.analysis.repositories import (
     HotelProfileRepository,
     PromotionAnalysisRepository,
@@ -34,6 +43,8 @@ from app.analysis.service import (
     SegmentSelectionError,
 )
 from app.analysis.vector_service import (
+    DEFAULT_VECTOR_VERSION,
+    SegmentVectorConflictError,
     SegmentVectorDataUnavailableError,
     SegmentVectorService,
 )
@@ -59,6 +70,18 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
         postgres_executor = PsycopgPostgresExecutor(connection)
         user_behavior_vector_repository = UserBehaviorVectorRepository(clickhouse_client)
         segment_vector_repository = SegmentVectorRepository(postgres_executor)
+        segment_vector_service = SegmentVectorService(
+            segment_vector_repository=segment_vector_repository,
+            user_behavior_vector_repository=user_behavior_vector_repository,
+        )
+        audience_v2_coordinator = AudienceV2Coordinator(
+            search_repository=PgClickHouseAudienceVectorSearchRepository(
+                postgres=postgres_executor,
+                clickhouse=clickhouse_client,
+            ),
+            snapshot_repository=AudienceSnapshotRepository(postgres_executor),
+            segment_vector_service=segment_vector_service,
+        )
         segment_report_generator = build_segment_suggestion_report_generator(settings)
         yield PromotionAnalysisService(
             promotion_repository=PromotionRepository(postgres_executor),
@@ -69,10 +92,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             promotion_analysis_repository=PromotionAnalysisRepository(
                 postgres_executor,
             ),
-            segment_vector_service=SegmentVectorService(
-                segment_vector_repository=segment_vector_repository,
-                user_behavior_vector_repository=user_behavior_vector_repository,
-            ),
+            segment_vector_service=segment_vector_service,
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=user_behavior_vector_repository,
                 raw_event_signal_repository=user_behavior_vector_repository,
@@ -81,8 +101,10 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
                     settings.segment_performance_model_path
                 ),
                 audience_selection_policy=build_audience_selection_policy(),
+                vector_version=DEFAULT_VECTOR_VERSION,
             ),
             segment_report_generator=segment_report_generator,
+            audience_v2_coordinator=audience_v2_coordinator,
         )
         connection.commit()
     except Exception:
@@ -96,6 +118,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
 @router.post(
     "/{promotion_id}/segment-suggestions/recommend",
     response_model=AnalysisResponse,
+    response_model_exclude_none=True,
 )
 def recommend_promotion_segments(
     promotion_id: str,
@@ -112,7 +135,11 @@ def recommend_promotion_segments(
         _raise_analysis_http_error(exc)
 
 
-@router.post("/{promotion_id}/analyses", response_model=AnalysisResponse)
+@router.post(
+    "/{promotion_id}/analyses",
+    response_model=AnalysisResponse,
+    response_model_exclude_none=True,
+)
 def analyze_promotion_segments(
     promotion_id: str,
     request: SegmentAnalysisRequest,
@@ -131,6 +158,7 @@ def analyze_promotion_segments(
 @router.post(
     "/{promotion_id}/analysis",
     response_model=AnalysisResponse,
+    response_model_exclude_none=True,
     deprecated=True,
     include_in_schema=False,
 )
@@ -156,6 +184,8 @@ def _validate_promotion_id(path_promotion_id: str, request_promotion_id: str) ->
 
 
 def _raise_analysis_http_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, SegmentAudienceContractError):
+        raise HTTPException(status_code=422, detail=exc.to_detail()) from exc
     if isinstance(exc, PromotionNotFoundError):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -163,6 +193,10 @@ def _raise_analysis_http_error(exc: Exception) -> NoReturn:
         ) from exc
     if isinstance(exc, SegmentSelectionError):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if isinstance(exc, AudienceSnapshotBindingError):
+        raise HTTPException(status_code=409, detail=exc.to_detail()) from exc
+    if isinstance(exc, SegmentVectorConflictError):
+        raise HTTPException(status_code=409, detail=exc.to_detail()) from exc
     if isinstance(exc, SegmentVectorDataUnavailableError):
         raise HTTPException(
             status_code=422,
@@ -204,6 +238,29 @@ def _target_segment_response(
         segment_name=target_segment.segment_name,
         segment_vector_id=target_segment.segment_vector_id,
         estimated_size=target_segment.estimated_size,
+        audience_snapshot_id=target_segment.audience_snapshot_id,
+        eligible_user_count=target_segment.data_evidence_json.get(
+            "total_eligible_user_count"
+        ),
+        behavior_match_count=target_segment.data_evidence_json.get(
+            "matching_user_count"
+        ),
+        final_audience_count=(
+            target_segment.estimated_size
+            if target_segment.audience_snapshot_id is not None
+            else None
+        ),
+        meets_min_sample_size=target_segment.data_evidence_json.get(
+            "meets_min_sample_size"
+        ),
+        targetable=target_segment.data_evidence_json.get("targetable"),
+        audience_status=target_segment.data_evidence_json.get("audience_status"),
+        selection_method=target_segment.data_evidence_json.get(
+            "selection_method"
+        ),
+        recall_lower_bound=target_segment.data_evidence_json.get(
+            "recall_lower_bound"
+        ),
         content_brief=ContentBriefResponse(
             message_direction=content_brief.message_direction,
             keywords=content_brief.keywords,

@@ -3,10 +3,17 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Literal, Mapping, Protocol, Sequence
 
+from app.audience_contract import (
+    SEGMENT_AUDIENCE_CONTRACT,
+    SegmentAudienceContractError,
+    SegmentDefinitionAudienceAdapter,
+)
+from app.analysis.audience_v2 import AudienceV2Coordinator
+from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
 from app.analysis.booking_model import (
     BookingPropensityModel,
     BookingPropensityPrediction,
@@ -20,6 +27,7 @@ from app.analysis.repositories import (
     PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
+    SegmentSuggestionAudienceBindingRecord,
 )
 from app.analysis.report_generator import (
     DeterministicSegmentSuggestionReportGenerator,
@@ -328,6 +336,16 @@ class PromotionAnalysisWriter(Protocol):
     ) -> None:
         ...
 
+    def get_latest_audience_bindings(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[SegmentSuggestionAudienceBindingRecord]:
+        ...
+
 
 class SegmentVectorPreparer(Protocol):
     def prepare_segment_vector(
@@ -408,6 +426,8 @@ class PromotionAnalysisService:
         segment_suggester: SegmentDefinitionSuggester | None = None,
         segment_report_generator: SegmentSuggestionReportGenerator | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
+        audience_v2_coordinator: AudienceV2Coordinator | None = None,
+        audience_adapter: SegmentDefinitionAudienceAdapter | None = None,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._segment_definition_repository = segment_definition_repository
@@ -420,6 +440,8 @@ class PromotionAnalysisService:
             or DeterministicSegmentSuggestionReportGenerator()
         )
         self._max_default_target_segments = max_default_target_segments
+        self._audience_v2_coordinator = audience_v2_coordinator
+        self._audience_adapter = audience_adapter or SegmentDefinitionAudienceAdapter()
 
     @log_context_scope
     def recommend_segments(
@@ -597,6 +619,21 @@ class PromotionAnalysisService:
         if not selected_candidates:
             log.warn("segment_candidates_empty", {"candidateCount": len(candidates)})
             raise SegmentSelectionError("no active segment candidates matched analysis request")
+        audience_resolutions = {
+            candidate.segment_id: self._audience_adapter.resolve(
+                segment_id=candidate.segment_id,
+                rule_json=candidate.definition.rule_json,
+            )
+            for candidate in selected_candidates
+        }
+        contracts = {
+            resolution.contract for resolution in audience_resolutions.values()
+        }
+        if persist_target_segments and len(contracts) > 1:
+            raise AudienceSnapshotBindingError(
+                "legacy and segment_audience.v1 segments cannot be confirmed together",
+                code="segment_audience_contract_mixed",
+            )
 
         analysis_id = _analysis_id(
             promotion_id=promotion.promotion_id,
@@ -618,22 +655,127 @@ class PromotionAnalysisService:
         self._promotion_analysis_repository.save_analysis(analysis)
         log.assign_context({"analysisId": analysis.analysis_id})
         log.info("promotion_analysis_created", {"analysis": analysis})
-        target_segments = [
-            self._build_target_segment(
+        v2_segments_to_prepare = [
+            candidate.definition
+            for candidate in selected_candidates
+            if audience_resolutions[candidate.segment_id].is_v2
+            and (
+                refresh_segment_suggestions
+                or next_loop_context is not None
+            )
+        ]
+        v2_segments_to_reuse = [
+            candidate.definition
+            for candidate in selected_candidates
+            if audience_resolutions[candidate.segment_id].is_v2
+            and persist_target_segments
+            and not refresh_segment_suggestions
+            and next_loop_context is None
+        ]
+        v2_segments = v2_segments_to_prepare + v2_segments_to_reuse
+        if v2_segments and self._audience_v2_coordinator is None:
+            first_segment = v2_segments[0]
+            raise SegmentAudienceContractError(
+                code="segment_audience_calculator_unavailable",
+                segment_id=first_segment.segment_id,
+                reason="V2 audience calculator is unavailable",
+            )
+        prepared_v2 = (
+            self._audience_v2_coordinator.prepare_many(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                segments=v2_segments_to_prepare,
+            )
+            if v2_segments_to_prepare
+            and self._audience_v2_coordinator is not None
+            else {}
+        )
+        if v2_segments_to_reuse and self._audience_v2_coordinator is not None:
+            prepared_v2.update(
+                self._reuse_recommendation_audiences(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    segments=v2_segments_to_reuse,
+                )
+            )
+        target_segments: list[PromotionTargetSegmentWrite] = []
+        for rank, candidate in enumerate(selected_candidates):
+            resolution = audience_resolutions[candidate.segment_id]
+            is_v2_candidate = resolution.is_v2
+            should_prepare_v2 = (
+                is_v2_candidate
+                and (
+                    refresh_segment_suggestions
+                    or persist_target_segments
+                    or next_loop_context is not None
+                )
+            )
+            audience_v2 = (
+                prepared_v2.get(candidate.segment_id)
+                if should_prepare_v2
+                else None
+            )
+            segment_vector_id = (
+                audience_v2.segment_vector_id
+                if audience_v2 is not None
+                else self._prepare_segment_vector_id(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    candidate=candidate,
+                )
+            )
+            target_segment = self._build_target_segment(
                 analysis_id=analysis_id,
                 promotion=promotion,
                 candidate=candidate,
                 rank=rank,
                 operator_instruction=request.operator_instruction,
                 status=target_status,
-                segment_vector_id=self._prepare_segment_vector_id(
-                    analysis_id=analysis_id,
-                    promotion=promotion,
-                    candidate=candidate,
-                ),
+                segment_vector_id=segment_vector_id,
             )
-            for rank, candidate in enumerate(selected_candidates)
-        ]
+            if audience_v2 is not None:
+                evidence = dict(target_segment.data_evidence_json)
+                evidence.update(
+                    {
+                        "total_eligible_user_count": (
+                            audience_v2.total_eligible_user_count
+                        ),
+                        "matching_user_count": audience_v2.matching_user_count,
+                        "selected_user_count": audience_v2.selected_user_count,
+                        "selection_method": audience_v2.selection_method,
+                        "estimated_recall": audience_v2.estimated_recall,
+                        "recall_lower_bound": audience_v2.recall_lower_bound,
+                        "recall_target": audience_v2.recall_target,
+                        "selected_user_role": "final_experiment_audience",
+                        "vector_version": audience_v2.vector_version,
+                        "input_stability": "snapshotted",
+                        "audience_snapshot_id": audience_v2.audience_snapshot_id,
+                        "vector_generation_id": audience_v2.vector_generation_id,
+                        "meets_min_sample_size": (
+                            audience_v2.meets_min_sample_size
+                        ),
+                        "targetable": audience_v2.selected_user_count > 0,
+                        "audience_status": (
+                            "no_eligible_audience"
+                            if audience_v2.selected_user_count == 0
+                            else (
+                                "targetable"
+                                if audience_v2.meets_min_sample_size
+                                else "insufficient_sample"
+                            )
+                        ),
+                        "audience_resolution_contract": (
+                            SEGMENT_AUDIENCE_CONTRACT
+                        ),
+                    }
+                )
+                target_segment = replace(
+                    target_segment,
+                    estimated_size=audience_v2.selected_user_count,
+                    data_evidence_json=evidence,
+                    audience_snapshot_id=audience_v2.audience_snapshot_id,
+                )
+            target_segments.append(target_segment)
         segment_suggestions: list[PromotionSegmentSuggestionWrite] = []
         if persist_segment_suggestions:
             segment_suggestions = [
@@ -664,6 +806,54 @@ class PromotionAnalysisService:
             target_segments=target_segments,
             segment_suggestions=segment_suggestions,
         )
+
+    def _reuse_recommendation_audiences(
+        self,
+        *,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> dict[str, Any]:
+        segment_ids = [segment.segment_id for segment in segments]
+        bindings = self._promotion_analysis_repository.get_latest_audience_bindings(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=segment_ids,
+        )
+        by_segment = {binding.segment_id: binding for binding in bindings}
+        missing = [
+            segment_id
+            for segment_id in segment_ids
+            if segment_id not in by_segment
+            or by_segment[segment_id].audience_snapshot_id is None
+        ]
+        if missing:
+            raise AudienceSnapshotBindingError(
+                "selected V2 segment requires a completed recommendation snapshot",
+                code="segment_audience_snapshot_binding_required",
+                segment_id=missing[0],
+            )
+        recommendation_analysis_ids = {
+            binding.analysis_id for binding in by_segment.values()
+        }
+        if len(recommendation_analysis_ids) != 1:
+            raise AudienceSnapshotBindingError(
+                "selected V2 segments must come from the same recommendation analysis",
+                code="segment_audience_snapshot_binding_required",
+            )
+        assert self._audience_v2_coordinator is not None
+        return {
+            segment.segment_id: self._audience_v2_coordinator.prepare(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                segment=segment,
+                audience_snapshot_id=by_segment[
+                    segment.segment_id
+                ].audience_snapshot_id,
+            )
+            for segment in segments
+        }
 
     def _train_booking_model(self) -> BookingPropensityModel | None:
         training_records = self._hotel_profile_repository.list_booking_training_records()
@@ -976,6 +1166,7 @@ class PromotionAnalysisService:
             score_json=score_json,
             reason_json=reason_json,
             metadata_json=metadata_json,
+            audience_snapshot_id=target_segment.audience_snapshot_id,
         )
 
     def _build_content_brief_json(
@@ -1113,6 +1304,10 @@ class PromotionAnalysisService:
                 "attempt_no": next_loop_context.attempt_no,
             }
 
+        output_json: dict[str, Any] = {
+            "selected_segment_ids": list(selected_segment_ids),
+            "target_segment_count": len(selected_segment_ids),
+        }
         return PromotionAnalysisWrite(
             analysis_id=analysis_id,
             project_id=promotion.project_id,
@@ -1129,10 +1324,7 @@ class PromotionAnalysisService:
                 "selection_mode": "focus" if focus_segment_ids else "default",
                 "reason": _analysis_reason(focus_segment_ids),
             },
-            output_json={
-                "selected_segment_ids": list(selected_segment_ids),
-                "target_segment_count": len(selected_segment_ids),
-            },
+            output_json=output_json,
         )
 
     def _prepare_segment_vector_id(

@@ -338,7 +338,36 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
         r"analysis_promo_banner_001_run_[0-9a-f]{8}",
         body["analysis_id"],
     )
-    assert body == {
+    audience_fields = {
+        "audience_snapshot_id",
+        "behavior_match_count",
+        "final_audience_count",
+        "meets_min_sample_size",
+        "targetable",
+        "audience_status",
+        "selection_method",
+        "recall_lower_bound",
+    }
+    for target in body["target_segments"]:
+        assert target["eligible_user_count"] == 74200
+        actual_audience_fields = {
+            field: target.get(field) for field in audience_fields
+        }
+        assert all(
+            value is None for value in actual_audience_fields.values()
+        ), actual_audience_fields
+    legacy_body = {
+        **body,
+        "target_segments": [
+            {
+                key: value
+                for key, value in target.items()
+                if key not in audience_fields | {"eligible_user_count"}
+            }
+            for target in body["target_segments"]
+        ],
+    }
+    assert legacy_body == {
         "analysis_id": body["analysis_id"],
         "promotion_id": "promo_banner_001",
         "status": "completed",

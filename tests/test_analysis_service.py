@@ -15,6 +15,12 @@ from app.analysis.repositories import (
     PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
+    SegmentSuggestionAudienceBindingRecord,
+)
+from app.analysis.audience_v2 import AudienceV2Preparation
+from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
+from app.analysis.segment_audience_templates import (
+    RegisteredSegmentAudienceBinder,
 )
 from app.analysis.schemas import AnalysisRequest, SegmentAnalysisRequest
 from app.analysis.service import (
@@ -139,9 +145,13 @@ class FakeHotelProfileRepository:
 
 
 class FakePromotionAnalysisRepository:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        bindings: Sequence[SegmentSuggestionAudienceBindingRecord] = (),
+    ) -> None:
         self.saved = SavedAnalysis()
         self.events: list[str] = []
+        self.bindings = list(bindings)
 
     def save_analysis(self, analysis: PromotionAnalysisWrite) -> None:
         self.saved.analysis = analysis
@@ -160,6 +170,38 @@ class FakePromotionAnalysisRepository:
     ) -> None:
         self.saved.segment_suggestions = list(suggestions)
         self.events.append("segment_suggestions")
+
+    def get_latest_audience_bindings(self, **_kwargs: object):
+        return list(self.bindings)
+
+
+class FakeAudienceV2Coordinator:
+    def __init__(self) -> None:
+        self.prepare_calls: list[dict[str, object]] = []
+        self.prepare_many_calls = 0
+
+    def prepare(self, **kwargs: object) -> AudienceV2Preparation:
+        self.prepare_calls.append(dict(kwargs))
+        snapshot_id = str(kwargs["audience_snapshot_id"])
+        segment = kwargs["segment"]
+        return AudienceV2Preparation(
+            audience_snapshot_id=snapshot_id,
+            segment_vector_id=f"vector_{segment.segment_id}",
+            vector_generation_id="generation_active",
+            vector_version="hotel_behavior.v2",
+            total_eligible_user_count=100,
+            matching_user_count=20,
+            selected_user_count=10,
+            selection_method="exact",
+            estimated_recall=1.0,
+            recall_lower_bound=1.0,
+            recall_target=1.0,
+            meets_min_sample_size=False,
+        )
+
+    def prepare_many(self, **_kwargs: object):
+        self.prepare_many_calls += 1
+        raise AssertionError("confirmation must not search or create a new snapshot")
 
 
 class FakeSegmentVectorService:
@@ -279,12 +321,14 @@ def build_service(
     booking_training_records: list[BookingTrainingRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
     segment_suggester: FakeSegmentSuggester | None = None,
+    audience_v2_coordinator: FakeAudienceV2Coordinator | None = None,
+    audience_bindings: Sequence[SegmentSuggestionAudienceBindingRecord] = (),
 ) -> tuple[
     PromotionAnalysisService,
     FakePromotionAnalysisRepository,
     FakeSegmentDefinitionRepository,
 ]:
-    analysis_repository = FakePromotionAnalysisRepository()
+    analysis_repository = FakePromotionAnalysisRepository(audience_bindings)
     segment_definition_repository = FakeSegmentDefinitionRepository(segments)
     service = PromotionAnalysisService(
         promotion_repository=FakePromotionRepository(promotion),
@@ -297,6 +341,7 @@ def build_service(
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
+        audience_v2_coordinator=audience_v2_coordinator,
     )
     return service, analysis_repository, segment_definition_repository
 
@@ -562,6 +607,157 @@ def test_service_analyzes_requested_segments_without_refreshing_suggestions() ->
     assert suggester.calls == []
     assert segment_definition_repository.saved_ai_suggested == []
     assert analysis_repository.events == ["analysis", "target_segments"]
+
+
+def test_v2_confirmation_reuses_latest_snapshot_without_searching_again() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segment_id = "seg_ai_registered_intent"
+    segment = replace(
+        segment_record(
+            segment_id,
+            source="ai_suggested",
+            rule_json={
+                "audience_resolution_contract": "segment_audience.v1",
+                "segment_audience_spec": dict(
+                    RegisteredSegmentAudienceBinder().bind(
+                        candidate_type="intent_matched"
+                    )
+                ),
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    coordinator = FakeAudienceV2Coordinator()
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=[segment],
+        audience_v2_coordinator=coordinator,
+        audience_bindings=(
+            SegmentSuggestionAudienceBindingRecord(
+                suggestion_id="suggestion_1",
+                analysis_id="recommendation_analysis_1",
+                segment_id=segment_id,
+                audience_snapshot_id="snapshot_1",
+            ),
+        ),
+    )
+
+    result = service.analyze_segments(
+        SegmentAnalysisRequest(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=[segment_id],
+        )
+    )
+
+    assert coordinator.prepare_many_calls == 0
+    assert len(coordinator.prepare_calls) == 1
+    assert result.target_segments[0].audience_snapshot_id == "snapshot_1"
+    assert analysis_repository.saved.target_segments == result.target_segments
+
+
+def test_v2_confirmation_rejects_missing_recommendation_snapshot() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segment_id = "seg_ai_registered_missing_snapshot"
+    segment = replace(
+        segment_record(
+            segment_id,
+            source="ai_suggested",
+            rule_json={
+                "audience_resolution_contract": "segment_audience.v1",
+                "segment_audience_spec": dict(
+                    RegisteredSegmentAudienceBinder().bind(
+                        candidate_type="promotion_responsive"
+                    )
+                ),
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    coordinator = FakeAudienceV2Coordinator()
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[segment],
+        audience_v2_coordinator=coordinator,
+        audience_bindings=(),
+    )
+
+    with pytest.raises(AudienceSnapshotBindingError) as error:
+        service.analyze_segments(
+            SegmentAnalysisRequest(
+                project_id=promotion.project_id,
+                campaign_id=promotion.campaign_id,
+                promotion_id=promotion.promotion_id,
+                segment_ids=[segment_id],
+            )
+        )
+
+    assert error.value.code == "segment_audience_snapshot_binding_required"
+    assert error.value.segment_id == segment_id
+    assert coordinator.prepare_calls == []
+    assert coordinator.prepare_many_calls == 0
+
+
+def test_v2_confirmation_rejects_stale_selection_from_different_analyses() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    binder = RegisteredSegmentAudienceBinder()
+    segments = [
+        replace(
+            segment_record(
+                segment_id,
+                source="ai_suggested",
+                rule_json={
+                    "audience_resolution_contract": "segment_audience.v1",
+                    "segment_audience_spec": dict(
+                        binder.bind(candidate_type=candidate_type)
+                    ),
+                },
+            ),
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+        )
+        for segment_id, candidate_type in (
+            ("seg_ai_responsive", "promotion_responsive"),
+            ("seg_ai_explorer", "general_destination_explorer"),
+        )
+    ]
+    coordinator = FakeAudienceV2Coordinator()
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=segments,
+        audience_v2_coordinator=coordinator,
+        audience_bindings=(
+            SegmentSuggestionAudienceBindingRecord(
+                suggestion_id="suggestion_1",
+                analysis_id="recommendation_analysis_1",
+                segment_id=segments[0].segment_id,
+                audience_snapshot_id="snapshot_1",
+            ),
+            SegmentSuggestionAudienceBindingRecord(
+                suggestion_id="suggestion_2",
+                analysis_id="recommendation_analysis_2",
+                segment_id=segments[1].segment_id,
+                audience_snapshot_id="snapshot_2",
+            ),
+        ),
+    )
+
+    with pytest.raises(AudienceSnapshotBindingError) as error:
+        service.analyze_segments(
+            SegmentAnalysisRequest(
+                project_id=promotion.project_id,
+                campaign_id=promotion.campaign_id,
+                promotion_id=promotion.promotion_id,
+                segment_ids=[segment.segment_id for segment in segments],
+            )
+        )
+
+    assert error.value.code == "segment_audience_snapshot_binding_required"
+    assert coordinator.prepare_calls == []
+    assert coordinator.prepare_many_calls == 0
 
 
 def test_service_keeps_stored_ai_focus_segment_without_refreshing_suggestions() -> None:
