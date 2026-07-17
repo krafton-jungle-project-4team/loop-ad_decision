@@ -152,6 +152,11 @@ class SegmentAssignmentBuildResponse(BaseModel):
     below_threshold_fallback_count: int = Field(ge=0)
     no_candidate_fallback_count: int = Field(ge=0)
     invalid_user_vector_fallback_count: int = Field(ge=0)
+    unassigned_count: int = Field(ge=0)
+    unassigned_reason_counts: dict[str, int]
+    below_threshold_unassigned_count: int = Field(ge=0)
+    no_candidate_unassigned_count: int = Field(ge=0)
+    invalid_user_vector_unassigned_count: int = Field(ge=0)
     similarity_score_buckets: dict[str, int]
     ann_underfilled_user_count: int = Field(ge=0)
     ann_applied: bool

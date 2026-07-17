@@ -10,7 +10,6 @@ from psycopg import errors
 
 from app.config import load_settings
 from tests.config_env import required_env_values
-from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import PromotionRunWrite
 from app.decision.router import get_promotion_run_service
 from app.decision.schemas import (
@@ -355,7 +354,7 @@ def test_run_api_activates_dashboard_approval_fixture_with_lineage_and_retry() -
     assert first.json()["segment_ids"] == ["seg_family_trip", "seg_mobile_user"]
     assert [
         experiment["is_fallback"] for experiment in first.json()["ad_experiments"]
-    ] == [False, False, True]
+    ] == [False, False]
     lineage = {
         experiment.segment_id: (
             experiment.parent_ad_experiment_id,
@@ -366,7 +365,6 @@ def test_run_api_activates_dashboard_approval_fixture_with_lineage_and_retry() -
     assert lineage == {
         "seg_family_trip": ("adexp_source_family", "eval_source_family"),
         "seg_mobile_user": ("adexp_source_mobile", "eval_source_mobile"),
-        FALLBACK_SEGMENT_ID: (None, None),
     }
     assert len(repos.runs.inserted) == 1
     assert len(repos.ad_experiments.inserted_batches) == 1
@@ -429,7 +427,6 @@ def test_run_api_keeps_legacy_single_candidate_and_nullable_lineage() -> None:
     experiments = repos.ad_experiments.inserted_batches[0]
     assert [experiment.segment_id for experiment in experiments] == [
         "seg_family_trip",
-        FALLBACK_SEGMENT_ID,
     ]
     assert all(
         experiment.parent_ad_experiment_id is None

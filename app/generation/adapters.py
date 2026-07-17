@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import re
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
@@ -52,6 +53,10 @@ from app.logging import log, duration_ms
 EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v3"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 MAX_HTML_ARTIFACT_BYTES = 1_000_000
+MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS = 3
+_GEMINI_IMAGE_REQUEST_SLOTS = threading.BoundedSemaphore(
+    MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS
+)
 
 TEXT_FIELD_NAMES = (
     "subject",
@@ -273,33 +278,49 @@ class GeminiImageClient:
         self._client = client
 
     def generate_image(self, *, image_prompt: str) -> ImageArtifact:
-        client = self._client or _create_gemini_client(
-            self._api_key,
-            timeout_seconds=self._timeout_seconds,
-        )
-        started_at = perf_counter()
-        log.info("provider_request_prepared", {"provider": "gemini", "model": self._model, "request": {"imagePrompt": image_prompt}})
-        try:
-            response = client.models.generate_content(
-                model=self._model,
-                contents=image_prompt,
-                config=_gemini_image_config(),
+        with _GEMINI_IMAGE_REQUEST_SLOTS:
+            client = self._client or _create_gemini_client(
+                self._api_key,
+                timeout_seconds=self._timeout_seconds,
             )
-            artifact = _extract_gemini_image(response)
-        except Exception as exc:
-            log.warn("provider_request_failed", {"provider": "gemini", "model": self._model, "err": exc, "durationMs": duration_ms(started_at)})
-            raise
-        log.info(
-            "provider_request_completed",
-            {
-                "provider": "gemini",
-                "model": self._model,
-                "contentType": artifact.content_type,
-                "byteLength": len(artifact.data),
-                "durationMs": duration_ms(started_at),
-            },
-        )
-        return artifact
+            started_at = perf_counter()
+            log.info(
+                "provider_request_prepared",
+                {
+                    "provider": "gemini",
+                    "model": self._model,
+                    "request": {"imagePrompt": image_prompt},
+                },
+            )
+            try:
+                response = client.models.generate_content(
+                    model=self._model,
+                    contents=image_prompt,
+                    config=_gemini_image_config(),
+                )
+                artifact = _extract_gemini_image(response)
+            except Exception as exc:
+                log.warn(
+                    "provider_request_failed",
+                    {
+                        "provider": "gemini",
+                        "model": self._model,
+                        "err": exc,
+                        "durationMs": duration_ms(started_at),
+                    },
+                )
+                raise
+            log.info(
+                "provider_request_completed",
+                {
+                    "provider": "gemini",
+                    "model": self._model,
+                    "contentType": artifact.content_type,
+                    "byteLength": len(artifact.data),
+                    "durationMs": duration_ms(started_at),
+                },
+            )
+            return artifact
 
 
 class S3AssetStorage:

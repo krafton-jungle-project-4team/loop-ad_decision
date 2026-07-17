@@ -43,7 +43,6 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 COMPLETED_STATUS = "completed"
-FALLBACK_SEGMENT_NAME = "Existing users fallback"
 MAX_CONTRACT_ID_LENGTH = 100
 
 
@@ -225,7 +224,6 @@ class PromotionRunService:
             promotion_run_id=promotion_run_id,
             target_segments=target_segments,
             selected_content=selected_content,
-            content_by_segment=content_by_segment,
             loop_count=loop_count,
         )
         log.assign_context({"promotionRunId": run.promotion_run_id})
@@ -320,7 +318,7 @@ class PromotionRunService:
             tuple(sorted(experiment_segment_ids))
             != tuple(run.segment_scope_json)
             or len(experiment_segment_ids) != len(set(experiment_segment_ids))
-            or fallback_count != 1
+            or fallback_count > 1
             or build_segment_scope_fingerprint(run.segment_scope_json)
             != run.segment_scope_fingerprint
         ):
@@ -526,7 +524,6 @@ class PromotionRunService:
             promotion_run_id=promotion_run_id,
             target_segments=target_segments,
             selected_content=selected_content,
-            content_by_segment=content_by_segment,
             loop_count=request.loop_count,
             lineage_by_segment=lineage_by_segment,
         )
@@ -823,7 +820,7 @@ class PromotionRunService:
             len(non_fallback) != len(expected_segment_ids)
             or {experiment.segment_id for experiment in non_fallback}
             != expected_segment_ids
-            or len(fallback) != 1
+            or len(fallback) > 1
         ):
             raise RunConflictError(
                 "activated next-loop preparation canonical experiments are invalid"
@@ -1063,38 +1060,6 @@ class PromotionRunService:
             selected_content[segment.segment_id] = candidate
         return selected_content
 
-    def _select_fallback_content(
-        self,
-        *,
-        promotion: PromotionRecord,
-        analysis: PromotionAnalysisRecord,
-        generation: GenerationRunRecord,
-        target_segments: Sequence[PromotionTargetSegmentRecord],
-        selected_content: dict[str, ContentCandidateRecord],
-        content_by_segment: dict[str, list[ContentCandidateRecord]],
-    ) -> ContentCandidateRecord:
-        fallback_candidates = content_by_segment.get(FALLBACK_SEGMENT_ID, [])
-        if len(fallback_candidates) > 1:
-            raise RunValidationError(
-                "fallback segment must have at most one approved or active "
-                "content candidate"
-            )
-        if fallback_candidates:
-            candidate = fallback_candidates[0]
-            _validate_content_candidate(
-                candidate=candidate,
-                promotion=promotion,
-                analysis=analysis,
-                generation=generation,
-            )
-            return candidate
-
-        for segment in target_segments:
-            if segment.segment_id != FALLBACK_SEGMENT_ID:
-                return selected_content[segment.segment_id]
-
-        raise RunValidationError("at least one non-fallback target segment is required")
-
     def _build_promotion_run(
         self,
         *,
@@ -1151,7 +1116,6 @@ class PromotionRunService:
         promotion_run_id: str,
         target_segments: Sequence[PromotionTargetSegmentRecord],
         selected_content: dict[str, ContentCandidateRecord],
-        content_by_segment: dict[str, list[ContentCandidateRecord]],
         loop_count: int,
         lineage_by_segment: dict[str, tuple[str, str]] | None = None,
     ) -> list[AdExperimentWrite]:
@@ -1179,29 +1143,6 @@ class PromotionRunService:
                     loop_count=loop_count,
                     parent_ad_experiment_id=parent_ad_experiment_id,
                     source_evaluation_id=source_evaluation_id,
-                )
-            )
-        if not any(
-            experiment.segment_id == FALLBACK_SEGMENT_ID for experiment in experiments
-        ):
-            fallback_content = self._select_fallback_content(
-                promotion=promotion,
-                analysis=analysis,
-                generation=generation,
-                target_segments=target_segments,
-                selected_content=selected_content,
-                content_by_segment=content_by_segment,
-            )
-            experiments.append(
-                _build_ad_experiment(
-                    promotion=promotion,
-                    analysis=analysis,
-                    generation=generation,
-                    promotion_run_id=promotion_run_id,
-                    segment_id=FALLBACK_SEGMENT_ID,
-                    segment_name=FALLBACK_SEGMENT_NAME,
-                    content=fallback_content,
-                    loop_count=loop_count,
                 )
             )
         return experiments

@@ -1,3 +1,4 @@
+import threading
 from dataclasses import replace
 
 import pytest
@@ -269,6 +270,51 @@ def test_durable_execution_requires_and_returns_ready_artifact_fields() -> None:
         "public_url": "https://assets.example.test/banner.png",
     }
     assert result.generation_report_json["status"] == "completed"
+
+
+def test_durable_execution_builds_staged_candidates_in_parallel() -> None:
+    request = generation_request(content_option_count=3)
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.ONSITE_BANNER,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Drive hotel bookings.",
+            landing_url="https://demo-stay.example.com/summer",
+        ),
+        target_segment=target_segment_input(),
+    )
+    generator = ConcurrentStagedContentGenerator(candidate_count=3)
+    checkpoints: list[ContentCandidateRecord] = []
+    checkpoint_lock = threading.Lock()
+
+    def checkpoint(candidate: ContentCandidateRecord) -> None:
+        with checkpoint_lock:
+            checkpoints.append(candidate)
+
+    result = GenerationService(content_generator=generator).execute_durable(
+        generation_id="generation_banner_001_0123456789abcdef",
+        prompt_inputs=[prompt_input],
+        checkpoint=checkpoint,
+    )
+
+    expected_ids = [
+        "content_banner_repeat_hotel_0123456789abcdef_001",
+        "content_banner_repeat_hotel_0123456789abcdef_002",
+        "content_banner_repeat_hotel_0123456789abcdef_003",
+    ]
+    assert generator.max_active_images == 3
+    assert [candidate.content_id for candidate in result.content_candidates] == expected_ids
+    assert {
+        candidate.content_id
+        for candidate in checkpoints
+        if candidate.artifact_status == "published"
+    } == set(expected_ids)
 
 
 def test_candidate_records_canonical_stored_image_metadata() -> None:
@@ -1918,6 +1964,67 @@ class ReadyImageContentGenerator:
             image_url="https://assets.example.test/banner.png",
             landing_url="https://demo-stay.example.com/summer",
         )
+
+
+class ConcurrentStagedContentGenerator:
+    version = "concurrent-staged-test.v1"
+
+    def __init__(self, *, candidate_count: int) -> None:
+        self._barrier = threading.Barrier(candidate_count)
+        self._lock = threading.Lock()
+        self._active_images = 0
+        self.max_active_images = 0
+
+    def generate_source(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_input, prompt_result, artifact_identity
+        return GeneratedContent(
+            title=f"후보 {option_index}",
+            body="예약 가능한 객실을 확인해보세요.",
+            cta="호텔 보기",
+            image_prompt=f"hotel image option {option_index}, no visible text",
+            landing_url="https://demo-stay.example.com/summer",
+        )
+
+    def ensure_image(
+        self,
+        *,
+        channel: ContentChannel,
+        content: GeneratedContent,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        assert channel == ContentChannel.ONSITE_BANNER
+        with self._lock:
+            self._active_images += 1
+            self.max_active_images = max(
+                self.max_active_images,
+                self._active_images,
+            )
+        try:
+            self._barrier.wait(timeout=5)
+            stored = StoredAsset(
+                storage_key=f"genai/{artifact_identity.content_id}/image.png",
+                public_url=(
+                    f"https://assets.example.test/{artifact_identity.content_id}.png"
+                ),
+                sha256="d" * 64,
+                bytes=321,
+                content_type="image/png",
+            )
+            return replace(
+                content,
+                image_url=stored.public_url,
+                image_artifact=stored,
+            )
+        finally:
+            with self._lock:
+                self._active_images -= 1
 
 
 class ReadyStoredImageContentGenerator:

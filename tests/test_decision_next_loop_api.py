@@ -984,7 +984,7 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
     )
     assert [
         experiment["segment_id"] for experiment in body["next_ad_experiments"]
-    ] == ["seg_luxury", "seg_existing_all"]
+    ] == ["seg_luxury"]
     assert "status" not in body
     connection = connections[0]
     assert connection.commit_count == 1
@@ -1166,7 +1166,7 @@ def test_next_loop_api_reuses_stored_ai_segment_without_recommending_again(
     )
     assert [
         experiment["segment_id"] for experiment in body["next_ad_experiments"]
-    ] == [stored_segment_id, "seg_existing_all"]
+    ] == [stored_segment_id]
     assert not any("from raw_events" in query for query in clickhouse_client.queries)
     connection = connections[0]
     assert connection.commit_count == 1
