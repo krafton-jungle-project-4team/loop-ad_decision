@@ -308,6 +308,7 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     assert "input_snapshot_json" in sql
     assert "profile_summary_json" in sql
     assert "output_json" in sql
+    assert "on conflict (analysis_id) do nothing" in sql
     assert call.params == (
         "analysis_banner_001",
         "hotel-client-a",

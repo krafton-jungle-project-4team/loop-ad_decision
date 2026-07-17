@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
 from dataclasses import dataclass, field, replace
@@ -12,7 +13,8 @@ from app.audience_contract import (
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
 )
-from app.analysis.audience_v2 import AudienceV2Coordinator
+from app.analysis.audience_v2 import AudienceV2Coordinator, AudienceV2Preparation
+from app.audience_allocation import AudienceAllocationService
 from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
 from app.analysis.booking_model import (
     BookingPropensityModel,
@@ -34,6 +36,7 @@ from app.analysis.report_generator import (
     SegmentSuggestionReportGenerator,
     SegmentSuggestionReportInput,
 )
+from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 from app.analysis.schemas import (
     AnalysisRequest,
     AnalysisStatus,
@@ -49,7 +52,7 @@ from app.content_brief import build_content_brief_v2
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
-MAX_DEFAULT_TARGET_SEGMENTS = 4
+MAX_DEFAULT_TARGET_SEGMENTS = DEFAULT_MAX_SUGGESTED_SEGMENTS
 
 TargetSegmentStatus = Literal["planned", "approved"]
 
@@ -428,6 +431,7 @@ class PromotionAnalysisService:
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
         audience_v2_coordinator: AudienceV2Coordinator | None = None,
         audience_adapter: SegmentDefinitionAudienceAdapter | None = None,
+        audience_allocation_service: AudienceAllocationService | None = None,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._segment_definition_repository = segment_definition_repository
@@ -442,6 +446,7 @@ class PromotionAnalysisService:
         self._max_default_target_segments = max_default_target_segments
         self._audience_v2_coordinator = audience_v2_coordinator
         self._audience_adapter = audience_adapter or SegmentDefinitionAudienceAdapter()
+        self._audience_allocation_service = audience_allocation_service
 
     @log_context_scope
     def recommend_segments(
@@ -635,9 +640,39 @@ class PromotionAnalysisService:
                 code="segment_audience_contract_mixed",
             )
 
-        analysis_id = _analysis_id(
-            promotion_id=promotion.promotion_id,
-            next_loop_context=next_loop_context,
+        confirmation_source_analysis_id: str | None = None
+        confirmation_source_snapshot_ids: tuple[str, ...] = ()
+        if (
+            persist_target_segments
+            and not refresh_segment_suggestions
+            and next_loop_context is None
+            and contracts == {SEGMENT_AUDIENCE_CONTRACT}
+        ):
+            (
+                confirmation_source_analysis_id,
+                confirmation_source_snapshot_ids,
+            ) = self._resolve_confirmation_source_batch(
+                promotion=promotion,
+                segment_ids=[
+                    candidate.segment_id for candidate in selected_candidates
+                ],
+            )
+
+        analysis_id = (
+            _confirmation_analysis_id(
+                promotion_id=promotion.promotion_id,
+                source_analysis_id=confirmation_source_analysis_id,
+                segment_ids=[
+                    candidate.segment_id for candidate in selected_candidates
+                ],
+                source_snapshot_ids=confirmation_source_snapshot_ids,
+                operator_instruction=request.operator_instruction,
+            )
+            if confirmation_source_analysis_id is not None
+            else _analysis_id(
+                promotion_id=promotion.promotion_id,
+                next_loop_context=next_loop_context,
+            )
         )
         analysis = self._build_analysis(
             analysis_id=analysis_id,
@@ -690,12 +725,26 @@ class PromotionAnalysisService:
             and self._audience_v2_coordinator is not None
             else {}
         )
+        if (
+            v2_segments_to_prepare
+            and persist_target_segments
+            and next_loop_context is not None
+        ):
+            prepared_v2.update(
+                self._allocate_recommendation_audiences(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    segments=v2_segments_to_prepare,
+                    source_analysis_id=analysis_id,
+                )
+            )
         if v2_segments_to_reuse and self._audience_v2_coordinator is not None:
             prepared_v2.update(
-                self._reuse_recommendation_audiences(
+                self._allocate_recommendation_audiences(
                     analysis_id=analysis_id,
                     promotion=promotion,
                     segments=v2_segments_to_reuse,
+                    source_analysis_id=confirmation_source_analysis_id,
                 )
             )
         target_segments: list[PromotionTargetSegmentWrite] = []
@@ -783,6 +832,13 @@ class PromotionAnalysisService:
                         "input_stability": "snapshotted",
                         "audience_snapshot_id": audience_v2.audience_snapshot_id,
                         "vector_generation_id": audience_v2.vector_generation_id,
+                        "promotion_exclusion_revision": (
+                            audience_v2.promotion_exclusion_revision
+                        ),
+                        "promotion_exclusion_hash": (
+                            audience_v2.promotion_exclusion_hash
+                        ),
+                        "excluded_user_count": audience_v2.excluded_user_count,
                         "meets_min_sample_size": (
                             audience_v2.meets_min_sample_size
                         ),
@@ -806,6 +862,10 @@ class PromotionAnalysisService:
                     estimated_size=audience_v2.selected_user_count,
                     data_evidence_json=evidence,
                     audience_snapshot_id=audience_v2.audience_snapshot_id,
+                    source_audience_snapshot_id=(
+                        audience_v2.source_audience_snapshot_id
+                    ),
+                    allocation_plan_id=audience_v2.allocation_plan_id,
                 )
             target_segments.append(target_segment)
         segment_suggestions: list[PromotionSegmentSuggestionWrite] = []
@@ -829,6 +889,19 @@ class PromotionAnalysisService:
             log.info("promotion_target_segments_created", {"targetSegments": target_segments})
         if persist_segment_suggestions:
             self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
+            if v2_segments_to_prepare:
+                if self._audience_allocation_service is None:
+                    raise SegmentAudienceContractError(
+                        code="segment_audience_exclusion_contract_missing",
+                        segment_id=v2_segments_to_prepare[0].segment_id,
+                        reason="audience allocation service is unavailable",
+                    )
+                self._audience_allocation_service.refresh_recommendation_previews(
+                    analysis_id=analysis_id,
+                    project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
+                )
             log.info(
                 "promotion_segment_suggestions_created",
                 {"segmentSuggestions": segment_suggestions},
@@ -839,14 +912,53 @@ class PromotionAnalysisService:
             segment_suggestions=segment_suggestions,
         )
 
-    def _reuse_recommendation_audiences(
+    def _allocate_recommendation_audiences(
         self,
         *,
         analysis_id: str,
         promotion: PromotionRecord,
         segments: Sequence[SegmentDefinitionRecord],
+        source_analysis_id: str | None = None,
     ) -> dict[str, Any]:
-        segment_ids = [segment.segment_id for segment in segments]
+        if self._audience_allocation_service is None:
+            raise SegmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=segments[0].segment_id,
+                reason="audience allocation service is unavailable",
+            )
+        result = self._audience_allocation_service.confirm_selection(
+            confirmation_analysis_id=analysis_id,
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=[segment.segment_id for segment in segments],
+            min_sample_size=promotion.min_sample_size,
+            source_analysis_id=source_analysis_id,
+        )
+        assert self._audience_v2_coordinator is not None
+        prepared: dict[str, AudienceV2Preparation] = {}
+        for segment in segments:
+            allocation = result.allocations[segment.segment_id]
+            bound = self._audience_v2_coordinator.prepare(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                segment=segment,
+                audience_snapshot_id=allocation.final_snapshot_id,
+            )
+            prepared[segment.segment_id] = replace(
+                bound,
+                source_audience_snapshot_id=allocation.source_snapshot_id,
+                allocation_plan_id=allocation.allocation_plan_id,
+            )
+        return prepared
+
+    def _resolve_confirmation_source_batch(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segment_ids: Sequence[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        expected = set(segment_ids)
         bindings = self._promotion_analysis_repository.get_latest_audience_bindings(
             project_id=promotion.project_id,
             campaign_id=promotion.campaign_id,
@@ -854,38 +966,31 @@ class PromotionAnalysisService:
             segment_ids=segment_ids,
         )
         by_segment = {binding.segment_id: binding for binding in bindings}
-        missing = [
-            segment_id
-            for segment_id in segment_ids
-            if segment_id not in by_segment
-            or by_segment[segment_id].audience_snapshot_id is None
-        ]
-        if missing:
+        if set(by_segment) != expected or any(
+            binding.audience_snapshot_id is None
+            for binding in by_segment.values()
+        ):
+            missing = sorted(expected - set(by_segment))
             raise AudienceSnapshotBindingError(
                 "selected V2 segment requires a completed recommendation snapshot",
                 code="segment_audience_snapshot_binding_required",
-                segment_id=missing[0],
+                segment_id=missing[0] if missing else sorted(expected)[0],
             )
-        recommendation_analysis_ids = {
+        source_analysis_ids = {
             binding.analysis_id for binding in by_segment.values()
         }
-        if len(recommendation_analysis_ids) != 1:
+        if len(source_analysis_ids) != 1:
             raise AudienceSnapshotBindingError(
                 "selected V2 segments must come from the same recommendation analysis",
-                code="segment_audience_snapshot_binding_required",
+                code="segment_audience_source_batch_mismatch",
             )
-        assert self._audience_v2_coordinator is not None
-        return {
-            segment.segment_id: self._audience_v2_coordinator.prepare(
-                analysis_id=analysis_id,
-                promotion=promotion,
-                segment=segment,
-                audience_snapshot_id=by_segment[
-                    segment.segment_id
-                ].audience_snapshot_id,
-            )
-            for segment in segments
-        }
+        return (
+            next(iter(source_analysis_ids)),
+            tuple(
+                str(by_segment[segment_id].audience_snapshot_id)
+                for segment_id in sorted(expected)
+            ),
+        )
 
     def _train_booking_model(self) -> BookingPropensityModel | None:
         training_records = self._hotel_profile_repository.list_booking_training_records()
@@ -1467,6 +1572,33 @@ def _analysis_id(
         source_promotion_run_id=next_loop_context.source_promotion_run_id,
         attempt_no=next_loop_context.attempt_no,
     )
+
+
+def _confirmation_analysis_id(
+    *,
+    promotion_id: str,
+    source_analysis_id: str,
+    segment_ids: Sequence[str],
+    source_snapshot_ids: Sequence[str],
+    operator_instruction: str | None,
+) -> str:
+    canonical = {
+        "promotion_id": promotion_id,
+        "source_analysis_id": source_analysis_id,
+        "segment_ids": sorted(set(segment_ids)),
+        "source_snapshot_ids": sorted(set(source_snapshot_ids)),
+        "operator_instruction": operator_instruction,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    promotion_slug = _slug_from_promotion_id(promotion_id)[:48].rstrip("_")
+    return f"analysis_{promotion_slug or 'promotion'}_confirm_{digest}"
 
 
 def _bounded_next_loop_lineage_id(

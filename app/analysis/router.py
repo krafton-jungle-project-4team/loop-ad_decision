@@ -5,6 +5,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from psycopg import IntegrityError, errors
 
 from app.audience_contract import SegmentAudienceContractError
+from app.audience_allocation import (
+    AudienceAllocationService,
+    PostgresAudienceAllocationRepository,
+)
+from app.audience_exclusions import (
+    PromotionAudienceExclusionRepository,
+    SegmentAudienceExclusionError,
+)
 from app.analysis.audience_selection import build_audience_selection_policy
 from app.analysis.audience_search_repository import (
     PgClickHouseAudienceVectorSearchRepository,
@@ -68,6 +76,16 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
     try:
         clickhouse_client = create_clickhouse_client(settings)
         postgres_executor = PsycopgPostgresExecutor(connection)
+        exclusion_repository = PromotionAudienceExclusionRepository(
+            postgres=postgres_executor,
+            clickhouse=clickhouse_client,
+        )
+        allocation_service = AudienceAllocationService(
+            PostgresAudienceAllocationRepository(
+                postgres=postgres_executor,
+                exclusion_reader=exclusion_repository,
+            )
+        )
         user_behavior_vector_repository = UserBehaviorVectorRepository(clickhouse_client)
         segment_vector_repository = SegmentVectorRepository(postgres_executor)
         segment_vector_service = SegmentVectorService(
@@ -78,6 +96,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             search_repository=PgClickHouseAudienceVectorSearchRepository(
                 postgres=postgres_executor,
                 clickhouse=clickhouse_client,
+                exclusion_repository=exclusion_repository,
             ),
             snapshot_repository=AudienceSnapshotRepository(postgres_executor),
             segment_vector_service=segment_vector_service,
@@ -105,6 +124,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             ),
             segment_report_generator=segment_report_generator,
             audience_v2_coordinator=audience_v2_coordinator,
+            audience_allocation_service=allocation_service,
         )
         connection.commit()
     except Exception:
@@ -184,6 +204,13 @@ def _validate_promotion_id(path_promotion_id: str, request_promotion_id: str) ->
 
 
 def _raise_analysis_http_error(exc: Exception) -> NoReturn:
+    if isinstance(exc, SegmentAudienceExclusionError):
+        status_code = (
+            422
+            if exc.code == "segment_audience_exclusion_contract_missing"
+            else 409
+        )
+        raise HTTPException(status_code=status_code, detail=exc.to_detail()) from exc
     if isinstance(exc, SegmentAudienceContractError):
         raise HTTPException(status_code=422, detail=exc.to_detail()) from exc
     if isinstance(exc, PromotionNotFoundError):

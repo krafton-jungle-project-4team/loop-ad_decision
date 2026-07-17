@@ -152,6 +152,8 @@ class PromotionTargetSegmentWrite:
     priority: str | None
     status: str
     audience_snapshot_id: str | None = None
+    source_audience_snapshot_id: str | None = None
+    allocation_plan_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -433,6 +435,7 @@ class PromotionAnalysisRepository:
                 output_json
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (analysis_id) DO NOTHING
             """,
             (
                 analysis.analysis_id,
@@ -552,10 +555,16 @@ class PromotionAnalysisRepository:
                     segment_vector_id,
                     estimated_size,
                     priority,
+                    source_audience_snapshot_id,
+                    allocation_plan_id,
                     status,
                     audience_snapshot_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (analysis_id, segment_id) DO NOTHING
                 """,
                 (
                     segment.analysis_id,
@@ -571,6 +580,8 @@ class PromotionAnalysisRepository:
                     segment.segment_vector_id,
                     segment.estimated_size,
                     segment.priority,
+                    segment.source_audience_snapshot_id,
+                    segment.allocation_plan_id,
                     segment.status,
                     segment.audience_snapshot_id,
                 ),

@@ -421,22 +421,6 @@ def test_analysis_api_response_snapshot_for_dashboard_contract() -> None:
                     ],
                 },
             },
-            {
-                "segment_id": "seg_near_checkin",
-                "segment_name": "Seg Near Checkin",
-                "segment_vector_id": "segvec_seg_near_checkin_v1",
-                "estimated_size": 1800,
-                "content_brief": {
-                    "message_direction": (
-                        "Emphasize near check-in availability and low-friction booking."
-                    ),
-                    "keywords": [
-                        "near check-in",
-                        "same-day availability",
-                        "free cancellation",
-                    ],
-                },
-            },
         ],
     }
     assert_no_forbidden_public_terms(response.json())
@@ -490,7 +474,6 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "seg_family_trip",
         "seg_mobile_user",
         "seg_repeat_hotel_no_booking",
-        "seg_near_checkin",
     ]
     saved_segments = result.target_segments
     assert [segment.segment_id for segment in saved_suggestions] == expected_segment_ids
@@ -500,16 +483,15 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "seg_family_trip": ["가족 여행 관심"],
         "seg_mobile_user": ["모바일 이용"],
         "seg_repeat_hotel_no_booking": ["반복 조회"],
-        "seg_near_checkin": ["임박 예약 관심"],
     }
     assert saved_analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
-        "target_segment_count": 4,
+        "target_segment_count": 3,
     }
     assert saved_analysis.profile_summary_json == {
         "total_eligible_users": 74200,
         "candidate_segment_count": 5,
-        "selected_segment_count": 4,
+        "selected_segment_count": 3,
         "selection_mode": "default",
         "reason": (
             "Selected hotel audience segments by channel, goal metric, "

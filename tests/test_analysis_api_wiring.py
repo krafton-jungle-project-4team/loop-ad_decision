@@ -106,7 +106,6 @@ def test_analysis_api_wires_real_service_and_commits(monkeypatch) -> None:
         "seg_family_trip",
         "seg_mobile_user",
         "seg_repeat_hotel_no_booking",
-        "seg_near_checkin",
     ]
 
     assert len(connections) == 1
@@ -409,7 +408,7 @@ class RecordingCursor:
                     segment_vector_id=str(params[10]),
                     estimated_size=int(params[11]),
                     priority=str(params[12]),
-                    status=str(params[13]),
+                    status=str(params[-2]),
                 )
             )
 
