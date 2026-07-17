@@ -43,7 +43,10 @@ from app.analysis.audience_v2 import (
     load_bundled_candidate_calibrations,
 )
 from app.analysis.semantic_selection import (
+    _instantiate_anchor,
+    _matches_hard_predicates,
     compile_registered_segment_audience,
+    load_bundled_semantic_selection,
     semantic_query_vector_hash,
 )
 from app.analysis.segment_audience_templates import (
@@ -440,6 +443,110 @@ def test_coordinator_batches_three_segments_once() -> None:
     assert search.batch_call_count == 1
     assert search.individual_call_count == 0
     assert len(snapshots.writes) == 3
+
+
+def test_six_registered_templates_build_expected_exact_snapshot_members() -> None:
+    schema = HotelBookingBehaviorSchemaV2()
+    artifact = load_bundled_semantic_selection(segment_id="demo_validation")
+    segments = tuple(
+        _v2_segment(
+            f"segment_{candidate_type}",
+            candidate_type=candidate_type,
+        )
+        for candidate_type in (
+            "intent_matched",
+            "target_destination_affinity",
+            "funnel_recovery",
+            "benefit_value_seeker",
+            "promotion_responsive",
+            "general_destination_explorer",
+        )
+    )
+    specs_by_segment = {}
+    queries_by_segment = {}
+    profiles = []
+    expected_positive_user_ids = {}
+    expected_negative_user_ids = {}
+    for segment in segments:
+        resolution = SegmentDefinitionAudienceAdapter().resolve(
+            segment_id=segment.segment_id,
+            rule_json=segment.rule_json,
+        )
+        assert resolution.spec is not None
+        calibration = artifact.calibration_for(
+            segment_id=segment.segment_id,
+            spec=resolution.spec,
+            schema=schema,
+        )
+        query = schema.compile_segment_audience(
+            spec=resolution.spec,
+            calibration=calibration,
+        )
+        anchors = artifact.templates[resolution.spec.template_id]
+        positive = _instantiate_anchor(
+            anchors.accepted[0],
+            spec=resolution.spec,
+            index=0,
+        )
+        negative = _instantiate_anchor(
+            anchors.negative[0],
+            spec=resolution.spec,
+            index=200,
+        )
+        specs_by_segment[segment.segment_id] = resolution.spec
+        queries_by_segment[segment.segment_id] = query
+        profiles.extend((positive, negative))
+        expected_positive_user_ids[segment.segment_id] = positive.user_id
+        expected_negative_user_ids[segment.segment_id] = negative.user_id
+
+    search = _SemanticCorpusSearchRepository(
+        schema=schema,
+        profiles=tuple(profiles),
+        specs_by_segment=specs_by_segment,
+        queries_by_segment=queries_by_segment,
+    )
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+        schema=schema,
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis_demo",
+        promotion=_analysis_promotion(),
+        segments=segments,
+    )
+
+    assert search.batch_call_count == 1
+    assert search.individual_call_count == 0
+    assert search.exact_call_count == 6
+    assert len(prepared) == len(snapshots.writes) == 6
+    writes_by_segment = {write.segment_id: write for write in snapshots.writes}
+    for segment in segments:
+        write = writes_by_segment[segment.segment_id]
+        member_ids = {member.user_id for member in write.search_result.members}
+        assert expected_positive_user_ids[segment.segment_id] in member_ids
+        assert expected_negative_user_ids[segment.segment_id] not in member_ids
+        assert prepared[segment.segment_id].selected_user_count == len(member_ids)
+        assert prepared[segment.segment_id].selected_user_count > 0
+
+    demo_segment_ids = {
+        "segment_funnel_recovery",
+        "segment_benefit_value_seeker",
+        "segment_promotion_responsive",
+    }
+    for segment_id in demo_segment_ids:
+        positive_user_id = expected_positive_user_ids[segment_id]
+        overlap_scores = {
+            candidate_segment_id: member.behavior_fit_score
+            for candidate_segment_id, write in writes_by_segment.items()
+            if candidate_segment_id in demo_segment_ids
+            for member in write.search_result.members
+            if member.user_id == positive_user_id
+        }
+        assert max(overlap_scores, key=overlap_scores.get) == segment_id
 
 
 def test_semantic_selection_is_manifest_bound_and_business_lift_pending(
@@ -1073,6 +1180,98 @@ class _BatchCoordinatorSearchRepository:
 
     def materialize_exact_members(self, **_kwargs: object) -> int:
         return 2
+
+
+class _SemanticCorpusSearchRepository:
+    def __init__(
+        self,
+        *,
+        schema: HotelBookingBehaviorSchemaV2,
+        profiles,
+        specs_by_segment,
+        queries_by_segment,
+    ) -> None:
+        self.schema = schema
+        self.profiles = profiles
+        self.specs_by_segment = specs_by_segment
+        self.query_by_vector = {
+            tuple(query.query_vector): (specs_by_segment[segment_id], query)
+            for segment_id, query in queries_by_segment.items()
+        }
+        now = datetime(2026, 7, 16, tzinfo=UTC)
+        self.context = AudienceSearchContext(
+            vector_generation_id="uvgen_demo",
+            manifest_hash=HOTEL_BEHAVIOR_MANIFEST_HASH,
+            source_cutoff=now,
+            source_revision_cutoff=now,
+            window_start=now - timedelta(days=30),
+            corpus_user_count=len(profiles),
+        )
+        self.batch_call_count = 0
+        self.individual_call_count = 0
+        self.exact_call_count = 0
+
+    def get_context(self, **_kwargs: object) -> AudienceSearchContext:
+        return self.context
+
+    def count_hard_matches_batch(self, *, requests, **_kwargs: object):
+        self.batch_call_count += 1
+        return {
+            request.segment_id: sum(
+                _matches_hard_predicates(
+                    profile,
+                    spec=self.specs_by_segment[request.segment_id],
+                )
+                for profile in self.profiles
+            )
+            for request in requests
+        }
+
+    def count_hard_matches(self, **_kwargs: object) -> int:
+        self.individual_call_count += 1
+        raise AssertionError("all registered demo predicates must batch")
+
+    def estimate_score_pass_rate(self, **kwargs: object) -> float:
+        spec, query = self.query_by_vector[tuple(kwargs["query_vector"])]
+        hard_matches = [
+            profile
+            for profile in self.profiles
+            if _matches_hard_predicates(profile, spec=spec)
+        ]
+        if not hard_matches:
+            return 0.0
+        return sum(
+            cosine_similarity(
+                query.query_vector,
+                self.schema.vectorize_user(profile),
+            )
+            >= query.score_threshold
+            for profile in hard_matches
+        ) / len(hard_matches)
+
+    def exact_search(self, **kwargs: object) -> list[SearchCandidate]:
+        self.exact_call_count += 1
+        spec, query = self.query_by_vector[tuple(kwargs["query_vector"])]
+        members = []
+        for profile in self.profiles:
+            score = cosine_similarity(
+                query.query_vector,
+                self.schema.vectorize_user(profile),
+            )
+            if (
+                _matches_hard_predicates(profile, spec=spec)
+                and score >= query.score_threshold
+            ):
+                members.append((profile.user_id, score))
+        members.sort(key=lambda value: (-value[1], value[0]))
+        return [
+            SearchCandidate(
+                user_id=user_id,
+                behavior_fit_score=score,
+                retrieval_rank=index,
+            )
+            for index, (user_id, score) in enumerate(members, start=1)
+        ]
 
 
 class _BatchSegmentVectorPreparer:
