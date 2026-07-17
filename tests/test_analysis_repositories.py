@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from app.analysis.repositories import (
     HotelProfileRepository,
@@ -308,13 +309,17 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     assert "input_snapshot_json" in sql
     assert "profile_summary_json" in sql
     assert "output_json" in sql
-    assert call.params == (
+    assert "on conflict (analysis_id) do nothing" in sql
+    assert call.params[:5] == (
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "completed",
-        ["seg_repeat_hotel_no_booking"],
+    )
+    assert isinstance(call.params[5], Jsonb)
+    assert call.params[5].obj == ["seg_repeat_hotel_no_booking"]
+    assert call.params[6:] == (
         "Focus on users with booking intent.",
         {"promotion": {"promotion_id": "promo_banner_001"}},
         {"selected_segment_count": 1},
@@ -373,6 +378,43 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
             "segment_name": "Repeat hotel viewers without booking",
             "segment_vector_id": "segvec_repeat_hotel_no_booking_v1",
         },
+        None,
+    )
+
+
+def test_promotion_analysis_repository_reads_confirmable_audience_bindings() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "suggestion_id": "sugg_analysis_banner_001_seg_repeat",
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_repeat_hotel_no_booking",
+                "audience_snapshot_id": "snapshot_source_repeat",
+            }
+        ]
+    )
+    repo = PromotionAnalysisRepository(db)
+
+    bindings = repo.get_latest_audience_bindings(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        segment_ids=["seg_repeat_hotel_no_booking"],
+    )
+
+    assert len(bindings) == 1
+    assert bindings[0].suggestion_id == "sugg_analysis_banner_001_seg_repeat"
+    assert bindings[0].audience_snapshot_id == "snapshot_source_repeat"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "fetchall"
+    assert "status in ('suggested', 'accepted', 'confirmed')" in sql
+    assert "dismissed" not in sql
+    assert call.params == (
+        "hotel-client-a",
+        "camp_summer_2026",
+        "promo_banner_001",
+        ["seg_repeat_hotel_no_booking"],
     )
 
 
@@ -436,7 +478,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
     assert "embedding" in compact_sql(insert_call.query)
-    assert insert_call.params == (
+    assert insert_call.params[:7] == (
         "segvec_repeat_hotel_no_booking_v1",
         "hotel-client-a",
         "promo_banner_001",
@@ -444,7 +486,10 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "analysis_banner_001",
         "seg_repeat_hotel_no_booking",
         64,
-        vector_values,
+    )
+    assert isinstance(insert_call.params[7], Jsonb)
+    assert insert_call.params[7].obj == vector_values
+    assert insert_call.params[8:] == (
         "[" + ",".join(str(value) for value in vector_values) + "]",
         "v1",
         "decision_analysis",

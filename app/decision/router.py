@@ -9,6 +9,18 @@ from fastapi.responses import JSONResponse
 from psycopg import IntegrityError, errors
 from pydantic import ValidationError
 
+from app.analysis.audience_search_repository import (
+    PgClickHouseAudienceVectorSearchRepository,
+)
+from app.analysis.audience_snapshot_repository import (
+    AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
+)
+from app.analysis.audience_v2 import AudienceV2Coordinator
+from app.audience_allocation import (
+    AudienceAllocationService,
+    PostgresAudienceAllocationRepository,
+)
+from app.audience_exclusions import PromotionAudienceExclusionRepository
 from app.analysis.repositories import (
     HotelProfileRepository as AnalysisHotelProfileRepository,
     PromotionAnalysisRepository as AnalysisPromotionAnalysisRepository,
@@ -23,15 +35,18 @@ from app.analysis.raw_event_segments import build_promotion_intent_extractor
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 from app.analysis.service import PromotionAnalysisService
 from app.analysis.vector_service import (
+    DEFAULT_VECTOR_VERSION,
     SegmentVectorDataUnavailableError,
     SegmentVectorService,
 )
 from app.db import create_clickhouse_client, create_postgres_connection
 from app.decision.assignment_service import (
+    SegmentAssignmentAudienceContractError,
     SegmentAssignmentRunNotFoundError,
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
 )
+from app.decision.audience_snapshots import AudienceSnapshotRepository
 from app.decision.evaluation_service import (
     AdExperimentEvaluationNotFoundError,
     AdExperimentEvaluationService,
@@ -155,6 +170,7 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
     executor = PsycopgPostgresExecutor(connection)
+    audience_snapshot_repository = AudienceSnapshotRepository(executor)
     try:
         yield PromotionRunService(
             promotion_repository=PromotionRepository(executor),
@@ -168,6 +184,7 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             ad_experiment_repository=AdExperimentRepository(executor),
             promotion_evaluation_repository=PromotionEvaluationRepository(executor),
             next_loop_preparation_repository=NextLoopPreparationRepository(executor),
+            run_audience_binding_repository=audience_snapshot_repository,
             manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
@@ -197,6 +214,7 @@ def get_segment_assignment_service(
                 executor,
             ),
             reranker=SegmentCandidateReranker(),
+            audience_snapshot_repository=AudienceSnapshotRepository(executor),
         )
         connection.commit()
     except Exception:
@@ -287,6 +305,24 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
         analysis_segment_vector_repository = AnalysisSegmentVectorRepository(
             analysis_executor
         )
+        analysis_segment_vector_service = SegmentVectorService(
+            segment_vector_repository=analysis_segment_vector_repository,
+            user_behavior_vector_repository=analysis_user_behavior_vector_repository,
+        )
+        audience_v2_coordinator = AudienceV2Coordinator(
+            search_repository=PgClickHouseAudienceVectorSearchRepository(
+                postgres=analysis_executor,
+                clickhouse=clickhouse_client,
+                exclusion_repository=PromotionAudienceExclusionRepository(
+                    postgres=analysis_executor,
+                    clickhouse=clickhouse_client,
+                ),
+            ),
+            snapshot_repository=AnalysisAudienceSnapshotRepository(
+                analysis_executor
+            ),
+            segment_vector_service=analysis_segment_vector_service,
+        )
         analysis_service = PromotionAnalysisService(
             promotion_repository=AnalysisPromotionRepository(analysis_executor),
             segment_definition_repository=AnalysisSegmentDefinitionRepository(
@@ -296,16 +332,24 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             promotion_analysis_repository=AnalysisPromotionAnalysisRepository(
                 analysis_executor,
             ),
-            segment_vector_service=SegmentVectorService(
-                segment_vector_repository=analysis_segment_vector_repository,
-                user_behavior_vector_repository=analysis_user_behavior_vector_repository,
-            ),
+            segment_vector_service=analysis_segment_vector_service,
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=analysis_user_behavior_vector_repository,
                 raw_event_signal_repository=analysis_user_behavior_vector_repository,
                 promotion_intent_extractor=build_promotion_intent_extractor(settings),
+                vector_version=DEFAULT_VECTOR_VERSION,
             ),
             segment_report_generator=build_segment_suggestion_report_generator(settings),
+            audience_v2_coordinator=audience_v2_coordinator,
+            audience_allocation_service=AudienceAllocationService(
+                PostgresAudienceAllocationRepository(
+                    postgres=analysis_executor,
+                    exclusion_reader=PromotionAudienceExclusionRepository(
+                        postgres=analysis_executor,
+                        clickhouse=clickhouse_client,
+                    ),
+                )
+            ),
         )
         content_generator = None
         artifact_publisher = None
@@ -358,6 +402,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
             next_loop_preparation_repository=next_loop_preparation_repository,
+            run_audience_binding_repository=AudienceSnapshotRepository(executor),
             manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         yield NextLoopService(
@@ -411,7 +456,7 @@ async def create_promotion_run(
     except RunConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
+            detail=(exc.to_detail() if hasattr(exc, "to_detail") else str(exc)),
         ) from exc
     except IntegrityError as exc:
         if _is_unique_violation(exc):
@@ -444,6 +489,11 @@ async def build_segment_assignments(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=str(exc),
+        ) from exc
+    except SegmentAssignmentAudienceContractError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=exc.to_detail(),
         ) from exc
     except SegmentAssignmentValidationError as exc:
         raise HTTPException(
@@ -539,7 +589,7 @@ async def create_next_loop(
     except RunConflictError as exc:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=str(exc),
+            detail=(exc.to_detail() if hasattr(exc, "to_detail") else str(exc)),
         ) from exc
     except IntegrityError as exc:
         if _is_unique_violation(exc):

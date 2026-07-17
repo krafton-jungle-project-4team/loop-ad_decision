@@ -9,6 +9,10 @@ from time import perf_counter
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
+from app.audience_contract import (
+    SEGMENT_AUDIENCE_CONTRACT,
+    SegmentAudienceContractError,
+)
 from app.analysis.audience_selection import (
     AudienceSelectionDecision,
     AudienceSelectionPolicyProtocol,
@@ -18,6 +22,9 @@ from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
     SegmentDefinitionRecord,
+)
+from app.analysis.segment_audience_templates import (
+    RegisteredSegmentAudienceBinder,
 )
 from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
@@ -211,6 +218,13 @@ class RawEventIntentCompilation:
 
 
 @dataclass(frozen=True)
+class RawEventAudienceParameters:
+    destination_ids: tuple[str, ...] = ()
+    season_months: tuple[int, ...] = ()
+    benefit_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class _RawEventCandidate:
     candidate_type: str
     strategy_role: str
@@ -231,6 +245,7 @@ class _RawEventCandidate:
     performance_features: SegmentPerformanceFeatures
     performance_model_metadata: Mapping[str, Any]
     audience_selection: AudienceSelectionDecision
+    audience_parameters: RawEventAudienceParameters
     rank_distinctiveness: float = 1.0
 
     @property
@@ -654,6 +669,40 @@ def season_months_from_intent(intent: PromotionIntent) -> tuple[int, ...]:
     return tuple(dict.fromkeys(months))
 
 
+def _audience_parameters_from_intent(
+    *,
+    candidate_type: str,
+    intent: PromotionIntent | None,
+) -> RawEventAudienceParameters:
+    """Freeze structured candidate parameters before SegmentDefinition storage.
+
+    The runtime binder receives only this value. It never reads the promotion or
+    re-extracts meaning from text.
+    """
+
+    if intent is None:
+        return RawEventAudienceParameters()
+    destination_ids: Sequence[str] = ()
+    season_months: Sequence[int] = ()
+    benefit_keys: Sequence[str] = ()
+    if candidate_type in {
+        "intent_matched",
+        "target_destination_affinity",
+        "funnel_recovery",
+        "benefit_value_seeker",
+    }:
+        destination_ids = intent.destinations
+    if candidate_type == "intent_matched":
+        season_months = season_months_from_intent(intent)
+    if candidate_type == "benefit_value_seeker":
+        benefit_keys = intent.benefits
+    return RawEventAudienceParameters(
+        destination_ids=tuple(destination_ids),
+        season_months=tuple(season_months),
+        benefit_keys=tuple(benefit_keys),
+    )
+
+
 def _intent_matched_candidate(
     *,
     promotion: PromotionRecord,
@@ -1022,6 +1071,10 @@ def _candidate_from_profiles(
             **dict(prediction_metadata),
         },
         audience_selection=audience_selection,
+        audience_parameters=_audience_parameters_from_intent(
+            candidate_type=candidate_type,
+            intent=intent,
+        ),
     )
 
 
@@ -1239,6 +1292,7 @@ def _with_distinctiveness(
         performance_features=candidate.performance_features,
         performance_model_metadata=candidate.performance_model_metadata,
         audience_selection=candidate.audience_selection,
+        audience_parameters=candidate.audience_parameters,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
     )
 
@@ -1354,6 +1408,19 @@ def _segment_definition_from_candidate(
         candidate_type=candidate.candidate_type,
         candidate_user_ids=candidate.candidate_user_ids,
     )
+    try:
+        audience_spec = RegisteredSegmentAudienceBinder().bind(
+            candidate_type=candidate.candidate_type,
+            destination_ids=candidate.audience_parameters.destination_ids,
+            season_months=candidate.audience_parameters.season_months,
+            benefit_keys=candidate.audience_parameters.benefit_keys,
+        )
+    except ValueError as exc:
+        raise SegmentAudienceContractError(
+            code="segment_audience_template_binding_invalid",
+            segment_id=segment_id,
+            reason=str(exc),
+        ) from exc
     profile_json: dict[str, Any] = {
         "primary_segment": segment_id,
         "source": "raw_event_intent",
@@ -1417,6 +1484,8 @@ def _segment_definition_from_candidate(
             "candidate_user_ids": list(candidate.candidate_user_ids),
             "fallback_used": False,
             "version": RAW_EVENT_SEGMENT_VERSION,
+            "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
+            "segment_audience_spec": dict(audience_spec),
         },
         profile_json=profile_json,
         sample_size=candidate.sample_size,

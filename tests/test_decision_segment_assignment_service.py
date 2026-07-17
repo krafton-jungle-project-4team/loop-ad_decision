@@ -10,6 +10,7 @@ from app.decision.assignment_service import (
     SegmentAssignmentService,
     SegmentAssignmentValidationError,
 )
+from app.decision.audience_snapshots import TargetAudienceResolution
 from app.decision.matcher import (
     FALLBACK_REASON_BELOW_THRESHOLD,
     FALLBACK_REASON_INVALID_USER_VECTOR,
@@ -122,6 +123,20 @@ def test_assignment_service_preserves_fallback_for_existing_runs() -> None:
     assert fallback.fallback_reason == FALLBACK_REASON_BELOW_THRESHOLD
     assert repos.segment_vectors.configure_ann_search_count == 1
     assert len(repos.segment_vectors.ann_calls) == 1
+
+
+def test_assignment_service_requires_snapshot_repository_at_construction() -> None:
+    _, repos = make_service()
+
+    with pytest.raises(TypeError, match="audience_snapshot_repository"):
+        SegmentAssignmentService(
+            promotion_run_repository=repos.runs,
+            ad_experiment_repository=repos.ad_experiments,
+            segment_vector_repository=repos.segment_vectors,
+            user_behavior_vector_repository=repos.user_vectors,
+            user_segment_assignment_repository=repos.assignments,
+            reranker=SegmentCandidateReranker(),
+        )
 
 
 def test_assignment_service_leaves_below_threshold_user_unassigned_without_fallback() -> None:
@@ -938,6 +953,20 @@ class FakePromotionRunRepository:
         return self.run
 
 
+class FakeLegacyAudienceSnapshotRepository:
+    def resolve_target_contract(
+        self,
+        *,
+        analysis_id: str,
+        segment_ids: list[str],
+    ) -> TargetAudienceResolution:
+        return TargetAudienceResolution(
+            analysis_id=analysis_id,
+            segment_ids=tuple(sorted(set(segment_ids))),
+            contract="legacy",
+        )
+
+
 class FakeAdExperimentRepository:
     def __init__(self, experiments: list[AdExperimentRecord]) -> None:
         self.experiments = experiments
@@ -1115,6 +1144,7 @@ class FakeRepositoryBundle:
             existing_user_ids,
             insert_conflict_user_ids,
         )
+        self.audience_snapshots = FakeLegacyAudienceSnapshotRepository()
 
 
 def make_service(
@@ -1160,6 +1190,7 @@ def make_service(
         user_behavior_vector_repository=repos.user_vectors,
         user_segment_assignment_repository=repos.assignments,
         reranker=SegmentCandidateReranker(),
+        audience_snapshot_repository=repos.audience_snapshots,
     )
     return service, repos
 
