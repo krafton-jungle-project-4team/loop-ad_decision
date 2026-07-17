@@ -735,13 +735,45 @@ class PromotionAnalysisService:
             )
             if audience_v2 is not None:
                 evidence = dict(target_segment.data_evidence_json)
+                candidate_generation_user_count = int(
+                    evidence.get("sample_size", target_segment.estimated_size) or 0
+                )
+                selected_user_ratio = _safe_audience_ratio(
+                    audience_v2.selected_user_count,
+                    audience_v2.total_eligible_user_count,
+                )
+                matching_user_ratio = _safe_audience_ratio(
+                    audience_v2.matching_user_count,
+                    audience_v2.total_eligible_user_count,
+                )
+                selection_ratio_within_matching = _safe_audience_ratio(
+                    audience_v2.selected_user_count,
+                    audience_v2.matching_user_count,
+                )
                 evidence.update(
                     {
+                        "candidate_generation_user_count": (
+                            candidate_generation_user_count
+                        ),
+                        "sample_size": audience_v2.selected_user_count,
+                        "sample_ratio": selected_user_ratio,
                         "total_eligible_user_count": (
                             audience_v2.total_eligible_user_count
                         ),
                         "matching_user_count": audience_v2.matching_user_count,
                         "selected_user_count": audience_v2.selected_user_count,
+                        "matching_user_ratio": matching_user_ratio,
+                        "selected_user_ratio": selected_user_ratio,
+                        "selection_ratio_within_matching": (
+                            selection_ratio_within_matching
+                        ),
+                        "selection_limited": (
+                            audience_v2.selected_user_count
+                            < audience_v2.matching_user_count
+                        ),
+                        "selection_basis": (
+                            "hard_predicate_and_exact_cosine"
+                        ),
                         "selection_method": audience_v2.selection_method,
                         "estimated_recall": audience_v2.estimated_recall,
                         "recall_lower_bound": audience_v2.recall_lower_bound,
@@ -1579,6 +1611,9 @@ def _display_copy(
                 "프로모션 메시지의 우선 타겟으로 적합합니다.",
             ),
         )
+        if _is_v2_audience_evidence(evidence):
+            display_copy["audience_summary"] = _v2_audience_summary(evidence)
+            display_copy["audience"] = _v2_display_audience(evidence)
         return display_copy
     display_copy = {
         "title": _display_title(signal_keys),
@@ -1601,7 +1636,65 @@ def _display_copy(
     )
     if strategy_role:
         display_copy["strategy_role"] = strategy_role
+    if _is_v2_audience_evidence(evidence):
+        display_copy["audience_summary"] = _v2_audience_summary(evidence)
+        display_copy["audience"] = _v2_display_audience(evidence)
     return display_copy
+
+
+def _is_v2_audience_evidence(evidence: Mapping[str, Any]) -> bool:
+    return (
+        evidence.get("audience_resolution_contract")
+        == SEGMENT_AUDIENCE_CONTRACT
+        and evidence.get("selected_user_role") == "final_experiment_audience"
+    )
+
+
+def _v2_audience_summary(evidence: Mapping[str, Any]) -> str:
+    total_eligible_user_count = int(
+        evidence.get("total_eligible_user_count", 0) or 0
+    )
+    matching_user_count = int(evidence.get("matching_user_count", 0) or 0)
+    selected_user_count = int(evidence.get("selected_user_count", 0) or 0)
+    return (
+        f"분석 가능 사용자 {total_eligible_user_count}명 · "
+        f"행동 조건 부합 {matching_user_count}명 · "
+        f"실험 대상 사용자 {selected_user_count}명"
+    )
+
+
+def _v2_display_audience(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    total_eligible_user_count = int(
+        evidence.get("total_eligible_user_count", 0) or 0
+    )
+    matching_user_count = int(evidence.get("matching_user_count", 0) or 0)
+    selected_user_count = int(evidence.get("selected_user_count", 0) or 0)
+    return {
+        "total_eligible_user_count": total_eligible_user_count,
+        "matching_user_count": matching_user_count,
+        "selected_user_count": selected_user_count,
+        "matching_user_ratio": _safe_audience_ratio(
+            matching_user_count,
+            total_eligible_user_count,
+        ),
+        "selected_user_ratio": _safe_audience_ratio(
+            selected_user_count,
+            total_eligible_user_count,
+        ),
+        "selection_ratio_within_matching": _safe_audience_ratio(
+            selected_user_count,
+            matching_user_count,
+        ),
+        "selection_limited": selected_user_count < matching_user_count,
+        "selection_basis": "hard_predicate_and_exact_cosine",
+        "selected_user_role": "final_experiment_audience",
+    }
+
+
+def _safe_audience_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(max(numerator, 0) / denominator, 6)
 
 
 def _is_raw_event_intent_segment(segment: SegmentDefinitionRecord) -> bool:
