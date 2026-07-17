@@ -15,6 +15,7 @@ from psycopg import sql
 
 from app.config import load_settings
 from tests.config_env import required_env_values
+from app.decision.audience_snapshots import AudienceSnapshotRepository
 from app.decision.next_loop_service import (
     NextLoopConflictError,
     NextLoopGenerationFailedError,
@@ -393,7 +394,8 @@ def test_manual_next_loop_api_persists_preparation_and_returns_pending_candidate
         if "insert into promotion_target_segments" in compact_sql(query)
     ]
     assert manual_target_params
-    assert {params[-1] for params in manual_target_params} == {"planned"}
+    assert {params[-2] for params in manual_target_params} == {"planned"}
+    assert {params[-1] for params in manual_target_params} == {None}
     assert any("pg_advisory_xact_lock" in query for query in executed_sql)
     assert not any("insert into promotion_runs" in query for query in executed_sql)
     assert not any("insert into ad_experiments" in query for query in executed_sql)
@@ -867,6 +869,10 @@ def test_next_loop_service_wires_s3_artifact_publisher_outside_test_env(
         generation_gateway = service._generation_gateway
         generation_service = generation_gateway._generation_service
         assert generation_service._artifact_publisher is artifact_publisher
+        assert isinstance(
+            service._run_creator._run_audience_binding_repository,
+            AudienceSnapshotRepository,
+        )
     finally:
         service_iterator.close()
 
@@ -999,7 +1005,8 @@ def test_next_loop_api_wires_focus_analysis_generation_and_creates_next_run(
         if "insert into promotion_target_segments" in compact_sql(query)
     ]
     assert automatic_target_params
-    assert {params[-1] for params in automatic_target_params} == {"approved"}
+    assert {params[-2] for params in automatic_target_params} == {"approved"}
+    assert {params[-1] for params in automatic_target_params} == {None}
     assert any("insert into generation_runs" in query for query in executed_sql)
     assert any("insert into content_candidates" in query for query in executed_sql)
     assert any("insert into promotion_runs" in query for query in executed_sql)

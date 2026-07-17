@@ -11,6 +11,7 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
 )
 from app.analysis.report_generator import (
+    DeterministicSegmentSuggestionReportGenerator,
     OpenAISegmentSuggestionReportGenerator,
     SegmentSuggestionReportInput,
 )
@@ -179,6 +180,55 @@ def test_openai_segment_report_replaces_unverified_sample_caution() -> None:
     assert "표본 수가 160명으로 작아" not in report["caution"]
     assert "학습 범위" not in report["caution"]
     assert "분포 제한" not in report["caution"]
+
+
+def test_v2_segment_report_uses_final_audience_for_minimum_sample_wording() -> None:
+    base_input = _report_input()
+    target_segment = replace(
+        base_input.target_segment,
+        estimated_size=1,
+        audience_snapshot_id="snapshot_demo",
+        data_evidence_json={
+            **dict(base_input.target_segment.data_evidence_json),
+            "candidate_generation_user_count": 160,
+            "sample_size": 1,
+            "sample_ratio": 0.125,
+            "total_eligible_user_count": 8,
+            "matching_user_count": 4,
+            "selected_user_count": 1,
+            "selected_user_role": "final_experiment_audience",
+            "audience_resolution_contract": "segment_audience.v1",
+            "meets_min_sample_size": False,
+            "audience_status": "insufficient_sample",
+        },
+    )
+    report_input = replace(
+        base_input,
+        target_segment=target_segment,
+        display_copy={
+            **dict(base_input.display_copy),
+            "audience_summary": (
+                "분석 가능 사용자 8명 · 행동 조건 부합 4명 · "
+                "실험 대상 사용자 1명"
+            ),
+            "tradeoff_summary": "대표 표본 규모를 확인하세요.",
+            "performance_estimate": {
+                "confidence_label": "high",
+            },
+        },
+    )
+
+    report = DeterministicSegmentSuggestionReportGenerator().generate_report(
+        report_input
+    )
+
+    assert report["confidence_label"] == "low"
+    assert report["caution"] == (
+        "실험 대상 사용자가 최소 평가 인원보다 적어 첫 실험 결과는 "
+        "insufficient_data로 평가됩니다."
+    )
+    assert "실험 대상 사용자 규모" in report["selection_considerations"][0]
+    assert "대표 표본" not in str(report)
 
 
 def _report_input() -> SegmentSuggestionReportInput:

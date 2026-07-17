@@ -9,6 +9,7 @@ from app.analysis.repositories import SegmentVectorRecord, UserBehaviorVectorRec
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorDataUnavailableError,
+    SegmentVectorConflictError,
     SegmentVectorService,
 )
 
@@ -164,6 +165,71 @@ def test_segment_vector_service_averages_candidate_user_vectors() -> None:
     assert vector_norm(saved.vector_values) == pytest.approx(1.0)
     assert saved.vector_values[0] == pytest.approx(1 / math.sqrt(2))
     assert saved.vector_values[1] == pytest.approx(1 / math.sqrt(2))
+
+
+def test_segment_vector_service_stores_behavior_query_without_centroid() -> None:
+    store = FakeSegmentVectorRepository()
+    reader = FakeUserBehaviorVectorRepository([])
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=reader,
+    )
+    query = [1.0, 1.0, *([0.0] * 62)]
+
+    result = service.prepare_segment_vector(
+        SegmentVectorBuildRequest(
+            project_id="hotel-client-a",
+            promotion_id="promo_banner_001",
+            analysis_id="analysis_v2",
+            segment_id="seg_v2",
+            vector_version="hotel_behavior.v2",
+            query_vector=query,
+        )
+    )
+
+    assert reader.calls == []
+    assert result.source == "behavior_query"
+    assert store.saved[0].source == "behavior_query"
+    assert store.saved[0].vector_version == "hotel_behavior.v2"
+    assert store.saved[0].vector_values[:2] == pytest.approx(
+        [1 / math.sqrt(2), 1 / math.sqrt(2)]
+    )
+    assert store.latest_calls == []
+
+
+def test_behavior_query_retry_rejects_changed_semantics() -> None:
+    existing = SegmentVectorRecord(
+        segment_vector_id="segvec_v2",
+        project_id="hotel-client-a",
+        promotion_id="promo_banner_001",
+        promotion_run_id=None,
+        analysis_id="analysis_v2",
+        segment_id="seg_v2",
+        vector_dim=64,
+        vector_values=[1.0, *([0.0] * 63)],
+        vector_version="hotel_behavior.v2",
+        source="behavior_query",
+    )
+    store = FakeSegmentVectorRepository(snapshot=existing)
+    service = SegmentVectorService(
+        segment_vector_repository=store,
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+    )
+
+    with pytest.raises(SegmentVectorConflictError, match="conflicts"):
+        service.prepare_segment_vector(
+            SegmentVectorBuildRequest(
+                project_id="hotel-client-a",
+                promotion_id="promo_banner_001",
+                analysis_id="analysis_v2",
+                segment_id="seg_v2",
+                vector_version="hotel_behavior.v2",
+                query_vector=[0.0, 1.0, *([0.0] * 62)],
+            )
+        )
+
+    assert store.latest_calls == []
+    assert store.saved == []
 
 
 def test_segment_vector_service_rejects_missing_candidate_user_ids() -> None:

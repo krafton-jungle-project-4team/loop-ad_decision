@@ -1,12 +1,21 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from decimal import Decimal
 from typing import Any, Literal, Mapping, Protocol, Sequence
 
+from app.audience_contract import (
+    SEGMENT_AUDIENCE_CONTRACT,
+    SegmentAudienceContractError,
+    SegmentDefinitionAudienceAdapter,
+)
+from app.analysis.audience_v2 import AudienceV2Coordinator, AudienceV2Preparation
+from app.audience_allocation import AudienceAllocationService
+from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
 from app.analysis.booking_model import (
     BookingPropensityModel,
     BookingPropensityPrediction,
@@ -20,12 +29,14 @@ from app.analysis.repositories import (
     PromotionSegmentSuggestionWrite,
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
+    SegmentSuggestionAudienceBindingRecord,
 )
 from app.analysis.report_generator import (
     DeterministicSegmentSuggestionReportGenerator,
     SegmentSuggestionReportGenerator,
     SegmentSuggestionReportInput,
 )
+from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 from app.analysis.schemas import (
     AnalysisRequest,
     AnalysisStatus,
@@ -41,7 +52,7 @@ from app.content_brief import build_content_brief_v2
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
-MAX_DEFAULT_TARGET_SEGMENTS = 4
+MAX_DEFAULT_TARGET_SEGMENTS = DEFAULT_MAX_SUGGESTED_SEGMENTS
 
 TargetSegmentStatus = Literal["planned", "approved"]
 
@@ -328,6 +339,16 @@ class PromotionAnalysisWriter(Protocol):
     ) -> None:
         ...
 
+    def get_latest_audience_bindings(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[SegmentSuggestionAudienceBindingRecord]:
+        ...
+
 
 class SegmentVectorPreparer(Protocol):
     def prepare_segment_vector(
@@ -408,6 +429,9 @@ class PromotionAnalysisService:
         segment_suggester: SegmentDefinitionSuggester | None = None,
         segment_report_generator: SegmentSuggestionReportGenerator | None = None,
         max_default_target_segments: int = MAX_DEFAULT_TARGET_SEGMENTS,
+        audience_v2_coordinator: AudienceV2Coordinator | None = None,
+        audience_adapter: SegmentDefinitionAudienceAdapter | None = None,
+        audience_allocation_service: AudienceAllocationService | None = None,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._segment_definition_repository = segment_definition_repository
@@ -420,6 +444,9 @@ class PromotionAnalysisService:
             or DeterministicSegmentSuggestionReportGenerator()
         )
         self._max_default_target_segments = max_default_target_segments
+        self._audience_v2_coordinator = audience_v2_coordinator
+        self._audience_adapter = audience_adapter or SegmentDefinitionAudienceAdapter()
+        self._audience_allocation_service = audience_allocation_service
 
     @log_context_scope
     def recommend_segments(
@@ -597,10 +624,55 @@ class PromotionAnalysisService:
         if not selected_candidates:
             log.warn("segment_candidates_empty", {"candidateCount": len(candidates)})
             raise SegmentSelectionError("no active segment candidates matched analysis request")
+        audience_resolutions = {
+            candidate.segment_id: self._audience_adapter.resolve(
+                segment_id=candidate.segment_id,
+                rule_json=candidate.definition.rule_json,
+            )
+            for candidate in selected_candidates
+        }
+        contracts = {
+            resolution.contract for resolution in audience_resolutions.values()
+        }
+        if persist_target_segments and len(contracts) > 1:
+            raise AudienceSnapshotBindingError(
+                "legacy and segment_audience.v1 segments cannot be confirmed together",
+                code="segment_audience_contract_mixed",
+            )
 
-        analysis_id = _analysis_id(
-            promotion_id=promotion.promotion_id,
-            next_loop_context=next_loop_context,
+        confirmation_source_analysis_id: str | None = None
+        confirmation_source_snapshot_ids: tuple[str, ...] = ()
+        if (
+            persist_target_segments
+            and not refresh_segment_suggestions
+            and next_loop_context is None
+            and contracts == {SEGMENT_AUDIENCE_CONTRACT}
+        ):
+            (
+                confirmation_source_analysis_id,
+                confirmation_source_snapshot_ids,
+            ) = self._resolve_confirmation_source_batch(
+                promotion=promotion,
+                segment_ids=[
+                    candidate.segment_id for candidate in selected_candidates
+                ],
+            )
+
+        analysis_id = (
+            _confirmation_analysis_id(
+                promotion_id=promotion.promotion_id,
+                source_analysis_id=confirmation_source_analysis_id,
+                segment_ids=[
+                    candidate.segment_id for candidate in selected_candidates
+                ],
+                source_snapshot_ids=confirmation_source_snapshot_ids,
+                operator_instruction=request.operator_instruction,
+            )
+            if confirmation_source_analysis_id is not None
+            else _analysis_id(
+                promotion_id=promotion.promotion_id,
+                next_loop_context=next_loop_context,
+            )
         )
         analysis = self._build_analysis(
             analysis_id=analysis_id,
@@ -618,22 +690,178 @@ class PromotionAnalysisService:
         self._promotion_analysis_repository.save_analysis(analysis)
         log.assign_context({"analysisId": analysis.analysis_id})
         log.info("promotion_analysis_created", {"analysis": analysis})
-        target_segments = [
-            self._build_target_segment(
+        v2_segments_to_prepare = [
+            candidate.definition
+            for candidate in selected_candidates
+            if audience_resolutions[candidate.segment_id].is_v2
+            and (
+                refresh_segment_suggestions
+                or next_loop_context is not None
+            )
+        ]
+        v2_segments_to_reuse = [
+            candidate.definition
+            for candidate in selected_candidates
+            if audience_resolutions[candidate.segment_id].is_v2
+            and persist_target_segments
+            and not refresh_segment_suggestions
+            and next_loop_context is None
+        ]
+        v2_segments = v2_segments_to_prepare + v2_segments_to_reuse
+        if v2_segments and self._audience_v2_coordinator is None:
+            first_segment = v2_segments[0]
+            raise SegmentAudienceContractError(
+                code="segment_audience_calculator_unavailable",
+                segment_id=first_segment.segment_id,
+                reason="V2 audience calculator is unavailable",
+            )
+        prepared_v2 = (
+            self._audience_v2_coordinator.prepare_many(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                segments=v2_segments_to_prepare,
+            )
+            if v2_segments_to_prepare
+            and self._audience_v2_coordinator is not None
+            else {}
+        )
+        if (
+            v2_segments_to_prepare
+            and persist_target_segments
+            and next_loop_context is not None
+        ):
+            prepared_v2.update(
+                self._allocate_recommendation_audiences(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    segments=v2_segments_to_prepare,
+                    source_analysis_id=analysis_id,
+                )
+            )
+        if v2_segments_to_reuse and self._audience_v2_coordinator is not None:
+            prepared_v2.update(
+                self._allocate_recommendation_audiences(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    segments=v2_segments_to_reuse,
+                    source_analysis_id=confirmation_source_analysis_id,
+                )
+            )
+        target_segments: list[PromotionTargetSegmentWrite] = []
+        for rank, candidate in enumerate(selected_candidates):
+            resolution = audience_resolutions[candidate.segment_id]
+            is_v2_candidate = resolution.is_v2
+            should_prepare_v2 = (
+                is_v2_candidate
+                and (
+                    refresh_segment_suggestions
+                    or persist_target_segments
+                    or next_loop_context is not None
+                )
+            )
+            audience_v2 = (
+                prepared_v2.get(candidate.segment_id)
+                if should_prepare_v2
+                else None
+            )
+            segment_vector_id = (
+                audience_v2.segment_vector_id
+                if audience_v2 is not None
+                else self._prepare_segment_vector_id(
+                    analysis_id=analysis_id,
+                    promotion=promotion,
+                    candidate=candidate,
+                )
+            )
+            target_segment = self._build_target_segment(
                 analysis_id=analysis_id,
                 promotion=promotion,
                 candidate=candidate,
                 rank=rank,
                 operator_instruction=request.operator_instruction,
                 status=target_status,
-                segment_vector_id=self._prepare_segment_vector_id(
-                    analysis_id=analysis_id,
-                    promotion=promotion,
-                    candidate=candidate,
-                ),
+                segment_vector_id=segment_vector_id,
             )
-            for rank, candidate in enumerate(selected_candidates)
-        ]
+            if audience_v2 is not None:
+                evidence = dict(target_segment.data_evidence_json)
+                candidate_generation_user_count = int(
+                    evidence.get("sample_size", target_segment.estimated_size) or 0
+                )
+                selected_user_ratio = _safe_audience_ratio(
+                    audience_v2.selected_user_count,
+                    audience_v2.total_eligible_user_count,
+                )
+                matching_user_ratio = _safe_audience_ratio(
+                    audience_v2.matching_user_count,
+                    audience_v2.total_eligible_user_count,
+                )
+                selection_ratio_within_matching = _safe_audience_ratio(
+                    audience_v2.selected_user_count,
+                    audience_v2.matching_user_count,
+                )
+                evidence.update(
+                    {
+                        "candidate_generation_user_count": (
+                            candidate_generation_user_count
+                        ),
+                        "sample_size": audience_v2.selected_user_count,
+                        "sample_ratio": selected_user_ratio,
+                        "total_eligible_user_count": (
+                            audience_v2.total_eligible_user_count
+                        ),
+                        "matching_user_count": audience_v2.matching_user_count,
+                        "selected_user_count": audience_v2.selected_user_count,
+                        "matching_user_ratio": matching_user_ratio,
+                        "selected_user_ratio": selected_user_ratio,
+                        "selection_ratio_within_matching": (
+                            selection_ratio_within_matching
+                        ),
+                        "selection_limited": (
+                            audience_v2.selected_user_count
+                            < audience_v2.matching_user_count
+                        ),
+                        "selection_basis": (
+                            "hard_predicate_and_exact_cosine"
+                        ),
+                        "selection_method": audience_v2.selection_method,
+                        "estimated_recall": audience_v2.estimated_recall,
+                        "recall_lower_bound": audience_v2.recall_lower_bound,
+                        "recall_target": audience_v2.recall_target,
+                        "selected_user_role": "final_experiment_audience",
+                        "vector_version": audience_v2.vector_version,
+                        "input_stability": "snapshotted",
+                        "audience_snapshot_id": audience_v2.audience_snapshot_id,
+                        "vector_generation_id": audience_v2.vector_generation_id,
+                        "promotion_exclusion_revision": (
+                            audience_v2.promotion_exclusion_revision
+                        ),
+                        "excluded_user_count": audience_v2.excluded_user_count,
+                        "meets_min_sample_size": (
+                            audience_v2.meets_min_sample_size
+                        ),
+                        "targetable": audience_v2.selected_user_count > 0,
+                        "audience_status": (
+                            "no_eligible_audience"
+                            if audience_v2.selected_user_count == 0
+                            else (
+                                "targetable"
+                                if audience_v2.meets_min_sample_size
+                                else "insufficient_sample"
+                            )
+                        ),
+                        "audience_resolution_contract": (
+                            SEGMENT_AUDIENCE_CONTRACT
+                        ),
+                    }
+                )
+                target_segment = replace(
+                    target_segment,
+                    estimated_size=audience_v2.selected_user_count,
+                    data_evidence_json=evidence,
+                    audience_snapshot_id=audience_v2.audience_snapshot_id,
+                    allocation_plan_id=audience_v2.allocation_plan_id,
+                )
+            target_segments.append(target_segment)
         segment_suggestions: list[PromotionSegmentSuggestionWrite] = []
         if persist_segment_suggestions:
             segment_suggestions = [
@@ -655,6 +883,19 @@ class PromotionAnalysisService:
             log.info("promotion_target_segments_created", {"targetSegments": target_segments})
         if persist_segment_suggestions:
             self._promotion_analysis_repository.save_segment_suggestions(segment_suggestions)
+            if v2_segments_to_prepare:
+                if self._audience_allocation_service is None:
+                    raise SegmentAudienceContractError(
+                        code="segment_audience_exclusion_contract_missing",
+                        segment_id=v2_segments_to_prepare[0].segment_id,
+                        reason="audience allocation service is unavailable",
+                    )
+                self._audience_allocation_service.refresh_recommendation_previews(
+                    analysis_id=analysis_id,
+                    project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
+                )
             log.info(
                 "promotion_segment_suggestions_created",
                 {"segmentSuggestions": segment_suggestions},
@@ -663,6 +904,86 @@ class PromotionAnalysisService:
             analysis=analysis,
             target_segments=target_segments,
             segment_suggestions=segment_suggestions,
+        )
+
+    def _allocate_recommendation_audiences(
+        self,
+        *,
+        analysis_id: str,
+        promotion: PromotionRecord,
+        segments: Sequence[SegmentDefinitionRecord],
+        source_analysis_id: str | None = None,
+    ) -> dict[str, Any]:
+        if self._audience_allocation_service is None:
+            raise SegmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=segments[0].segment_id,
+                reason="audience allocation service is unavailable",
+            )
+        result = self._audience_allocation_service.confirm_selection(
+            confirmation_analysis_id=analysis_id,
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=[segment.segment_id for segment in segments],
+            min_sample_size=promotion.min_sample_size,
+            source_analysis_id=source_analysis_id,
+        )
+        assert self._audience_v2_coordinator is not None
+        prepared: dict[str, AudienceV2Preparation] = {}
+        for segment in segments:
+            allocation = result.allocations[segment.segment_id]
+            bound = self._audience_v2_coordinator.prepare(
+                analysis_id=analysis_id,
+                promotion=promotion,
+                segment=segment,
+                audience_snapshot_id=allocation.final_snapshot_id,
+            )
+            prepared[segment.segment_id] = replace(
+                bound,
+                source_audience_snapshot_id=allocation.source_snapshot_id,
+                allocation_plan_id=allocation.allocation_plan_id,
+            )
+        return prepared
+
+    def _resolve_confirmation_source_batch(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segment_ids: Sequence[str],
+    ) -> tuple[str, tuple[str, ...]]:
+        expected = set(segment_ids)
+        bindings = self._promotion_analysis_repository.get_latest_audience_bindings(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=segment_ids,
+        )
+        by_segment = {binding.segment_id: binding for binding in bindings}
+        if set(by_segment) != expected or any(
+            binding.audience_snapshot_id is None
+            for binding in by_segment.values()
+        ):
+            missing = sorted(expected - set(by_segment))
+            raise AudienceSnapshotBindingError(
+                "selected V2 segment requires a completed recommendation snapshot",
+                code="segment_audience_snapshot_binding_required",
+                segment_id=missing[0] if missing else sorted(expected)[0],
+            )
+        source_analysis_ids = {
+            binding.analysis_id for binding in by_segment.values()
+        }
+        if len(source_analysis_ids) != 1:
+            raise AudienceSnapshotBindingError(
+                "selected V2 segments must come from the same recommendation analysis",
+                code="segment_audience_source_batch_mismatch",
+            )
+        return (
+            next(iter(source_analysis_ids)),
+            tuple(
+                str(by_segment[segment_id].audience_snapshot_id)
+                for segment_id in sorted(expected)
+            ),
         )
 
     def _train_booking_model(self) -> BookingPropensityModel | None:
@@ -976,6 +1297,7 @@ class PromotionAnalysisService:
             score_json=score_json,
             reason_json=reason_json,
             metadata_json=metadata_json,
+            audience_snapshot_id=target_segment.audience_snapshot_id,
         )
 
     def _build_content_brief_json(
@@ -1113,6 +1435,10 @@ class PromotionAnalysisService:
                 "attempt_no": next_loop_context.attempt_no,
             }
 
+        output_json: dict[str, Any] = {
+            "selected_segment_ids": list(selected_segment_ids),
+            "target_segment_count": len(selected_segment_ids),
+        }
         return PromotionAnalysisWrite(
             analysis_id=analysis_id,
             project_id=promotion.project_id,
@@ -1129,10 +1455,7 @@ class PromotionAnalysisService:
                 "selection_mode": "focus" if focus_segment_ids else "default",
                 "reason": _analysis_reason(focus_segment_ids),
             },
-            output_json={
-                "selected_segment_ids": list(selected_segment_ids),
-                "target_segment_count": len(selected_segment_ids),
-            },
+            output_json=output_json,
         )
 
     def _prepare_segment_vector_id(
@@ -1243,6 +1566,33 @@ def _analysis_id(
         source_promotion_run_id=next_loop_context.source_promotion_run_id,
         attempt_no=next_loop_context.attempt_no,
     )
+
+
+def _confirmation_analysis_id(
+    *,
+    promotion_id: str,
+    source_analysis_id: str,
+    segment_ids: Sequence[str],
+    source_snapshot_ids: Sequence[str],
+    operator_instruction: str | None,
+) -> str:
+    canonical = {
+        "promotion_id": promotion_id,
+        "source_analysis_id": source_analysis_id,
+        "segment_ids": sorted(set(segment_ids)),
+        "source_snapshot_ids": sorted(set(source_snapshot_ids)),
+        "operator_instruction": operator_instruction,
+    }
+    digest = hashlib.sha256(
+        json.dumps(
+            canonical,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()[:24]
+    promotion_slug = _slug_from_promotion_id(promotion_id)[:48].rstrip("_")
+    return f"analysis_{promotion_slug or 'promotion'}_confirm_{digest}"
 
 
 def _bounded_next_loop_lineage_id(
@@ -1387,6 +1737,9 @@ def _display_copy(
                 "프로모션 메시지의 우선 타겟으로 적합합니다.",
             ),
         )
+        if _is_v2_audience_evidence(evidence):
+            display_copy["audience_summary"] = _v2_audience_summary(evidence)
+            display_copy["audience"] = _v2_display_audience(evidence)
         return display_copy
     display_copy = {
         "title": _display_title(signal_keys),
@@ -1409,7 +1762,65 @@ def _display_copy(
     )
     if strategy_role:
         display_copy["strategy_role"] = strategy_role
+    if _is_v2_audience_evidence(evidence):
+        display_copy["audience_summary"] = _v2_audience_summary(evidence)
+        display_copy["audience"] = _v2_display_audience(evidence)
     return display_copy
+
+
+def _is_v2_audience_evidence(evidence: Mapping[str, Any]) -> bool:
+    return (
+        evidence.get("audience_resolution_contract")
+        == SEGMENT_AUDIENCE_CONTRACT
+        and evidence.get("selected_user_role") == "final_experiment_audience"
+    )
+
+
+def _v2_audience_summary(evidence: Mapping[str, Any]) -> str:
+    total_eligible_user_count = int(
+        evidence.get("total_eligible_user_count", 0) or 0
+    )
+    matching_user_count = int(evidence.get("matching_user_count", 0) or 0)
+    selected_user_count = int(evidence.get("selected_user_count", 0) or 0)
+    return (
+        f"분석 가능 사용자 {total_eligible_user_count}명 · "
+        f"행동 조건 부합 {matching_user_count}명 · "
+        f"실험 대상 사용자 {selected_user_count}명"
+    )
+
+
+def _v2_display_audience(evidence: Mapping[str, Any]) -> dict[str, Any]:
+    total_eligible_user_count = int(
+        evidence.get("total_eligible_user_count", 0) or 0
+    )
+    matching_user_count = int(evidence.get("matching_user_count", 0) or 0)
+    selected_user_count = int(evidence.get("selected_user_count", 0) or 0)
+    return {
+        "total_eligible_user_count": total_eligible_user_count,
+        "matching_user_count": matching_user_count,
+        "selected_user_count": selected_user_count,
+        "matching_user_ratio": _safe_audience_ratio(
+            matching_user_count,
+            total_eligible_user_count,
+        ),
+        "selected_user_ratio": _safe_audience_ratio(
+            selected_user_count,
+            total_eligible_user_count,
+        ),
+        "selection_ratio_within_matching": _safe_audience_ratio(
+            selected_user_count,
+            matching_user_count,
+        ),
+        "selection_limited": selected_user_count < matching_user_count,
+        "selection_basis": "hard_predicate_and_exact_cosine",
+        "selected_user_role": "final_experiment_audience",
+    }
+
+
+def _safe_audience_ratio(numerator: int, denominator: int) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round(max(numerator, 0) / denominator, 6)
 
 
 def _is_raw_event_intent_segment(segment: SegmentDefinitionRecord) -> bool:

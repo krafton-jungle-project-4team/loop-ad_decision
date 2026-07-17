@@ -1,4 +1,5 @@
 from enum import Enum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -49,7 +50,6 @@ class SegmentAnalysisRequest(AnalysisRequest):
             raise ValueError("segment_ids must not contain duplicates")
         return cleaned
 
-
 class ContentBriefResponse(BaseModel):
     message_direction: str
     keywords: list[str]
@@ -60,6 +60,19 @@ class TargetSegmentResponse(BaseModel):
     segment_name: str
     segment_vector_id: str
     estimated_size: int
+    audience_snapshot_id: str | None = None
+    eligible_user_count: int | None = None
+    behavior_match_count: int | None = None
+    final_audience_count: int | None = None
+    meets_min_sample_size: bool | None = None
+    targetable: bool | None = None
+    audience_status: Literal[
+        "targetable",
+        "insufficient_sample",
+        "no_eligible_audience",
+    ] | None = None
+    selection_method: str | None = None
+    recall_lower_bound: float | None = None
     content_brief: ContentBriefResponse
 
 

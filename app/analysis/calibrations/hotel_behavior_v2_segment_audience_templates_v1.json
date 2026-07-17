@@ -1,0 +1,238 @@
+{
+  "status": "validated",
+  "artifact_version": "segment-audience-semantic-selection.2026-07-17.v1",
+  "audience_resolution_contract": "segment_audience.v1",
+  "schema_version": "hotel_behavior.v2",
+  "behavior_schema_version": "hotel_booking_behavior.v2",
+  "vector_version": "hotel_behavior.v2",
+  "manifest_hash": "86ded0d76ddba811d35b8f02b036a80054112d586ff8de5cb28dc4a22138868c",
+  "query_compiler_version": "segment_behavior_query.v2",
+  "query_compiler_hash": "b91a8c7b4778efeb8c66519aecd7333dce8294f1b3e68e96333256243feb69a1",
+  "user_vectorizer_version": "hotel_user_behavior_vectorizer.v2",
+  "user_vectorizer_semantic_hash": "8965541c851203a437e8de0525984c2e5108063eda07f8d10ab6c8c562ae03a3",
+  "semantic_selection_status": "validated",
+  "business_lift_status": "pending",
+  "minimum_margin": 0.02,
+  "templates": {
+    "hotel.intent_matched.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.intent_matched.semantic-selection.v1",
+      "template_semantic_hash": "sha256:995af31310e54a1e9b161cbc1d2bac34f295a62d7da8e2ac62e1c93c5b7db7c1",
+      "semantic_selection_policy_id": "hotel.intent_matched.selection.v1",
+      "semantic_anchor_policy_id": "hotel.intent_matched.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 24, "hotel_search_count": 8, "hotel_click_count": 5, "hotel_detail_view_count": 8},
+          "event_age_days": 7,
+          "destination_mode": "matched_dense",
+          "season_mode": "matched_dense",
+          "checkin_lead_days": 14
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 12, "hotel_search_count": 3, "hotel_click_count": 1, "hotel_detail_view_count": 2},
+          "event_age_days": 20,
+          "destination_mode": "matched_twice",
+          "season_mode": "matched",
+          "checkin_lead_days": 14
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "hotel_search_count": 1, "promotion_impression_count": 30, "booking_complete_count": 20, "booking_cancel_count": 20},
+          "event_age_days": 29,
+          "destination_mode": "matched_once",
+          "season_mode": "matched",
+          "checkin_lead_days": 45
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 50, "promotion_impression_count": 30, "promotion_click_count": 2},
+          "event_age_days": 45,
+          "destination_mode": "single_other",
+          "season_mode": "other",
+          "checkin_lead_days": 45
+        }
+      ]
+    },
+    "hotel.target_destination_affinity.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.target_destination_affinity.semantic-selection.v1",
+      "template_semantic_hash": "sha256:b6e10ebd5a7570682abd9829c4fde002f70303c06084afaa3157585af717163a",
+      "semantic_selection_policy_id": "hotel.target_destination_affinity.selection.v1",
+      "semantic_anchor_policy_id": "hotel.target_destination_affinity.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 24, "hotel_search_count": 10, "hotel_click_count": 5, "hotel_detail_view_count": 8},
+          "event_age_days": 7,
+          "destination_mode": "matched_dense"
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 12, "hotel_search_count": 4, "hotel_detail_view_count": 3},
+          "event_age_days": 20,
+          "destination_mode": "matched_twice"
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "hotel_search_count": 1, "promotion_impression_count": 40, "booking_complete_count": 25},
+          "event_age_days": 29,
+          "destination_mode": "matched_twice"
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 30, "hotel_search_count": 4, "hotel_detail_view_count": 2},
+          "event_age_days": 45,
+          "destination_mode": "matched_once"
+        }
+      ]
+    },
+    "hotel.funnel_recovery.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.funnel_recovery.semantic-selection.v1",
+      "template_semantic_hash": "sha256:19d3f8ca412b165ec18d13f157f8e4a3a28fbe3b4c0f905baa02bf3a4464e768",
+      "semantic_selection_policy_id": "hotel.funnel_recovery.selection.v1",
+      "semantic_anchor_policy_id": "hotel.funnel_recovery.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 20, "hotel_detail_view_count": 8, "booking_start_count": 6, "booking_complete_count": 1},
+          "event_age_days": 7,
+          "destination_mode": "matched_dense"
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 10, "hotel_detail_view_count": 2, "booking_start_count": 2, "booking_complete_count": 1},
+          "event_age_days": 20,
+          "destination_mode": "matched_twice"
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "booking_start_count": 1, "promotion_impression_count": 40, "booking_cancel_count": 30},
+          "event_age_days": 29,
+          "destination_mode": "matched_once"
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 20, "hotel_detail_view_count": 5, "booking_start_count": 2, "booking_complete_count": 2},
+          "event_age_days": 45,
+          "destination_mode": "matched_twice"
+        }
+      ]
+    },
+    "hotel.benefit_value_seeker.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.benefit_value_seeker.semantic-selection.v1",
+      "template_semantic_hash": "sha256:2937991702a94eded6104bee7834f40e5a7672b7dc83bd5513512d278a1d420d",
+      "semantic_selection_policy_id": "hotel.benefit_value_seeker.selection.v1",
+      "semantic_anchor_policy_id": "hotel.benefit_value_seeker.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 20, "hotel_search_count": 6},
+          "event_age_days": 7,
+          "destination_mode": "matched_dense",
+          "benefit_mode": "selected",
+          "benefit_count": 6
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 10, "hotel_search_count": 2},
+          "event_age_days": 20,
+          "destination_mode": "matched_twice",
+          "benefit_mode": "selected",
+          "benefit_count": 2
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "booking_complete_count": 30, "promotion_impression_count": 30},
+          "event_age_days": 29,
+          "destination_mode": "matched_once",
+          "benefit_mode": "selected",
+          "benefit_count": 1
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 20, "hotel_search_count": 5, "hotel_detail_view_count": 5},
+          "event_age_days": 45,
+          "destination_mode": "matched_twice"
+        }
+      ]
+    },
+    "hotel.promotion_responsive.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.promotion_responsive.semantic-selection.v1",
+      "template_semantic_hash": "sha256:e639af24712004dabe9e6c95f337432b4761affc101007282af162818e2d52da",
+      "semantic_selection_policy_id": "hotel.promotion_responsive.selection.v1",
+      "semantic_anchor_policy_id": "hotel.promotion_responsive.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 24, "promotion_impression_count": 10, "promotion_click_count": 6, "campaign_redirect_click_count": 4, "campaign_landing_count": 4}
+          ,"event_age_days": 7
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 10, "promotion_impression_count": 5, "promotion_click_count": 1, "campaign_landing_count": 1}
+          ,"event_age_days": 20
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "promotion_click_count": 1, "hotel_search_count": 30, "booking_complete_count": 20}
+          ,"event_age_days": 29
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 20, "promotion_impression_count": 10, "hotel_search_count": 4}
+          ,"event_age_days": 45
+        }
+      ]
+    },
+    "hotel.general_destination_explorer.v1": {
+      "template_version": 1,
+      "selection_artifact_version": "hotel.general_destination_explorer.semantic-selection.v1",
+      "template_semantic_hash": "sha256:cc9204368da044c9d96c1d7716e0bc17382df7572f811977ce64b19f38b1a27c",
+      "semantic_selection_policy_id": "hotel.general_destination_explorer.selection.v1",
+      "semantic_anchor_policy_id": "hotel.general_destination_explorer.anchors.v1",
+      "accepted": [
+        {
+          "counts": {"event_count": 24, "hotel_search_count": 10, "hotel_click_count": 6, "hotel_detail_view_count": 6},
+          "event_age_days": 7,
+          "destination_mode": "broad"
+        }
+      ],
+      "boundary_accepted": [
+        {
+          "counts": {"event_count": 10, "hotel_search_count": 4, "hotel_click_count": 1, "hotel_detail_view_count": 1},
+          "event_age_days": 20,
+          "destination_mode": "broad"
+        }
+      ],
+      "boundary_rejected": [
+        {
+          "counts": {"event_count": 100, "hotel_search_count": 2, "promotion_impression_count": 40, "booking_complete_count": 20},
+          "event_age_days": 29,
+          "destination_mode": "broad"
+        }
+      ],
+      "negative": [
+        {
+          "counts": {"event_count": 20, "hotel_search_count": 5, "hotel_click_count": 2},
+          "event_age_days": 45,
+          "destination_mode": "single_other"
+        }
+      ]
+    }
+  }
+}

@@ -83,8 +83,6 @@ def _adapt_params(
 def _adapt_param(value: Any) -> Any:
     if isinstance(value, Mapping):
         return Jsonb(value)
-    if isinstance(value, list):
-        return Jsonb(value)
     return value
 
 
@@ -151,6 +149,8 @@ class PromotionTargetSegmentWrite:
     estimated_size: int
     priority: str | None
     status: str
+    audience_snapshot_id: str | None = None
+    allocation_plan_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -167,6 +167,15 @@ class PromotionSegmentSuggestionWrite:
     score_json: Mapping[str, Any]
     reason_json: Mapping[str, Any]
     metadata_json: Mapping[str, Any]
+    audience_snapshot_id: str | None = None
+
+
+@dataclass(frozen=True)
+class SegmentSuggestionAudienceBindingRecord:
+    suggestion_id: str
+    analysis_id: str
+    segment_id: str
+    audience_snapshot_id: str | None
 
 
 @dataclass(frozen=True)
@@ -223,6 +232,18 @@ class RawEventUserSignalRecord:
     preferred_category_values: tuple[str, ...]
     destination_match_count: int
     season_match_count: int
+    page_view_count: int = 0
+    hotel_search_recency_days: int | None = None
+    hotel_detail_recency_days: int | None = None
+    booking_start_recency_days: int | None = None
+    deal_recency_days: int | None = None
+    promotion_response_recency_days: int | None = None
+    lead_time_0_7_count: int = 0
+    lead_time_8_30_count: int = 0
+    lead_time_gt_30_count: int = 0
+    weekend_checkin_count: int = 0
+    budget_price_count: int = 0
+    premium_price_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -411,6 +432,7 @@ class PromotionAnalysisRepository:
                 output_json
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (analysis_id) DO NOTHING
             """,
             (
                 analysis.analysis_id,
@@ -418,13 +440,59 @@ class PromotionAnalysisRepository:
                 analysis.campaign_id,
                 analysis.promotion_id,
                 analysis.status,
-                analysis.focus_segment_ids_json,
+                (
+                    Jsonb(list(analysis.focus_segment_ids_json))
+                    if analysis.focus_segment_ids_json is not None
+                    else None
+                ),
                 analysis.operator_instruction,
                 analysis.input_snapshot_json,
                 analysis.profile_summary_json,
                 analysis.output_json,
             ),
         )
+
+    def get_latest_audience_bindings(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        segment_ids: Sequence[str],
+    ) -> list[SegmentSuggestionAudienceBindingRecord]:
+        if not segment_ids:
+            return []
+        rows = self._db.fetchall(
+            """
+            WITH ranked AS (
+                SELECT
+                    suggestion_id,
+                    analysis_id,
+                    segment_id,
+                    audience_snapshot_id,
+                    row_number() OVER (
+                        PARTITION BY segment_id
+                        ORDER BY created_at DESC, suggestion_id DESC
+                    ) AS row_rank
+                FROM promotion_segment_suggestions
+                WHERE project_id = %s
+                  AND campaign_id = %s
+                  AND promotion_id = %s
+                  AND segment_id = ANY(%s)
+                  AND status IN ('suggested', 'accepted', 'confirmed')
+            )
+            SELECT
+                suggestion_id,
+                analysis_id,
+                segment_id,
+                audience_snapshot_id
+            FROM ranked
+            WHERE row_rank = 1
+            ORDER BY segment_id ASC
+            """,
+            (project_id, campaign_id, promotion_id, list(segment_ids)),
+        )
+        return [SegmentSuggestionAudienceBindingRecord(**row) for row in rows]
 
     def save_segment_suggestions(
         self,
@@ -445,9 +513,10 @@ class PromotionAnalysisRepository:
                     status,
                     score_json,
                     reason_json,
-                    metadata_json
+                    metadata_json,
+                    audience_snapshot_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     suggestion.suggestion_id,
@@ -462,6 +531,7 @@ class PromotionAnalysisRepository:
                     suggestion.score_json,
                     suggestion.reason_json,
                     suggestion.metadata_json,
+                    suggestion.audience_snapshot_id,
                 ),
             )
 
@@ -486,9 +556,37 @@ class PromotionAnalysisRepository:
                     segment_vector_id,
                     estimated_size,
                     priority,
-                    status
+                    allocation_plan_id,
+                    audience_reservation_state,
+                    status,
+                    audience_snapshot_id
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s
+                )
+                ON CONFLICT (analysis_id, segment_id) DO UPDATE SET
+                    segment_name = EXCLUDED.segment_name,
+                    rule_json = EXCLUDED.rule_json,
+                    profile_json = EXCLUDED.profile_json,
+                    content_brief_json = EXCLUDED.content_brief_json,
+                    data_evidence_json = EXCLUDED.data_evidence_json,
+                    segment_vector_id = EXCLUDED.segment_vector_id,
+                    estimated_size = EXCLUDED.estimated_size,
+                    priority = EXCLUDED.priority,
+                    status = EXCLUDED.status,
+                    allocation_plan_id = COALESCE(
+                        promotion_target_segments.allocation_plan_id,
+                        EXCLUDED.allocation_plan_id
+                    ),
+                    audience_reservation_state = COALESCE(
+                        promotion_target_segments.audience_reservation_state,
+                        EXCLUDED.audience_reservation_state
+                    ),
+                    audience_snapshot_id = COALESCE(
+                        promotion_target_segments.audience_snapshot_id,
+                        EXCLUDED.audience_snapshot_id
+                    )
                 """,
                 (
                     segment.analysis_id,
@@ -504,7 +602,10 @@ class PromotionAnalysisRepository:
                     segment.segment_vector_id,
                     segment.estimated_size,
                     segment.priority,
+                    segment.allocation_plan_id,
+                    "reserved" if segment.allocation_plan_id is not None else None,
                     segment.status,
+                    segment.audience_snapshot_id,
                 ),
             )
 
@@ -629,7 +730,7 @@ class SegmentVectorRepository:
                 vector.analysis_id,
                 vector.segment_id,
                 vector.vector_dim,
-                vector.vector_values,
+                Jsonb(vector.vector_values),
                 _vector_literal(vector.vector_values, self.VECTOR_DIM),
                 vector.vector_version,
                 vector.source,

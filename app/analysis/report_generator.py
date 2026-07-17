@@ -5,6 +5,7 @@ from decimal import Decimal
 from time import perf_counter
 from typing import Any, Mapping, Protocol, Sequence
 
+from app.audience_contract import SEGMENT_AUDIENCE_CONTRACT
 from app.analysis.repositories import (
     PromotionRecord,
     PromotionTargetSegmentWrite,
@@ -206,6 +207,11 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
     evidence = report_input.target_segment.data_evidence_json
     signal_chips = display_copy.get("signal_chips", [])
     performance_estimate = _mapping_value(display_copy.get("performance_estimate"))
+    audience_count_label = (
+        "실험 대상 사용자 수"
+        if _is_v2_final_audience(report_input)
+        else "표본 수"
+    )
     return "\n".join(
         [
             "아래 세그먼트 추천 결과를 대시보드 리포트로 정리하세요.",
@@ -221,7 +227,7 @@ def _user_instruction(report_input: SegmentSuggestionReportInput) -> str:
             f"- 추천 분류 근거: {display_copy.get('recommendation_tier_reason', '-')}",
             f"- 분석 대상 요약: {display_copy.get('audience_summary', '-')}",
             f"- 주요 행동 신호: {', '.join(map(str, signal_chips)) or '-'}",
-            f"- 표본 수: {evidence.get('sample_size', report_input.target_segment.estimated_size)}",
+            f"- {audience_count_label}: {evidence.get('sample_size', report_input.target_segment.estimated_size)}",
             f"- 전체 분석 대상 수: {evidence.get('total_eligible_user_count', '-')}",
             f"- 예상 목표 성과: {performance_estimate.get('label', '-')} {performance_estimate.get('formatted', '-')}",
             f"- 예상 기준: {performance_estimate.get('window_label', performance_estimate.get('basis_label', '-'))}",
@@ -334,6 +340,12 @@ def _sanitize_report(
     computed_confidence = _confidence_label(
         performance_estimate.get("confidence_label")
     )
+    if (
+        _is_v2_final_audience(report_input)
+        and _report_sample_size(report_input)
+        < report_input.promotion.min_sample_size
+    ):
+        computed_confidence = "low"
     sanitized = {
         "version": REPORT_GENERATOR_VERSION,
         "source": source,
@@ -357,6 +369,8 @@ def _sanitize_report(
     }
     if _contains_forbidden_terms(sanitized):
         return _fallback_report(report_input=report_input, source="fallback")
+    if _is_v2_final_audience(report_input):
+        return _replace_legacy_sample_wording(sanitized)
     return sanitized
 
 
@@ -393,8 +407,19 @@ def _fallback_report(
     performance_confidence = _confidence_label(
         performance_estimate.get("confidence_label")
     )
-
-    return {
+    sample_size = _report_sample_size(report_input)
+    fallback_confidence = _fallback_confidence_label(
+        sample_size=sample_size,
+        min_sample_size=report_input.promotion.min_sample_size,
+    )
+    if (
+        _is_v2_final_audience(report_input)
+        and sample_size < report_input.promotion.min_sample_size
+    ):
+        confidence_label = "low"
+    else:
+        confidence_label = performance_confidence or fallback_confidence
+    report = {
         "version": REPORT_GENERATOR_VERSION,
         "source": source,
         "title": title,
@@ -412,22 +437,33 @@ def _fallback_report(
         ],
         "selection_considerations": [
             tradeoff_summary
-            or "예상 성과와 대표 표본 규모를 함께 확인해 선택하세요."
+            or (
+                "예상 성과와 실험 대상 사용자 규모를 함께 확인해 선택하세요."
+                if _is_v2_final_audience(report_input)
+                else "예상 성과와 대표 표본 규모를 함께 확인해 선택하세요."
+            )
         ],
         "action_hint": str(display_copy.get("action_hint", "")).strip()
         or "이 고객군을 우선 타겟으로 테스트해보는 것이 좋습니다.",
         "caution": _verified_caution(report_input),
-        "confidence_label": performance_confidence or _fallback_confidence_label(
-            sample_size=int(evidence.get("sample_size", 0) or 0),
-            min_sample_size=report_input.promotion.min_sample_size,
-        ),
+        "confidence_label": confidence_label,
     }
+    if _is_v2_final_audience(report_input):
+        return _replace_legacy_sample_wording(report)
+    return report
 
 
 def _audience_summary(report_input: SegmentSuggestionReportInput) -> str:
     evidence = report_input.target_segment.data_evidence_json
     sample_size = int(evidence.get("sample_size", 0) or 0)
     total_users = int(evidence.get("total_eligible_user_count", 0) or 0)
+    if _is_v2_final_audience(report_input):
+        matching_user_count = int(evidence.get("matching_user_count", 0) or 0)
+        return (
+            f"분석 가능 사용자 {total_users}명 · "
+            f"행동 조건 부합 {matching_user_count}명 · "
+            f"실험 대상 사용자 {sample_size}명"
+        )
     return f"분석 대상 {total_users}명 중 {sample_size}명이 이 고객군에 해당합니다."
 
 
@@ -465,6 +501,27 @@ def _verified_caution(report_input: SegmentSuggestionReportInput) -> str:
     confidence_label = _confidence_label(
         performance_estimate.get("confidence_label")
     )
+    if _is_v2_final_audience(report_input):
+        sample_size = _report_sample_size(report_input)
+        if sample_size < report_input.promotion.min_sample_size:
+            return (
+                "실험 대상 사용자가 최소 평가 인원보다 적어 첫 실험 결과는 "
+                "insufficient_data로 평가됩니다."
+            )
+        if confidence_label == "low":
+            return (
+                "예상 성과의 신뢰도가 제한적인 후보이므로 실제 캠페인 "
+                "성과와 함께 비교해 활용하세요."
+            )
+        if confidence_label in {"high", "medium"}:
+            return (
+                "예상값은 과거 행동을 바탕으로 한 참고 지표이며 실제 캠페인 "
+                "성과와 함께 활용하세요."
+            )
+        return _caution_text(
+            sample_size=sample_size,
+            min_sample_size=report_input.promotion.min_sample_size,
+        )
     if confidence_label == "low":
         return (
             "대표 표본이 제한적인 후보이므로 실제 캠페인 성과와 함께 "
@@ -481,6 +538,36 @@ def _verified_caution(report_input: SegmentSuggestionReportInput) -> str:
         sample_size=int(evidence.get("sample_size", 0) or 0),
         min_sample_size=report_input.promotion.min_sample_size,
     )
+
+
+def _is_v2_final_audience(report_input: SegmentSuggestionReportInput) -> bool:
+    evidence = report_input.target_segment.data_evidence_json
+    return (
+        evidence.get("audience_resolution_contract")
+        == SEGMENT_AUDIENCE_CONTRACT
+        and evidence.get("selected_user_role") == "final_experiment_audience"
+    )
+
+
+def _report_sample_size(report_input: SegmentSuggestionReportInput) -> int:
+    evidence = report_input.target_segment.data_evidence_json
+    return int(
+        evidence.get("sample_size", report_input.target_segment.estimated_size)
+        or 0
+    )
+
+
+def _replace_legacy_sample_wording(value: Any) -> Any:
+    if isinstance(value, str):
+        return value.replace("대표 표본", "실험 대상 사용자")
+    if isinstance(value, list):
+        return [_replace_legacy_sample_wording(item) for item in value]
+    if isinstance(value, dict):
+        return {
+            key: _replace_legacy_sample_wording(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 def _fallback_confidence_label(*, sample_size: int, min_sample_size: int) -> str:

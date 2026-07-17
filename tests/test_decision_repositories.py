@@ -337,9 +337,9 @@ def test_target_segment_repository_lists_segments_for_analysis() -> None:
     assert [segment.segment_id for segment in segments] == ["seg_family_trip"]
     call = db.calls[0]
     sql = compact_sql(call.query)
-    assert "from promotion_target_segments" in sql
-    assert "where analysis_id = %s" in sql
-    assert "order by id asc" in sql
+    assert "from promotion_target_segments as target" in sql
+    assert "where target.analysis_id = %s" in sql
+    assert "order by target.id asc" in sql
     assert "segment_vector_id" in sql
     assert call.params == ("analysis_banner_001",)
 
@@ -375,8 +375,8 @@ def test_target_segment_repository_lists_only_requested_approved_records() -> No
     assert [segment.segment_id for segment in segments] == ["seg_family_trip"]
     call = db.calls[0]
     sql = compact_sql(call.query)
-    assert "status = 'approved'" in sql
-    assert "segment_id = any(%s)" in sql
+    assert "target.status = 'approved'" in sql
+    assert "target.segment_id = any(%s)" in sql
     assert call.params == ("analysis_banner_001", ["seg_family_trip"])
 
 
@@ -388,8 +388,8 @@ def test_target_segment_repository_lists_all_approved_records_when_ids_omitted()
 
     call = db.calls[0]
     sql = compact_sql(call.query)
-    assert "status = 'approved'" in sql
-    assert "segment_id = any" not in sql
+    assert "target.status = 'approved'" in sql
+    assert "target.segment_id = any" not in sql
     assert call.params == ("analysis_banner_001",)
 
 
