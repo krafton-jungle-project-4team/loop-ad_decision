@@ -204,6 +204,42 @@ class FakeAudienceV2Coordinator:
         raise AssertionError("confirmation must not search or create a new snapshot")
 
 
+class FakePreparingAudienceV2Coordinator:
+    def __init__(
+        self,
+        *,
+        total_eligible_user_count: int = 100,
+        matching_user_count: int = 20,
+        selected_user_count: int = 10,
+        meets_min_sample_size: bool = False,
+    ) -> None:
+        self.total_eligible_user_count = total_eligible_user_count
+        self.matching_user_count = matching_user_count
+        self.selected_user_count = selected_user_count
+        self.meets_min_sample_size = meets_min_sample_size
+        self.prepare_many_calls: list[dict[str, object]] = []
+
+    def prepare_many(self, **kwargs: object):
+        self.prepare_many_calls.append(dict(kwargs))
+        return {
+            segment.segment_id: AudienceV2Preparation(
+                audience_snapshot_id=f"snapshot_{segment.segment_id}",
+                segment_vector_id=f"vector_{segment.segment_id}",
+                vector_generation_id="generation_active",
+                vector_version="hotel_behavior.v2",
+                total_eligible_user_count=self.total_eligible_user_count,
+                matching_user_count=self.matching_user_count,
+                selected_user_count=self.selected_user_count,
+                selection_method="exact",
+                estimated_recall=1.0,
+                recall_lower_bound=1.0,
+                recall_target=1.0,
+                meets_min_sample_size=self.meets_min_sample_size,
+            )
+            for segment in kwargs["segments"]
+        }
+
+
 class FakeSegmentVectorService:
     def __init__(self) -> None:
         self.calls: list[SegmentVectorBuildRequest] = []
@@ -609,6 +645,149 @@ def test_service_analyzes_requested_segments_without_refreshing_suggestions() ->
     assert analysis_repository.events == ["analysis", "target_segments"]
 
 
+def test_v2_recommendation_projects_snapshot_counts_to_card_metadata() -> None:
+    promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
+    segment = _v2_ai_segment(
+        promotion=promotion,
+        segment_id="seg_ai_registered_intent",
+        sample_size=40,
+        raw_audience={
+            "total_eligible_user_count": 74_200,
+            "matching_user_count": 40,
+            "selected_user_count": 40,
+            "selection_basis": "candidate_condition_match",
+            "selected_user_role": "recommended_audience",
+        },
+    )
+    coordinator = FakePreparingAudienceV2Coordinator()
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester([segment]),
+        audience_v2_coordinator=coordinator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id)
+    )
+
+    assert len(coordinator.prepare_many_calls) == 1
+    target = result.target_segments[0]
+    evidence = target.data_evidence_json
+    assert target.estimated_size == 10
+    assert evidence["candidate_generation_user_count"] == 40
+    assert evidence["sample_size"] == 10
+    assert evidence["sample_ratio"] == 0.1
+    assert evidence["matching_user_ratio"] == 0.2
+    assert evidence["selection_ratio_within_matching"] == 0.5
+    assert evidence["targetable"] is True
+    assert evidence["audience_status"] == "insufficient_sample"
+
+    suggestion = result.segment_suggestions[0]
+    assert suggestion.score_json["estimated_size"] == 10
+    assert suggestion.audience_snapshot_id == f"snapshot_{segment.segment_id}"
+    display_copy = suggestion.metadata_json["display_copy"]
+    assert display_copy["audience_summary"] == (
+        "분석 가능 사용자 100명 · 행동 조건 부합 20명 · "
+        "실험 대상 사용자 10명"
+    )
+    assert display_copy["audience"] == {
+        "total_eligible_user_count": 100,
+        "matching_user_count": 20,
+        "selected_user_count": 10,
+        "matching_user_ratio": 0.2,
+        "selected_user_ratio": 0.1,
+        "selection_ratio_within_matching": 0.5,
+        "selection_limited": True,
+        "selection_basis": "hard_predicate_and_exact_cosine",
+        "selected_user_role": "final_experiment_audience",
+    }
+    assert analysis_repository.saved.segment_suggestions == result.segment_suggestions
+
+
+def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> None:
+    promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
+    segment = _v2_ai_segment(
+        promotion=promotion,
+        segment_id="seg_ai_registered_zero",
+        sample_size=40,
+        raw_audience={
+            "total_eligible_user_count": 74_200,
+            "matching_user_count": 40,
+            "selected_user_count": 40,
+        },
+    )
+    coordinator = FakePreparingAudienceV2Coordinator(selected_user_count=0)
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester([segment]),
+        audience_v2_coordinator=coordinator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id)
+    )
+
+    target = result.target_segments[0]
+    assert target.estimated_size == 0
+    assert target.data_evidence_json["sample_size"] == 0
+    assert target.data_evidence_json["sample_ratio"] == 0.0
+    assert target.data_evidence_json["targetable"] is False
+    assert target.data_evidence_json["audience_status"] == "no_eligible_audience"
+    audience = result.segment_suggestions[0].metadata_json["display_copy"][
+        "audience"
+    ]
+    assert audience["selected_user_count"] == 0
+    assert audience["selected_user_ratio"] == 0.0
+    assert audience["selection_ratio_within_matching"] == 0.0
+
+
+def test_legacy_recommendation_preserves_existing_card_audience() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    raw_audience = {
+        "total_eligible_user_count": 100,
+        "matching_user_count": 40,
+        "selected_user_count": 25,
+        "selection_basis": "candidate_condition_match",
+        "selected_user_role": "recommended_audience",
+    }
+    segment = replace(
+        segment_record(
+            "seg_ai_legacy",
+            source="ai_suggested",
+            sample_size=25,
+            rule_json={"candidate_user_ids": ["user_1"]},
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_legacy",
+            "display_copy": {
+                "title": "기존 고객군",
+                "audience_summary": "기존 요약",
+                "audience": raw_audience,
+            },
+        },
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester([segment]),
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id)
+    )
+
+    display_copy = result.segment_suggestions[0].metadata_json["display_copy"]
+    assert display_copy["audience_summary"] == "기존 요약"
+    assert display_copy["audience"] == raw_audience
+    assert "candidate_generation_user_count" not in (
+        result.target_segments[0].data_evidence_json
+    )
+
+
 def test_v2_confirmation_reuses_latest_snapshot_without_searching_again() -> None:
     promotion = promotion_record(channel="onsite_banner")
     segment_id = "seg_ai_registered_intent"
@@ -699,6 +878,42 @@ def test_v2_confirmation_rejects_missing_recommendation_snapshot() -> None:
     assert error.value.segment_id == segment_id
     assert coordinator.prepare_calls == []
     assert coordinator.prepare_many_calls == 0
+
+
+def _v2_ai_segment(
+    *,
+    promotion: PromotionRecord,
+    segment_id: str,
+    sample_size: int,
+    raw_audience: Mapping[str, Any],
+) -> SegmentDefinitionRecord:
+    return replace(
+        segment_record(
+            segment_id,
+            source="ai_suggested",
+            sample_size=sample_size,
+            rule_json={
+                "source": "raw_event_intent",
+                "audience_resolution_contract": "segment_audience.v1",
+                "segment_audience_spec": dict(
+                    RegisteredSegmentAudienceBinder().bind(
+                        candidate_type="intent_matched"
+                    )
+                ),
+                "candidate_user_ids": ["candidate_user"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": segment_id,
+            "display_copy": {
+                "title": "기존 후보 카드",
+                "audience_summary": "과거 후보 계산 요약",
+                "audience": dict(raw_audience),
+            },
+        },
+    )
 
 
 def test_v2_confirmation_rejects_stale_selection_from_different_analyses() -> None:
