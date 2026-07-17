@@ -38,7 +38,7 @@ from app.logging import duration_ms, log, log_context_scope
 
 RAW_EVENT_SEGMENT_VERSION = "raw-event-segment.v7"
 RAW_EVENT_INTENT_COMPILER_VERSION = "raw-event-intent.v2"
-INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v1"
+INTENT_EXTRACTOR_VERSION = "dec.segment-intent.v2"
 EXPECTED_RATE_PRIOR_USER_COUNT = 30.0
 PRIMARY_RECOMMENDATION_MIN_RELIABILITY = 0.75
 MAX_RANK_USER_OVERLAP = 0.70
@@ -50,6 +50,20 @@ CANDIDATE_TYPE_ORDER = (
     "benefit_value_seeker",
     "promotion_responsive",
     "general_destination_explorer",
+)
+EXCLUDED_BEHAVIOR_VALUES = (
+    "booking_complete",
+    "booking_cancel",
+    "booking_start",
+    "promotion_response",
+    "hotel_search",
+    "hotel_detail_view",
+)
+AUDIENCE_HINT_VALUES = (
+    "20s_30s",
+    "male",
+    "female",
+    "travel_ready",
 )
 
 DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
@@ -137,7 +151,12 @@ DESTINATION_KEYWORDS: Mapping[str, tuple[str, ...]] = {
 
 
 class PromotionIntentExtractor(Protocol):
-    def extract(self, promotion: PromotionRecord) -> "PromotionIntent":
+    def extract(
+        self,
+        promotion: PromotionRecord,
+        *,
+        segment_instruction: str | None = None,
+    ) -> "PromotionIntent":
         ...
 
 
@@ -154,6 +173,8 @@ class PromotionIntent:
     funnel_goal: str
     desired_behaviors: tuple[str, ...]
     explicit_conditions: tuple[str, ...]
+    excluded_behaviors: tuple[str, ...] = ()
+    requested_candidate_types: tuple[str, ...] = ()
     source: str = "deterministic"
 
     def to_json(self) -> dict[str, Any]:
@@ -170,7 +191,9 @@ class PromotionIntent:
             "goal_metric": self.goal_metric,
             "funnel_goal": self.funnel_goal,
             "desired_behaviors": list(self.desired_behaviors),
+            "excluded_behaviors": list(self.excluded_behaviors),
             "explicit_conditions": list(self.explicit_conditions),
+            "requested_candidate_types": list(self.requested_candidate_types),
         }
 
 
@@ -239,8 +262,17 @@ class _RawEventCandidate:
 
 
 class DeterministicPromotionIntentExtractor:
-    def extract(self, promotion: PromotionRecord) -> PromotionIntent:
-        return _fallback_intent(promotion=promotion, source="deterministic")
+    def extract(
+        self,
+        promotion: PromotionRecord,
+        *,
+        segment_instruction: str | None = None,
+    ) -> PromotionIntent:
+        return _fallback_intent(
+            promotion=promotion,
+            segment_instruction=segment_instruction,
+            source="deterministic",
+        )
 
 
 class OpenAIPromotionIntentExtractor:
@@ -262,7 +294,12 @@ class OpenAIPromotionIntentExtractor:
         self._transport = transport or _post_json
 
     @log_context_scope
-    def extract(self, promotion: PromotionRecord) -> PromotionIntent:
+    def extract(
+        self,
+        promotion: PromotionRecord,
+        *,
+        segment_instruction: str | None = None,
+    ) -> PromotionIntent:
         payload = {
             "model": self._model,
             "input": [
@@ -280,7 +317,10 @@ class OpenAIPromotionIntentExtractor:
                     "content": [
                         {
                             "type": "input_text",
-                            "text": _intent_user_instruction(promotion),
+                            "text": _intent_user_instruction(
+                                promotion,
+                                segment_instruction=segment_instruction,
+                            ),
                         }
                     ],
                 },
@@ -325,6 +365,7 @@ class OpenAIPromotionIntentExtractor:
             intent = _intent_from_payload(
                 _parse_output_json(response_payload),
                 promotion=promotion,
+                segment_instruction=segment_instruction,
                 source="openai",
             )
         except Exception as exc:
@@ -338,7 +379,10 @@ class OpenAIPromotionIntentExtractor:
                     "fallback": "deterministic",
                 },
             )
-            return self._fallback_extractor.extract(promotion)
+            return self._fallback_extractor.extract(
+                promotion,
+                segment_instruction=segment_instruction,
+            )
         log.info(
             "provider_request_completed",
             {
@@ -571,6 +615,9 @@ def _generate_raw_event_candidates(
     if len(profiles) < min_sample_size:
         return []
     baseline = _baseline_metrics(profiles)
+    eligible_profiles = _exclude_profiles(profiles, intent.excluded_behaviors)
+    if len(eligible_profiles) < min_sample_size:
+        return []
     predictor = performance_predictor or ContextualBookingHeuristicPredictor()
     candidate_factories: tuple[
         tuple[str, Callable[..., _RawEventCandidate | None]],
@@ -591,6 +638,11 @@ def _generate_raw_event_candidates(
     )
     raw_candidates: list[_RawEventCandidate | None] = []
     for candidate_type, candidate_factory in candidate_factories:
+        if (
+            intent.requested_candidate_types
+            and candidate_type not in intent.requested_candidate_types
+        ):
+            continue
         if enforce_prediction_support:
             support = candidate_type_prediction_support(
                 predictor,
@@ -614,7 +666,7 @@ def _generate_raw_event_candidates(
                 promotion=promotion,
                 intent=intent,
                 compilation=compilation,
-                profiles=profiles,
+                profiles=eligible_profiles,
                 baseline=baseline,
                 min_sample_size=min_sample_size,
                 performance_predictor=predictor,
@@ -666,17 +718,20 @@ def _intent_matched_candidate(
 ) -> _RawEventCandidate | None:
     requires_destination = bool(intent.destinations)
     requires_season = bool(intent.season)
+    requires_profile = _has_profile_constraint(intent.audience_hints)
     matched_profiles = [
         profile
         for profile in profiles
         if (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
         and (not requires_destination or profile.destination_match_count > 0)
         and (not requires_season or profile.season_match_count > 0)
+        and _matches_profile_constraints(profile, intent.audience_hints)
     ]
     if (
         len(matched_profiles) < min_sample_size
         and not requires_destination
         and not requires_season
+        and not requires_profile
     ):
         matched_profiles = [
             profile
@@ -691,6 +746,8 @@ def _intent_matched_candidate(
         matched_condition_keys.append("summer_checkin_search" if "summer" in intent.season else "winter_checkin_search")
     if any(profile.hotel_detail_view_count > 0 for profile in matched_profiles):
         matched_condition_keys.append("hotel_detail_view")
+    if requires_profile:
+        matched_condition_keys.append("profile_hint")
     return _candidate_from_profiles(
         candidate_type="intent_matched",
         promotion=promotion,
@@ -1453,20 +1510,43 @@ def _intent_system_instruction() -> str:
     return (
         "당신은 숙박/여행 프로모션을 세그먼트 추천 조건으로 구조화하는 분석기입니다. "
         "반드시 입력에 포함된 정보만 사용하고, 추정이 필요한 경우 넓은 의도 표현으로 남기세요. "
+        "segment_instruction은 운영자가 명시한 고객군 제약입니다. 목적지, 행동, 제외 조건을 "
+        "생략하지 말고 프로모션 기본 설명과 충돌하면 segment_instruction을 우선하세요. "
+        "segment_instruction에 '후속 요청:'이 여러 번 나오면 뒤에 나온 요청이 앞선 요청을 "
+        "구체화하거나 변경한 것으로 해석하고, 서로 충돌하는 조건은 가장 마지막 요청을 우선하세요. "
+        "requested_candidate_types에는 운영자가 특정한 전략만 넣고, 특정 전략을 요구하지 않았다면 "
+        "빈 배열을 반환하세요. "
+        "excluded_behaviors에는 사용자가 명시적으로 제외해 달라고 한 행동만 넣으세요. "
         "최종 고객 선정이나 순위 결정은 하지 말고 조건 추출만 수행하세요."
     )
 
 
-def _intent_user_instruction(promotion: PromotionRecord) -> str:
+def _intent_user_instruction(
+    promotion: PromotionRecord,
+    *,
+    segment_instruction: str | None = None,
+) -> str:
+    cleaned_instruction = _clean_segment_instruction(segment_instruction)
     return "\n".join(
         [
             "프로모션 입력을 SDK raw_events 기반 세그먼트 추천 의도로 구조화하세요.",
+            "운영자 요청이 있으면 하드 제약으로 반영하되 입력에 없는 사실을 만들지 마세요.",
+            (
+                "requested_candidate_types 허용값: intent_matched, "
+                "target_destination_affinity, funnel_recovery, benefit_value_seeker, "
+                "promotion_responsive, general_destination_explorer"
+            ),
+            (
+                "excluded_behaviors 허용값: booking_complete, booking_cancel, "
+                "booking_start, promotion_response, hotel_search, hotel_detail_view"
+            ),
             f"- channel: {promotion.channel}",
             f"- goal_metric: {promotion.goal_metric}",
             f"- goal_basis: {promotion.goal_basis}",
             f"- goal_target_value: {promotion.goal_target_value}",
             f"- landing_url: {promotion.landing_url or '-'}",
             f"- message_brief: {promotion.message_brief or '-'}",
+            f"- segment_instruction: {cleaned_instruction or '-'}",
         ]
     )
 
@@ -1491,7 +1571,9 @@ def _intent_schema() -> dict[str, Any]:
             "goal_metric",
             "funnel_goal",
             "desired_behaviors",
+            "excluded_behaviors",
             "explicit_conditions",
+            "requested_candidate_types",
         ],
         "properties": {
             "summary": {"type": "string"},
@@ -1499,12 +1581,26 @@ def _intent_schema() -> dict[str, Any]:
             "season": array_schema,
             "destinations": array_schema,
             "benefits": array_schema,
-            "audience_hints": array_schema,
+            "audience_hints": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(AUDIENCE_HINT_VALUES)},
+                "maxItems": len(AUDIENCE_HINT_VALUES),
+            },
             "channel": {"type": "string"},
             "goal_metric": {"type": "string"},
             "funnel_goal": {"type": "string"},
             "desired_behaviors": array_schema,
+            "excluded_behaviors": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(EXCLUDED_BEHAVIOR_VALUES)},
+                "maxItems": len(EXCLUDED_BEHAVIOR_VALUES),
+            },
             "explicit_conditions": array_schema,
+            "requested_candidate_types": {
+                "type": "array",
+                "items": {"type": "string", "enum": list(CANDIDATE_TYPE_ORDER)},
+                "maxItems": len(CANDIDATE_TYPE_ORDER),
+            },
         },
     }
 
@@ -1513,9 +1609,14 @@ def _intent_from_payload(
     payload: Mapping[str, Any],
     *,
     promotion: PromotionRecord,
+    segment_instruction: str | None = None,
     source: str,
 ) -> PromotionIntent:
-    fallback = _fallback_intent(promotion=promotion, source=source)
+    fallback = _fallback_intent(
+        promotion=promotion,
+        segment_instruction=segment_instruction,
+        source=source,
+    )
     return PromotionIntent(
         summary=_safe_text(payload.get("summary")) or fallback.summary,
         product=_safe_text(payload.get("product")) or fallback.product,
@@ -1523,21 +1624,47 @@ def _intent_from_payload(
         destinations=tuple(_safe_text_list(payload.get("destinations")))
         or fallback.destinations,
         benefits=tuple(_safe_text_list(payload.get("benefits"))) or fallback.benefits,
-        audience_hints=tuple(_safe_text_list(payload.get("audience_hints")))
+        audience_hints=tuple(
+            hint
+            for hint in _safe_text_list(payload.get("audience_hints"))
+            if hint in AUDIENCE_HINT_VALUES
+        )
         or fallback.audience_hints,
         channel=_safe_text(payload.get("channel")) or promotion.channel,
         goal_metric=_safe_text(payload.get("goal_metric")) or promotion.goal_metric,
         funnel_goal=_safe_text(payload.get("funnel_goal")) or fallback.funnel_goal,
         desired_behaviors=tuple(_safe_text_list(payload.get("desired_behaviors")))
         or fallback.desired_behaviors,
+        excluded_behaviors=tuple(
+            behavior
+            for behavior in _safe_text_list(payload.get("excluded_behaviors"))
+            if behavior in EXCLUDED_BEHAVIOR_VALUES
+        )
+        or fallback.excluded_behaviors,
         explicit_conditions=tuple(_safe_text_list(payload.get("explicit_conditions")))
         or fallback.explicit_conditions,
+        requested_candidate_types=tuple(
+            candidate_type
+            for candidate_type in _safe_text_list(
+                payload.get("requested_candidate_types")
+            )
+            if candidate_type in CANDIDATE_TYPE_ORDER
+        )
+        or fallback.requested_candidate_types,
         source=source,
     )
 
 
-def _fallback_intent(*, promotion: PromotionRecord, source: str) -> PromotionIntent:
-    searchable = _promotion_searchable_text(promotion)
+def _fallback_intent(
+    *,
+    promotion: PromotionRecord,
+    segment_instruction: str | None = None,
+    source: str,
+) -> PromotionIntent:
+    searchable = _promotion_searchable_text(
+        promotion,
+        segment_instruction=segment_instruction,
+    )
     season = _extract_seasons(searchable)
     destinations = _extract_destinations(searchable)
     benefits = _extract_benefits(searchable)
@@ -1555,6 +1682,10 @@ def _fallback_intent(*, promotion: PromotionRecord, source: str) -> PromotionInt
         "hotel",
         promotion.channel,
     ]
+    requested_candidate_types = _extract_requested_candidate_types(
+        segment_instruction
+    )
+    excluded_behaviors = _extract_excluded_behaviors(segment_instruction)
     return PromotionIntent(
         summary=_fallback_summary(season=season, destinations=destinations, benefits=benefits),
         product="hotel",
@@ -1566,12 +1697,18 @@ def _fallback_intent(*, promotion: PromotionRecord, source: str) -> PromotionInt
         goal_metric=promotion.goal_metric,
         funnel_goal=_funnel_goal(promotion.goal_metric),
         desired_behaviors=tuple(dict.fromkeys(desired_behaviors)),
+        excluded_behaviors=tuple(excluded_behaviors),
         explicit_conditions=tuple(dict.fromkeys(explicit_conditions)),
+        requested_candidate_types=tuple(requested_candidate_types),
         source=source,
     )
 
 
-def _promotion_searchable_text(promotion: PromotionRecord) -> str:
+def _promotion_searchable_text(
+    promotion: PromotionRecord,
+    *,
+    segment_instruction: str | None = None,
+) -> str:
     parsed_url = urlparse(promotion.landing_url or "")
     query_values = " ".join(
         value
@@ -1586,8 +1723,95 @@ def _promotion_searchable_text(promotion: PromotionRecord) -> str:
             promotion.landing_url or "",
             parsed_url.path,
             query_values,
+            _clean_segment_instruction(segment_instruction) or "",
         ]
     ).lower()
+
+
+def _clean_segment_instruction(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = " ".join(str(value).split()).strip()
+    return cleaned or None
+
+
+def _extract_requested_candidate_types(value: str | None) -> list[str]:
+    searchable = (_clean_segment_instruction(value) or "").lower()
+    if not searchable:
+        return []
+
+    requested: list[str] = []
+    destinations = _extract_destinations(searchable)
+    if (
+        "예약" in searchable
+        and any(
+            term in searchable
+            for term in ("이탈", "미완료", "중단", "완료하지", "결제 전")
+        )
+    ):
+        requested.append("funnel_recovery")
+    if any(
+        term in searchable
+        for term in (
+            "할인",
+            "혜택",
+            "가격 비교",
+            "무료 취소",
+            "조식 포함",
+            "블랙프라이데이",
+            "black friday",
+        )
+    ):
+        requested.append("benefit_value_seeker")
+    if any(term in searchable for term in ("프로모션", "캠페인", "광고")) and any(
+        term in searchable for term in ("반응", "클릭", "랜딩", "유입")
+    ):
+        requested.append("promotion_responsive")
+    if destinations and any(
+        term in searchable for term in ("반복", "여러 번", "재검색", "다시 검색")
+    ):
+        requested.append("target_destination_affinity")
+    if destinations and any(
+        term in searchable for term in ("검색", "조회", "관심", "탐색", "숙소", "호텔")
+    ):
+        requested.append("intent_matched")
+    if any(
+        term in searchable
+        for term in ("여러 목적지", "다목적지", "여행지를 비교", "목적지 비교")
+    ):
+        requested.append("general_destination_explorer")
+    if any(term in searchable for term in ("연령", "20대", "30대", "남성", "여성")):
+        requested.append("intent_matched")
+    return list(dict.fromkeys(requested))
+
+
+def _extract_excluded_behaviors(value: str | None) -> list[str]:
+    searchable = (_clean_segment_instruction(value) or "").lower()
+    if not searchable:
+        return []
+    if not any(
+        term in searchable
+        for term in ("제외", "빼", "않은", "없는", "미완료", "exclude", "without")
+    ):
+        return []
+
+    excluded: list[str] = []
+    if any(
+        term in searchable
+        for term in ("예약 완료", "예약한 고객", "예약한 사람", "booking complete")
+    ):
+        excluded.append("booking_complete")
+    if any(term in searchable for term in ("예약 취소", "booking cancel")):
+        excluded.append("booking_cancel")
+    if any(term in searchable for term in ("예약 시작", "booking start")):
+        excluded.append("booking_start")
+    if any(term in searchable for term in ("프로모션 반응", "광고 반응", "promotion response")):
+        excluded.append("promotion_response")
+    if any(term in searchable for term in ("숙소 검색", "호텔 검색", "hotel search")):
+        excluded.append("hotel_search")
+    if any(term in searchable for term in ("상세 조회", "hotel detail")):
+        excluded.append("hotel_detail_view")
+    return list(dict.fromkeys(excluded))
 
 
 def _extract_seasons(searchable: str) -> list[str]:
@@ -1613,7 +1837,19 @@ def _extract_destinations(searchable: str) -> list[str]:
 
 def _extract_benefits(searchable: str) -> list[str]:
     benefits: list[str] = []
-    if any(term in searchable for term in ("discount", "deal", "sale", "할인", "특가", "혜택")):
+    if any(
+        term in searchable
+        for term in (
+            "discount",
+            "deal",
+            "sale",
+            "할인",
+            "특가",
+            "혜택",
+            "블랙프라이데이",
+            "black friday",
+        )
+    ):
         benefits.append("discount")
     if any(term in searchable for term in ("early", "조기", "얼리")):
         benefits.append("early_booking")
@@ -1671,6 +1907,96 @@ def _dedupe_conditions(
     for condition in conditions:
         deduped.setdefault(condition.key, condition)
     return list(deduped.values())
+
+
+def _exclude_profiles(
+    profiles: Sequence[RawEventUserSignalRecord],
+    excluded_behaviors: Sequence[str],
+) -> list[RawEventUserSignalRecord]:
+    excluded = set(excluded_behaviors)
+    if not excluded:
+        return list(profiles)
+
+    def is_excluded(profile: RawEventUserSignalRecord) -> bool:
+        return any(
+            (
+                behavior == "booking_complete"
+                and profile.booking_complete_count > 0
+            )
+            or (behavior == "booking_cancel" and profile.booking_cancel_count > 0)
+            or (behavior == "booking_start" and profile.booking_start_count > 0)
+            or (
+                behavior == "promotion_response"
+                and (
+                    profile.promotion_click_count > 0
+                    or profile.campaign_redirect_click_count > 0
+                    or profile.campaign_landing_count > 0
+                )
+            )
+            or (behavior == "hotel_search" and profile.hotel_search_count > 0)
+            or (
+                behavior == "hotel_detail_view"
+                and profile.hotel_detail_view_count > 0
+            )
+            for behavior in excluded
+        )
+
+    return [profile for profile in profiles if not is_excluded(profile)]
+
+
+def _has_profile_constraint(audience_hints: Sequence[str]) -> bool:
+    return any(hint in {"20s_30s", "male", "female"} for hint in audience_hints)
+
+
+def _matches_profile_constraints(
+    profile: RawEventUserSignalRecord,
+    audience_hints: Sequence[str],
+) -> bool:
+    hints = set(audience_hints)
+    if "20s_30s" in hints and not any(
+        _is_twenty_or_thirty_age_group(value)
+        for value in profile.age_group_values
+    ):
+        return False
+
+    requested_genders = hints & {"male", "female"}
+    if len(requested_genders) == 1:
+        requested_gender = next(iter(requested_genders))
+        if not any(
+            _normalized_gender(value) == requested_gender
+            for value in profile.gender_values
+        ):
+            return False
+    return True
+
+
+def _is_twenty_or_thirty_age_group(value: str) -> bool:
+    normalized = (
+        value.strip()
+        .lower()
+        .replace(" ", "")
+        .replace("_", "-")
+        .replace("~", "-")
+    )
+    return normalized in {
+        "20",
+        "20s",
+        "20대",
+        "20-29",
+        "30",
+        "30s",
+        "30대",
+        "30-39",
+    }
+
+
+def _normalized_gender(value: str) -> str | None:
+    normalized = value.strip().lower()
+    if normalized in {"male", "m", "남", "남성"}:
+        return "male"
+    if normalized in {"female", "f", "여", "여성"}:
+        return "female"
+    return None
 
 
 def _baseline_metrics(
