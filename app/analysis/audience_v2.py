@@ -64,6 +64,11 @@ class AudienceV2Preparation:
     recall_lower_bound: float
     recall_target: float
     meets_min_sample_size: bool
+    source_audience_snapshot_id: str | None = None
+    allocation_plan_id: str | None = None
+    promotion_exclusion_revision: int | None = None
+    promotion_exclusion_hash: str | None = None
+    excluded_user_count: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +142,9 @@ class AudienceV2Coordinator:
             recall_lower_bound=bound.recall_lower_bound,
             recall_target=bound.recall_target,
             meets_min_sample_size=bound.meets_min_sample_size,
+            promotion_exclusion_revision=bound.promotion_exclusion_revision,
+            promotion_exclusion_hash=bound.promotion_exclusion_hash,
+            excluded_user_count=bound.excluded_user_count,
         )
 
     def prepare_many(
@@ -156,6 +164,8 @@ class AudienceV2Coordinator:
             if context is None:
                 context = self._active_context(
                     project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
                     segment_id=segment.segment_id,
                     vector_version=spec.vector_version,
                 )
@@ -237,12 +247,16 @@ class AudienceV2Coordinator:
         self,
         *,
         project_id: str,
+        campaign_id: str,
+        promotion_id: str,
         segment_id: str,
         vector_version: str,
     ) -> AudienceSearchContext:
         try:
             return self._search_repository.get_context(
                 project_id=project_id,
+                campaign_id=campaign_id,
+                promotion_id=promotion_id,
                 vector_version=vector_version,
             )
         except RuntimeError as exc:
@@ -323,6 +337,7 @@ class AudienceV2Coordinator:
                             )
                             for item in batchable
                         ),
+                        exclusion_context=context.exclusion_context,
                     )
                 )
             for item in items:
@@ -338,6 +353,7 @@ class AudienceV2Coordinator:
                         window_end=context.source_cutoff,
                         hard_predicate_keys=item.spec.hard_predicate_keys,
                         predicate_parameters=item.spec.predicate_parameters,
+                        exclusion_context=context.exclusion_context,
                     )
                 )
         return counts
@@ -365,6 +381,7 @@ class AudienceV2Coordinator:
                 score_threshold=spec.score_threshold,
                 hard_predicate_keys=spec.hard_predicate_keys,
                 predicate_parameters=spec.predicate_parameters,
+                exclusion_context=context.exclusion_context,
             )
         )
         search_result = self._search_service.search(
@@ -391,6 +408,7 @@ class AudienceV2Coordinator:
                 spec=spec,
                 search_result=search_result,
                 min_sample_size=promotion.min_sample_size,
+                exclusion_context=context.exclusion_context,
             )
         )
         audit = search_result.recall_audit
@@ -410,6 +428,21 @@ class AudienceV2Coordinator:
             meets_min_sample_size=(
                 final_user_count > 0
                 and final_user_count >= promotion.min_sample_size
+            ),
+            promotion_exclusion_revision=(
+                context.exclusion_context.revision
+                if context.exclusion_context is not None
+                else 0
+            ),
+            promotion_exclusion_hash=(
+                context.exclusion_context.exclusion_hash
+                if context.exclusion_context is not None
+                else None
+            ),
+            excluded_user_count=(
+                context.exclusion_context.excluded_user_count
+                if context.exclusion_context is not None
+                else 0
             ),
         )
 

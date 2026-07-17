@@ -7,6 +7,13 @@ from typing import Any, Mapping, Sequence
 from app.analysis.audience_search import SearchCandidate
 from app.analysis.behavior_manifest import clickhouse_canonical_destination_sql
 from app.analysis.repositories import ClickHouseClient, PostgresExecutor
+from app.audience_exclusions import (
+    CLICKHOUSE_EXCLUSION_RELATION,
+    POSTGRES_EXCLUSION_RELATION,
+    PromotionAudienceExclusionContext,
+    PromotionAudienceExclusionReader,
+    PromotionAudienceExclusionRepository,
+)
 
 
 VECTOR_DIM = 64
@@ -27,6 +34,7 @@ class AudienceSearchContext:
     source_revision_cutoff: datetime
     window_start: datetime
     corpus_user_count: int
+    exclusion_context: PromotionAudienceExclusionContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,18 +52,63 @@ class PgClickHouseAudienceVectorSearchRepository:
         *,
         postgres: PostgresExecutor,
         clickhouse: ClickHouseClient,
+        exclusion_repository: PromotionAudienceExclusionReader | None = None,
     ) -> None:
         self._postgres = postgres
         self._clickhouse = clickhouse
+        self._exclusion_repository = (
+            exclusion_repository
+            or PromotionAudienceExclusionRepository(
+                postgres=postgres,
+                clickhouse=clickhouse,
+            )
+        )
+        self._exclusions_by_generation: dict[
+            str,
+            PromotionAudienceExclusionContext,
+        ] = {}
 
     def get_context(
         self,
         *,
         project_id: str,
         vector_version: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
     ) -> AudienceSearchContext:
-        row = self._postgres.fetchone(
+        exclusion_context = None
+        exclusion_join = ""
+        exclusion_params: tuple[Any, ...] = ()
+        if campaign_id is not None and promotion_id is not None:
+            self._postgres.execute(
+                """
+                SELECT pg_advisory_xact_lock(
+                    hashtext('promotion-audience-allocation-v1'),
+                    hashtext(%s || ':' || %s)
+                )
+                """,
+                (project_id, promotion_id),
+            )
+            exclusion_context = (
+                self._exclusion_repository.load_active_exclusion_context(
+                    project_id=project_id,
+                    campaign_id=campaign_id,
+                    promotion_id=promotion_id,
+                )
+            )
+            exclusion_join = f"""
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {POSTGRES_EXCLUSION_RELATION} AS excluded
+                  WHERE excluded.project_id = generation.project_id
+                    AND excluded.promotion_id = %s
+                    AND excluded.user_id = search.user_id
+                    AND excluded.state IN ('reserved', 'consumed')
+              )
             """
+            exclusion_params = (promotion_id,)
+        row = self._postgres.fetchone(
+            f"""
             SELECT
                 generation.vector_generation_id,
                 generation.manifest_hash,
@@ -70,22 +123,29 @@ class PgClickHouseAudienceVectorSearchRepository:
               AND generation.vector_version = %s
               AND generation.status = 'activated'
               AND generation.is_active = true
+              {exclusion_join}
             GROUP BY generation.vector_generation_id, generation.manifest_hash,
                      generation.window_end, generation.source_revision_cutoff,
                      generation.window_start
             """,
-            (project_id, vector_version),
+            (project_id, vector_version, *exclusion_params),
         )
         if row is None:
             raise RuntimeError("completed user vector search sync is required")
-        return AudienceSearchContext(
+        context = AudienceSearchContext(
             vector_generation_id=str(row["vector_generation_id"]),
             manifest_hash=str(row["manifest_hash"]),
             source_cutoff=row["source_cutoff"],
             source_revision_cutoff=row["source_revision_cutoff"],
             window_start=row["window_start"],
             corpus_user_count=int(row["corpus_user_count"]),
+            exclusion_context=exclusion_context,
         )
+        if exclusion_context is not None:
+            self._exclusions_by_generation[context.vector_generation_id] = (
+                exclusion_context
+            )
+        return context
 
     def count_hard_matches(
         self,
@@ -97,13 +157,20 @@ class PgClickHouseAudienceVectorSearchRepository:
         window_end: datetime,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+        exclusion_context: PromotionAudienceExclusionContext | None = None,
     ) -> int:
+        exclusion_context = exclusion_context or self._context_for_window(
+            project_id=project_id,
+            vector_version=vector_version,
+            window_end=window_end,
+        )
         result = self._clickhouse.query(
             "SELECT count() AS matching_user_count FROM ("
             + _hard_predicate_query(
                 hard_predicate_keys,
                 filter_user_ids=False,
                 restrict_to_vector_population=True,
+                exclude_promotion_users=exclusion_context is not None,
             )
             + ")",
             parameters={
@@ -120,6 +187,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 "destinations": list(predicate_parameters.get("destinations", ())),
                 "season_months": list(predicate_parameters.get("season_months", ())),
                 "benefit_keys": list(predicate_parameters.get("benefit_keys", ())),
+                **_clickhouse_exclusion_parameters(exclusion_context),
             },
         )
         rows = (
@@ -143,10 +211,19 @@ class PgClickHouseAudienceVectorSearchRepository:
         window_start: datetime,
         window_end: datetime,
         requests: Sequence[HardMatchAggregateRequest],
+        exclusion_context: PromotionAudienceExclusionContext | None = None,
     ) -> Mapping[str, int]:
         if not requests:
             return {}
-        query, predicate_parameters = _hard_predicate_batch_query(requests)
+        exclusion_context = exclusion_context or self._context_for_window(
+            project_id=project_id,
+            vector_version=vector_version,
+            window_end=window_end,
+        )
+        query, predicate_parameters = _hard_predicate_batch_query(
+            requests,
+            exclude_promotion_users=exclusion_context is not None,
+        )
         result = self._clickhouse.query(
             query,
             parameters={
@@ -161,6 +238,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 "window_start": _datetime_string(window_start),
                 "window_end": _datetime_string(window_end),
                 **predicate_parameters,
+                **_clickhouse_exclusion_parameters(exclusion_context),
             },
         )
         rows = (
@@ -194,13 +272,18 @@ class PgClickHouseAudienceVectorSearchRepository:
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
         sample_size: int = 10_000,
+        exclusion_context: PromotionAudienceExclusionContext | None = None,
     ) -> float:
+        exclusion_context = exclusion_context or self._exclusions_by_generation.get(
+            vector_generation_id
+        )
         result = self._clickhouse.query(
             _hard_predicate_query(
                 hard_predicate_keys,
                 filter_user_ids=False,
                 restrict_to_vector_population=True,
                 deterministic_sample=True,
+                exclude_promotion_users=exclusion_context is not None,
             )
             + " LIMIT {sample_size:UInt32}",
             parameters={
@@ -221,6 +304,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     f"{project_id}:{vector_generation_id}:{source_cutoff.isoformat()}"
                 ),
                 "sample_size": sample_size,
+                **_clickhouse_exclusion_parameters(exclusion_context),
             },
         )
         rows = (
@@ -282,6 +366,11 @@ class PgClickHouseAudienceVectorSearchRepository:
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> int:
         candidate_relation = "audience_exact_candidates"
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         self._drop_temp_relation(candidate_relation)
         self._postgres.execute(
             f"""
@@ -305,6 +394,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                   AND search.vector_dim = 64
                   AND search.window_end = %s
                   AND search.vector_generation_id = %s
+                  {exclusion_sql}
             ) AS scored
             WHERE scored.behavior_fit_score >= %s
             """,
@@ -314,6 +404,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
+                *exclusion_params,
                 score_threshold,
             ),
         )
@@ -341,6 +432,11 @@ class PgClickHouseAudienceVectorSearchRepository:
         limit: int,
     ) -> int:
         relation = "audience_ann_retrieval"
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         self._postgres.execute("SET LOCAL hnsw.ef_search = 100")
         self._postgres.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
         self._postgres.execute("SET LOCAL hnsw.max_scan_tuples = 20000")
@@ -368,6 +464,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                   AND search.vector_dim = 64
                   AND search.window_end = %s
                   AND search.vector_generation_id = %s
+                  {exclusion_sql}
                 ORDER BY search.embedding <=> %s::vector
                 LIMIT %s
             ) AS retrieved
@@ -378,6 +475,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
+                *exclusion_params,
                 _vector_literal(query_vector),
                 limit,
             ),
@@ -421,8 +519,13 @@ class PgClickHouseAudienceVectorSearchRepository:
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
         sample_size: int,
     ) -> tuple[int, int]:
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         rows = self._postgres.fetchall(
-            """
+            f"""
             SELECT
                 search.user_id,
                 1 - (search.embedding <=> %s::vector) AS behavior_fit_score
@@ -432,6 +535,7 @@ class PgClickHouseAudienceVectorSearchRepository:
               AND search.vector_dim = 64
               AND search.window_end = %s
               AND search.vector_generation_id = %s
+              {exclusion_sql}
               AND NOT EXISTS (
                   SELECT 1
                   FROM audience_ann_retrieval AS retrieved
@@ -446,6 +550,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
+                *exclusion_params,
                 f"{project_id}:{vector_generation_id}:{source_cutoff}",
                 sample_size,
             ),
@@ -503,19 +608,25 @@ class PgClickHouseAudienceVectorSearchRepository:
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> list[SearchCandidate]:
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         rows = self._postgres.fetchall(
-            """
+            f"""
             SELECT
                 search.user_id,
-                1 - (embedding <=> %s::vector) AS behavior_fit_score
-            FROM user_behavior_vector_search
-            WHERE project_id = %s
-              AND vector_version = %s
-              AND vector_dim = 64
-              AND window_end = %s
-              AND vector_generation_id = %s
-              AND 1 - (embedding <=> %s::vector) >= %s
-            ORDER BY behavior_fit_score DESC, user_id ASC
+                1 - (search.embedding <=> %s::vector) AS behavior_fit_score
+            FROM user_behavior_vector_search AS search
+            WHERE search.project_id = %s
+              AND search.vector_version = %s
+              AND search.vector_dim = 64
+              AND search.window_end = %s
+              AND search.vector_generation_id = %s
+              AND 1 - (search.embedding <=> %s::vector) >= %s
+              {exclusion_sql}
+            ORDER BY behavior_fit_score DESC, search.user_id ASC
             """,
             (
                 _vector_literal(query_vector),
@@ -525,6 +636,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_generation_id,
                 _vector_literal(query_vector),
                 score_threshold,
+                *exclusion_params,
             ),
         )
         candidates = _rows_to_candidates(rows)
@@ -548,21 +660,27 @@ class PgClickHouseAudienceVectorSearchRepository:
         query_vector: Sequence[float],
         limit: int,
     ) -> list[SearchCandidate]:
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         self._postgres.execute("SET LOCAL hnsw.ef_search = 100")
         self._postgres.execute("SET LOCAL hnsw.iterative_scan = 'strict_order'")
         self._postgres.execute("SET LOCAL hnsw.max_scan_tuples = 20000")
         rows = self._postgres.fetchall(
-            """
+            f"""
             SELECT
-                user_id,
-                1 - (embedding <=> %s::vector) AS behavior_fit_score
-            FROM user_behavior_vector_search
-            WHERE project_id = %s
-              AND vector_version = %s
-              AND vector_dim = 64
-              AND window_end = %s
-              AND vector_generation_id = %s
-            ORDER BY embedding <=> %s::vector
+                search.user_id,
+                1 - (search.embedding <=> %s::vector) AS behavior_fit_score
+            FROM user_behavior_vector_search AS search
+            WHERE search.project_id = %s
+              AND search.vector_version = %s
+              AND search.vector_dim = 64
+              AND search.window_end = %s
+              AND search.vector_generation_id = %s
+              {exclusion_sql}
+            ORDER BY search.embedding <=> %s::vector
             LIMIT %s
             """,
             (
@@ -571,6 +689,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
+                *exclusion_params,
                 _vector_literal(query_vector),
                 limit,
             ),
@@ -592,12 +711,17 @@ class PgClickHouseAudienceVectorSearchRepository:
     ) -> list[SearchCandidate]:
         if not user_ids:
             return []
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         self._replace_temp_user_ids(
             table_name="audience_ann_candidates",
             user_ids=user_ids,
         )
         rows = self._postgres.fetchall(
-            """
+            f"""
             SELECT
                 user_id,
                 1 - (embedding <=> %s::vector) AS behavior_fit_score
@@ -609,6 +733,7 @@ class PgClickHouseAudienceVectorSearchRepository:
               AND search.window_end = %s
               AND search.vector_generation_id = %s
               AND 1 - (embedding <=> %s::vector) >= %s
+              {exclusion_sql}
             ORDER BY behavior_fit_score DESC, search.user_id ASC
             """,
             (
@@ -619,6 +744,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_generation_id,
                 _vector_literal(query_vector),
                 score_threshold,
+                *exclusion_params,
             ),
         )
         return self._filter_hard_predicates(
@@ -645,26 +771,32 @@ class PgClickHouseAudienceVectorSearchRepository:
         excluded_user_ids: Sequence[str],
         sample_size: int,
     ) -> tuple[int, int]:
+        exclusion_sql, exclusion_params = self._postgres_exclusion_clause(
+            vector_generation_id=vector_generation_id,
+            user_expression="search.user_id",
+            project_expression="search.project_id",
+        )
         self._replace_temp_user_ids(
             table_name="audience_ann_retrieved",
             user_ids=excluded_user_ids,
         )
         rows = self._postgres.fetchall(
-            """
+            f"""
             SELECT
                 user_id,
                 1 - (embedding <=> %s::vector) AS behavior_fit_score
-            FROM user_behavior_vector_search
-            WHERE project_id = %s
-              AND vector_version = %s
-              AND vector_dim = 64
-              AND window_end = %s
-              AND vector_generation_id = %s
+            FROM user_behavior_vector_search AS search
+            WHERE search.project_id = %s
+              AND search.vector_version = %s
+              AND search.vector_dim = 64
+              AND search.window_end = %s
+              AND search.vector_generation_id = %s
+              {exclusion_sql}
               AND NOT EXISTS (
                   SELECT 1 FROM audience_ann_retrieved AS retrieved
-                  WHERE retrieved.user_id = user_behavior_vector_search.user_id
+                  WHERE retrieved.user_id = search.user_id
               )
-            ORDER BY md5(user_id || %s) ASC, user_id ASC
+            ORDER BY md5(search.user_id || %s) ASC, search.user_id ASC
             LIMIT %s
             """,
             (
@@ -673,6 +805,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
+                *exclusion_params,
                 f"{project_id}:{vector_generation_id}:{source_cutoff}",
                 sample_size,
             ),
@@ -843,11 +976,17 @@ class PgClickHouseAudienceVectorSearchRepository:
             vector_version=vector_version,
             source_cutoff=source_cutoff,
         )
+        exclusion_context = self._exclusions_by_generation.get(
+            vector_generation_id
+        )
         matched_user_ids: set[str] = set()
         for offset in range(0, len(candidates), PREDICATE_CHUNK_SIZE):
             chunk = candidates[offset : offset + PREDICATE_CHUNK_SIZE]
             result = self._clickhouse.query(
-                _hard_predicate_query(hard_predicate_keys),
+                _hard_predicate_query(
+                    hard_predicate_keys,
+                    exclude_promotion_users=exclusion_context is not None,
+                ),
                 parameters={
                     "project_id": project_id,
                     "user_ids": [candidate.user_id for candidate in chunk],
@@ -865,6 +1004,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     "benefit_keys": list(
                         predicate_parameters.get("benefit_keys", ())
                     ),
+                    **_clickhouse_exclusion_parameters(exclusion_context),
                 },
             )
             rows = (
@@ -881,6 +1021,42 @@ class PgClickHouseAudienceVectorSearchRepository:
             for candidate in candidates
             if candidate.user_id in matched_user_ids
         ]
+
+    def _postgres_exclusion_clause(
+        self,
+        *,
+        vector_generation_id: str,
+        user_expression: str,
+        project_expression: str,
+    ) -> tuple[str, tuple[Any, ...]]:
+        context = self._exclusions_by_generation.get(vector_generation_id)
+        if context is None:
+            return "", ()
+        return (
+            f"""
+            AND NOT EXISTS (
+                SELECT 1
+                FROM {POSTGRES_EXCLUSION_RELATION} AS excluded
+                WHERE excluded.project_id = {project_expression}
+                  AND excluded.promotion_id = %s
+                  AND excluded.user_id = {user_expression}
+                  AND excluded.state IN ('reserved', 'consumed')
+            )
+            """,
+            (context.promotion_id,),
+        )
+
+    def _context_for_window(
+        self,
+        *,
+        project_id: str,
+        vector_version: str,
+        window_end: str | datetime,
+    ) -> PromotionAudienceExclusionContext | None:
+        _ = (project_id, vector_version, window_end)
+        if len(self._exclusions_by_generation) != 1:
+            return None
+        return next(iter(self._exclusions_by_generation.values()))
 
     def _generation_window(
         self,
@@ -937,6 +1113,8 @@ def hard_predicates_support_batch_aggregate(keys: Sequence[str]) -> bool:
 
 def _hard_predicate_batch_query(
     requests: Sequence[HardMatchAggregateRequest],
+    *,
+    exclude_promotion_users: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     if not requests:
         raise ValueError("hard match aggregate requests are required")
@@ -1058,6 +1236,7 @@ def _hard_predicate_batch_query(
                     properties_json, 'breakfast_included'
                 )) = 1) AS breakfast_count
             FROM raw_events
+            {_clickhouse_exclusion_join(exclude_promotion_users)}
             WHERE project_id = {{project_id:String}}
               AND user_id IN (
                   SELECT user_id
@@ -1103,6 +1282,7 @@ def _hard_predicate_query(
     filter_user_ids: bool = True,
     restrict_to_vector_population: bool = False,
     deterministic_sample: bool = False,
+    exclude_promotion_users: bool = False,
 ) -> str:
     supported = {
         "hotel_product_interest",
@@ -1219,6 +1399,7 @@ def _hard_predicate_query(
     return f"""
         SELECT user_id
         FROM raw_events
+        {_clickhouse_exclusion_join(exclude_promotion_users)}
         WHERE project_id = {{project_id:String}}
           {user_filter}
           {vector_population_filter}
@@ -1238,6 +1419,34 @@ def _hard_predicate_query(
         HAVING {having}
         {order_by}
     """
+
+
+def _clickhouse_exclusion_join(enabled: bool) -> str:
+    if not enabled:
+        return ""
+    return f"""
+      LEFT ANTI JOIN (
+          SELECT user_id
+          FROM {CLICKHOUSE_EXCLUSION_RELATION}
+          WHERE project_id = {{project_id:String}}
+            AND promotion_id = {{exclusion_promotion_id:String}}
+            AND exclusion_revision <= {{exclusion_revision:UInt64}}
+          GROUP BY user_id
+          HAVING argMax(state, exclusion_revision) IN ('reserved', 'consumed')
+      ) AS promotion_excluded USING (user_id)
+    """
+
+
+def _clickhouse_exclusion_parameters(
+    context: PromotionAudienceExclusionContext | None,
+) -> dict[str, Any]:
+    if context is None:
+        return {}
+    return {
+        "exclusion_promotion_id": context.promotion_id,
+        "exclusion_revision": context.revision,
+        "exclusion_hash": context.exclusion_hash,
+    }
 
 
 def _rows_to_candidates(rows: Sequence[Mapping[str, Any]]) -> list[SearchCandidate]:

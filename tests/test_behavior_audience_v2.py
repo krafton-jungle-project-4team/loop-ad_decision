@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import hashlib
@@ -18,6 +19,7 @@ from app.analysis.audience_search import (
 from app.analysis.audience_snapshot_repository import (
     AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
     AudienceSnapshotWrite,
+    _input_fingerprint,
 )
 from app.analysis.behavior_vector_schema import (
     CandidateCalibration,
@@ -74,6 +76,7 @@ from app.audience_contract import (
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
 )
+from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.vector_service import SegmentVectorBuildResult
 from app.decision.assignment_service import SegmentAssignmentService
 from app.decision.audience_snapshots import (
@@ -897,7 +900,62 @@ def test_snapshot_bulk_copies_materialized_members_without_python_list() -> None
     assert "calibration_hash" in snapshot_insert[0]
 
 
-def test_assignment_reuses_snapshot_and_resolves_overlap_before_writes() -> None:
+def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision() -> None:
+    now = datetime(2026, 7, 17, tzinfo=UTC)
+    spec = HotelBookingBehaviorSchemaV2().compile_candidate(
+        candidate_type="promotion_responsive",
+        intent=_intent(),
+        calibration=CandidateCalibration(0.5, "test.v1"),
+    )
+    base = AudienceSnapshotWrite(
+        analysis_id="analysis",
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+        segment_id="segment",
+        segment_vector_id="segment_vector",
+        vector_generation_id="generation",
+        source_cutoff=now,
+        window_start=now - timedelta(days=30),
+        window_end=now,
+        spec=spec,
+        search_result=AudienceSearchResult(
+            method=AudienceSearchMethod.EXACT,
+            members=(),
+            corpus_user_count=100,
+            hard_match_user_count=20,
+            requested_k=0,
+            recall_audit=None,
+            policy_version="audience_search.v2",
+        ),
+        min_sample_size=10,
+    )
+    revision_one = PromotionAudienceExclusionContext(
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+        revision=1,
+        exclusion_hash="sha256:one",
+        excluded_user_count=2,
+        projection_revision=1,
+        projection_hash="sha256:one",
+    )
+    revision_two = replace(
+        revision_one,
+        revision=2,
+        exclusion_hash="sha256:two",
+        excluded_user_count=3,
+        projection_revision=2,
+        projection_hash="sha256:two",
+    )
+
+    first = _input_fingerprint(replace(base, exclusion_context=revision_one))
+    second = _input_fingerprint(replace(base, exclusion_context=revision_two))
+
+    assert first != second
+
+
+def test_assignment_reuses_preallocated_run_target_snapshots_without_winner_search() -> None:
     run = PromotionRunRecord(
         promotion_run_id="run_1",
         project_id="project",
@@ -912,6 +970,7 @@ def test_assignment_reuses_snapshot_and_resolves_overlap_before_writes() -> None
         segment_scope_fingerprint="a" * 64,
     )
     assignments = _AssignmentWriter()
+    snapshots = _SnapshotReader()
     service = SegmentAssignmentService(
         promotion_run_repository=_RunReader(run),
         ad_experiment_repository=_ExperimentReader(
@@ -921,7 +980,7 @@ def test_assignment_reuses_snapshot_and_resolves_overlap_before_writes() -> None
         user_behavior_vector_repository=_UnusedRepository(),
         user_segment_assignment_repository=assignments,
         reranker=SegmentCandidateReranker(),
-        audience_snapshot_repository=_SnapshotReader(),
+        audience_snapshot_repository=snapshots,
     )
     response = service.build_assignments(
         promotion_run_id="run_1",
@@ -939,6 +998,7 @@ def test_assignment_reuses_snapshot_and_resolves_overlap_before_writes() -> None
         row.assignment_source == AssignmentSource.ANALYSIS_SNAPSHOT.value
         for row in assignments.rows
     )
+    assert snapshots.consume_calls == 1
 
 
 def test_vector_search_sync_is_incremental_and_advances_complete_cutoff() -> None:
@@ -1399,20 +1459,26 @@ class _ExperimentReader:
 
 
 class _SnapshotReader:
-    def resolve_target_contract(self, **_kwargs: object) -> TargetAudienceResolution:
+    def __init__(self) -> None:
+        self.consume_calls = 0
+
+    def resolve_run_contract(self, **_kwargs: object) -> TargetAudienceResolution:
         return TargetAudienceResolution(
             "analysis",
             ("seg_a", "seg_b"),
             "segment_audience.v1",
         )
 
-    def require_complete_set(self, **_kwargs: object) -> AudienceSnapshotSet:
+    def require_run_binding_set(self, **_kwargs: object) -> AudienceSnapshotSet:
         return AudienceSnapshotSet("analysis", ("seg_a", "seg_b"), "hotel_behavior.v2", 3)
 
-    def list_winning_members(self, **kwargs: object) -> list[AudienceSnapshotMember]:
+    def consume_run_members(self, **_kwargs: object) -> None:
+        self.consume_calls += 1
+
+    def list_run_members(self, **kwargs: object) -> list[AudienceSnapshotMember]:
         if kwargs["after_user_id"] is not None:
             return []
-        # Repository contract already resolves user_1 overlap to seg_b.
+        # Final allocation snapshots are already mutually exclusive.
         return [
             AudienceSnapshotMember("user_1", "seg_b", Decimal("0.9")),
             AudienceSnapshotMember("user_2", "seg_a", Decimal("0.8")),

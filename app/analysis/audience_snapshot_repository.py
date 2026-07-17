@@ -11,6 +11,7 @@ from typing import Any, Mapping, Protocol, Sequence
 from app.analysis.audience_search import AudienceSearchMethod, AudienceSearchResult
 from app.analysis.behavior_vector_schema import CandidateBehaviorSpec
 from app.analysis.semantic_selection import semantic_query_vector_hash
+from app.audience_exclusions import PromotionAudienceExclusionContext
 
 
 class AudienceSnapshotBindingError(RuntimeError):
@@ -66,6 +67,7 @@ class AudienceSnapshotWrite:
     search_result: AudienceSearchResult
     min_sample_size: int
     suggestion_id: str | None = None
+    exclusion_context: PromotionAudienceExclusionContext | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +86,9 @@ class BoundAudienceSnapshot:
     recall_lower_bound: float
     recall_target: float
     meets_min_sample_size: bool
+    promotion_exclusion_revision: int | None = None
+    promotion_exclusion_hash: str | None = None
+    excluded_user_count: int = 0
 
 
 class AudienceSnapshotRepository:
@@ -172,12 +177,16 @@ class AudienceSnapshotRepository:
                 input_fingerprint,
                 meets_min_sample_size,
                 status,
-                metadata_json
+                metadata_json,
+                snapshot_role,
+                source_audience_snapshot_id,
+                allocation_plan_id
             )
             VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'source', NULL, NULL
             )
             """,
             (
@@ -221,6 +230,7 @@ class AudienceSnapshotRepository:
                 "completed",
                 {
                     "candidate_type": write.spec.candidate_type,
+                    "snapshot_role": "source",
                     "spec_fingerprint": _spec_fingerprint(write.spec),
                     "hard_predicate_keys": list(write.spec.hard_predicate_keys),
                     "predicate_parameters": {
@@ -264,6 +274,26 @@ class AudienceSnapshotRepository:
                     ),
                     "user_vectorizer_semantic_hash": (
                         write.spec.user_vectorizer_semantic_hash
+                    ),
+                    "exclusion_revision": (
+                        write.exclusion_context.revision
+                        if write.exclusion_context is not None
+                        else None
+                    ),
+                    "exclusion_hash": (
+                        write.exclusion_context.exclusion_hash
+                        if write.exclusion_context is not None
+                        else None
+                    ),
+                    "excluded_user_count": (
+                        write.exclusion_context.excluded_user_count
+                        if write.exclusion_context is not None
+                        else 0
+                    ),
+                    "exclusion_projection_revision": (
+                        write.exclusion_context.projection_revision
+                        if write.exclusion_context is not None
+                        else None
                     ),
                 },
             ),
@@ -477,6 +507,17 @@ class AudienceSnapshotRepository:
             recall_lower_bound=float(row["recall_lower_bound"]),
             recall_target=float(row["recall_target"]),
             meets_min_sample_size=bool(row["meets_min_sample_size"]),
+            promotion_exclusion_revision=(
+                int(metadata["exclusion_revision"])
+                if metadata.get("exclusion_revision") is not None
+                else None
+            ),
+            promotion_exclusion_hash=(
+                str(metadata["exclusion_hash"])
+                if metadata.get("exclusion_hash") is not None
+                else None
+            ),
+            excluded_user_count=int(metadata.get("excluded_user_count") or 0),
         )
 
 
@@ -534,6 +575,16 @@ def _input_fingerprint(write: AudienceSnapshotWrite) -> str:
         "source_cutoff": write.source_cutoff.isoformat(),
         "window_start": write.window_start.isoformat(),
         "window_end": write.window_end.isoformat(),
+        "exclusion_revision": (
+            write.exclusion_context.revision
+            if write.exclusion_context is not None
+            else None
+        ),
+        "exclusion_hash": (
+            write.exclusion_context.exclusion_hash
+            if write.exclusion_context is not None
+            else None
+        ),
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
