@@ -3,6 +3,8 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Mapping
@@ -13,6 +15,7 @@ from app.generation.adapters import (
     ExternalContentGenerator,
     GeminiImageClient,
     ImageArtifact,
+    MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS,
     OpenAIResponsesContentClient,
     S3AssetStorage,
 )
@@ -491,6 +494,45 @@ def test_gemini_image_client_extracts_inline_bytes() -> None:
     image = client.generate_image(image_prompt="bright hotel suite banner")
 
     assert image == ImageArtifact(data=b"image-bytes", content_type="image/png")
+
+
+def test_gemini_image_client_limits_process_wide_parallel_requests() -> None:
+    probe = BlockingGeminiClient()
+    client = GeminiImageClient(
+        **provider_key_kwargs(GEMINI_FIXTURE_KEY),
+        model="gemini-test",
+        client=probe,
+    )
+    request_count = MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS * 2
+
+    with ThreadPoolExecutor(max_workers=request_count) as executor:
+        futures = [
+            executor.submit(
+                client.generate_image,
+                image_prompt="bright hotel suite banner",
+            )
+            for _ in range(request_count)
+        ]
+        try:
+            assert probe.limit_reached.wait(timeout=5)
+            with probe.lock:
+                assert (
+                    probe.active_requests == MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS
+                )
+                assert (
+                    probe.max_active_requests
+                    == MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS
+                )
+        finally:
+            probe.release.set()
+        images = [future.result(timeout=5) for future in futures]
+
+    assert len(images) == request_count
+    assert all(
+        image == ImageArtifact(data=b"image-bytes", content_type="image/png")
+        for image in images
+    )
+    assert probe.max_active_requests == MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS
 
 
 def test_gemini_image_client_uses_developer_api_supported_config() -> None:
@@ -1037,6 +1079,47 @@ class FakeGeminiClient:
         assert config.response_modalities == ["IMAGE"]
         assert config.image_config is None
         return self._response
+
+
+class BlockingGeminiClient:
+    def __init__(self) -> None:
+        inline = SimpleNamespace(data=b"image-bytes", mime_type="image/png")
+        part = SimpleNamespace(inline_data=inline)
+        content = SimpleNamespace(parts=[part])
+        self._response = SimpleNamespace(
+            candidates=[SimpleNamespace(content=content)]
+        )
+        self.models = self
+        self.lock = threading.Lock()
+        self.active_requests = 0
+        self.max_active_requests = 0
+        self.limit_reached = threading.Event()
+        self.release = threading.Event()
+
+    def generate_content(
+        self,
+        *,
+        model: str,
+        contents: str,
+        config: object,
+    ) -> object:
+        assert model == "gemini-test"
+        assert contents == "bright hotel suite banner"
+        assert config is not None
+        with self.lock:
+            self.active_requests += 1
+            self.max_active_requests = max(
+                self.max_active_requests,
+                self.active_requests,
+            )
+            if self.active_requests == MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS:
+                self.limit_reached.set()
+        try:
+            self.release.wait(timeout=5)
+            return self._response
+        finally:
+            with self.lock:
+                self.active_requests -= 1
 
 
 class FakeS3Client:

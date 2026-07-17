@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -73,6 +74,15 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 MAX_CONTENT_IDENTIFIER_LENGTH = 100
 CONTENT_SLUG_HASH_LENGTH = 16
+MAX_DURABLE_CANDIDATE_WORKERS = 3
+
+
+@dataclass(frozen=True, slots=True)
+class _CandidateBuildTask:
+    prompt_input: GenerationPromptInput
+    generation_context: GenerationContext
+    strategy_plan: GenerationStrategyPlan
+    index: int
 
 
 class GenerationRunWriter(Protocol):
@@ -324,6 +334,7 @@ class GenerationService:
             prompt_inputs=prompt_inputs,
             existing_candidates=existing_candidates,
             checkpoint=checkpoint,
+            parallel_candidates=_supports_staged_generation(self._content_generator),
         )
         for candidate in content_candidates:
             _validate_durable_candidate_ready(candidate)
@@ -668,11 +679,12 @@ class GenerationService:
         candidate_status: ContentCandidateStatus = ContentCandidateStatus.DRAFT,
         existing_candidates: Sequence[ContentCandidateRecord] = (),
         checkpoint: CandidateCheckpoint | None = None,
+        parallel_candidates: bool = False,
     ) -> list[ContentCandidateRecord]:
-        records: list[ContentCandidateRecord] = []
         existing_by_id = {
             candidate.content_id: candidate for candidate in existing_candidates
         }
+        tasks: list[_CandidateBuildTask] = []
         for raw_prompt_input in prompt_inputs:
             prompt_input = _prompt_input_with_resolved_landing_url(raw_prompt_input)
             generation_context = self._generation_context_builder.build(prompt_input)
@@ -693,19 +705,104 @@ class GenerationService:
                     generation_context,
                     option_index=index,
                 )
-                records.append(
-                    self._build_content_candidate_record(
-                        generation_id=generation_id,
+                tasks.append(
+                    _CandidateBuildTask(
                         prompt_input=prompt_input,
                         generation_context=generation_context,
                         strategy_plan=strategy_plan,
                         index=index,
-                        status=candidate_status,
-                        existing_by_id=existing_by_id,
-                        checkpoint=checkpoint,
                     )
                 )
+        if not parallel_candidates or len(tasks) < 2:
+            return [
+                self._run_candidate_build_task(
+                    task,
+                    generation_id=generation_id,
+                    status=candidate_status,
+                    existing_by_id=existing_by_id,
+                    checkpoint=checkpoint,
+                )
+                for task in tasks
+            ]
+        return self._build_content_candidates_in_parallel(
+            tasks,
+            generation_id=generation_id,
+            status=candidate_status,
+            existing_by_id=existing_by_id,
+            checkpoint=checkpoint,
+        )
+
+    def _build_content_candidates_in_parallel(
+        self,
+        tasks: Sequence[_CandidateBuildTask],
+        *,
+        generation_id: str,
+        status: ContentCandidateStatus,
+        existing_by_id: Mapping[str, ContentCandidateRecord],
+        checkpoint: CandidateCheckpoint | None,
+    ) -> list[ContentCandidateRecord]:
+        worker_count = min(len(tasks), MAX_DURABLE_CANDIDATE_WORKERS)
+        log.info(
+            "generation_candidates_parallel_started",
+            {
+                "generationId": generation_id,
+                "candidateCount": len(tasks),
+                "workerCount": worker_count,
+            },
+        )
+        records_by_position: dict[int, ContentCandidateRecord] = {}
+        with ThreadPoolExecutor(
+            max_workers=worker_count,
+            thread_name_prefix="loop-ad-candidate",
+        ) as executor:
+            positions_by_future: dict[Future[ContentCandidateRecord], int] = {
+                executor.submit(
+                    self._run_candidate_build_task,
+                    task,
+                    generation_id=generation_id,
+                    status=status,
+                    existing_by_id=existing_by_id,
+                    checkpoint=checkpoint,
+                ): position
+                for position, task in enumerate(tasks)
+            }
+            try:
+                for future in as_completed(positions_by_future):
+                    records_by_position[positions_by_future[future]] = future.result()
+            except Exception:
+                for future in positions_by_future:
+                    future.cancel()
+                raise
+        records = [records_by_position[position] for position in range(len(tasks))]
+        log.info(
+            "generation_candidates_parallel_completed",
+            {
+                "generationId": generation_id,
+                "candidateCount": len(records),
+                "workerCount": worker_count,
+            },
+        )
         return records
+
+    def _run_candidate_build_task(
+        self,
+        task: _CandidateBuildTask,
+        *,
+        generation_id: str,
+        status: ContentCandidateStatus,
+        existing_by_id: Mapping[str, ContentCandidateRecord],
+        checkpoint: CandidateCheckpoint | None,
+    ) -> ContentCandidateRecord:
+        return self._build_content_candidate_record(
+            generation_id=generation_id,
+            prompt_input=task.prompt_input,
+            generation_context=task.generation_context,
+            strategy_plan=task.strategy_plan,
+            index=task.index,
+            status=status,
+            existing_by_id=existing_by_id,
+            checkpoint=checkpoint,
+        )
 
     def _build_content_candidate_record(
         self,
