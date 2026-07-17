@@ -242,6 +242,41 @@ def test_segment_spec_query_is_deterministic_and_does_not_read_promotion() -> No
     assert first.segment_audience_spec_hash == second.segment_audience_spec_hash
 
 
+def test_registered_segment_query_never_uses_legacy_promotion_compiler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_if_called(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("registered segment query used promotion compiler")
+
+    monkeypatch.setattr(
+        HotelBookingBehaviorSchemaV2,
+        "compile_candidate",
+        fail_if_called,
+    )
+    segment = _v2_segment(
+        "segment_registered_funnel",
+        candidate_type="funnel_recovery",
+    )
+
+    compiled = compile_registered_segment_audience(
+        segment_id=segment.segment_id,
+        rule_json=segment.rule_json,
+    )
+
+    assert compiled.audience_resolution_contract == SEGMENT_AUDIENCE_CONTRACT
+    assert compiled.template_id == "hotel.funnel_recovery.v1"
+    assert (
+        compiled.query_compiler_version
+        == SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION
+    )
+    assert cosine_similarity(
+        compiled.query_vector,
+        compiled.query_vector,
+    ) == pytest.approx(
+        1.0,
+    )
+
+
 def test_v2_contract_never_infers_a_missing_spec_from_promotion() -> None:
     with pytest.raises(SegmentAudienceContractError) as error:
         SegmentDefinitionAudienceAdapter().resolve(

@@ -212,32 +212,43 @@ class FakePreparingAudienceV2Coordinator:
         matching_user_count: int = 20,
         selected_user_count: int = 10,
         meets_min_sample_size: bool = False,
+        counts_by_segment: Mapping[str, tuple[int, int, int, bool]] | None = None,
     ) -> None:
         self.total_eligible_user_count = total_eligible_user_count
         self.matching_user_count = matching_user_count
         self.selected_user_count = selected_user_count
         self.meets_min_sample_size = meets_min_sample_size
+        self.counts_by_segment = counts_by_segment or {}
         self.prepare_many_calls: list[dict[str, object]] = []
 
     def prepare_many(self, **kwargs: object):
         self.prepare_many_calls.append(dict(kwargs))
-        return {
-            segment.segment_id: AudienceV2Preparation(
+        preparations: dict[str, AudienceV2Preparation] = {}
+        for segment in kwargs["segments"]:
+            eligible, matching, selected, meets_minimum = self.counts_by_segment.get(
+                segment.segment_id,
+                (
+                    self.total_eligible_user_count,
+                    self.matching_user_count,
+                    self.selected_user_count,
+                    self.meets_min_sample_size,
+                ),
+            )
+            preparations[segment.segment_id] = AudienceV2Preparation(
                 audience_snapshot_id=f"snapshot_{segment.segment_id}",
                 segment_vector_id=f"vector_{segment.segment_id}",
                 vector_generation_id="generation_active",
                 vector_version="hotel_behavior.v2",
-                total_eligible_user_count=self.total_eligible_user_count,
-                matching_user_count=self.matching_user_count,
-                selected_user_count=self.selected_user_count,
+                total_eligible_user_count=eligible,
+                matching_user_count=matching,
+                selected_user_count=selected,
                 selection_method="exact",
                 estimated_recall=1.0,
                 recall_lower_bound=1.0,
                 recall_target=1.0,
-                meets_min_sample_size=self.meets_min_sample_size,
+                meets_min_sample_size=meets_minimum,
             )
-            for segment in kwargs["segments"]
-        }
+        return preparations
 
 
 class FakeSegmentVectorService:
@@ -703,6 +714,66 @@ def test_v2_recommendation_projects_snapshot_counts_to_card_metadata() -> None:
         "selected_user_role": "final_experiment_audience",
     }
     assert analysis_repository.saved.segment_suggestions == result.segment_suggestions
+
+
+def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
+    promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
+    segments = [
+        _v2_ai_segment(
+            promotion=promotion,
+            segment_id=segment_id,
+            sample_size=40,
+            raw_audience={
+                "total_eligible_user_count": 74_200,
+                "matching_user_count": 40,
+                "selected_user_count": 40,
+            },
+        )
+        for segment_id in ("seg_ai_first", "seg_ai_second", "seg_ai_third")
+    ]
+    expected = {
+        "seg_ai_first": (100, 60, 30, True),
+        "seg_ai_second": (100, 20, 5, False),
+        "seg_ai_third": (100, 0, 0, False),
+    }
+    coordinator = FakePreparingAudienceV2Coordinator(
+        counts_by_segment=expected,
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester(segments),
+        audience_v2_coordinator=coordinator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id)
+    )
+
+    assert len(coordinator.prepare_many_calls) == 1
+    assert len(result.segment_suggestions) == 3
+    for suggestion in result.segment_suggestions:
+        eligible, matching, selected, _meets_minimum = expected[
+            suggestion.segment_id
+        ]
+        audience = suggestion.metadata_json["display_copy"]["audience"]
+        assert audience["total_eligible_user_count"] == eligible
+        assert audience["matching_user_count"] == matching
+        assert audience["selected_user_count"] == selected
+        assert suggestion.audience_snapshot_id == (
+            f"snapshot_{suggestion.segment_id}"
+        )
+
+    targets = {target.segment_id: target for target in result.target_segments}
+    assert targets["seg_ai_first"].data_evidence_json["audience_status"] == (
+        "targetable"
+    )
+    assert targets["seg_ai_second"].data_evidence_json["audience_status"] == (
+        "insufficient_sample"
+    )
+    assert targets["seg_ai_third"].data_evidence_json["audience_status"] == (
+        "no_eligible_audience"
+    )
 
 
 def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> None:
