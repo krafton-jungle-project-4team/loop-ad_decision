@@ -6,6 +6,8 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterator, Mapping, Sequence
 
+from psycopg import errors as pg_errors
+
 from app.decision.audience_snapshots import (
     AudienceSnapshotContractError,
     AudienceSnapshotReader,
@@ -302,6 +304,7 @@ class SegmentAssignmentService:
         log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
 
         audience_contract = self._resolve_target_audience_contract(
+            promotion_run_id=run.promotion_run_id,
             analysis_id=run.analysis_id,
             segment_ids=[
                 experiment.segment_id for experiment in experiments.non_fallback
@@ -511,14 +514,32 @@ class SegmentAssignmentService:
     def _resolve_target_audience_contract(
         self,
         *,
+        promotion_run_id: str,
         analysis_id: str,
         segment_ids: Sequence[str],
     ) -> str:
         try:
+            resolver = getattr(
+                self._audience_snapshot_repository,
+                "resolve_run_contract",
+                None,
+            )
+            if callable(resolver):
+                return resolver(
+                    promotion_run_id=promotion_run_id,
+                    analysis_id=analysis_id,
+                    segment_ids=segment_ids,
+                ).contract
             return self._audience_snapshot_repository.resolve_target_contract(
                 analysis_id=analysis_id,
                 segment_ids=segment_ids,
             ).contract
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(segment_ids),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
         except AudienceSnapshotContractError as exc:
             raise SegmentAssignmentAudienceContractError(
                 code="segment_audience_assignment_contract_invalid",
@@ -542,10 +563,20 @@ class SegmentAssignmentService:
             experiment.segment_id for experiment in experiments.non_fallback
         ]
         try:
-            snapshot_set = self._audience_snapshot_repository.require_complete_set(
-                analysis_id=run.analysis_id,
+            snapshot_set = self._audience_snapshot_repository.require_run_binding_set(
+                promotion_run_id=run.promotion_run_id,
                 segment_ids=segment_ids,
             )
+            self._audience_snapshot_repository.consume_run_members(
+                promotion_run_id=run.promotion_run_id,
+                segment_ids=segment_ids,
+            )
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(segment_ids),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
         except AudienceSnapshotContractError as exc:
             raise SegmentAssignmentAudienceContractError(
                 code="segment_audience_snapshot_binding_invalid",
@@ -572,20 +603,9 @@ class SegmentAssignmentService:
         score_buckets = {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
         after_user_id: str | None = None
 
-        materialize = getattr(
-            self._audience_snapshot_repository,
-            "materialize_winning_members",
-            None,
-        )
-        if callable(materialize):
-            materialize(
-                analysis_id=run.analysis_id,
-                segment_ids=segment_ids,
-            )
-
         while True:
-            members = self._audience_snapshot_repository.list_winning_members(
-                analysis_id=run.analysis_id,
+            members = self._audience_snapshot_repository.list_run_members(
+                promotion_run_id=run.promotion_run_id,
                 segment_ids=segment_ids,
                 after_user_id=after_user_id,
                 limit=ASSIGNMENT_PAGE_SIZE,

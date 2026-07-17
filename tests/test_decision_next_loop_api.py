@@ -15,6 +15,7 @@ from psycopg import sql
 
 from app.config import load_settings
 from tests.config_env import required_env_values
+from app.decision.audience_snapshots import AudienceSnapshotRepository
 from app.decision.next_loop_service import (
     NextLoopConflictError,
     NextLoopGenerationFailedError,
@@ -868,6 +869,10 @@ def test_next_loop_service_wires_s3_artifact_publisher_outside_test_env(
         generation_gateway = service._generation_gateway
         generation_service = generation_gateway._generation_service
         assert generation_service._artifact_publisher is artifact_publisher
+        assert isinstance(
+            service._run_creator._run_audience_binding_repository,
+            AudienceSnapshotRepository,
+        )
     finally:
         service_iterator.close()
 

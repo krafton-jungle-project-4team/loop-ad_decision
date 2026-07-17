@@ -165,7 +165,9 @@ class PromotionTargetSegmentRecord:
     estimated_size: int
     priority: str | None
     status: str
+    source_audience_snapshot_id: str | None = None
     audience_snapshot_id: str | None = None
+    allocation_plan_id: str | None = None
     audience_snapshot_status: str | None = None
     audience_status: str | None = None
     audience_final_user_count: int | None = None
@@ -830,7 +832,9 @@ class PromotionTargetSegmentRepository:
                 target.estimated_size,
                 target.priority,
                 target.status,
+                target.source_audience_snapshot_id,
                 target.audience_snapshot_id,
+                target.allocation_plan_id,
                 snapshot.status AS audience_snapshot_status,
                 snapshot.audience_status,
                 snapshot.final_user_count AS audience_final_user_count,
@@ -897,7 +901,9 @@ class PromotionTargetSegmentRepository:
                 target.estimated_size,
                 target.priority,
                 target.status,
+                target.source_audience_snapshot_id,
                 target.audience_snapshot_id,
+                target.allocation_plan_id,
                 snapshot.status AS audience_snapshot_status,
                 snapshot.audience_status,
                 snapshot.final_user_count AS audience_final_user_count,

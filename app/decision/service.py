@@ -7,6 +7,8 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
+from psycopg import errors as pg_errors
+
 from app.audience_contract import (
     LEGACY_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_CONTRACT,
@@ -40,6 +42,12 @@ from app.decision.repositories import (
     PromotionRunWriter,
     PromotionTargetSegmentReader,
     PromotionTargetSegmentRecord,
+)
+from app.decision.audience_snapshots import (
+    AudienceSnapshotContractError,
+    AudienceSnapshotTargetAlreadyBoundError,
+    RunAudienceBindingWriter,
+    RunAudienceTargetBindingWrite,
 )
 from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.schemas import (
@@ -101,6 +109,7 @@ class PromotionRunService:
         ad_experiment_repository: AdExperimentWriter,
         promotion_evaluation_repository: PromotionEvaluationWriter,
         next_loop_preparation_repository: NextLoopPreparationWriter,
+        run_audience_binding_repository: RunAudienceBindingWriter | None = None,
         manual_activation_enabled: bool = False,
     ) -> None:
         self._promotion_repository = promotion_repository
@@ -112,6 +121,7 @@ class PromotionRunService:
         self._ad_experiment_repository = ad_experiment_repository
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._next_loop_preparation_repository = next_loop_preparation_repository
+        self._run_audience_binding_repository = run_audience_binding_repository
         self._manual_activation_enabled = manual_activation_enabled
 
     @log_context_scope
@@ -167,25 +177,46 @@ class PromotionRunService:
         snapshot_segment_ids = normalize_generation_segment_snapshot(
             generation.input_json.get("target_segment_ids"),
             target_segments_snapshot=generation.input_json.get("target_segments"),
-            required=requested_segment_ids is not None,
+            required=False,
         )
         if requested_segment_ids is None:
             effective_segment_ids = snapshot_segment_ids
         else:
-            if not set(requested_segment_ids).issubset(
-                set(snapshot_segment_ids or ())
-            ):
-                raise RunValidationError(
-                    "segment_ids must be a subset of the generation target_segment_ids snapshot"
-                )
             effective_segment_ids = requested_segment_ids
 
         target_segments = self._load_target_segments(
             analysis,
             promotion,
             segment_ids=effective_segment_ids,
+            explicit_source=(
+                request.analysis_id is not None
+                and request.generation_id is not None
+                and requested_segment_ids is not None
+            ),
         )
-        _require_uniform_target_audience_contract(target_segments)
+        audience_contract = _require_uniform_target_audience_contract(target_segments)
+        if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+            self._validate_v2_run_source_request(
+                request=request,
+                analysis=analysis,
+                generation=generation,
+                target_segments=target_segments,
+            )
+        if audience_contract == LEGACY_AUDIENCE_CONTRACT:
+            if requested_segment_ids is not None and not set(
+                requested_segment_ids
+            ).issubset(set(snapshot_segment_ids or ())):
+                raise RunValidationError(
+                    "legacy segment_ids must be a subset of the generation "
+                    "target_segment_ids snapshot"
+                )
+            if any(
+                target.analysis_id != analysis.analysis_id
+                for target in target_segments
+            ):
+                raise RunValidationError(
+                    "legacy target segments must belong to the selected analysis"
+                )
         segment_ids = tuple(
             sorted({target_segment.segment_id for target_segment in target_segments})
         )
@@ -224,7 +255,9 @@ class PromotionRunService:
             return response
 
         log.info("target_segments_loaded", {"targetSegmentCount": len(target_segments)})
-        content_by_segment = self._load_content_by_segment(generation.generation_id)
+        content_by_segment = self._load_content_by_segment(
+            generation.generation_id,
+        )
         log.info("content_candidates_loaded", {"segmentCount": len(content_by_segment)})
         selected_content = self._select_content_for_segments(
             promotion=promotion,
@@ -279,6 +312,12 @@ class PromotionRunService:
             return response
 
         self._ad_experiment_repository.insert_many(ad_experiments)
+        if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+            self._bind_v2_run_targets(
+                run=run,
+                target_segments=target_segments,
+                selected_content=selected_content,
+            )
         log.info("promotion_run_created", {"promotionRun": run, "adExperiments": ad_experiments})
         response = self._build_response(run, ad_experiments)
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
@@ -323,6 +362,37 @@ class PromotionRunService:
             run.promotion_run_id
         )
         self._validate_existing_run_integrity(run, ad_experiments)
+        if self._run_audience_binding_repository is not None:
+            segment_ids = [
+                experiment.segment_id
+                for experiment in ad_experiments
+                if experiment.segment_id != FALLBACK_SEGMENT_ID
+            ]
+            try:
+                resolution = (
+                    self._run_audience_binding_repository.resolve_run_contract(
+                        promotion_run_id=run.promotion_run_id,
+                        analysis_id=run.analysis_id,
+                        segment_ids=segment_ids,
+                    )
+                )
+                if resolution.contract == SEGMENT_AUDIENCE_CONTRACT:
+                    self._run_audience_binding_repository.require_run_binding_set(
+                        promotion_run_id=run.promotion_run_id,
+                        segment_ids=segment_ids,
+                    )
+            except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+                raise RunAudienceContractError(
+                    code="segment_audience_exclusion_contract_missing",
+                    segment_id=",".join(sorted(segment_ids)),
+                    reason="V2 run-target binding Data Contract is missing",
+                ) from exc
+            except AudienceSnapshotContractError as exc:
+                raise RunAudienceContractError(
+                    code="segment_audience_run_binding_invalid",
+                    segment_id=",".join(sorted(segment_ids)),
+                    reason=str(exc),
+                ) from exc
         log.assign_context({"promotionRunId": run.promotion_run_id})
         log.info("promotion_run_reused")
         return self._build_response(run, ad_experiments)
@@ -482,6 +552,9 @@ class PromotionRunService:
             promotion,
             segment_ids=expected_segment_ids,
         )
+        audience_contract = _require_uniform_target_audience_contract(
+            target_segments
+        )
         self._validate_generation_segment_snapshot(
             generation=generation,
             requested_segment_ids=expected_segment_ids,
@@ -532,6 +605,12 @@ class PromotionRunService:
                 run=existing_run,
                 experiments=experiments,
             )
+            if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+                self._bind_v2_run_targets(
+                    run=existing_run,
+                    target_segments=target_segments,
+                    selected_content=selected_content,
+                )
             self._activate_preparation(preparation, existing_run.promotion_run_id)
             return self._build_response(existing_run, experiments)
 
@@ -577,10 +656,22 @@ class PromotionRunService:
                 run=concurrent_run,
                 experiments=experiments,
             )
+            if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+                self._bind_v2_run_targets(
+                    run=concurrent_run,
+                    target_segments=target_segments,
+                    selected_content=selected_content,
+                )
             self._activate_preparation(preparation, concurrent_run.promotion_run_id)
             return self._build_response(concurrent_run, experiments)
 
         self._ad_experiment_repository.insert_many(ad_experiments)
+        if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+            self._bind_v2_run_targets(
+                run=run,
+                target_segments=target_segments,
+                selected_content=selected_content,
+            )
         self._activate_preparation(preparation, run.promotion_run_id)
         return self._build_response(run, ad_experiments)
 
@@ -635,8 +726,7 @@ class PromotionRunService:
             run=run,
             experiments=experiments,
         )
-        self._validate_existing_run_integrity(run, experiments)
-        return self._build_response(run, experiments)
+        return self._reuse_existing_run(run)
 
     def _validate_activation_request(
         self,
@@ -979,6 +1069,7 @@ class PromotionRunService:
         promotion: PromotionRecord,
         *,
         segment_ids: Sequence[str] | None,
+        explicit_source: bool = False,
     ) -> list[PromotionTargetSegmentRecord]:
         target_segments = (
             self._promotion_target_segment_repository.list_approved_for_analysis(
@@ -994,6 +1085,15 @@ class PromotionRunService:
         if not target_segments:
             log.warn("target_segments_empty", {"analysisId": analysis.analysis_id})
             if segment_ids is not None:
+                if explicit_source:
+                    raise RunAudienceContractError(
+                        code="segment_audience_run_source_mismatch",
+                        segment_id=",".join(sorted(set(segment_ids))),
+                        reason=(
+                            "requested segments do not belong to the selected "
+                            "analysis and generation"
+                        ),
+                    )
                 raise RunValidationError(
                     "segment_ids must match approved promotion_target_segments"
                 )
@@ -1008,11 +1108,6 @@ class PromotionRunService:
                 promotion_id=segment.promotion_id,
                 promotion=promotion,
             )
-            if segment.analysis_id != analysis.analysis_id:
-                log.warn("target_segment_mismatch", {"segmentId": segment.segment_id, "analysisId": segment.analysis_id})
-                raise RunValidationError(
-                    "target segment must belong to the selected promotion analysis"
-                )
             if segment.segment_id in seen_segment_ids:
                 log.warn("target_segment_conflict", {"segmentId": segment.segment_id})
                 raise RunValidationError(
@@ -1021,6 +1116,15 @@ class PromotionRunService:
             seen_segment_ids.add(segment.segment_id)
 
         if segment_ids is not None and seen_segment_ids != set(segment_ids):
+            if explicit_source:
+                raise RunAudienceContractError(
+                    code="segment_audience_run_source_mismatch",
+                    segment_id=",".join(sorted(set(segment_ids))),
+                    reason=(
+                        "all requested segments must belong to one selected "
+                        "analysis and generation"
+                    ),
+                )
             raise RunValidationError(
                 "segment_ids must match approved promotion_target_segments"
             )
@@ -1050,9 +1154,8 @@ class PromotionRunService:
         generation_id: str,
     ) -> dict[str, list[ContentCandidateRecord]]:
         content_candidates = (
-            self._content_candidate_repository.list_approved_or_active_for_generation(
-                generation_id,
-            )
+            self._content_candidate_repository
+            .list_approved_or_active_for_generation(generation_id)
         )
         content_by_segment: dict[str, list[ContentCandidateRecord]] = defaultdict(list)
         for candidate in content_candidates:
@@ -1086,6 +1189,49 @@ class PromotionRunService:
             )
             selected_content[segment.segment_id] = candidate
         return selected_content
+
+    def _validate_v2_run_source_request(
+        self,
+        *,
+        request: RunCreateRequest,
+        analysis: PromotionAnalysisRecord,
+        generation: GenerationRunRecord,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
+    ) -> None:
+        requested_segment_ids = normalize_explicit_segment_ids(request.segment_ids)
+        if (
+            request.analysis_id is None
+            or request.generation_id is None
+            or requested_segment_ids is None
+        ):
+            raise RunAudienceContractError(
+                code="segment_audience_run_source_required",
+                segment_id=",".join(
+                    sorted(target.segment_id for target in target_segments)
+                ),
+                reason=(
+                    "V2 run requires explicit analysis_id, generation_id, "
+                    "and segment_ids"
+                ),
+            )
+        expected = set(requested_segment_ids)
+        if (
+            request.analysis_id != analysis.analysis_id
+            or request.generation_id != generation.generation_id
+            or any(
+                target.analysis_id != analysis.analysis_id
+                for target in target_segments
+            )
+            or {target.segment_id for target in target_segments} != expected
+        ):
+            raise RunAudienceContractError(
+                code="segment_audience_run_source_mismatch",
+                segment_id=",".join(sorted(expected)),
+                reason=(
+                    "V2 run targets must belong to the explicitly selected "
+                    "analysis and generation"
+                ),
+            )
 
     def _build_promotion_run(
         self,
@@ -1161,8 +1307,8 @@ class PromotionRunService:
             experiments.append(
                 _build_ad_experiment(
                     promotion=promotion,
-                    analysis=analysis,
-                    generation=generation,
+                    analysis_id=analysis.analysis_id,
+                    generation_id=generation.generation_id,
                     promotion_run_id=promotion_run_id,
                     segment_id=segment.segment_id,
                     segment_name=segment.segment_name,
@@ -1173,6 +1319,81 @@ class PromotionRunService:
                 )
             )
         return experiments
+
+    def _bind_v2_run_targets(
+        self,
+        *,
+        run: PromotionRunWrite,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
+        selected_content: Mapping[str, ContentCandidateRecord],
+    ) -> None:
+        repository = self._run_audience_binding_repository
+        if repository is None:
+            raise RunAudienceContractError(
+                code="segment_audience_run_binding_repository_missing",
+                segment_id=",".join(
+                    sorted(target.segment_id for target in target_segments)
+                ),
+                reason="V2 run-target binding repository is not configured",
+            )
+        bindings: list[RunAudienceTargetBindingWrite] = []
+        for target in target_segments:
+            if (
+                target.source_audience_snapshot_id is None
+                or target.audience_snapshot_id is None
+                or target.allocation_plan_id is None
+            ):
+                raise RunAudienceContractError(
+                    code="segment_audience_run_binding_missing",
+                    segment_id=target.segment_id,
+                    reason=(
+                        "V2 target requires source snapshot, final snapshot, "
+                        "and allocation plan"
+                    ),
+                )
+            content = selected_content[target.segment_id]
+            bindings.append(
+                RunAudienceTargetBindingWrite(
+                    target_analysis_id=target.analysis_id,
+                    segment_id=target.segment_id,
+                    source_audience_snapshot_id=target.source_audience_snapshot_id,
+                    final_audience_snapshot_id=target.audience_snapshot_id,
+                    allocation_plan_id=target.allocation_plan_id,
+                    generation_id=content.generation_id,
+                    content_id=content.content_id,
+                    content_option_id=content.content_option_id,
+                )
+            )
+        try:
+            repository.bind_run_targets(
+                promotion_run_id=run.promotion_run_id,
+                project_id=run.project_id,
+                campaign_id=run.campaign_id,
+                promotion_id=run.promotion_id,
+                bindings=bindings,
+            )
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise RunAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(
+                    sorted(target.segment_id for target in target_segments)
+                ),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
+        except AudienceSnapshotTargetAlreadyBoundError as exc:
+            raise RunAudienceContractError(
+                code=exc.code,
+                segment_id=exc.segment_id,
+                reason=exc.reason,
+            ) from exc
+        except AudienceSnapshotContractError as exc:
+            raise RunAudienceContractError(
+                code="segment_audience_run_binding_invalid",
+                segment_id=",".join(
+                    sorted(target.segment_id for target in target_segments)
+                ),
+                reason=str(exc),
+            ) from exc
 
 
 def build_bounded_decision_id(prefix: str, *parts: str) -> str:
@@ -1375,11 +1596,18 @@ def _require_uniform_target_audience_contract(
             else LEGACY_AUDIENCE_CONTRACT
         )
         if contract == SEGMENT_AUDIENCE_CONTRACT:
-            if target.audience_snapshot_id is None:
+            if (
+                target.source_audience_snapshot_id is None
+                or target.audience_snapshot_id is None
+                or target.allocation_plan_id is None
+            ):
                 raise RunAudienceContractError(
                     code="segment_audience_snapshot_binding_missing",
                     segment_id=target.segment_id,
-                    reason="segment_audience.v1 target requires audience_snapshot_id",
+                    reason=(
+                        "segment_audience.v1 target requires source snapshot, "
+                        "final allocation snapshot, and allocation plan"
+                    ),
                 )
             if (
                 target.audience_snapshot_status != "completed"
@@ -1525,8 +1753,8 @@ def _decimal_to_snapshot_string(value: Decimal) -> str:
 def _build_ad_experiment(
     *,
     promotion: PromotionRecord,
-    analysis: PromotionAnalysisRecord,
-    generation: GenerationRunRecord,
+    analysis_id: str,
+    generation_id: str,
     promotion_run_id: str,
     segment_id: str,
     segment_name: str | None,
@@ -1545,8 +1773,8 @@ def _build_ad_experiment(
         campaign_id=promotion.campaign_id,
         promotion_id=promotion.promotion_id,
         promotion_run_id=promotion_run_id,
-        analysis_id=analysis.analysis_id,
-        generation_id=generation.generation_id,
+        analysis_id=analysis_id,
+        generation_id=generation_id,
         segment_id=segment_id,
         segment_name=segment_name,
         content_id=content.content_id,

@@ -16,6 +16,11 @@ from app.analysis.audience_snapshot_repository import (
     AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
 )
 from app.analysis.audience_v2 import AudienceV2Coordinator
+from app.audience_allocation import (
+    AudienceAllocationService,
+    PostgresAudienceAllocationRepository,
+)
+from app.audience_exclusions import PromotionAudienceExclusionRepository
 from app.analysis.repositories import (
     HotelProfileRepository as AnalysisHotelProfileRepository,
     PromotionAnalysisRepository as AnalysisPromotionAnalysisRepository,
@@ -165,6 +170,7 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
     settings = get_settings(request)
     connection = create_postgres_connection(settings)
     executor = PsycopgPostgresExecutor(connection)
+    audience_snapshot_repository = AudienceSnapshotRepository(executor)
     try:
         yield PromotionRunService(
             promotion_repository=PromotionRepository(executor),
@@ -178,6 +184,7 @@ def get_promotion_run_service(request: Request) -> Iterator[PromotionRunService]
             ad_experiment_repository=AdExperimentRepository(executor),
             promotion_evaluation_repository=PromotionEvaluationRepository(executor),
             next_loop_preparation_repository=NextLoopPreparationRepository(executor),
+            run_audience_binding_repository=audience_snapshot_repository,
             manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         connection.commit()
@@ -306,6 +313,10 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             search_repository=PgClickHouseAudienceVectorSearchRepository(
                 postgres=analysis_executor,
                 clickhouse=clickhouse_client,
+                exclusion_repository=PromotionAudienceExclusionRepository(
+                    postgres=analysis_executor,
+                    clickhouse=clickhouse_client,
+                ),
             ),
             snapshot_repository=AnalysisAudienceSnapshotRepository(
                 analysis_executor
@@ -330,6 +341,15 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             ),
             segment_report_generator=build_segment_suggestion_report_generator(settings),
             audience_v2_coordinator=audience_v2_coordinator,
+            audience_allocation_service=AudienceAllocationService(
+                PostgresAudienceAllocationRepository(
+                    postgres=analysis_executor,
+                    exclusion_reader=PromotionAudienceExclusionRepository(
+                        postgres=analysis_executor,
+                        clickhouse=clickhouse_client,
+                    ),
+                )
+            ),
         )
         content_generator = None
         artifact_publisher = None
@@ -382,6 +402,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             ad_experiment_repository=ad_experiment_repository,
             promotion_evaluation_repository=promotion_evaluation_repository,
             next_loop_preparation_repository=next_loop_preparation_repository,
+            run_audience_binding_repository=AudienceSnapshotRepository(executor),
             manual_activation_enabled=_manual_next_loop_enabled(request),
         )
         yield NextLoopService(

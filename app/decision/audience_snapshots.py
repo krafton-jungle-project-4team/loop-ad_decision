@@ -62,7 +62,58 @@ class TargetAudienceResolution:
     contract: str
 
 
+@dataclass(frozen=True, slots=True)
+class RunAudienceTargetBindingWrite:
+    target_analysis_id: str
+    segment_id: str
+    source_audience_snapshot_id: str
+    final_audience_snapshot_id: str
+    allocation_plan_id: str
+    generation_id: str
+    content_id: str
+    content_option_id: str
+
+
+class RunAudienceBindingWriter(Protocol):
+    def bind_run_targets(
+        self,
+        *,
+        promotion_run_id: str,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        bindings: Sequence[RunAudienceTargetBindingWrite],
+    ) -> None:
+        ...
+
+    def resolve_run_contract(
+        self,
+        *,
+        promotion_run_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> TargetAudienceResolution:
+        ...
+
+    def require_run_binding_set(
+        self,
+        *,
+        promotion_run_id: str,
+        segment_ids: Sequence[str],
+    ) -> AudienceSnapshotSet:
+        ...
+
+
 class AudienceSnapshotReader(Protocol):
+    def resolve_run_contract(
+        self,
+        *,
+        promotion_run_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> TargetAudienceResolution:
+        ...
+
     def resolve_target_contract(
         self,
         *,
@@ -79,18 +130,26 @@ class AudienceSnapshotReader(Protocol):
     ) -> AudienceSnapshotSet:
         ...
 
-    def materialize_winning_members(
+    def require_run_binding_set(
         self,
         *,
-        analysis_id: str,
+        promotion_run_id: str,
+        segment_ids: Sequence[str],
+    ) -> AudienceSnapshotSet:
+        ...
+
+    def consume_run_members(
+        self,
+        *,
+        promotion_run_id: str,
         segment_ids: Sequence[str],
     ) -> None:
         ...
 
-    def list_winning_members(
+    def list_run_members(
         self,
         *,
-        analysis_id: str,
+        promotion_run_id: str,
         segment_ids: Sequence[str],
         after_user_id: str | None,
         limit: int,
@@ -100,6 +159,15 @@ class AudienceSnapshotReader(Protocol):
 
 class AudienceSnapshotContractError(RuntimeError):
     pass
+
+
+class AudienceSnapshotTargetAlreadyBoundError(AudienceSnapshotContractError):
+    code = "segment_audience_target_already_run_bound"
+
+    def __init__(self, *, segment_id: str, reason: str) -> None:
+        self.segment_id = segment_id
+        self.reason = reason
+        super().__init__(reason)
 
 
 class AudienceSnapshotRepository:
@@ -112,6 +180,283 @@ class AudienceSnapshotRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
         self._adapter = SegmentDefinitionAudienceAdapter()
+
+    def bind_run_targets(
+        self,
+        *,
+        promotion_run_id: str,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        bindings: Sequence[RunAudienceTargetBindingWrite],
+    ) -> None:
+        expected = tuple(sorted({binding.segment_id for binding in bindings}))
+        if not expected or len(expected) != len(bindings):
+            raise AudienceSnapshotContractError(
+                "run audience bindings require unique target segments"
+            )
+        for binding in sorted(bindings, key=lambda value: value.segment_id):
+            row = self._db.fetchone(
+                """
+                SELECT
+                    target.source_audience_snapshot_id,
+                    target.audience_snapshot_id AS final_audience_snapshot_id,
+                    target.allocation_plan_id,
+                    plan.source_analysis_id,
+                    plan.exclusion_revision,
+                    plan.exclusion_hash,
+                    plan.status AS plan_status,
+                    snapshot.status AS snapshot_status,
+                    snapshot.final_user_count,
+                    (SELECT count(*)
+                     FROM segment_audience_members AS member
+                     WHERE member.snapshot_id = snapshot.snapshot_id)
+                        AS actual_member_count,
+                    (SELECT count(*)
+                     FROM promotion_audience_exclusion_members AS excluded
+                     WHERE excluded.project_id = target.project_id
+                       AND excluded.promotion_id = target.promotion_id
+                       AND excluded.source_allocation_plan_id = target.allocation_plan_id
+                       AND excluded.source_segment_id = target.segment_id
+                       AND excluded.state IN ('reserved', 'consumed'))
+                        AS active_reservation_count,
+                    NOT EXISTS (
+                        SELECT 1
+                        FROM segment_audience_members AS member
+                        WHERE member.snapshot_id = target.audience_snapshot_id
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM promotion_audience_exclusion_members AS excluded
+                              WHERE excluded.project_id = target.project_id
+                                AND excluded.promotion_id = target.promotion_id
+                                AND excluded.user_id = member.user_id
+                                AND excluded.source_allocation_plan_id = target.allocation_plan_id
+                                AND excluded.source_segment_id = target.segment_id
+                                AND excluded.state IN ('reserved', 'consumed')
+                          )
+                    ) AS every_member_reserved
+                FROM promotion_target_segments AS target
+                JOIN segment_audience_allocation_plans AS plan
+                  ON plan.allocation_plan_id = target.allocation_plan_id
+                JOIN segment_audience_snapshots AS snapshot
+                  ON snapshot.snapshot_id = target.audience_snapshot_id
+                WHERE target.analysis_id = %s
+                  AND target.project_id = %s
+                  AND target.campaign_id = %s
+                  AND target.promotion_id = %s
+                  AND target.segment_id = %s
+                  AND target.source_audience_snapshot_id = %s
+                  AND target.audience_snapshot_id = %s
+                  AND target.allocation_plan_id = %s
+                FOR UPDATE OF target, plan
+                """,
+                (
+                    binding.target_analysis_id,
+                    project_id,
+                    campaign_id,
+                    promotion_id,
+                    binding.segment_id,
+                    binding.source_audience_snapshot_id,
+                    binding.final_audience_snapshot_id,
+                    binding.allocation_plan_id,
+                ),
+            )
+            if row is None:
+                raise AudienceSnapshotContractError(
+                    "segment_audience_run_binding_target_invalid: "
+                    + binding.segment_id
+                )
+            if (
+                str(row["plan_status"]) not in {"finalized", "locked"}
+                or str(row["snapshot_status"]) != "completed"
+                or int(row["final_user_count"]) <= 0
+                or int(row["actual_member_count"]) != int(row["final_user_count"])
+                or int(row["active_reservation_count"])
+                != int(row["final_user_count"])
+                or not bool(row["every_member_reserved"])
+            ):
+                raise AudienceSnapshotContractError(
+                    "segment_audience_exclusion_binding_invalid: "
+                    + binding.segment_id
+                )
+            self._db.execute(
+                """
+                INSERT INTO promotion_run_target_bindings (
+                    promotion_run_id,
+                    target_analysis_id,
+                    source_analysis_id,
+                    project_id,
+                    campaign_id,
+                    promotion_id,
+                    segment_id,
+                    allocation_plan_id,
+                    source_audience_snapshot_id,
+                    final_audience_snapshot_id,
+                    reservation_revision,
+                    reservation_hash,
+                    generation_id,
+                    content_id,
+                    content_option_id,
+                    bound_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, now()
+                )
+                ON CONFLICT DO NOTHING
+                """,
+                (
+                    promotion_run_id,
+                    binding.target_analysis_id,
+                    str(row["source_analysis_id"]),
+                    project_id,
+                    campaign_id,
+                    promotion_id,
+                    binding.segment_id,
+                    binding.allocation_plan_id,
+                    binding.source_audience_snapshot_id,
+                    binding.final_audience_snapshot_id,
+                    int(row["exclusion_revision"]),
+                    str(row["exclusion_hash"]),
+                    binding.generation_id,
+                    binding.content_id,
+                    binding.content_option_id,
+                ),
+            )
+            stored = self._db.fetchone(
+                """
+                SELECT
+                    target_analysis_id,
+                    source_analysis_id,
+                    allocation_plan_id,
+                    source_audience_snapshot_id,
+                    final_audience_snapshot_id,
+                    generation_id,
+                    content_id,
+                    content_option_id
+                FROM promotion_run_target_bindings
+                WHERE promotion_run_id = %s
+                  AND segment_id = %s
+                """,
+                (promotion_run_id, binding.segment_id),
+            )
+            if stored is None:
+                existing_target = self._db.fetchone(
+                    """
+                    SELECT promotion_run_id
+                    FROM promotion_run_target_bindings
+                    WHERE target_analysis_id = %s
+                      AND segment_id = %s
+                    """,
+                    (binding.target_analysis_id, binding.segment_id),
+                )
+                if existing_target is not None:
+                    raise AudienceSnapshotTargetAlreadyBoundError(
+                        segment_id=binding.segment_id,
+                        reason=(
+                            "V2 target is already bound to promotion run "
+                            + str(existing_target["promotion_run_id"])
+                        ),
+                    )
+                raise AudienceSnapshotContractError(
+                    "segment_audience_run_binding_conflict: "
+                    + binding.segment_id
+                )
+            if (
+                str(stored["target_analysis_id"]),
+                str(stored["source_analysis_id"]),
+                str(stored["allocation_plan_id"]),
+                str(stored["source_audience_snapshot_id"]),
+                str(stored["final_audience_snapshot_id"]),
+                str(stored["generation_id"]),
+                str(stored["content_id"]),
+                str(stored["content_option_id"]),
+            ) != (
+                binding.target_analysis_id,
+                str(row["source_analysis_id"]),
+                binding.allocation_plan_id,
+                binding.source_audience_snapshot_id,
+                binding.final_audience_snapshot_id,
+                binding.generation_id,
+                binding.content_id,
+                binding.content_option_id,
+            ):
+                raise AudienceSnapshotContractError(
+                    "segment_audience_run_binding_conflict: "
+                    + binding.segment_id
+                )
+            self._db.execute(
+                """
+                UPDATE promotion_audience_exclusion_members
+                SET source_promotion_run_id = %s
+                WHERE project_id = %s
+                  AND promotion_id = %s
+                  AND source_allocation_plan_id = %s
+                  AND source_segment_id = %s
+                  AND state IN ('reserved', 'consumed')
+                  AND (source_promotion_run_id IS NULL
+                       OR source_promotion_run_id = %s)
+                """,
+                (
+                    promotion_run_id,
+                    project_id,
+                    promotion_id,
+                    binding.allocation_plan_id,
+                    binding.segment_id,
+                    promotion_run_id,
+                ),
+            )
+            self._db.execute(
+                """
+                UPDATE segment_audience_allocation_plans
+                SET status = 'locked', locked_at = coalesce(locked_at, now())
+                WHERE allocation_plan_id = %s
+                  AND status IN ('finalized', 'locked')
+                """,
+                (binding.allocation_plan_id,),
+            )
+        self.require_run_binding_set(
+            promotion_run_id=promotion_run_id,
+            segment_ids=expected,
+        )
+
+    def resolve_run_contract(
+        self,
+        *,
+        promotion_run_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> TargetAudienceResolution:
+        expected = tuple(sorted(set(segment_ids)))
+        rows = self._db.fetchall(
+            """
+            SELECT segment_id
+            FROM promotion_run_target_bindings
+            WHERE promotion_run_id = %s
+            ORDER BY segment_id ASC
+            """,
+            (promotion_run_id,),
+        )
+        bound = tuple(str(row["segment_id"]) for row in rows)
+        if bound:
+            if bound != expected:
+                raise AudienceSnapshotContractError(
+                    "segment_audience_run_binding_set_incomplete"
+                )
+            return TargetAudienceResolution(
+                analysis_id=analysis_id,
+                segment_ids=expected,
+                contract=SEGMENT_AUDIENCE_CONTRACT,
+            )
+        resolution = self.resolve_target_contract(
+            analysis_id=analysis_id,
+            segment_ids=expected,
+        )
+        if resolution.contract == SEGMENT_AUDIENCE_CONTRACT:
+            raise AudienceSnapshotContractError(
+                "segment_audience_run_binding_required"
+            )
+        return resolution
 
     def resolve_target_contract(
         self,
@@ -328,44 +673,164 @@ class AudienceSnapshotRepository:
             snapshot_ids=tuple(str(value) for value in binding_values),
         )
 
-    def materialize_winning_members(
+    def require_run_binding_set(
         self,
         *,
-        analysis_id: str,
+        promotion_run_id: str,
         segment_ids: Sequence[str],
-    ) -> None:
-        expected = list(sorted(set(segment_ids)))
-        self._db.execute(
+    ) -> AudienceSnapshotSet:
+        expected = tuple(sorted(set(segment_ids)))
+        if not expected:
+            raise AudienceSnapshotContractError(
+                "run audience bindings require target segments"
+            )
+        rows = self._db.fetchall(
             """
-            CREATE TEMP TABLE resolved_audience_members
-            ON COMMIT DROP
-            AS
-            SELECT DISTINCT ON (member.user_id)
-                member.user_id,
-                target.segment_id,
-                member.behavior_fit_score
-            FROM promotion_target_segments AS target
-            JOIN segment_audience_members AS member
-              ON member.snapshot_id = target.audience_snapshot_id
-            WHERE target.analysis_id = %s
-              AND target.segment_id = ANY(%s)
-            ORDER BY member.user_id ASC,
-                     member.behavior_fit_score DESC,
-                     target.segment_id ASC
+            SELECT
+                binding.segment_id,
+                binding.final_audience_snapshot_id,
+                binding.allocation_plan_id,
+                binding.project_id,
+                binding.promotion_id,
+                plan.status AS plan_status,
+                snapshot.status AS snapshot_status,
+                snapshot.vector_version,
+                snapshot.final_user_count,
+                snapshot.audience_status,
+                snapshot.snapshot_role,
+                snapshot.source_audience_snapshot_id,
+                snapshot.allocation_plan_id AS snapshot_allocation_plan_id,
+                (SELECT count(*)
+                 FROM segment_audience_members AS member
+                 WHERE member.snapshot_id = binding.final_audience_snapshot_id)
+                    AS actual_member_count,
+                (SELECT count(*)
+                 FROM promotion_audience_exclusion_members AS excluded
+                 WHERE excluded.project_id = binding.project_id
+                   AND excluded.promotion_id = binding.promotion_id
+                   AND excluded.source_promotion_run_id = binding.promotion_run_id
+                   AND excluded.source_allocation_plan_id = binding.allocation_plan_id
+                   AND excluded.source_segment_id = binding.segment_id
+                   AND excluded.state IN ('reserved', 'consumed'))
+                    AS active_reservation_count,
+                NOT EXISTS (
+                    SELECT 1
+                    FROM segment_audience_members AS member
+                    WHERE member.snapshot_id = binding.final_audience_snapshot_id
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM promotion_audience_exclusion_members AS excluded
+                          WHERE excluded.project_id = binding.project_id
+                            AND excluded.promotion_id = binding.promotion_id
+                            AND excluded.user_id = member.user_id
+                            AND excluded.source_promotion_run_id = binding.promotion_run_id
+                            AND excluded.source_allocation_plan_id = binding.allocation_plan_id
+                            AND excluded.source_segment_id = binding.segment_id
+                            AND excluded.state IN ('reserved', 'consumed')
+                      )
+                ) AS every_member_reserved
+            FROM promotion_run_target_bindings AS binding
+            JOIN segment_audience_allocation_plans AS plan
+              ON plan.allocation_plan_id = binding.allocation_plan_id
+            JOIN segment_audience_snapshots AS snapshot
+              ON snapshot.snapshot_id = binding.final_audience_snapshot_id
+            WHERE binding.promotion_run_id = %s
+            ORDER BY binding.segment_id ASC
             """,
-            (analysis_id, expected),
+            (promotion_run_id,),
         )
-        self._db.execute(
+        found = tuple(str(row["segment_id"]) for row in rows)
+        if found != expected:
+            raise AudienceSnapshotContractError(
+                "segment_audience_run_binding_set_incomplete"
+            )
+        for row in rows:
+            if (
+                str(row["plan_status"]) != "locked"
+                or str(row["snapshot_status"]) != "completed"
+                or str(row["snapshot_role"]) != "final_allocation"
+                or str(row["snapshot_allocation_plan_id"])
+                != str(row["allocation_plan_id"])
+                or not row["source_audience_snapshot_id"]
+                or int(row["final_user_count"]) <= 0
+                or str(row["audience_status"]) == "no_eligible_audience"
+                or int(row["actual_member_count"]) != int(row["final_user_count"])
+                or int(row["active_reservation_count"])
+                != int(row["final_user_count"])
+                or not bool(row["every_member_reserved"])
+            ):
+                raise AudienceSnapshotContractError(
+                    "segment_audience_run_binding_invalid: "
+                    + str(row["segment_id"])
+                )
+        duplicate = self._db.fetchone(
             """
-            CREATE UNIQUE INDEX resolved_audience_members_user_idx
-            ON resolved_audience_members (user_id)
-            """
+            SELECT member.user_id
+            FROM promotion_run_target_bindings AS binding
+            JOIN segment_audience_members AS member
+              ON member.snapshot_id = binding.final_audience_snapshot_id
+            WHERE binding.promotion_run_id = %s
+            GROUP BY member.user_id
+            HAVING count(*) > 1
+            LIMIT 1
+            """,
+            (promotion_run_id,),
+        )
+        if duplicate is not None:
+            raise AudienceSnapshotContractError(
+                "segment_audience_final_snapshots_overlap"
+            )
+        versions = {str(row["vector_version"]) for row in rows}
+        if len(versions) != 1:
+            raise AudienceSnapshotContractError(
+                "run final snapshots must use one vector version"
+            )
+        return AudienceSnapshotSet(
+            analysis_id=promotion_run_id,
+            segment_ids=expected,
+            vector_version=next(iter(versions)),
+            member_count=sum(int(row["final_user_count"]) for row in rows),
+            snapshot_ids=tuple(
+                str(row["final_audience_snapshot_id"]) for row in rows
+            ),
         )
 
-    def list_winning_members(
+    def consume_run_members(
         self,
         *,
-        analysis_id: str,
+        promotion_run_id: str,
+        segment_ids: Sequence[str],
+    ) -> None:
+        snapshot_set = self.require_run_binding_set(
+            promotion_run_id=promotion_run_id,
+            segment_ids=segment_ids,
+        )
+        self._db.execute(
+            """
+            UPDATE promotion_audience_exclusion_members AS excluded
+            SET state = 'consumed',
+                consumed_at = coalesce(consumed_at, now())
+            FROM promotion_run_target_bindings AS binding
+            WHERE binding.promotion_run_id = %s
+              AND binding.segment_id = ANY(%s)
+              AND excluded.project_id = binding.project_id
+              AND excluded.promotion_id = binding.promotion_id
+              AND excluded.source_promotion_run_id = binding.promotion_run_id
+              AND excluded.source_allocation_plan_id = binding.allocation_plan_id
+              AND excluded.source_segment_id = binding.segment_id
+              AND excluded.state = 'reserved'
+            """,
+            (promotion_run_id, list(snapshot_set.segment_ids)),
+        )
+        self.require_run_binding_set(
+            promotion_run_id=promotion_run_id,
+            segment_ids=snapshot_set.segment_ids,
+        )
+
+    def list_run_members(
+        self,
+        *,
+        promotion_run_id: str,
         segment_ids: Sequence[str],
         after_user_id: str | None,
         limit: int,
@@ -374,13 +839,22 @@ class AudienceSnapshotRepository:
             raise ValueError("snapshot page limit must be positive")
         rows = self._db.fetchall(
             """
-            SELECT user_id, segment_id, behavior_fit_score
-            FROM resolved_audience_members
-            WHERE (%s::text IS NULL OR user_id > %s)
-            ORDER BY user_id ASC
+            SELECT
+                member.user_id,
+                binding.segment_id,
+                member.behavior_fit_score
+            FROM promotion_run_target_bindings AS binding
+            JOIN segment_audience_members AS member
+              ON member.snapshot_id = binding.final_audience_snapshot_id
+            WHERE binding.promotion_run_id = %s
+              AND binding.segment_id = ANY(%s)
+              AND (%s::text IS NULL OR member.user_id > %s)
+            ORDER BY member.user_id ASC
             LIMIT %s
             """,
             (
+                promotion_run_id,
+                list(sorted(set(segment_ids))),
                 after_user_id,
                 after_user_id,
                 limit,
@@ -394,7 +868,6 @@ class AudienceSnapshotRepository:
             )
             for row in rows
         ]
-
 
 def _snapshot_row_matches_compiled(
     row: Mapping[str, Any],
