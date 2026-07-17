@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
@@ -16,6 +17,7 @@ from app.analysis.repositories import (
     PromotionTargetSegmentWrite,
     SegmentDefinitionRecord,
 )
+from app.analysis.report_generator import SegmentSuggestionReportInput
 from app.analysis.schemas import AnalysisRequest, SegmentAnalysisRequest
 from app.analysis.service import (
     NextLoopFocusAnalysisRequest,
@@ -182,15 +184,31 @@ class FakeSegmentVectorService:
 class FakeSegmentSuggester:
     def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
         self.segments = segments
-        self.calls: list[PromotionRecord] = []
+        self.calls: list[tuple[PromotionRecord, str | None]] = []
 
     def suggest_segments(
         self,
         *,
         promotion: PromotionRecord,
+        segment_instruction: str | None = None,
     ) -> list[SegmentDefinitionRecord]:
-        self.calls.append(promotion)
+        self.calls.append((promotion, segment_instruction))
         return self.segments
+
+
+class ConcurrentSegmentReportGenerator:
+    def __init__(self, expected_calls: int) -> None:
+        self.barrier = threading.Barrier(expected_calls)
+        self.calls: list[str] = []
+
+    def generate_report(
+        self,
+        report_input: SegmentSuggestionReportInput,
+    ) -> dict[str, Any]:
+        self.barrier.wait(timeout=2)
+        segment_id = report_input.segment.segment_id
+        self.calls.append(segment_id)
+        return {"source": "test", "title": segment_id}
 
 
 def promotion_record(
@@ -261,12 +279,14 @@ def analysis_request(
     *,
     promotion_id: str,
     operator_instruction: str | None = None,
+    segment_instruction: str | None = None,
 ) -> AnalysisRequest:
     return AnalysisRequest(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
         operator_instruction=operator_instruction,
+        segment_instruction=segment_instruction,
     )
 
 
@@ -279,6 +299,7 @@ def build_service(
     booking_training_records: list[BookingTrainingRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
     segment_suggester: FakeSegmentSuggester | None = None,
+    segment_report_generator: ConcurrentSegmentReportGenerator | None = None,
 ) -> tuple[
     PromotionAnalysisService,
     FakePromotionAnalysisRepository,
@@ -297,6 +318,7 @@ def build_service(
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
+        segment_report_generator=segment_report_generator,
     )
     return service, analysis_repository, segment_definition_repository
 
@@ -706,7 +728,7 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     ]
     assert segment_ids(result.target_segments) == expected_segment_ids
     assert segment_definition_repository.saved_ai_suggested == [ai_segment]
-    assert suggester.calls == [promotion]
+    assert suggester.calls == [(promotion, None)]
     assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert result.analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
@@ -834,6 +856,171 @@ def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist(
         for segment in result.analysis.input_snapshot_json[
             "available_segment_definitions"
         ]
+    )
+
+
+def test_service_scopes_conversational_recommendation_to_fresh_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    instruction = "최근 제주 숙소를 반복 탐색한 고객을 찾아줘"
+    stale_ai_segment = replace(
+        segment_record(
+            "seg_ai_stale",
+            source="ai_suggested",
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["old_user_001"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_jeju_repeat",
+            source="ai_suggested",
+            sample_size=120,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["jeju_user_001", "jeju_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_jeju_repeat",
+            "source": "raw_event_intent",
+            "recommendation_score": 0.81,
+        },
+    )
+    segment_suggester = FakeSegmentSuggester([fresh_ai_segment])
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stale_ai_segment, *default_segments()],
+        segment_suggester=segment_suggester,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            segment_instruction=instruction,
+        ),
+    )
+
+    assert segment_suggester.calls == [(promotion, instruction)]
+    assert segment_ids(result.target_segments) == [fresh_ai_segment.segment_id]
+    assert suggestion_segment_ids(result.segment_suggestions) == [
+        fresh_ai_segment.segment_id
+    ]
+    assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
+
+
+def test_service_does_not_replace_empty_conversational_result_with_defaults() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segment_suggester = FakeSegmentSuggester([])
+    service, analysis_repository, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=segment_suggester,
+    )
+
+    with pytest.raises(
+        SegmentSelectionError,
+        match="no segment candidates matched segment instruction",
+    ):
+        service.recommend_segments(
+            analysis_request(
+                promotion_id=promotion.promotion_id,
+                segment_instruction="최근 부산에서 반려동물 동반 객실을 본 고객",
+            ),
+        )
+
+    assert analysis_repository.events == []
+    assert segment_definition_repository.saved_ai_suggested == []
+
+
+def test_service_builds_ai_reports_concurrently_without_mixing_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    first_segment = replace(
+        segment_record(
+            "seg_ai_first",
+            source="ai_suggested",
+            sample_size=200,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_001", "user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    second_segment = replace(
+        segment_record(
+            "seg_ai_second",
+            source="ai_suggested",
+            sample_size=100,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_003", "user_004"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    report_generator = ConcurrentSegmentReportGenerator(expected_calls=2)
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[first_segment, second_segment],
+        segment_report_generator=report_generator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert len(report_generator.calls) == 2
+    assert set(report_generator.calls) == {
+        first_segment.segment_id,
+        second_segment.segment_id,
+    }
+    assert [
+        suggestion.metadata_json["ai_report"]["title"]
+        for suggestion in result.segment_suggestions
+    ] == [suggestion.segment_id for suggestion in result.segment_suggestions]
+
+
+def test_conversational_recommendation_skips_additional_openai_report_calls() -> None:
+    promotion = promotion_record(channel="email")
+    suggested_segment = replace(
+        segment_record(
+            "seg_ai_conversation_destination",
+            source="ai_suggested",
+            sample_size=80,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["user_001", "user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    report_generator = ConcurrentSegmentReportGenerator(expected_calls=1)
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester([suggested_segment]),
+        segment_report_generator=report_generator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            segment_instruction="최근 제주 숙소를 반복 검색한 고객",
+        ),
+    )
+
+    assert report_generator.calls == []
+    assert result.segment_suggestions[0].metadata_json["ai_report"]["source"] == (
+        "deterministic"
     )
 
 
@@ -1269,7 +1456,7 @@ def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -
         "seg_near_checkin",
     ]
     assert segment_definition_repository.saved_ai_suggested == []
-    assert suggester.calls == [promotion]
+    assert suggester.calls == [(promotion, None)]
 
 
 def test_service_skips_zero_size_default_segments() -> None:
