@@ -411,6 +411,8 @@ class RecordingCursor:
                     "segment_id": "seg_family_trip",
                     "rule_json": {},
                     "audience_snapshot_id": None,
+                    "allocation_plan_id": None,
+                    "audience_reservation_state": None,
                 }
             ]
         if "insert into user_segment_assignments" in sql:

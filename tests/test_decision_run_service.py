@@ -209,7 +209,7 @@ def test_v2_run_uses_only_the_selected_card_source_and_snapshot() -> None:
     generation = generation_record(
         analysis_id=analysis.analysis_id,
         generation_id="generation_a",
-        target_segment_ids=["seg_a"],
+        target_segment_ids=["seg_a", "seg_b"],
     )
     target_a = replace(
         target_segment_record(
@@ -260,7 +260,7 @@ def test_v2_run_uses_only_the_selected_card_source_and_snapshot() -> None:
     assert response.segment_ids == ["seg_a"]
     assert [item.segment_id for item in response.ad_experiments] == ["seg_a"]
     bindings = repos.run_audience_bindings.bindings[response.promotion_run_id]
-    assert [(item.segment_id, item.final_audience_snapshot_id) for item in bindings] == [
+    assert [(item.segment_id, item.final_snapshot_id) for item in bindings] == [
         ("seg_a", "final_a")
     ]
 
@@ -1203,7 +1203,7 @@ def test_v2_preparation_activation_binds_final_snapshots_before_activation() -> 
         "seg_family_trip",
         "seg_mobile_user",
     }
-    assert {binding.final_audience_snapshot_id for binding in bindings} == {
+    assert {binding.final_snapshot_id for binding in bindings} == {
         "final_seg_family_trip",
         "final_seg_mobile_user",
     }
@@ -1980,7 +1980,7 @@ class FakeRunAudienceBindingRepository:
             vector_version="hotel_behavior.v2",
             member_count=12 * len(bindings),
             snapshot_ids=tuple(
-                binding.final_audience_snapshot_id for binding in bindings
+                binding.final_snapshot_id for binding in bindings
             ),
         )
 
@@ -2393,6 +2393,9 @@ def target_segment_record(
             f"allocation_{segment_id}"
             if audience_snapshot_id is not None
             else None
+        ),
+        audience_reservation_state=(
+            "reserved" if audience_snapshot_id is not None else None
         ),
         audience_snapshot_status=(
             "completed" if audience_snapshot_id is not None else None

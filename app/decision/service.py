@@ -1339,16 +1339,14 @@ class PromotionRunService:
         bindings: list[RunAudienceTargetBindingWrite] = []
         for target in target_segments:
             if (
-                target.source_audience_snapshot_id is None
-                or target.audience_snapshot_id is None
+                target.audience_snapshot_id is None
                 or target.allocation_plan_id is None
             ):
                 raise RunAudienceContractError(
                     code="segment_audience_run_binding_missing",
                     segment_id=target.segment_id,
                     reason=(
-                        "V2 target requires source snapshot, final snapshot, "
-                        "and allocation plan"
+                        "V2 target requires a final snapshot and allocation plan"
                     ),
                 )
             content = selected_content[target.segment_id]
@@ -1356,12 +1354,8 @@ class PromotionRunService:
                 RunAudienceTargetBindingWrite(
                     target_analysis_id=target.analysis_id,
                     segment_id=target.segment_id,
-                    source_audience_snapshot_id=target.source_audience_snapshot_id,
-                    final_audience_snapshot_id=target.audience_snapshot_id,
                     allocation_plan_id=target.allocation_plan_id,
-                    generation_id=content.generation_id,
-                    content_id=content.content_id,
-                    content_option_id=content.content_option_id,
+                    final_snapshot_id=target.audience_snapshot_id,
                 )
             )
         try:
@@ -1597,16 +1591,17 @@ def _require_uniform_target_audience_contract(
         )
         if contract == SEGMENT_AUDIENCE_CONTRACT:
             if (
-                target.source_audience_snapshot_id is None
-                or target.audience_snapshot_id is None
+                target.audience_snapshot_id is None
                 or target.allocation_plan_id is None
+                or target.audience_reservation_state
+                not in {"reserved", "consumed"}
             ):
                 raise RunAudienceContractError(
                     code="segment_audience_snapshot_binding_missing",
                     segment_id=target.segment_id,
                     reason=(
-                        "segment_audience.v1 target requires source snapshot, "
-                        "final allocation snapshot, and allocation plan"
+                        "segment_audience.v1 target requires an active final "
+                        "snapshot and allocation plan"
                     ),
                 )
             if (
