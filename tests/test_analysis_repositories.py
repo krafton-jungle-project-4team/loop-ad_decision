@@ -382,6 +382,42 @@ def test_promotion_analysis_repository_saves_segment_suggestions() -> None:
     )
 
 
+def test_promotion_analysis_repository_reads_confirmable_audience_bindings() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "suggestion_id": "sugg_analysis_banner_001_seg_repeat",
+                "analysis_id": "analysis_banner_001",
+                "segment_id": "seg_repeat_hotel_no_booking",
+                "audience_snapshot_id": "snapshot_source_repeat",
+            }
+        ]
+    )
+    repo = PromotionAnalysisRepository(db)
+
+    bindings = repo.get_latest_audience_bindings(
+        project_id="hotel-client-a",
+        campaign_id="camp_summer_2026",
+        promotion_id="promo_banner_001",
+        segment_ids=["seg_repeat_hotel_no_booking"],
+    )
+
+    assert len(bindings) == 1
+    assert bindings[0].suggestion_id == "sugg_analysis_banner_001_seg_repeat"
+    assert bindings[0].audience_snapshot_id == "snapshot_source_repeat"
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "fetchall"
+    assert "status in ('suggested', 'accepted', 'confirmed')" in sql
+    assert "dismissed" not in sql
+    assert call.params == (
+        "hotel-client-a",
+        "camp_summer_2026",
+        "promo_banner_001",
+        ["seg_repeat_hotel_no_booking"],
+    )
+
+
 def test_segment_vector_repository_get_and_save_vector() -> None:
     vector_values = [0.1] * 64
     db = FakePostgresExecutor(

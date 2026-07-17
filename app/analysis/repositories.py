@@ -479,7 +479,7 @@ class PromotionAnalysisRepository:
                   AND campaign_id = %s
                   AND promotion_id = %s
                   AND segment_id = ANY(%s)
-                  AND status = 'suggested'
+                  AND status IN ('suggested', 'accepted', 'confirmed')
             )
             SELECT
                 suggestion_id,
