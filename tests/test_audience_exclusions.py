@@ -9,7 +9,6 @@ from app.analysis.audience_search_repository import (
     _hard_predicate_query,
 )
 from app.audience_exclusions import (
-    EMPTY_EXCLUSION_HASH,
     PromotionAudienceExclusionContext,
     PromotionAudienceExclusionRepository,
     SegmentAudienceExclusionError,
@@ -57,20 +56,17 @@ class _ExclusionReader:
         return self.context
 
 
-def test_exclusion_context_requires_exact_clickhouse_revision_and_hash() -> None:
+def test_exclusion_context_requires_clickhouse_revision_at_least_postgres() -> None:
     postgres = _Postgres(
         {
             "revision": 4,
-            "exclusion_hash": "sha256:revision-4",
             "excluded_user_count": 37,
         }
     )
     clickhouse = _ClickHouse(
         [
             {
-                "revision": 4,
-                "exclusion_hash": "sha256:revision-4",
-                "status": "ready",
+                "applied_revision": 4,
             }
         ]
     )
@@ -86,10 +82,8 @@ def test_exclusion_context_requires_exact_clickhouse_revision_and_hash() -> None
     )
 
     assert context.revision == 4
-    assert context.exclusion_hash == "sha256:revision-4"
     assert context.excluded_user_count == 37
     assert context.projection_revision == context.revision
-    assert context.projection_hash == context.exclusion_hash
 
 
 def test_stale_clickhouse_projection_fails_without_empty_fallback() -> None:
@@ -97,16 +91,13 @@ def test_stale_clickhouse_projection_fails_without_empty_fallback() -> None:
         postgres=_Postgres(
             {
                 "revision": 2,
-                "exclusion_hash": "sha256:revision-2",
                 "excluded_user_count": 3,
             }
         ),
         clickhouse=_ClickHouse(
             [
                 {
-                    "revision": 1,
-                    "exclusion_hash": "sha256:revision-1",
-                    "status": "ready",
+                    "applied_revision": 1,
                 }
             ]
         ),
@@ -139,10 +130,8 @@ def test_vector_population_count_anti_joins_same_promotion_exclusions() -> None:
         campaign_id="campaign",
         promotion_id="promotion",
         revision=3,
-        exclusion_hash="sha256:revision-3",
         excluded_user_count=12,
         projection_revision=3,
-        projection_hash="sha256:revision-3",
     )
     exclusion_reader = _ExclusionReader(context)
     repository = PgClickHouseAudienceVectorSearchRepository(
@@ -170,7 +159,7 @@ def test_vector_population_count_anti_joins_same_promotion_exclusions() -> None:
     assert result.exclusion_context == context
 
 
-def test_empty_exclusion_context_still_uses_versioned_empty_hash() -> None:
+def test_empty_exclusion_context_uses_zero_revisions() -> None:
     repository = PromotionAudienceExclusionRepository(
         postgres=_Postgres(None),
         clickhouse=_ClickHouse(),
@@ -183,8 +172,7 @@ def test_empty_exclusion_context_still_uses_versioned_empty_hash() -> None:
     )
 
     assert context.revision == 0
-    assert context.exclusion_hash == EMPTY_EXCLUSION_HASH
-    assert context.projection_hash == EMPTY_EXCLUSION_HASH
+    assert context.projection_revision == 0
 
 
 def test_clickhouse_hard_predicate_uses_revisioned_anti_join() -> None:
@@ -196,7 +184,6 @@ def test_clickhouse_hard_predicate_uses_revisioned_anti_join() -> None:
     )
 
     assert "LEFT ANTI JOIN" in query
-    assert "promotion_audience_exclusion_members" in query
-    assert "argMax(state, exclusion_revision)" in query
+    assert "promotion_audience_exclusion_active" in query
     assert "reserved" in query and "consumed" in query
     assert "NOT IN" not in query

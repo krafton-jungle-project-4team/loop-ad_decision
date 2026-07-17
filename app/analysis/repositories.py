@@ -83,8 +83,6 @@ def _adapt_params(
 def _adapt_param(value: Any) -> Any:
     if isinstance(value, Mapping):
         return Jsonb(value)
-    if isinstance(value, list):
-        return Jsonb(value)
     return value
 
 
@@ -152,7 +150,6 @@ class PromotionTargetSegmentWrite:
     priority: str | None
     status: str
     audience_snapshot_id: str | None = None
-    source_audience_snapshot_id: str | None = None
     allocation_plan_id: str | None = None
 
 
@@ -443,7 +440,11 @@ class PromotionAnalysisRepository:
                 analysis.campaign_id,
                 analysis.promotion_id,
                 analysis.status,
-                analysis.focus_segment_ids_json,
+                (
+                    Jsonb(list(analysis.focus_segment_ids_json))
+                    if analysis.focus_segment_ids_json is not None
+                    else None
+                ),
                 analysis.operator_instruction,
                 analysis.input_snapshot_json,
                 analysis.profile_summary_json,
@@ -555,8 +556,8 @@ class PromotionAnalysisRepository:
                     segment_vector_id,
                     estimated_size,
                     priority,
-                    source_audience_snapshot_id,
                     allocation_plan_id,
+                    audience_reservation_state,
                     status,
                     audience_snapshot_id
                 )
@@ -564,7 +565,28 @@ class PromotionAnalysisRepository:
                     %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s, %s, %s, %s, %s
                 )
-                ON CONFLICT (analysis_id, segment_id) DO NOTHING
+                ON CONFLICT (analysis_id, segment_id) DO UPDATE SET
+                    segment_name = EXCLUDED.segment_name,
+                    rule_json = EXCLUDED.rule_json,
+                    profile_json = EXCLUDED.profile_json,
+                    content_brief_json = EXCLUDED.content_brief_json,
+                    data_evidence_json = EXCLUDED.data_evidence_json,
+                    segment_vector_id = EXCLUDED.segment_vector_id,
+                    estimated_size = EXCLUDED.estimated_size,
+                    priority = EXCLUDED.priority,
+                    status = EXCLUDED.status,
+                    allocation_plan_id = COALESCE(
+                        promotion_target_segments.allocation_plan_id,
+                        EXCLUDED.allocation_plan_id
+                    ),
+                    audience_reservation_state = COALESCE(
+                        promotion_target_segments.audience_reservation_state,
+                        EXCLUDED.audience_reservation_state
+                    ),
+                    audience_snapshot_id = COALESCE(
+                        promotion_target_segments.audience_snapshot_id,
+                        EXCLUDED.audience_snapshot_id
+                    )
                 """,
                 (
                     segment.analysis_id,
@@ -580,8 +602,8 @@ class PromotionAnalysisRepository:
                     segment.segment_vector_id,
                     segment.estimated_size,
                     segment.priority,
-                    segment.source_audience_snapshot_id,
                     segment.allocation_plan_id,
+                    "reserved" if segment.allocation_plan_id is not None else None,
                     segment.status,
                     segment.audience_snapshot_id,
                 ),
@@ -708,7 +730,7 @@ class SegmentVectorRepository:
                 vector.analysis_id,
                 vector.segment_id,
                 vector.vector_dim,
-                vector.vector_values,
+                Jsonb(vector.vector_values),
                 _vector_literal(vector.vector_values, self.VECTOR_DIM),
                 vector.vector_version,
                 vector.source,

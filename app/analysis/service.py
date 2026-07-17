@@ -835,9 +835,6 @@ class PromotionAnalysisService:
                         "promotion_exclusion_revision": (
                             audience_v2.promotion_exclusion_revision
                         ),
-                        "promotion_exclusion_hash": (
-                            audience_v2.promotion_exclusion_hash
-                        ),
                         "excluded_user_count": audience_v2.excluded_user_count,
                         "meets_min_sample_size": (
                             audience_v2.meets_min_sample_size
@@ -862,9 +859,6 @@ class PromotionAnalysisService:
                     estimated_size=audience_v2.selected_user_count,
                     data_evidence_json=evidence,
                     audience_snapshot_id=audience_v2.audience_snapshot_id,
-                    source_audience_snapshot_id=(
-                        audience_v2.source_audience_snapshot_id
-                    ),
                     allocation_plan_id=audience_v2.allocation_plan_id,
                 )
             target_segments.append(target_segment)

@@ -4,15 +4,13 @@ import hashlib
 import itertools
 import json
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg import errors
 
 from app.audience_exclusions import (
-    EMPTY_EXCLUSION_HASH,
-    EXCLUSION_REVISION_RELATION,
     POSTGRES_EXCLUSION_RELATION,
     PromotionAudienceExclusionContext,
     PromotionAudienceExclusionReader,
@@ -60,7 +58,6 @@ class FinalAudienceAllocation:
     meets_min_sample_size: bool
     audience_status: str
     exclusion_revision: int
-    exclusion_hash: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,7 +65,6 @@ class ConfirmationAllocationResult:
     source_analysis_id: str
     allocation_plan_id: str
     exclusion_revision: int
-    exclusion_hash: str
     allocations: Mapping[str, FinalAudienceAllocation]
 
 
@@ -287,15 +283,27 @@ class PostgresAudienceAllocationRepository:
                 reason="confirmation allocation produced zero final users",
             )
 
+        self._ensure_target_rows(
+            target_analysis_id=confirmation_analysis_id,
+            project_id=project_id,
+            campaign_id=campaign_id,
+            promotion_id=promotion_id,
+            sources=sources,
+        )
+
+        reservation_revision = self._advance_exclusion_revision(
+            promotion_id=promotion_id,
+            expected_revision=context.revision,
+        )
+
         self._insert_plan(
             plan_id=plan_id,
             confirmation_analysis_id=confirmation_analysis_id,
             source_analysis_id=source_analysis_id,
-            project_id=project_id,
-            campaign_id=campaign_id,
             promotion_id=promotion_id,
             plan_fingerprint=plan_fingerprint,
-            context=context,
+            selected_segment_ids=selected,
+            exclusion_revision=reservation_revision,
         )
         allocations: dict[str, FinalAudienceAllocation] = {}
         for source in sources:
@@ -323,6 +331,13 @@ class PostgresAudienceAllocationRepository:
                 plan_id=plan_id,
                 final_snapshot_id=final_snapshot_id,
             )
+            self._bind_target_audience(
+                target_analysis_id=confirmation_analysis_id,
+                segment_id=source.segment_id,
+                plan_id=plan_id,
+                final_snapshot_id=final_snapshot_id,
+                final_user_count=final_count,
+            )
             allocations[source.segment_id] = FinalAudienceAllocation(
                 segment_id=source.segment_id,
                 source_analysis_id=source.source_analysis_id,
@@ -332,36 +347,17 @@ class PostgresAudienceAllocationRepository:
                 final_user_count=final_count,
                 meets_min_sample_size=final_count >= min_sample_size,
                 audience_status=audience_status,
-                exclusion_revision=0,
-                exclusion_hash="",
+                exclusion_revision=reservation_revision,
             )
 
         new_context = self._reserve_final_members(
             plan_id=plan_id,
+            target_analysis_id=confirmation_analysis_id,
             project_id=project_id,
-            campaign_id=campaign_id,
             promotion_id=promotion_id,
             previous=context,
+            reservation_revision=reservation_revision,
         )
-        self._db.execute(
-            """
-            UPDATE segment_audience_allocation_plans
-            SET exclusion_revision = %s,
-                exclusion_hash = %s,
-                status = 'finalized',
-                finalized_at = now()
-            WHERE allocation_plan_id = %s
-            """,
-            (new_context.revision, new_context.exclusion_hash, plan_id),
-        )
-        allocations = {
-            segment_id: replace(
-                allocation,
-                exclusion_revision=new_context.revision,
-                exclusion_hash=new_context.exclusion_hash,
-            )
-            for segment_id, allocation in allocations.items()
-        }
         self.refresh_recommendation_previews(
             analysis_id=source_analysis_id,
             project_id=project_id,
@@ -374,7 +370,6 @@ class PostgresAudienceAllocationRepository:
             source_analysis_id=source_analysis_id,
             allocation_plan_id=plan_id,
             exclusion_revision=new_context.revision,
-            exclusion_hash=new_context.exclusion_hash,
             allocations=allocations,
         )
 
@@ -439,7 +434,6 @@ class PostgresAudienceAllocationRepository:
                     ),
                     "candidate_batch_analysis_id": analysis_id,
                     "exclusion_revision": context.revision,
-                    "exclusion_hash": context.exclusion_hash,
                     "preview_version": ALLOCATION_PREVIEW_VERSION,
                     "allocation_policy_version": ALLOCATION_POLICY_VERSION,
                     "allocation_policy_hash": ALLOCATION_POLICY_HASH,
@@ -451,7 +445,6 @@ class PostgresAudienceAllocationRepository:
             "candidate_batch_analysis_id": analysis_id,
             "candidate_segment_ids": candidate_segment_ids,
             "exclusion_revision": context.revision,
-            "exclusion_hash": context.exclusion_hash,
             "allocation_policy_version": ALLOCATION_POLICY_VERSION,
             "allocation_policy_hash": ALLOCATION_POLICY_HASH,
             "allocation_previews": previews,
@@ -489,30 +482,26 @@ class PostgresAudienceAllocationRepository:
         row = self._db.fetchone(
             """
             SELECT
-                target.source_audience_snapshot_id,
                 target.audience_snapshot_id,
                 target.allocation_plan_id,
-                plan.source_analysis_id,
+                target.audience_reservation_state,
+                plan.candidate_batch_analysis_id,
                 plan.status,
-                (SELECT count(*)
-                 FROM segment_audience_allocation_plan_segments AS plan_segment
-                 WHERE plan_segment.allocation_plan_id = target.allocation_plan_id)
+                jsonb_array_length(plan.selected_segment_ids_json)
                     AS plan_segment_count,
                 EXISTS (
                     SELECT 1
                     FROM promotion_run_target_bindings AS binding
-                    WHERE binding.target_analysis_id = target.analysis_id
-                      AND binding.segment_id = target.segment_id
+                    WHERE binding.allocation_plan_id = target.allocation_plan_id
                 ) AS run_bound,
-                EXISTS (
-                    SELECT 1
-                    FROM user_segment_assignments AS assignment
-                    JOIN promotion_run_target_bindings AS binding
-                      ON binding.promotion_run_id = assignment.promotion_run_id
-                     AND binding.segment_id = assignment.segment_id
-                    WHERE binding.target_analysis_id = target.analysis_id
-                      AND binding.segment_id = target.segment_id
-                ) AS assigned
+                (SELECT count(*) FILTER (WHERE excluded.state = 'reserved')
+                 FROM promotion_audience_exclusion_members AS excluded
+                 WHERE excluded.allocation_plan_id = target.allocation_plan_id)
+                    AS reserved_count,
+                (SELECT count(*) FILTER (WHERE excluded.state = 'consumed')
+                 FROM promotion_audience_exclusion_members AS excluded
+                 WHERE excluded.allocation_plan_id = target.allocation_plan_id)
+                    AS consumed_count
             FROM promotion_target_segments AS target
             JOIN segment_audience_allocation_plans AS plan
               ON plan.allocation_plan_id = target.allocation_plan_id
@@ -542,7 +531,11 @@ class PostgresAudienceAllocationRepository:
                     "allocation plan"
                 ),
             )
-        if bool(row["run_bound"]) or bool(row["assigned"]) or row["status"] == "locked":
+        if (
+            bool(row["run_bound"])
+            or int(row["consumed_count"]) > 0
+            or row["status"] == "locked"
+        ):
             raise SegmentAudienceAllocationError(
                 code="segment_audience_allocation_locked",
                 promotion_id=promotion_id,
@@ -551,7 +544,7 @@ class PostgresAudienceAllocationRepository:
             )
         plan_id = str(row["allocation_plan_id"])
         segment_filter = (
-            "" if release_entire_plan else "AND source_segment_id = %s"
+            "" if release_entire_plan else "AND segment_id = %s"
         )
         state_params: tuple[Any, ...] = (
             (project_id, promotion_id, plan_id)
@@ -565,7 +558,7 @@ class PostgresAudienceAllocationRepository:
             FROM {POSTGRES_EXCLUSION_RELATION}
             WHERE project_id = %s
               AND promotion_id = %s
-              AND source_allocation_plan_id = %s
+              AND allocation_plan_id = %s
               {segment_filter}
             """,
             state_params,
@@ -577,41 +570,29 @@ class PostgresAudienceAllocationRepository:
                 segment_id=segment_id,
                 reason="consumed audience cannot be released",
             )
-        previous = self._load_postgres_context_for_update(
+        previous = self._exclusion_reader.load_active_exclusion_context(
             project_id=project_id,
             campaign_id=campaign_id,
             promotion_id=promotion_id,
         )
-        next_revision = previous.revision + 1
-        next_hash = _next_exclusion_hash(
-            previous_hash=previous.exclusion_hash,
-            operation=(
-                f"release-plan:{plan_id}"
-                if release_entire_plan
-                else f"release:{plan_id}:{segment_id}"
-            ),
-            revision=next_revision,
+        next_revision = self._advance_exclusion_revision(
+            promotion_id=promotion_id,
+            expected_revision=previous.revision,
         )
         self._db.execute(
             f"""
             UPDATE {POSTGRES_EXCLUSION_RELATION}
             SET state = 'released',
                 released_at = now(),
-                exclusion_revision = %s
+                consumed_at = NULL,
+                revision = %s
             WHERE project_id = %s
               AND promotion_id = %s
-              AND source_allocation_plan_id = %s
+              AND allocation_plan_id = %s
               {segment_filter}
               AND state = 'reserved'
             """,
             (next_revision, *state_params),
-        )
-        self._update_revision(
-            project_id=project_id,
-            campaign_id=campaign_id,
-            promotion_id=promotion_id,
-            revision=next_revision,
-            exclusion_hash=next_hash,
         )
         target_filter = (
             "allocation_plan_id = %s"
@@ -626,9 +607,7 @@ class PostgresAudienceAllocationRepository:
         self._db.execute(
             f"""
             UPDATE promotion_target_segments
-            SET audience_snapshot_id = NULL,
-                allocation_plan_id = NULL,
-                status = 'planned'
+            SET audience_reservation_state = 'released'
             WHERE {target_filter}
             """,
             target_params,
@@ -636,7 +615,9 @@ class PostgresAudienceAllocationRepository:
         self._db.execute(
             """
             UPDATE segment_audience_allocation_plans
-            SET status = 'superseded'
+            SET status = 'released',
+                released_at = now(),
+                locked_at = NULL
             WHERE allocation_plan_id = %s
               AND status = 'finalized'
             """,
@@ -647,18 +628,15 @@ class PostgresAudienceAllocationRepository:
             campaign_id=campaign_id,
             promotion_id=promotion_id,
             revision=next_revision,
-            exclusion_hash=next_hash,
             excluded_user_count=max(
                 0,
                 previous.excluded_user_count
                 - (int(state["reserved_count"]) if state is not None else 0),
             ),
-            projection_revision=next_revision,
-            projection_hash=next_hash,
-            projection_status="pending",
+            projection_revision=previous.projection_revision,
         )
         self.refresh_recommendation_previews(
-            analysis_id=str(row["source_analysis_id"]),
+            analysis_id=str(row["candidate_batch_analysis_id"]),
             project_id=project_id,
             campaign_id=campaign_id,
             promotion_id=promotion_id,
@@ -708,14 +686,14 @@ class PostgresAudienceAllocationRepository:
                 SELECT
                     latest.analysis_id AS source_analysis_id,
                     latest.segment_id,
-                    latest.audience_snapshot_id AS source_snapshot_id,
+                    latest.audience_snapshot_id AS snapshot_id,
                     snapshot.segment_vector_id,
                     snapshot.score_threshold,
                     snapshot.min_sample_size,
                     snapshot.metadata_json ->> 'candidate_type' AS candidate_type,
                     snapshot.metadata_json ->> 'semantic_margin' AS semantic_margin,
-                    snapshot.snapshot_role,
-                    snapshot.source_audience_snapshot_id,
+                    snapshot.snapshot_kind,
+                    snapshot.source_snapshot_id AS parent_source_snapshot_id,
                     snapshot.allocation_plan_id,
                     snapshot.status AS snapshot_status,
                     snapshot.final_user_count,
@@ -737,7 +715,7 @@ class PostgresAudienceAllocationRepository:
                     SELECT
                         snapshot.analysis_id AS source_analysis_id,
                         snapshot.segment_id,
-                        snapshot.snapshot_id AS source_snapshot_id,
+                        snapshot.snapshot_id,
                         snapshot.segment_vector_id,
                         snapshot.score_threshold,
                         snapshot.min_sample_size,
@@ -745,8 +723,8 @@ class PostgresAudienceAllocationRepository:
                             AS candidate_type,
                         snapshot.metadata_json ->> 'semantic_margin'
                             AS semantic_margin,
-                        snapshot.snapshot_role,
-                        snapshot.source_audience_snapshot_id,
+                        snapshot.snapshot_kind,
+                        snapshot.source_snapshot_id AS parent_source_snapshot_id,
                         snapshot.allocation_plan_id,
                         snapshot.status AS snapshot_status,
                         snapshot.final_user_count,
@@ -760,7 +738,7 @@ class PostgresAudienceAllocationRepository:
                       AND snapshot.campaign_id = %s
                       AND snapshot.promotion_id = %s
                       AND snapshot.segment_id = ANY(%s)
-                      AND snapshot.snapshot_role = 'source'
+                      AND snapshot.snapshot_kind = 'source'
                     ORDER BY snapshot.segment_id ASC
                     """,
                     (
@@ -786,8 +764,8 @@ class PostgresAudienceAllocationRepository:
         sources = tuple(_source_snapshot_from_row(row, promotion_id) for row in rows)
         if any(
             row["snapshot_status"] != "completed"
-            or str(row["snapshot_role"]) != "source"
-            or row["source_audience_snapshot_id"] is not None
+            or str(row["snapshot_kind"]) != "source"
+            or row["parent_source_snapshot_id"] is not None
             or row["allocation_plan_id"] is not None
             or int(row["actual_member_count"]) != int(row["final_user_count"])
             for row in rows
@@ -812,7 +790,7 @@ class PostgresAudienceAllocationRepository:
             SELECT
                 suggestion.analysis_id AS source_analysis_id,
                 suggestion.segment_id,
-                suggestion.audience_snapshot_id AS source_snapshot_id,
+                suggestion.audience_snapshot_id AS snapshot_id,
                 snapshot.segment_vector_id,
                 snapshot.score_threshold,
                 snapshot.min_sample_size,
@@ -832,8 +810,13 @@ class PostgresAudienceAllocationRepository:
                   WHERE target.project_id = suggestion.project_id
                     AND target.promotion_id = suggestion.promotion_id
                     AND target.segment_id = suggestion.segment_id
-                    AND target.source_audience_snapshot_id = suggestion.audience_snapshot_id
-                    AND target.audience_snapshot_id IS NOT NULL
+                    AND target.audience_snapshot_id IN (
+                        SELECT final.snapshot_id
+                        FROM segment_audience_snapshots AS final
+                        WHERE final.source_snapshot_id = suggestion.audience_snapshot_id
+                          AND final.snapshot_kind = 'final'
+                    )
+                    AND target.audience_reservation_state IN ('reserved', 'consumed')
               )
             ORDER BY suggestion.segment_id ASC
             """,
@@ -859,28 +842,31 @@ class PostgresAudienceAllocationRepository:
             """
             SELECT
                 plan.allocation_plan_id,
-                plan.source_analysis_id,
+                plan.candidate_batch_analysis_id AS source_analysis_id,
                 plan.exclusion_revision,
-                plan.exclusion_hash,
-                plan_segment.segment_id,
-                plan_segment.source_audience_snapshot_id,
-                plan_segment.final_audience_snapshot_id,
+                snapshot.segment_id,
+                snapshot.source_snapshot_id,
+                snapshot.snapshot_id AS final_snapshot_id,
                 snapshot.final_user_count,
                 snapshot.meets_min_sample_size,
                 snapshot.audience_status
             FROM segment_audience_allocation_plans AS plan
-            JOIN segment_audience_allocation_plan_segments AS plan_segment
-              ON plan_segment.allocation_plan_id = plan.allocation_plan_id
             JOIN segment_audience_snapshots AS snapshot
-              ON snapshot.snapshot_id = plan_segment.final_audience_snapshot_id
-            WHERE plan.project_id = %s
-              AND plan.promotion_id = %s
-              AND plan.confirmation_analysis_id = %s
+              ON snapshot.allocation_plan_id = plan.allocation_plan_id
+             AND snapshot.snapshot_kind = 'final'
+            WHERE plan.promotion_id = %s
+              AND plan.target_analysis_id = %s
               AND plan.status IN ('finalized', 'locked')
-              AND plan.source_snapshot_ids = %s
-            ORDER BY plan_segment.segment_id ASC
+              AND plan.selected_segment_ids_json = %s::jsonb
+              AND snapshot.source_snapshot_id = ANY(%s)
+            ORDER BY snapshot.segment_id ASC
             """,
-            (project_id, promotion_id, confirmation_analysis_id, source_ids),
+            (
+                promotion_id,
+                confirmation_analysis_id,
+                json.dumps(sorted(source.segment_id for source in sources)),
+                source_ids,
+            ),
         )
         if not rows:
             return None
@@ -894,14 +880,13 @@ class PostgresAudienceAllocationRepository:
             str(row["segment_id"]): FinalAudienceAllocation(
                 segment_id=str(row["segment_id"]),
                 source_analysis_id=str(row["source_analysis_id"]),
-                source_snapshot_id=str(row["source_audience_snapshot_id"]),
-                final_snapshot_id=str(row["final_audience_snapshot_id"]),
+                source_snapshot_id=str(row["source_snapshot_id"]),
+                final_snapshot_id=str(row["final_snapshot_id"]),
                 allocation_plan_id=str(row["allocation_plan_id"]),
                 final_user_count=int(row["final_user_count"]),
                 meets_min_sample_size=bool(row["meets_min_sample_size"]),
                 audience_status=str(row["audience_status"]),
                 exclusion_revision=int(row["exclusion_revision"]),
-                exclusion_hash=str(row["exclusion_hash"]),
             )
             for row in rows
         }
@@ -910,7 +895,6 @@ class PostgresAudienceAllocationRepository:
             source_analysis_id=str(first["source_analysis_id"]),
             allocation_plan_id=str(first["allocation_plan_id"]),
             exclusion_revision=int(first["exclusion_revision"]),
-            exclusion_hash=str(first["exclusion_hash"]),
             allocations=allocations,
         )
 
@@ -925,17 +909,18 @@ class PostgresAudienceAllocationRepository:
         source_ids = sorted(source.snapshot_id for source in sources)
         row = self._db.fetchone(
             """
-            SELECT confirmation_analysis_id
-            FROM segment_audience_allocation_plans
-            WHERE project_id = %s
-              AND promotion_id = %s
-              AND source_snapshot_ids = %s
-              AND status IN ('finalized', 'locked')
-              AND confirmation_analysis_id <> %s
+            SELECT plan.target_analysis_id
+            FROM segment_audience_allocation_plans AS plan
+            JOIN segment_audience_snapshots AS snapshot
+              ON snapshot.allocation_plan_id = plan.allocation_plan_id
+             AND snapshot.snapshot_kind = 'final'
+            WHERE plan.promotion_id = %s
+              AND snapshot.source_snapshot_id = ANY(%s)
+              AND plan.status IN ('finalized', 'locked')
+              AND plan.target_analysis_id <> %s
             LIMIT 1
             """,
             (
-                project_id,
                 promotion_id,
                 source_ids,
                 confirmation_analysis_id,
@@ -947,7 +932,7 @@ class PostgresAudienceAllocationRepository:
                 promotion_id=promotion_id,
                 reason=(
                     "one or more source snapshots were already confirmed by "
-                    + str(row["confirmation_analysis_id"])
+                    + str(row["target_analysis_id"])
                 ),
             )
 
@@ -972,12 +957,17 @@ class PostgresAudienceAllocationRepository:
               AND target.promotion_id = %s
               AND target.segment_id = ANY(%s)
               AND target.audience_snapshot_id IS NOT NULL
-              AND target.status = 'approved'
               AND (
-                    binding.promotion_run_id IS NULL
-                    OR run.status NOT IN (
-                        'goal_met', 'goal_not_met', 'partial_goal_met',
-                        'insufficient_data', 'stopped'
+                    (
+                        target.audience_reservation_state = 'reserved'
+                        AND binding.promotion_run_id IS NULL
+                    )
+                    OR (
+                        target.audience_reservation_state = 'consumed'
+                        AND run.status NOT IN (
+                            'goal_met', 'goal_not_met', 'partial_goal_met',
+                            'insufficient_data', 'stopped'
+                        )
                     )
                   )
             ORDER BY target.segment_id ASC
@@ -1032,11 +1022,14 @@ class PostgresAudienceAllocationRepository:
             )
             """,
             (
-                tuple(source.segment_id for source in sources),
-                tuple(source.snapshot_id for source in sources),
-                tuple(ALLOCATION_POLICY_PRIORITY[source.candidate_type] for source in sources),
-                tuple(source.score_threshold for source in sources),
-                tuple(source.semantic_margin for source in sources),
+                [source.segment_id for source in sources],
+                [source.snapshot_id for source in sources],
+                [
+                    ALLOCATION_POLICY_PRIORITY[source.candidate_type]
+                    for source in sources
+                ],
+                [source.score_threshold for source in sources],
+                [source.semantic_margin for source in sources],
             ),
         )
         self._db.execute(
@@ -1050,6 +1043,8 @@ class PostgresAudienceAllocationRepository:
                     source.segment_id,
                     source.source_snapshot_id,
                     member.behavior_fit_score,
+                    member.retrieval_source,
+                    member.retrieval_rank,
                     source.score_threshold,
                     source.semantic_margin,
                     (member.behavior_fit_score - source.score_threshold)
@@ -1100,53 +1095,82 @@ class PostgresAudienceAllocationRepository:
             for row in rows
         }
 
+    def _ensure_target_rows(
+        self,
+        *,
+        target_analysis_id: str,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        sources: Sequence[_SourceSnapshot],
+    ) -> None:
+        self._db.execute(
+            """
+            INSERT INTO promotion_target_segments (
+                analysis_id, project_id, campaign_id, promotion_id,
+                segment_id, segment_name, rule_json, profile_json,
+                content_brief_json, data_evidence_json, segment_vector_id,
+                estimated_size, priority, status
+            )
+            SELECT
+                %s, %s, %s, %s,
+                definition.segment_id, definition.segment_name,
+                definition.rule_json, definition.profile_json,
+                '{}'::jsonb, '{}'::jsonb, selected.segment_vector_id,
+                0, NULL, 'planned'
+            FROM unnest(%s::text[], %s::text[])
+                AS selected(segment_id, segment_vector_id)
+            JOIN segment_definitions AS definition
+              ON definition.segment_id = selected.segment_id
+            ON CONFLICT (analysis_id, segment_id) DO NOTHING
+            """,
+            (
+                target_analysis_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                [source.segment_id for source in sources],
+                [source.segment_vector_id for source in sources],
+            ),
+        )
+
     def _insert_plan(
         self,
         *,
         plan_id: str,
         confirmation_analysis_id: str,
         source_analysis_id: str,
-        project_id: str,
-        campaign_id: str,
         promotion_id: str,
         plan_fingerprint: str,
-        context: PromotionAudienceExclusionContext,
+        selected_segment_ids: Sequence[str],
+        exclusion_revision: int,
     ) -> None:
         self._db.execute(
             """
             INSERT INTO segment_audience_allocation_plans (
                 allocation_plan_id,
-                confirmation_analysis_id,
-                source_analysis_id,
-                project_id,
-                campaign_id,
                 promotion_id,
+                candidate_batch_analysis_id,
+                target_analysis_id,
+                selection_fingerprint,
+                selected_segment_ids_json,
+                exclusion_revision,
                 allocation_policy_version,
                 allocation_policy_hash,
-                input_fingerprint,
-                exclusion_revision,
-                exclusion_hash,
-                source_snapshot_ids,
                 status
             )
-            SELECT
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                array_agg(source_snapshot_id ORDER BY source_snapshot_id),
-                'building'
-            FROM audience_allocation_sources
+            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, 'finalized')
             """,
             (
                 plan_id,
-                confirmation_analysis_id,
-                source_analysis_id,
-                project_id,
-                campaign_id,
                 promotion_id,
+                source_analysis_id,
+                confirmation_analysis_id,
+                plan_fingerprint,
+                json.dumps(sorted(selected_segment_ids)),
+                exclusion_revision,
                 ALLOCATION_POLICY_VERSION,
                 ALLOCATION_POLICY_HASH,
-                plan_fingerprint,
-                context.revision,
-                context.exclusion_hash,
             ),
         )
 
@@ -1163,13 +1187,12 @@ class PostgresAudienceAllocationRepository:
         context: PromotionAudienceExclusionContext,
     ) -> None:
         metadata_patch = {
-            "snapshot_role": "final_allocation",
-            "source_audience_snapshot_id": source.snapshot_id,
+            "snapshot_kind": "final",
+            "source_snapshot_id": source.snapshot_id,
             "allocation_plan_id": plan_id,
             "allocation_policy_version": ALLOCATION_POLICY_VERSION,
             "allocation_policy_hash": ALLOCATION_POLICY_HASH,
             "source_exclusion_revision": context.revision,
-            "source_exclusion_hash": context.exclusion_hash,
             "targetable": final_user_count > 0,
         }
         self._db.execute(
@@ -1188,7 +1211,7 @@ class PostgresAudienceAllocationRepository:
                 min_sample_size, audience_status, selection_method,
                 estimated_recall, recall_lower_bound, recall_target,
                 input_fingerprint, meets_min_sample_size, status, metadata_json,
-                snapshot_role, source_audience_snapshot_id, allocation_plan_id
+                snapshot_kind, source_snapshot_id, allocation_plan_id
             )
             SELECT
                 %s, NULL, %s,
@@ -1201,10 +1224,10 @@ class PostgresAudienceAllocationRepository:
                 calibration_version, calibration_hash, score_threshold,
                 source_cutoff, window_start, window_end,
                 eligible_user_count, behavior_match_count, %s,
-                %s, %s, 'allocation_snapshot_reuse',
+                %s, %s, selection_method,
                 estimated_recall, recall_lower_bound, recall_target,
                 %s, %s, 'completed', metadata_json || %s::jsonb,
-                'final_allocation', %s, %s
+                'final', %s, %s
             FROM segment_audience_snapshots
             WHERE snapshot_id = %s
             """,
@@ -1245,100 +1268,56 @@ class PostgresAudienceAllocationRepository:
                 %s,
                 user_id,
                 behavior_fit_score,
-                'allocation',
-                row_number() OVER (
-                    ORDER BY behavior_fit_score DESC, user_id ASC
-                )::integer
+                retrieval_source,
+                retrieval_rank
             FROM audience_allocation_winners
             WHERE segment_id = %s
             ORDER BY user_id ASC
             """,
             (final_snapshot_id, source.segment_id),
         )
+
+    def _bind_target_audience(
+        self,
+        *,
+        target_analysis_id: str,
+        segment_id: str,
+        plan_id: str,
+        final_snapshot_id: str,
+        final_user_count: int,
+    ) -> None:
         self._db.execute(
             """
-            INSERT INTO segment_audience_allocation_plan_segments (
-                allocation_plan_id,
-                segment_id,
-                source_audience_snapshot_id,
-                final_audience_snapshot_id,
-                allocated_user_count,
-                targetable,
-                meets_min_sample_size,
-                audience_status
-            )
-            SELECT
-                %s, %s, %s, %s, count(*), count(*) > 0,
-                count(*) >= %s,
-                CASE
-                    WHEN count(*) = 0 THEN 'no_eligible_audience'
-                    WHEN count(*) < %s THEN 'insufficient_sample'
-                    ELSE 'targetable'
-                END
-            FROM audience_allocation_winners
-            WHERE segment_id = %s
+            UPDATE promotion_target_segments
+            SET audience_snapshot_id = %s,
+                allocation_plan_id = %s::uuid,
+                audience_reservation_state = 'reserved',
+                estimated_size = %s
+            WHERE analysis_id = %s
+              AND segment_id = %s
+              AND audience_snapshot_id IS NULL
+              AND allocation_plan_id IS NULL
+              AND audience_reservation_state IS NULL
             """,
             (
-                plan_id,
-                source.segment_id,
-                source.snapshot_id,
                 final_snapshot_id,
-                source.min_sample_size,
-                source.min_sample_size,
-                source.segment_id,
-            ),
-        )
-        self._db.execute(
-            """
-            INSERT INTO segment_audience_allocation_members (
-                allocation_plan_id,
+                plan_id,
+                final_user_count,
+                target_analysis_id,
                 segment_id,
-                final_audience_snapshot_id,
-                user_id,
-                behavior_fit_score,
-                score_threshold,
-                semantic_margin,
-                normalized_fit
-            )
-            SELECT
-                %s, segment_id, %s, user_id, behavior_fit_score,
-                score_threshold, semantic_margin, normalized_fit
-            FROM audience_allocation_winners
-            WHERE segment_id = %s
-            ORDER BY user_id ASC
-            """,
-            (plan_id, final_snapshot_id, source.segment_id),
+            ),
         )
 
     def _reserve_final_members(
         self,
         *,
         plan_id: str,
+        target_analysis_id: str,
         project_id: str,
-        campaign_id: str,
         promotion_id: str,
         previous: PromotionAudienceExclusionContext,
+        reservation_revision: int,
     ) -> PromotionAudienceExclusionContext:
-        locked = self._load_postgres_context_for_update(
-            project_id=project_id,
-            campaign_id=campaign_id,
-            promotion_id=promotion_id,
-        )
-        if (
-            locked.revision != previous.revision
-            or locked.exclusion_hash != previous.exclusion_hash
-        ):
-            raise SegmentAudienceAllocationError(
-                code="segment_audience_exclusion_conflict",
-                promotion_id=promotion_id,
-                reason="promotion exclusion revision changed during confirmation",
-            )
-        next_revision = previous.revision + 1
-        next_hash = _next_exclusion_hash(
-            previous_hash=previous.exclusion_hash,
-            operation=f"reserve:{plan_id}",
-            revision=next_revision,
-        )
         winner_count = sum(self._winner_counts().values())
         try:
             reserved = self._db.fetchone(
@@ -1346,34 +1325,38 @@ class PostgresAudienceAllocationRepository:
                 WITH upserted AS (
                     INSERT INTO {POSTGRES_EXCLUSION_RELATION} (
                         project_id,
-                        campaign_id,
                         promotion_id,
                         user_id,
-                        source_promotion_run_id,
-                        source_allocation_plan_id,
-                        source_segment_id,
+                        target_analysis_id,
+                        segment_id,
+                        allocation_plan_id,
+                        final_snapshot_id,
                         state,
+                        revision,
                         reserved_at,
                         consumed_at,
-                        released_at,
-                        exclusion_revision
+                        released_at
                     )
                     SELECT
-                        %s, %s, %s, winner.user_id, NULL, %s,
-                        winner.segment_id, 'reserved', now(), NULL, NULL, %s
+                        %s, %s, winner.user_id, %s, winner.segment_id, %s::uuid,
+                        final.snapshot_id, 'reserved', %s, now(), NULL, NULL
                     FROM audience_allocation_winners AS winner
+                    JOIN segment_audience_snapshots AS final
+                      ON final.allocation_plan_id = %s::uuid
+                     AND final.segment_id = winner.segment_id
+                     AND final.snapshot_kind = 'final'
                     ORDER BY winner.user_id ASC
                     ON CONFLICT (project_id, promotion_id, user_id)
                     DO UPDATE SET
-                        campaign_id = EXCLUDED.campaign_id,
-                        source_promotion_run_id = NULL,
-                        source_allocation_plan_id = EXCLUDED.source_allocation_plan_id,
-                        source_segment_id = EXCLUDED.source_segment_id,
+                        target_analysis_id = EXCLUDED.target_analysis_id,
+                        segment_id = EXCLUDED.segment_id,
+                        allocation_plan_id = EXCLUDED.allocation_plan_id,
+                        final_snapshot_id = EXCLUDED.final_snapshot_id,
                         state = 'reserved',
+                        revision = EXCLUDED.revision,
                         reserved_at = EXCLUDED.reserved_at,
                         consumed_at = NULL,
-                        released_at = NULL,
-                        exclusion_revision = EXCLUDED.exclusion_revision
+                        released_at = NULL
                     WHERE {POSTGRES_EXCLUSION_RELATION}.state = 'released'
                     RETURNING user_id
                 )
@@ -1382,10 +1365,11 @@ class PostgresAudienceAllocationRepository:
                 """,
                 (
                     project_id,
-                    campaign_id,
                     promotion_id,
+                    target_analysis_id,
                     plan_id,
-                    next_revision,
+                    reservation_revision,
+                    plan_id,
                 ),
             )
         except errors.UniqueViolation as exc:
@@ -1400,107 +1384,36 @@ class PostgresAudienceAllocationRepository:
                 promotion_id=promotion_id,
                 reason="one or more users already have an active reservation",
             )
-        self._update_revision(
-            project_id=project_id,
-            campaign_id=campaign_id,
-            promotion_id=promotion_id,
-            revision=next_revision,
-            exclusion_hash=next_hash,
-        )
         return PromotionAudienceExclusionContext(
             project_id=project_id,
-            campaign_id=campaign_id,
+            campaign_id=previous.campaign_id,
             promotion_id=promotion_id,
-            revision=next_revision,
-            exclusion_hash=next_hash,
+            revision=reservation_revision,
             excluded_user_count=previous.excluded_user_count + winner_count,
-            projection_revision=next_revision,
-            projection_hash=next_hash,
-            projection_status="pending",
+            projection_revision=previous.projection_revision,
         )
 
-    def _load_postgres_context_for_update(
+    def _advance_exclusion_revision(
         self,
         *,
-        project_id: str,
-        campaign_id: str,
         promotion_id: str,
-    ) -> PromotionAudienceExclusionContext:
-        self._db.execute(
-            f"""
-            INSERT INTO {EXCLUSION_REVISION_RELATION} (
-                project_id, campaign_id, promotion_id,
-                revision, exclusion_hash, projection_status
-            )
-            VALUES (%s, %s, %s, 0, %s, 'ready')
-            ON CONFLICT (project_id, promotion_id) DO NOTHING
-            """,
-            (project_id, campaign_id, promotion_id, EMPTY_EXCLUSION_HASH),
-        )
+        expected_revision: int,
+    ) -> int:
         row = self._db.fetchone(
-            f"""
-            SELECT
-                revision,
-                exclusion_hash,
-                (SELECT count(*)
-                 FROM {POSTGRES_EXCLUSION_RELATION} AS member
-                 WHERE member.project_id = revision.project_id
-                   AND member.promotion_id = revision.promotion_id
-                   AND member.state IN ('reserved', 'consumed'))
-                    AS excluded_user_count
-            FROM {EXCLUSION_REVISION_RELATION} AS revision
-            WHERE project_id = %s
-              AND promotion_id = %s
-            FOR UPDATE
+            """
+            SELECT advance_promotion_audience_exclusion_revision(%s)
+                AS revision
             """,
-            (project_id, promotion_id),
+            (promotion_id,),
         )
-        if row is None:
+        revision = int(row["revision"]) if row is not None else -1
+        if revision != expected_revision + 1:
             raise SegmentAudienceAllocationError(
-                code="segment_audience_exclusion_contract_missing",
+                code="segment_audience_exclusion_conflict",
                 promotion_id=promotion_id,
-                reason="promotion exclusion revision row could not be locked",
+                reason="promotion exclusion revision changed during allocation",
             )
-        return PromotionAudienceExclusionContext(
-            project_id=project_id,
-            campaign_id=campaign_id,
-            promotion_id=promotion_id,
-            revision=int(row["revision"]),
-            exclusion_hash=str(row["exclusion_hash"]),
-            excluded_user_count=int(row["excluded_user_count"]),
-            projection_revision=int(row["revision"]),
-            projection_hash=str(row["exclusion_hash"]),
-            projection_status="ready",
-        )
-
-    def _update_revision(
-        self,
-        *,
-        project_id: str,
-        campaign_id: str,
-        promotion_id: str,
-        revision: int,
-        exclusion_hash: str,
-    ) -> None:
-        self._db.execute(
-            f"""
-            UPDATE {EXCLUSION_REVISION_RELATION}
-            SET campaign_id = %s,
-                revision = %s,
-                exclusion_hash = %s,
-                projection_status = 'pending',
-                updated_at = now()
-            WHERE project_id = %s
-              AND promotion_id = %s
-            """,
-            (
-                campaign_id,
-                revision,
-                exclusion_hash,
-                project_id,
-                promotion_id,
-            ),
-        )
+        return revision
 
 
 def _source_snapshot_from_row(
@@ -1526,7 +1439,7 @@ def _source_snapshot_from_row(
     return _SourceSnapshot(
         segment_id=str(row["segment_id"]),
         source_analysis_id=str(row["source_analysis_id"]),
-        snapshot_id=str(row["source_snapshot_id"]),
+        snapshot_id=str(row["snapshot_id"]),
         candidate_type=candidate_type,
         score_threshold=Decimal(str(row["score_threshold"])),
         semantic_margin=semantic_margin,
@@ -1545,7 +1458,6 @@ def _plan_fingerprint(
             "source_snapshots": sorted(source.snapshot_id for source in sources),
             "segment_ids": sorted(source.segment_id for source in sources),
             "exclusion_revision": context.revision,
-            "exclusion_hash": context.exclusion_hash,
             "allocation_policy_version": ALLOCATION_POLICY_VERSION,
             "allocation_policy_hash": ALLOCATION_POLICY_HASH,
         }
@@ -1553,10 +1465,9 @@ def _plan_fingerprint(
 
 
 def _allocation_plan_id(*, promotion_id: str, plan_fingerprint: str) -> str:
-    return "allocation_" + uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"{promotion_id}:{plan_fingerprint}",
-    ).hex
+    return str(
+        uuid.uuid5(uuid.NAMESPACE_URL, f"{promotion_id}:{plan_fingerprint}")
+    )
 
 
 def _final_snapshot_id(*, plan_id: str, segment_id: str) -> str:
@@ -1576,22 +1487,10 @@ def _final_snapshot_fingerprint(
             "source_snapshot_id": source_snapshot_id,
             "segment_id": segment_id,
             "exclusion_revision": context.revision,
-            "exclusion_hash": context.exclusion_hash,
             "allocation_policy_version": ALLOCATION_POLICY_VERSION,
             "allocation_policy_hash": ALLOCATION_POLICY_HASH,
         }
     )
-
-
-def _next_exclusion_hash(
-    *,
-    previous_hash: str,
-    operation: str,
-    revision: int,
-) -> str:
-    return "sha256:" + hashlib.sha256(
-        f"{previous_hash}:{revision}:{operation}".encode("utf-8")
-    ).hexdigest()
 
 
 def _sha256_json(value: Mapping[str, Any]) -> str:

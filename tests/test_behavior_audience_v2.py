@@ -935,18 +935,14 @@ def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision()
         campaign_id="campaign",
         promotion_id="promotion",
         revision=1,
-        exclusion_hash="sha256:one",
         excluded_user_count=2,
         projection_revision=1,
-        projection_hash="sha256:one",
     )
     revision_two = replace(
         revision_one,
         revision=2,
-        exclusion_hash="sha256:two",
         excluded_user_count=3,
         projection_revision=2,
-        projection_hash="sha256:two",
     )
 
     first = _input_fingerprint(replace(base, exclusion_context=revision_one))
@@ -1662,6 +1658,11 @@ def _snapshot_contract_row(
             ),
         },
         "snapshot_status": "completed",
+        "snapshot_kind": "final",
+        "source_snapshot_id": f"source_{segment_id}",
+        "snapshot_allocation_plan_id": "plan",
+        "target_allocation_plan_id": "plan",
+        "audience_reservation_state": "reserved",
         "audience_status": "targetable",
         "final_user_count": 2,
         "identity_matches": True,

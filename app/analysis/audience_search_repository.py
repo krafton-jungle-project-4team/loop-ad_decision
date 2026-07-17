@@ -1445,7 +1445,6 @@ def _clickhouse_exclusion_parameters(
     return {
         "exclusion_promotion_id": context.promotion_id,
         "exclusion_revision": context.revision,
-        "exclusion_hash": context.exclusion_hash,
     }
 
 

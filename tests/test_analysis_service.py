@@ -352,7 +352,6 @@ class FakeAudienceAllocationService:
                 meets_min_sample_size=False,
                 audience_status="insufficient_sample",
                 exclusion_revision=1,
-                exclusion_hash="sha256:test",
             )
             for binding in matching
         }
@@ -360,7 +359,6 @@ class FakeAudienceAllocationService:
             source_analysis_id=source_analysis_id,
             allocation_plan_id=plan_id,
             exclusion_revision=1,
-            exclusion_hash="sha256:test",
             allocations=allocations,
         )
 
@@ -1041,7 +1039,6 @@ def test_v2_confirmation_reuses_latest_snapshot_without_searching_again() -> Non
 
     assert coordinator.prepare_many_calls == 0
     assert len(coordinator.prepare_calls) == 1
-    assert result.target_segments[0].source_audience_snapshot_id == "snapshot_1"
     assert result.target_segments[0].audience_snapshot_id == "final_snapshot_1"
     assert result.target_segments[0].allocation_plan_id == "allocation_test"
     assert analysis_repository.saved.target_segments == result.target_segments
@@ -1180,7 +1177,6 @@ def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None
     )
 
     target = result.target_segments[0]
-    assert target.source_audience_snapshot_id == f"snapshot_{segment_id}"
     assert target.audience_snapshot_id == f"final_snapshot_{segment_id}"
     assert target.allocation_plan_id == "allocation_test"
     assert allocation_service.confirm_calls[0]["source_analysis_id"] == (

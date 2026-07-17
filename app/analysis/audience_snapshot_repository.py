@@ -87,7 +87,6 @@ class BoundAudienceSnapshot:
     recall_target: float
     meets_min_sample_size: bool
     promotion_exclusion_revision: int | None = None
-    promotion_exclusion_hash: str | None = None
     excluded_user_count: int = 0
 
 
@@ -178,8 +177,8 @@ class AudienceSnapshotRepository:
                 meets_min_sample_size,
                 status,
                 metadata_json,
-                snapshot_role,
-                source_audience_snapshot_id,
+                snapshot_kind,
+                source_snapshot_id,
                 allocation_plan_id
             )
             VALUES (
@@ -230,7 +229,7 @@ class AudienceSnapshotRepository:
                 "completed",
                 {
                     "candidate_type": write.spec.candidate_type,
-                    "snapshot_role": "source",
+                    "snapshot_kind": "source",
                     "spec_fingerprint": _spec_fingerprint(write.spec),
                     "hard_predicate_keys": list(write.spec.hard_predicate_keys),
                     "predicate_parameters": {
@@ -277,11 +276,6 @@ class AudienceSnapshotRepository:
                     ),
                     "exclusion_revision": (
                         write.exclusion_context.revision
-                        if write.exclusion_context is not None
-                        else None
-                    ),
-                    "exclusion_hash": (
-                        write.exclusion_context.exclusion_hash
                         if write.exclusion_context is not None
                         else None
                     ),
@@ -512,11 +506,6 @@ class AudienceSnapshotRepository:
                 if metadata.get("exclusion_revision") is not None
                 else None
             ),
-            promotion_exclusion_hash=(
-                str(metadata["exclusion_hash"])
-                if metadata.get("exclusion_hash") is not None
-                else None
-            ),
             excluded_user_count=int(metadata.get("excluded_user_count") or 0),
         )
 
@@ -577,11 +566,6 @@ def _input_fingerprint(write: AudienceSnapshotWrite) -> str:
         "window_end": write.window_end.isoformat(),
         "exclusion_revision": (
             write.exclusion_context.revision
-            if write.exclusion_context is not None
-            else None
-        ),
-        "exclusion_hash": (
-            write.exclusion_context.exclusion_hash
             if write.exclusion_context is not None
             else None
         ),

@@ -5,6 +5,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from app.analysis.repositories import (
     HotelProfileRepository,
@@ -309,13 +310,16 @@ def test_promotion_analysis_repository_saves_analysis() -> None:
     assert "profile_summary_json" in sql
     assert "output_json" in sql
     assert "on conflict (analysis_id) do nothing" in sql
-    assert call.params == (
+    assert call.params[:5] == (
         "analysis_banner_001",
         "hotel-client-a",
         "camp_summer_2026",
         "promo_banner_001",
         "completed",
-        ["seg_repeat_hotel_no_booking"],
+    )
+    assert isinstance(call.params[5], Jsonb)
+    assert call.params[5].obj == ["seg_repeat_hotel_no_booking"]
+    assert call.params[6:] == (
         "Focus on users with booking intent.",
         {"promotion": {"promotion_id": "promo_banner_001"}},
         {"selected_segment_count": 1},
@@ -438,7 +442,7 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
     )
     assert "insert into segment_vectors" in compact_sql(insert_call.query)
     assert "embedding" in compact_sql(insert_call.query)
-    assert insert_call.params == (
+    assert insert_call.params[:7] == (
         "segvec_repeat_hotel_no_booking_v1",
         "hotel-client-a",
         "promo_banner_001",
@@ -446,7 +450,10 @@ def test_segment_vector_repository_get_and_save_vector() -> None:
         "analysis_banner_001",
         "seg_repeat_hotel_no_booking",
         64,
-        vector_values,
+    )
+    assert isinstance(insert_call.params[7], Jsonb)
+    assert insert_call.params[7].obj == vector_values
+    assert insert_call.params[8:] == (
         "[" + ",".join(str(value) for value in vector_values) + "]",
         "v1",
         "decision_analysis",

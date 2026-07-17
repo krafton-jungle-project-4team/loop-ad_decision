@@ -42,6 +42,14 @@ class _UnusedExclusionReader:
         raise AssertionError("explicit test context must be used")
 
 
+class _FixedExclusionReader:
+    def __init__(self, context: PromotionAudienceExclusionContext) -> None:
+        self.context = context
+
+    def load_active_exclusion_context(self, **_kwargs):
+        return self.context
+
+
 class _MissingContractRepository:
     def confirm_selection(self, **_kwargs):
         raise errors.UndefinedTable("allocation contract missing")
@@ -111,16 +119,9 @@ def test_allocation_winner_sql_uses_template_priority_then_normalized_fit() -> N
     assert "NOT EXISTS" in winner_query
 
 
-def test_confirmation_reservation_is_immediate_and_advances_revision() -> None:
+def test_confirmation_reservation_uses_the_advanced_revision() -> None:
     db = _Db()
-    db.fetchone_rows = [
-        {
-            "revision": 5,
-            "exclusion_hash": "sha256:five",
-            "excluded_user_count": 20,
-        },
-        {"reserved_count": 5},
-    ]
+    db.fetchone_rows = [{"reserved_count": 5}]
     db.fetchall_rows = [
         {"segment_id": "seg_a", "allocated_user_count": 3},
         {"segment_id": "seg_b", "allocated_user_count": 2},
@@ -134,18 +135,17 @@ def test_confirmation_reservation_is_immediate_and_advances_revision() -> None:
         campaign_id="campaign",
         promotion_id="promotion",
         revision=5,
-        exclusion_hash="sha256:five",
         excluded_user_count=20,
         projection_revision=5,
-        projection_hash="sha256:five",
     )
 
     context = repository._reserve_final_members(
         plan_id="plan",
+        target_analysis_id="confirmation",
         project_id="project",
-        campaign_id="campaign",
         promotion_id="promotion",
         previous=previous,
+        reservation_revision=6,
     )
 
     reservation_query = next(
@@ -153,21 +153,15 @@ def test_confirmation_reservation_is_immediate_and_advances_revision() -> None:
         for query, _params in db.executed
         if "INSERT INTO promotion_audience_exclusion_members" in query
     )
-    revision_query = next(
-        query
-        for query, _params in db.executed
-        if "UPDATE promotion_audience_exclusion_revisions" in query
-    )
     assert "'reserved'" in reservation_query
-    assert "source_promotion_run_id" in reservation_query
+    assert "target_analysis_id" in reservation_query
+    assert "final_snapshot_id" in reservation_query
     assert "winner.segment_id" in reservation_query
     assert "ON CONFLICT (project_id, promotion_id, user_id)" in reservation_query
     assert "state = 'released'" in reservation_query
     assert "released_at = NULL" in reservation_query
-    assert "projection_status = 'pending'" in revision_query
     assert context.revision == 6
     assert context.excluded_user_count == 25
-    assert context.projection_status == "pending"
 
 
 class _PreviewRepository(PostgresAudienceAllocationRepository):
@@ -208,10 +202,8 @@ def test_preview_metadata_is_one_lookup_per_current_selection_revision() -> None
         campaign_id="campaign",
         promotion_id="promotion",
         revision=7,
-        exclusion_hash="sha256:seven",
         excluded_user_count=44,
         projection_revision=7,
-        projection_hash="sha256:seven",
     )
 
     payload = repository.refresh_recommendation_previews(
@@ -234,7 +226,6 @@ def test_preview_metadata_is_one_lookup_per_current_selection_revision() -> None
         assert {row["segment_id"] for row in preview["per_segment"]} == selected
         assert preview["candidate_batch_analysis_id"] == "recommendation_analysis"
         assert preview["exclusion_revision"] == 7
-        assert preview["exclusion_hash"] == "sha256:seven"
         assert preview["preview_version"] == ALLOCATION_PREVIEW_VERSION
         assert preview["allocation_policy_version"] == ALLOCATION_POLICY_VERSION
     stored_payload = db.executed[-1][1][0]
@@ -261,10 +252,8 @@ def test_preview_respects_the_configured_candidate_batch_limit(
         campaign_id="campaign",
         promotion_id="promotion",
         revision=1,
-        exclusion_hash="sha256:one",
         excluded_user_count=0,
         projection_revision=1,
-        projection_hash="sha256:one",
     )
 
     payload = repository.refresh_recommendation_previews(
@@ -319,13 +308,6 @@ class _ReservationConflictDb(_Db):
 
 def test_concurrent_reservation_conflict_is_structured_and_not_silenced() -> None:
     db = _ReservationConflictDb()
-    db.fetchone_rows = [
-        {
-            "revision": 5,
-            "exclusion_hash": "sha256:five",
-            "excluded_user_count": 20,
-        }
-    ]
     repository = PostgresAudienceAllocationRepository(
         postgres=db,
         exclusion_reader=_UnusedExclusionReader(),
@@ -335,31 +317,26 @@ def test_concurrent_reservation_conflict_is_structured_and_not_silenced() -> Non
         campaign_id="campaign",
         promotion_id="promotion",
         revision=5,
-        exclusion_hash="sha256:five",
         excluded_user_count=20,
         projection_revision=5,
-        projection_hash="sha256:five",
     )
 
     with pytest.raises(SegmentAudienceAllocationError) as error:
         repository._reserve_final_members(
             plan_id="plan",
+            target_analysis_id="confirmation",
             project_id="project",
-            campaign_id="campaign",
             promotion_id="promotion",
             previous=previous,
+            reservation_revision=6,
         )
 
     assert error.value.code == "segment_audience_exclusion_conflict"
-    assert not any(
-        "UPDATE promotion_audience_exclusion_revisions" in query
-        for query, _params in db.executed
-    )
 
 
 def test_same_source_snapshot_cannot_be_confirmed_by_a_different_request() -> None:
     db = _Db()
-    db.fetchone_rows = [{"confirmation_analysis_id": "confirmation_existing"}]
+    db.fetchone_rows = [{"target_analysis_id": "confirmation_existing"}]
     repository = PostgresAudienceAllocationRepository(
         postgres=db,
         exclusion_reader=_UnusedExclusionReader(),
@@ -398,25 +375,31 @@ def test_reserved_target_release_advances_revision_and_refreshes_preview() -> No
     db = _Db()
     db.fetchone_rows = [
         {
-            "source_audience_snapshot_id": "source_a",
             "audience_snapshot_id": "final_a",
             "allocation_plan_id": "plan_a",
-            "source_analysis_id": "recommendation_analysis",
+            "audience_reservation_state": "reserved",
+            "candidate_batch_analysis_id": "recommendation_analysis",
             "status": "finalized",
             "plan_segment_count": 1,
             "run_bound": False,
-            "assigned": False,
+            "reserved_count": 3,
+            "consumed_count": 0,
         },
         {"reserved_count": 3, "consumed_count": 0},
-        {
-            "revision": 8,
-            "exclusion_hash": "sha256:eight",
-            "excluded_user_count": 10,
-        },
+        {"revision": 9},
     ]
     repository = PostgresAudienceAllocationRepository(
         postgres=db,
-        exclusion_reader=_UnusedExclusionReader(),
+        exclusion_reader=_FixedExclusionReader(
+            PromotionAudienceExclusionContext(
+                project_id="project",
+                campaign_id="campaign",
+                promotion_id="promotion",
+                revision=8,
+                excluded_user_count=10,
+                projection_revision=8,
+            )
+        ),
     )
 
     context = repository.release_reserved_target(
@@ -429,28 +412,27 @@ def test_reserved_target_release_advances_revision_and_refreshes_preview() -> No
 
     sql = "\n".join(query for query, _params in db.executed)
     assert "SET state = 'released'" in sql
-    assert "SET audience_snapshot_id = NULL" in sql
-    assert "SET status = 'superseded'" in sql
+    assert "SET audience_reservation_state = 'released'" in sql
+    assert "SET status = 'released'" in sql
     assert "audience_allocation_preview_context" in sql
     assert context.revision == 9
     assert context.excluded_user_count == 7
-    assert context.projection_status == "pending"
 
 
 def test_consumed_target_cannot_be_released() -> None:
     db = _Db()
     db.fetchone_rows = [
         {
-            "source_audience_snapshot_id": "source_a",
             "audience_snapshot_id": "final_a",
             "allocation_plan_id": "plan_a",
-            "source_analysis_id": "recommendation_analysis",
+            "audience_reservation_state": "consumed",
+            "candidate_batch_analysis_id": "recommendation_analysis",
             "status": "finalized",
             "plan_segment_count": 1,
             "run_bound": False,
-            "assigned": False,
+            "reserved_count": 0,
+            "consumed_count": 3,
         },
-        {"reserved_count": 0, "consumed_count": 3},
     ]
     repository = PostgresAudienceAllocationRepository(
         postgres=db,
@@ -476,14 +458,15 @@ def test_multi_target_confirmation_rejects_partial_release() -> None:
     db = _Db()
     db.fetchone_rows = [
         {
-            "source_audience_snapshot_id": "source_a",
             "audience_snapshot_id": "final_a",
             "allocation_plan_id": "plan_ab",
-            "source_analysis_id": "recommendation_analysis",
+            "audience_reservation_state": "reserved",
+            "candidate_batch_analysis_id": "recommendation_analysis",
             "status": "finalized",
             "plan_segment_count": 2,
             "run_bound": False,
-            "assigned": False,
+            "reserved_count": 5,
+            "consumed_count": 0,
         }
     ]
     repository = PostgresAudienceAllocationRepository(
@@ -510,25 +493,31 @@ def test_multi_target_confirmation_can_release_the_entire_plan_before_run() -> N
     db = _Db()
     db.fetchone_rows = [
         {
-            "source_audience_snapshot_id": "source_a",
             "audience_snapshot_id": "final_a",
             "allocation_plan_id": "plan_ab",
-            "source_analysis_id": "recommendation_analysis",
+            "audience_reservation_state": "reserved",
+            "candidate_batch_analysis_id": "recommendation_analysis",
             "status": "finalized",
             "plan_segment_count": 2,
             "run_bound": False,
-            "assigned": False,
+            "reserved_count": 5,
+            "consumed_count": 0,
         },
         {"reserved_count": 5, "consumed_count": 0},
-        {
-            "revision": 8,
-            "exclusion_hash": "sha256:eight",
-            "excluded_user_count": 10,
-        },
+        {"revision": 9},
     ]
     repository = PostgresAudienceAllocationRepository(
         postgres=db,
-        exclusion_reader=_UnusedExclusionReader(),
+        exclusion_reader=_FixedExclusionReader(
+            PromotionAudienceExclusionContext(
+                project_id="project",
+                campaign_id="campaign",
+                promotion_id="promotion",
+                revision=8,
+                excluded_user_count=10,
+                projection_revision=8,
+            )
+        ),
     )
 
     context = repository.release_reserved_target(
@@ -551,7 +540,7 @@ def test_multi_target_confirmation_can_release_the_entire_plan_before_run() -> N
     assert "source_segment_id" not in release_query
     assert "WHERE allocation_plan_id = %s" in target_query
     assert any(
-        "SET status = 'superseded'" in query
+        "SET status = 'released'" in query
         for query, _params in db.executed
     )
     assert context.revision == 9

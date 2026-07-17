@@ -67,7 +67,6 @@ class AudienceV2Preparation:
     source_audience_snapshot_id: str | None = None
     allocation_plan_id: str | None = None
     promotion_exclusion_revision: int | None = None
-    promotion_exclusion_hash: str | None = None
     excluded_user_count: int = 0
 
 
@@ -143,7 +142,6 @@ class AudienceV2Coordinator:
             recall_target=bound.recall_target,
             meets_min_sample_size=bound.meets_min_sample_size,
             promotion_exclusion_revision=bound.promotion_exclusion_revision,
-            promotion_exclusion_hash=bound.promotion_exclusion_hash,
             excluded_user_count=bound.excluded_user_count,
         )
 
@@ -433,11 +431,6 @@ class AudienceV2Coordinator:
                 context.exclusion_context.revision
                 if context.exclusion_context is not None
                 else 0
-            ),
-            promotion_exclusion_hash=(
-                context.exclusion_context.exclusion_hash
-                if context.exclusion_context is not None
-                else None
             ),
             excluded_user_count=(
                 context.exclusion_context.excluded_user_count

@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg import errors
 
 
-EMPTY_EXCLUSION_HASH = "sha256:" + hashlib.sha256(b"").hexdigest()
 POSTGRES_EXCLUSION_RELATION = "promotion_audience_exclusion_members"
-CLICKHOUSE_EXCLUSION_RELATION = "promotion_audience_exclusion_members"
-EXCLUSION_REVISION_RELATION = "promotion_audience_exclusion_revisions"
+CLICKHOUSE_EXCLUSION_RELATION = "promotion_audience_exclusion_active"
+EXCLUSION_REVISION_RELATION = "promotion_audience_exclusion_state"
 CLICKHOUSE_PROJECTION_REVISION_RELATION = (
-    "promotion_audience_exclusion_projection_revisions"
+    "promotion_audience_exclusion_projection_status"
 )
 
 
@@ -48,26 +46,19 @@ class PromotionAudienceExclusionContext:
     campaign_id: str
     promotion_id: str
     revision: int
-    exclusion_hash: str
     excluded_user_count: int
     postgres_relation: str = POSTGRES_EXCLUSION_RELATION
     clickhouse_relation: str = CLICKHOUSE_EXCLUSION_RELATION
     projection_revision: int = 0
-    projection_hash: str = EMPTY_EXCLUSION_HASH
-    projection_status: str = "ready"
 
     def require_projection_ready(self) -> None:
-        if (
-            self.projection_status != "ready"
-            or self.projection_revision != self.revision
-            or self.projection_hash != self.exclusion_hash
-        ):
+        if self.projection_revision < self.revision:
             raise SegmentAudienceExclusionError(
                 code="segment_audience_exclusion_projection_not_ready",
                 promotion_id=self.promotion_id,
                 reason=(
-                    "ClickHouse exclusion projection must exactly match the "
-                    "PostgreSQL exclusion revision and hash"
+                    "ClickHouse exclusion projection must be caught up to the "
+                    "PostgreSQL exclusion revision"
                 ),
             )
 
@@ -128,21 +119,18 @@ class PromotionAudienceExclusionRepository:
             row = self._postgres.fetchone(
                 f"""
                 SELECT
-                    revision,
-                    exclusion_hash,
+                    state.revision,
                     (
                         SELECT count(*)
                         FROM {POSTGRES_EXCLUSION_RELATION} AS member
-                        WHERE member.project_id = revision.project_id
-                          AND member.promotion_id = revision.promotion_id
+                        WHERE member.project_id = %s
+                          AND member.promotion_id = state.promotion_id
                           AND member.state IN ('reserved', 'consumed')
                     ) AS excluded_user_count
-                FROM {EXCLUSION_REVISION_RELATION} AS revision
-                WHERE project_id = %s
-                  AND campaign_id = %s
-                  AND promotion_id = %s
+                FROM {EXCLUSION_REVISION_RELATION} AS state
+                WHERE state.promotion_id = %s
                 """,
-                (project_id, campaign_id, promotion_id),
+                (project_id, promotion_id),
             )
         except (errors.UndefinedTable, errors.UndefinedColumn) as exc:
             raise SegmentAudienceExclusionError(
@@ -152,11 +140,6 @@ class PromotionAudienceExclusionRepository:
             ) from exc
 
         revision = int(row["revision"]) if row is not None else 0
-        exclusion_hash = (
-            str(row["exclusion_hash"])
-            if row is not None and row.get("exclusion_hash")
-            else EMPTY_EXCLUSION_HASH
-        )
         excluded_user_count = (
             int(row["excluded_user_count"]) if row is not None else 0
         )
@@ -169,11 +152,8 @@ class PromotionAudienceExclusionRepository:
             campaign_id=campaign_id,
             promotion_id=promotion_id,
             revision=revision,
-            exclusion_hash=exclusion_hash,
             excluded_user_count=excluded_user_count,
-            projection_revision=projection[0],
-            projection_hash=projection[1],
-            projection_status=projection[2],
+            projection_revision=projection,
         )
         context.require_projection_ready()
         return context
@@ -183,15 +163,15 @@ class PromotionAudienceExclusionRepository:
         *,
         project_id: str,
         promotion_id: str,
-    ) -> tuple[int, str, str]:
+    ) -> int:
         try:
             result = self._clickhouse.query(
                 f"""
-                SELECT revision, exclusion_hash, status
+                SELECT applied_revision
                 FROM {CLICKHOUSE_PROJECTION_REVISION_RELATION}
                 WHERE project_id = {{project_id:String}}
                   AND promotion_id = {{promotion_id:String}}
-                ORDER BY revision DESC
+                ORDER BY applied_revision DESC
                 LIMIT 1
                 """,
                 parameters={
@@ -216,11 +196,11 @@ class PromotionAudienceExclusionRepository:
             else list(result.result_rows)
         )
         if not rows:
-            return 0, EMPTY_EXCLUSION_HASH, "ready"
+            return 0
         row = rows[0]
         if isinstance(row, Mapping):
-            return int(row["revision"]), str(row["exclusion_hash"]), str(row["status"])
-        return int(row[0]), str(row[1]), str(row[2])
+            return int(row["applied_revision"])
+        return int(row[0])
 
 
 def _is_missing_clickhouse_contract(exc: Exception) -> bool:
