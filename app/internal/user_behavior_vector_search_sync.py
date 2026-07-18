@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -325,11 +325,11 @@ class UserBehaviorVectorSearchSyncRepository:
                 generation.vector_version,
                 generation.window_start,
                 generation.window_end,
-                tuple(revision.user_id for revision in revisions),
-                tuple(_vector_literal(revision.vector_values) for revision in revisions),
-                tuple(revision.vector_row_id for revision in revisions),
-                tuple(revision.updated_at for revision in revisions),
-                tuple(revision.ingested_at for revision in revisions),
+                [revision.user_id for revision in revisions],
+                [_vector_literal(revision.vector_values) for revision in revisions],
+                [revision.vector_row_id for revision in revisions],
+                [revision.updated_at for revision in revisions],
+                [revision.ingested_at for revision in revisions],
             ),
         )
 
@@ -675,8 +675,10 @@ def _validate_revision(
     if (
         revision.project_id != generation.project_id
         or revision.vector_version != generation.vector_version
-        or revision.window_start != generation.window_start
-        or revision.window_end != generation.window_end
+        or _normalize_vector_window(revision.window_start)
+        != _normalize_vector_window(generation.window_start)
+        or _normalize_vector_window(revision.window_end)
+        != _normalize_vector_window(generation.window_end)
     ):
         raise ValueError("search vector revision does not belong to generation")
     if revision.vector_dim != VECTOR_DIM or len(revision.vector_values) != VECTOR_DIM:
@@ -685,6 +687,15 @@ def _validate_revision(
         raise ValueError("search vector revision must contain finite values")
     if math.sqrt(sum(value * value for value in revision.vector_values)) == 0:
         raise ValueError("search vector revision must not be zero")
+
+
+def _normalize_vector_window(value: datetime) -> datetime:
+    utc_value = (
+        value.replace(tzinfo=UTC)
+        if value.tzinfo is None
+        else value.astimezone(UTC)
+    )
+    return utc_value.replace(microsecond=(utc_value.microsecond // 1_000) * 1_000)
 
 
 def _vector_literal(values: Sequence[float]) -> str:
