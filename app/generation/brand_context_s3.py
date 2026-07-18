@@ -26,7 +26,9 @@ MAX_POINTER_BYTES = 16_384
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_GUIDE_BYTES = 256_000
 MAX_BRAND_KIT_BYTES = 256_000
+MAX_CATALOG_BYTES = 512_000
 MAX_ASSET_VALIDATION_BYTES = 20_000_000
+PROMOTION_PRICE_CATALOG_SCHEMA_VERSION = "stayloop.promotion-price-catalog.v1"
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -48,6 +50,9 @@ class S3BrandContextLoader:
         self._base_prefix = _normalised_prefix(base_prefix)
         self._s3_client = s3_client
         self._manifest_cache: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        self._offer_catalog_cache: dict[
+            tuple[str, str, str], Mapping[str, Any]
+        ] = {}
 
     def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot | None:
         project_id = _validated_project_id(project_id)
@@ -112,6 +117,52 @@ class S3BrandContextLoader:
             },
         )
         return snapshot
+
+    def load_offer_catalog(
+        self,
+        *,
+        project_id: str,
+        snapshot: BrandContextSnapshot,
+    ) -> Mapping[str, Any] | None:
+        """Load verified promotion facts and public asset paths for email cards."""
+
+        project_id = _validated_project_id(project_id)
+        cache_key = (
+            project_id,
+            snapshot.context_version,
+            snapshot.manifest_sha256,
+        )
+        cached = self._offer_catalog_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        manifest = self._load_manifest(
+            project_id=project_id,
+            context_version=snapshot.context_version,
+            manifest_key=snapshot.manifest_key,
+            expected_sha256=snapshot.manifest_sha256,
+        )
+        catalog_entry = _select_offer_catalog(_mapping_list(manifest, "catalogs"))
+        if catalog_entry is None:
+            return None
+        catalog_id = _required_text(
+            catalog_entry.get("catalog_id"),
+            "catalog.catalog_id",
+        )
+        catalog_bytes = self._read_verified_reference(
+            catalog_entry,
+            project_id=project_id,
+            max_bytes=MAX_CATALOG_BYTES,
+            label=f"catalog {catalog_id}",
+        )
+        catalog = _json_object(catalog_bytes, label=f"catalog {catalog_id}")
+        normalized = _normalise_offer_catalog(
+            catalog,
+            catalog_entry=catalog_entry,
+            manifest=manifest,
+            project_id=project_id,
+        )
+        self._offer_catalog_cache[cache_key] = normalized
+        return normalized
 
     def load_documents(
         self,
@@ -603,6 +654,198 @@ def _manifest_catalog_version(
         if str(item.get("version") or "").strip()
     }
     return next(iter(versions)) if len(versions) == 1 else fallback
+
+
+def _select_offer_catalog(
+    catalogs: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    eligible = [
+        catalog
+        for catalog in catalogs
+        if bool(catalog.get("required"))
+        and (
+            not _string_list(catalog.get("applies_to"))
+            or ContentChannel.EMAIL.value
+            in _string_list(catalog.get("applies_to"))
+        )
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda item: str(item.get("catalog_id") or ""))
+
+
+def _normalise_offer_catalog(
+    catalog: Mapping[str, Any],
+    *,
+    catalog_entry: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    project_id: str,
+) -> Mapping[str, Any]:
+    _require_schema(
+        catalog,
+        PROMOTION_PRICE_CATALOG_SCHEMA_VERSION,
+        label="promotion price catalog",
+    )
+    _require_equal(
+        catalog,
+        "project_id",
+        project_id,
+        label="promotion price catalog",
+    )
+    catalog_id = _required_text(catalog.get("catalog_id"), "catalog.catalog_id")
+    _require_equal(
+        catalog_entry,
+        "catalog_id",
+        catalog_id,
+        label="promotion price catalog reference",
+    )
+    catalog_version = _required_text(
+        catalog.get("catalog_version"),
+        "catalog.catalog_version",
+    )
+    _require_equal(
+        catalog_entry,
+        "version",
+        catalog_version,
+        label="promotion price catalog reference",
+    )
+    currency = _required_text(catalog.get("currency"), "catalog.currency")
+    hotels = _mapping_list(catalog, "hotels")
+    if not hotels or len(hotels) > 20:
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="The promotion price catalog was invalid.",
+        )
+    assets = _mapping_list(manifest, "assets")
+    normalized_hotels: list[dict[str, Any]] = []
+    seen_hotel_ids: set[str] = set()
+    for hotel in hotels:
+        hotel_id = _required_text(hotel.get("hotel_id"), "catalog.hotel_id")
+        if hotel_id in seen_hotel_ids:
+            raise PermanentGenerationError(
+                code="brand_context_catalog_invalid",
+                safe_message="The promotion price catalog was invalid.",
+            )
+        seen_hotel_ids.add(hotel_id)
+        destination_id = _required_text(
+            hotel.get("destination_id"),
+            "catalog.destination_id",
+        )
+        asset = _select_offer_asset(
+            assets,
+            hotel_id=hotel_id,
+            destination_id=destination_id,
+        )
+        if asset is None:
+            raise PermanentGenerationError(
+                code="brand_context_offer_asset_missing",
+                safe_message="A promotion hotel image was unavailable.",
+            )
+        normalized_hotels.append(
+            {
+                "offer_id": hotel_id,
+                "hotel_name": _required_text(
+                    hotel.get("hotel_name"),
+                    "catalog.hotel_name",
+                ),
+                "destination_id": destination_id,
+                "currency": _required_text(
+                    hotel.get("currency"),
+                    "catalog.hotel.currency",
+                ),
+                "sale_price_per_night": _catalog_nonnegative_int(
+                    hotel.get("sale_price_per_night"),
+                    "catalog.sale_price_per_night",
+                ),
+                "original_price_per_night": _catalog_optional_nonnegative_int(
+                    hotel.get("original_price_per_night"),
+                    "catalog.original_price_per_night",
+                ),
+                "discount_rate_percent": _catalog_optional_nonnegative_int(
+                    hotel.get("discount_rate_percent"),
+                    "catalog.discount_rate_percent",
+                ),
+                "image_path": _validated_frontend_path(asset.get("frontend_path")),
+                "asset_id": _required_text(asset.get("asset_id"), "asset.asset_id"),
+            }
+        )
+    return {
+        "schema_version": PROMOTION_PRICE_CATALOG_SCHEMA_VERSION,
+        "catalog_id": catalog_id,
+        "catalog_version": catalog_version,
+        "promotion_label": _required_text(
+            catalog.get("promotion_label"),
+            "catalog.promotion_label",
+        ),
+        "currency": currency,
+        "price_basis": _required_text(
+            catalog.get("price_basis"),
+            "catalog.price_basis",
+        ),
+        "hotels": normalized_hotels,
+    }
+
+
+def _select_offer_asset(
+    assets: Sequence[Mapping[str, Any]],
+    *,
+    hotel_id: str,
+    destination_id: str,
+) -> Mapping[str, Any] | None:
+    candidates: list[tuple[int, str, Mapping[str, Any]]] = []
+    for asset in assets:
+        if not _asset_is_eligible(asset) or not str(
+            asset.get("frontend_path") or ""
+        ).strip():
+            continue
+        entity_refs = _mapping_list(asset, "entity_refs")
+        hotel_refs = [
+            ref
+            for ref in entity_refs
+            if str(ref.get("type") or "") == "hotel"
+            and str(ref.get("id") or "") == hotel_id
+        ]
+        destination_match = any(
+            str(ref.get("type") or "") == "destination"
+            and str(ref.get("id") or "") == destination_id
+            for ref in entity_refs
+        )
+        if hotel_refs:
+            primary = any(str(ref.get("usage") or "") == "primary" for ref in hotel_refs)
+            priority = 0 if primary else 1
+        elif destination_match and str(asset.get("role") or "") in {"hero", "hotel"}:
+            priority = 2
+        else:
+            continue
+        candidates.append(
+            (priority, str(asset.get("asset_id") or ""), asset)
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _validated_frontend_path(value: object) -> str:
+    path = _required_text(value, "asset.frontend_path")
+    if not path.startswith("/") or path.startswith("//") or ".." in path.split("/"):
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="A promotion image path was invalid.",
+        )
+    return path
+
+
+def _catalog_nonnegative_int(value: object, field_name: str) -> int:
+    return _required_nonnegative_int(value, field_name)
+
+
+def _catalog_optional_nonnegative_int(
+    value: object,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    return _required_nonnegative_int(value, field_name)
 
 
 def _brand_kit_rules(value: Mapping[str, Any]) -> dict[str, Any]:

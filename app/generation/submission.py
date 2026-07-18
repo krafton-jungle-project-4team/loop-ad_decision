@@ -14,6 +14,7 @@ from app.generation.brand_context import (
 from app.generation.prompt_builder import (
     GenerationInputBuilder,
     GenerationPromptInput,
+    PromotionOfferLink,
     PromotionPromptInput,
     TargetSegmentPromptInput,
 )
@@ -138,6 +139,12 @@ class GenerationSubmissionService:
             raise GenerationInputUnavailable(
                 "promotion input was not found for generation"
             )
+        offer_catalog = _submission_offer_catalog(
+            repository=self._brand_context_repository,
+            project_id=request.project_id,
+            promotion=promotion,
+            snapshot=brand_context,
+        )
         target_segments = self._generation_input_reader.list_target_segment_inputs(
             request
         )
@@ -150,6 +157,7 @@ class GenerationSubmissionService:
             promotion=promotion,
             target_segments=target_segments,
             brand_context=brand_context,
+            offer_catalog=offer_catalog,
             model_version=self._model_version,
         )
         fingerprint = generation_request_fingerprint(snapshot)
@@ -245,6 +253,7 @@ def build_generation_input_snapshot(
     promotion: PromotionPromptInput,
     target_segments: Sequence[TargetSegmentPromptInput],
     brand_context: BrandContextSnapshot | None = None,
+    offer_catalog: Mapping[str, Any] | None = None,
     model_version: str = "generation-default",
 ) -> dict[str, Any]:
     GenerationInputBuilder().build(
@@ -252,6 +261,7 @@ def build_generation_input_snapshot(
         promotion=promotion,
         target_segments=target_segments,
         brand_context=brand_context,
+        offer_catalog=offer_catalog,
     )
     targets = sorted(target_segments, key=lambda item: item.segment_id)
     if len({target.segment_id for target in targets}) != len(targets):
@@ -281,6 +291,8 @@ def build_generation_input_snapshot(
     }
     if brand_context is not None:
         snapshot["brand_context"] = brand_context.to_snapshot()
+    if offer_catalog is not None:
+        snapshot["offer_catalog"] = dict(offer_catalog)
     return snapshot
 
 
@@ -338,6 +350,7 @@ def prompt_inputs_from_snapshot(
         landing_url=_optional_text(promotion_value.get("landing_url")),
         offer_type=_optional_text(promotion_value.get("offer_type")),
         landing_type=_optional_text(promotion_value.get("landing_type")),
+        offer_links=_offer_links_from_snapshot(promotion_value.get("offer_links")),
     )
     raw_targets = value.get("target_segments")
     if not isinstance(raw_targets, list) or not raw_targets:
@@ -359,11 +372,22 @@ def prompt_inputs_from_snapshot(
         )
     except ValueError as exc:
         raise GenerationSnapshotError(str(exc)) from exc
+    offer_catalog_value = value.get("offer_catalog")
+    if offer_catalog_value is not None and not isinstance(
+        offer_catalog_value,
+        Mapping,
+    ):
+        raise GenerationSnapshotError("offer_catalog must be an object")
     return GenerationInputBuilder().build(
         request=request,
         promotion=promotion,
         target_segments=targets,
         brand_context=brand_context,
+        offer_catalog=(
+            dict(offer_catalog_value)
+            if isinstance(offer_catalog_value, Mapping)
+            else None
+        ),
     )
 
 
@@ -371,6 +395,59 @@ def _promotion_snapshot(value: PromotionPromptInput) -> dict[str, Any]:
     snapshot = asdict(value)
     snapshot["channel"] = value.channel.value
     return snapshot
+
+
+def _submission_offer_catalog(
+    *,
+    repository: BrandContextSnapshotReader | None,
+    project_id: str,
+    promotion: PromotionPromptInput,
+    snapshot: BrandContextSnapshot | None,
+) -> Mapping[str, Any] | None:
+    if not promotion.offer_links:
+        return None
+    if promotion.channel != ContentChannel.EMAIL:
+        raise GenerationInputUnavailable(
+            "promotion offer_links are supported only for email generation"
+        )
+    if repository is None or snapshot is None:
+        raise GenerationInputUnavailable(
+            "brand context is required for promotion offer_links"
+        )
+    load_offer_catalog = getattr(repository, "load_offer_catalog", None)
+    if not callable(load_offer_catalog):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog loader is unavailable"
+        )
+    catalog = load_offer_catalog(project_id=project_id, snapshot=snapshot)
+    if not isinstance(catalog, Mapping):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog is unavailable"
+        )
+    return dict(catalog)
+
+
+def _offer_links_from_snapshot(value: object) -> tuple[PromotionOfferLink, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise GenerationSnapshotError("promotion.offer_links must be an array")
+    links: list[PromotionOfferLink] = []
+    try:
+        for raw_link in value:
+            if not isinstance(raw_link, Mapping):
+                raise GenerationSnapshotError(
+                    "promotion.offer_links entries must be objects"
+                )
+            links.append(
+                PromotionOfferLink(
+                    offer_id=_required_text(raw_link, "offer_id"),
+                    destination_url=_required_text(raw_link, "destination_url"),
+                )
+            )
+    except ValueError as exc:
+        raise GenerationSnapshotError(str(exc)) from exc
+    return tuple(links)
 
 
 def _target_segment_snapshot(value: TargetSegmentPromptInput) -> dict[str, Any]:

@@ -15,6 +15,7 @@ from app.generation.artifacts import (
     source_for_channel,
 )
 from app.generation.prompt_builder import (
+    PromotionOfferLink,
     PromotionPromptInput,
     TargetSegmentPromptInput,
 )
@@ -817,7 +818,8 @@ class GenerationInputRepository:
             message_brief,
             landing_url,
             offer_type,
-            landing_type
+            landing_type,
+            metadata_json
         FROM promotions
         WHERE project_id = %(project_id)s
           AND campaign_id = %(campaign_id)s
@@ -894,6 +896,7 @@ class GenerationInputRepository:
             landing_url=_optional_text(row.get("landing_url")),
             offer_type=_optional_text(row.get("offer_type")),
             landing_type=_optional_text(row.get("landing_type")),
+            offer_links=_promotion_offer_links(row.get("metadata_json")),
         )
 
     def list_target_segment_inputs(
@@ -1683,6 +1686,31 @@ def _json_object(value: object) -> dict[str, Any]:
     if isinstance(value, Mapping):
         return dict(value)
     return {}
+
+
+def _promotion_offer_links(value: object) -> tuple[PromotionOfferLink, ...]:
+    metadata = _json_object(value)
+    raw_links = metadata.get("offer_links")
+    if raw_links is None:
+        return ()
+    if not isinstance(raw_links, list):
+        raise ValueError("promotion metadata_json.offer_links must be an array")
+    links: list[PromotionOfferLink] = []
+    for raw_link in raw_links:
+        if not isinstance(raw_link, Mapping):
+            raise ValueError("promotion offer_links entries must be objects")
+        links.append(
+            PromotionOfferLink(
+                offer_id=str(raw_link.get("offer_id") or ""),
+                destination_url=str(raw_link.get("destination_url") or ""),
+            )
+        )
+    if len(links) > 8:
+        raise ValueError("promotion offer_links must contain at most 8 items")
+    offer_ids = [link.offer_id for link in links]
+    if len(offer_ids) != len(set(offer_ids)):
+        raise ValueError("promotion offer_links must not contain duplicate offer_id")
+    return tuple(links)
 
 
 def _optional_text(value: object) -> str | None:
