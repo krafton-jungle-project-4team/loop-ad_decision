@@ -6,6 +6,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Iterator, Mapping, Sequence
 
+from psycopg import errors as pg_errors
+
+from app.decision.audience_snapshots import (
+    AudienceSnapshotContractError,
+    AudienceSnapshotReader,
+)
+from app.audience_contract import SEGMENT_AUDIENCE_CONTRACT
 from app.decision.matcher import (
     ANN_CANDIDATE_LIMIT,
     ANN_QUERY_USER_BATCH_SIZE,
@@ -47,6 +54,8 @@ DEFAULT_VECTOR_VERSION = "v1"
 AUDIENCE_SCOPE_BASE = "user_behavior_vectors"
 ASSIGNMENT_MODE_LIVE_KEYSET = "live_keyset"
 ASSIGNMENT_MODE_EXPLICIT_USER_IDS = "explicit_user_ids"
+ASSIGNMENT_MODE_ANALYSIS_SNAPSHOT = "analysis_snapshot"
+SNAPSHOT_MATCHING_MODE = "analysis_snapshot_reuse"
 ANN_NOT_APPLIED_NO_USERS = "no_users_to_match"
 ANN_NOT_APPLIED_NO_VALID_VECTORS = "no_valid_user_vectors"
 FALLBACK_REASON_KEYS = (
@@ -71,6 +80,21 @@ class SegmentAssignmentRunNotFoundError(Exception):
 
 class SegmentAssignmentValidationError(Exception):
     pass
+
+
+class SegmentAssignmentAudienceContractError(SegmentAssignmentValidationError):
+    def __init__(self, *, code: str, segment_id: str, reason: str) -> None:
+        super().__init__(reason)
+        self.code = code
+        self.segment_id = segment_id
+        self.reason = reason
+
+    def to_detail(self) -> dict[str, str]:
+        return {
+            "code": self.code,
+            "segment_id": self.segment_id,
+            "reason": self.reason,
+        }
 
 
 @dataclass(frozen=True)
@@ -232,6 +256,7 @@ class SegmentAssignmentService:
         user_behavior_vector_repository: UserBehaviorVectorReader,
         user_segment_assignment_repository: UserSegmentAssignmentWriter,
         reranker: SegmentCandidateReranker,
+        audience_snapshot_repository: AudienceSnapshotReader,
     ) -> None:
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
@@ -239,6 +264,7 @@ class SegmentAssignmentService:
         self._user_behavior_vector_repository = user_behavior_vector_repository
         self._user_segment_assignment_repository = user_segment_assignment_repository
         self._reranker = reranker
+        self._audience_snapshot_repository = audience_snapshot_repository
 
     @log_context_scope
     def build_assignments(
@@ -267,11 +293,6 @@ class SegmentAssignmentService:
         )
         log.info("promotion_run_loaded", {"promotionRun": run})
 
-        audience_scope = _build_effective_audience_scope(
-            goal_snapshot_json=run.goal_snapshot_json,
-            request=request,
-            project_id=run.project_id,
-        )
         experiments = _split_experiments(
             self._ad_experiment_repository.list_by_run(promotion_run_id)
         )
@@ -281,6 +302,27 @@ class SegmentAssignmentService:
                 "at least one non-fallback ad experiment is required"
             )
         log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
+
+        audience_contract = self._resolve_target_audience_contract(
+            promotion_run_id=run.promotion_run_id,
+            analysis_id=run.analysis_id,
+            segment_ids=[
+                experiment.segment_id for experiment in experiments.non_fallback
+            ],
+        )
+        if audience_contract == SEGMENT_AUDIENCE_CONTRACT:
+            return self._build_snapshot_assignments(
+                run=run,
+                experiments=experiments,
+                request=request,
+                started_at=started_at,
+            )
+
+        audience_scope = _build_effective_audience_scope(
+            goal_snapshot_json=run.goal_snapshot_json,
+            request=request,
+            project_id=run.project_id,
+        )
 
         segment_vectors = self._load_segment_vectors(
             project_id=run.project_id,
@@ -467,6 +509,198 @@ class SegmentAssignmentService:
             {"diagnostics": response.model_dump(mode="json")},
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
+
+    def _resolve_target_audience_contract(
+        self,
+        *,
+        promotion_run_id: str,
+        analysis_id: str,
+        segment_ids: Sequence[str],
+    ) -> str:
+        try:
+            resolver = getattr(
+                self._audience_snapshot_repository,
+                "resolve_run_contract",
+                None,
+            )
+            if callable(resolver):
+                return resolver(
+                    promotion_run_id=promotion_run_id,
+                    analysis_id=analysis_id,
+                    segment_ids=segment_ids,
+                ).contract
+            return self._audience_snapshot_repository.resolve_target_contract(
+                analysis_id=analysis_id,
+                segment_ids=segment_ids,
+            ).contract
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(segment_ids),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
+        except AudienceSnapshotContractError as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_assignment_contract_invalid",
+                segment_id=",".join(segment_ids),
+                reason=str(exc),
+            ) from exc
+
+    def _build_snapshot_assignments(
+        self,
+        *,
+        run: Any,
+        experiments: _ExperimentSet,
+        request: SegmentAssignmentBuildRequest,
+        started_at: int,
+    ) -> SegmentAssignmentBuildResponse:
+        if request.user_ids or request.eligible_user_limit is not None:
+            raise SegmentAssignmentValidationError(
+                "analysis snapshot assignment does not accept user_ids or a limit"
+            )
+        segment_ids = [
+            experiment.segment_id for experiment in experiments.non_fallback
+        ]
+        try:
+            snapshot_set = self._audience_snapshot_repository.require_run_binding_set(
+                promotion_run_id=run.promotion_run_id,
+                segment_ids=segment_ids,
+            )
+            self._audience_snapshot_repository.consume_run_members(
+                promotion_run_id=run.promotion_run_id,
+                segment_ids=segment_ids,
+            )
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(segment_ids),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
+        except AudienceSnapshotContractError as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_snapshot_binding_invalid",
+                segment_id=",".join(segment_ids),
+                reason=str(exc),
+            ) from exc
+
+        experiment_by_segment = {
+            experiment.segment_id: experiment
+            for experiment in experiments.non_fallback
+        }
+        assigned_at = datetime.now(UTC)
+        expires_at = (
+            assigned_at + timedelta(days=request.expires_in_days)
+            if request.expires_in_days is not None
+            else None
+        )
+        page_count = 0
+        processed_count = 0
+        assignment_count = 0
+        conflict_count = 0
+        skipped_existing_count = 0
+        segment_counts: dict[str, int] = {}
+        score_buckets = {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
+        after_user_id: str | None = None
+
+        while True:
+            members = self._audience_snapshot_repository.list_run_members(
+                promotion_run_id=run.promotion_run_id,
+                segment_ids=segment_ids,
+                after_user_id=after_user_id,
+                limit=ASSIGNMENT_PAGE_SIZE,
+            )
+            if not members:
+                break
+            page_count += 1
+            processed_count += len(members)
+            existing_user_ids = (
+                self._user_segment_assignment_repository.list_existing_user_ids(
+                    promotion_run_id=run.promotion_run_id,
+                    user_ids=[member.user_id for member in members],
+                )
+            )
+            skipped_existing_count += len(existing_user_ids)
+            writes: list[UserSegmentAssignmentWrite] = []
+            for member in members:
+                if member.user_id in existing_user_ids:
+                    continue
+                experiment = experiment_by_segment.get(member.segment_id)
+                if experiment is None:
+                    raise SegmentAssignmentValidationError(
+                        "snapshot member references an unknown experiment segment"
+                    )
+                writes.append(
+                    UserSegmentAssignmentWrite(
+                        project_id=run.project_id,
+                        promotion_run_id=run.promotion_run_id,
+                        user_id=member.user_id,
+                        segment_id=member.segment_id,
+                        ad_experiment_id=experiment.ad_experiment_id,
+                        content_id=experiment.content_id,
+                        content_option_id=experiment.content_option_id,
+                        similarity_score=member.behavior_fit_score,
+                        fallback=False,
+                        fallback_reason=None,
+                        assignment_source=AssignmentSource.ANALYSIS_SNAPSHOT.value,
+                        assigned_at=assigned_at,
+                        expires_at=expires_at,
+                    )
+                )
+            inserted = self._user_segment_assignment_repository.insert_many(writes)
+            assignment_count += len(inserted)
+            conflict_count += len(writes) - len(inserted)
+            for record in inserted:
+                segment_counts[record.segment_id] = (
+                    segment_counts.get(record.segment_id, 0) + 1
+                )
+                score_buckets[_similarity_score_bucket(record.similarity_score)] += 1
+            after_user_id = members[-1].user_id
+            if len(members) < ASSIGNMENT_PAGE_SIZE:
+                break
+
+        response = SegmentAssignmentBuildResponse(
+            promotion_run_id=run.promotion_run_id,
+            matching_mode=SNAPSHOT_MATCHING_MODE,
+            vector_version=snapshot_set.vector_version,
+            ann_candidate_limit=0,
+            ann_candidate_count=0,
+            exact_reranked_pair_count=0,
+            page_count=page_count,
+            processed_user_count=processed_count,
+            assignment_count=assignment_count,
+            insert_conflict_count=conflict_count,
+            segment_assignment_counts=segment_counts,
+            batch_has_fallback=False,
+            fallback_count=0,
+            fallback_rate=0.0 if assignment_count else None,
+            fallback_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+            below_threshold_fallback_count=0,
+            no_candidate_fallback_count=0,
+            invalid_user_vector_fallback_count=0,
+            unassigned_count=0,
+            unassigned_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+            below_threshold_unassigned_count=0,
+            no_candidate_unassigned_count=0,
+            invalid_user_vector_unassigned_count=0,
+            similarity_score_buckets=score_buckets,
+            ann_underfilled_user_count=0,
+            ann_applied=False,
+            ann_not_applied_reason="analysis_snapshot_reuse",
+            skipped_existing_count=skipped_existing_count,
+            insufficient_segment_count=0,
+            completion_scope="current_request",
+            assignment_mode=ASSIGNMENT_MODE_ANALYSIS_SNAPSHOT,
+            input_stability="snapshotted",
+            status="completed",
+        )
+        log.info(
+            "analysis_snapshot_assignments_completed",
+            {
+                "response": response.model_dump(mode="json"),
+                "durationMs": duration_ms(started_at),
+            },
+        )
         return response
 
     def _build_match_results(

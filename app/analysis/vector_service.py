@@ -12,11 +12,26 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 VECTOR_DIM = 64
 DEFAULT_VECTOR_VERSION = "v1"
 DECISION_ANALYSIS_VECTOR_SOURCE = "decision_analysis"
+BEHAVIOR_QUERY_VECTOR_SOURCE = "behavior_query"
 FIXTURE_VECTOR_SOURCE = "fixture"
 
 
 class SegmentVectorDataUnavailableError(Exception):
     pass
+
+
+class SegmentVectorConflictError(Exception):
+    def __init__(self, reason: str, *, segment_id: str) -> None:
+        super().__init__(reason)
+        self.segment_id = segment_id
+        self.reason = reason
+
+    def to_detail(self) -> dict[str, str]:
+        return {
+            "code": "segment_vector_semantic_conflict",
+            "segment_id": self.segment_id,
+            "reason": self.reason,
+        }
 
 
 class SegmentVectorStore(Protocol):
@@ -64,6 +79,7 @@ class SegmentVectorBuildRequest:
     segment_id: str
     candidate_user_ids: Sequence[str] = ()
     vector_version: str = DEFAULT_VECTOR_VERSION
+    query_vector: Sequence[float] | None = None
 
 
 @dataclass(frozen=True)
@@ -118,6 +134,16 @@ class SegmentVectorService:
                     "segment vector data unavailable for existing snapshot"
                 )
             _validate_vector(existing.vector_values, existing.vector_dim)
+            if request.query_vector is not None:
+                expected = _l2_normalize(request.query_vector)
+                if (
+                    existing.source != BEHAVIOR_QUERY_VECTOR_SOURCE
+                    or not _vectors_identical(existing.vector_values, expected)
+                ):
+                    raise SegmentVectorConflictError(
+                        "behavior query vector conflicts with the stored analysis snapshot",
+                        segment_id=request.segment_id,
+                    )
             response = SegmentVectorBuildResult(
                 segment_id=existing.segment_id,
                 segment_vector_id=existing.segment_vector_id,
@@ -135,11 +161,15 @@ class SegmentVectorService:
             )
             return response
 
-        reusable = self._segment_vector_repository.get_latest_by_segment(
-            project_id=request.project_id,
-            promotion_id=request.promotion_id,
-            segment_id=request.segment_id,
-            vector_version=request.vector_version,
+        reusable = (
+            None
+            if request.query_vector is not None
+            else self._segment_vector_repository.get_latest_by_segment(
+                project_id=request.project_id,
+                promotion_id=request.promotion_id,
+                segment_id=request.segment_id,
+                vector_version=request.vector_version,
+            )
         )
         if reusable is not None and reusable.source != FIXTURE_VECTOR_SOURCE:
             _validate_vector(reusable.vector_values, reusable.vector_dim)
@@ -149,26 +179,30 @@ class SegmentVectorService:
         else:
             if reusable is not None:
                 log.warn("segment_vector_fixture_reuse_rejected", {"segmentVectorId": reusable.segment_vector_id})
-            candidate_user_ids = _dedupe(request.candidate_user_ids)
-            if not candidate_user_ids:
-                raise SegmentVectorDataUnavailableError(
-                    "segment vector data unavailable: candidate user ids are required"
+            if request.query_vector is not None:
+                source = BEHAVIOR_QUERY_VECTOR_SOURCE
+                normalized_values = _l2_normalize(request.query_vector)
+            else:
+                candidate_user_ids = _dedupe(request.candidate_user_ids)
+                if not candidate_user_ids:
+                    raise SegmentVectorDataUnavailableError(
+                        "segment vector data unavailable: candidate user ids are required"
+                    )
+                user_vectors = self._user_behavior_vector_repository.list_by_user_ids(
+                    project_id=request.project_id,
+                    user_ids=candidate_user_ids,
+                    vector_version=request.vector_version,
                 )
-            user_vectors = self._user_behavior_vector_repository.list_by_user_ids(
-                project_id=request.project_id,
-                user_ids=candidate_user_ids,
-                vector_version=request.vector_version,
-            )
 
-            if not user_vectors:
-                raise SegmentVectorDataUnavailableError(
-                    "segment vector data unavailable: user behavior vectors are required"
-                )
+                if not user_vectors:
+                    raise SegmentVectorDataUnavailableError(
+                        "segment vector data unavailable: user behavior vectors are required"
+                    )
 
-            source = DECISION_ANALYSIS_VECTOR_SOURCE
-            vector_values = _mean_user_vectors(user_vectors)
-            log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
-            normalized_values = _l2_normalize(vector_values)
+                source = DECISION_ANALYSIS_VECTOR_SOURCE
+                vector_values = _mean_user_vectors(user_vectors)
+                log.info("user_vectors_loaded", {"userVectorCount": len(user_vectors)})
+                normalized_values = _l2_normalize(vector_values)
 
         segment_vector_id = _segment_vector_id(
             analysis_id=request.analysis_id,
@@ -230,6 +264,20 @@ def _l2_normalize(vector_values: Sequence[float]) -> list[float]:
     if norm == 0:
         raise ValueError("segment vector must not be a zero vector")
     return [float(value) / norm for value in vector_values]
+
+
+def _vectors_identical(
+    stored: Sequence[float],
+    expected: Sequence[float],
+) -> bool:
+    if len(stored) != len(expected):
+        return False
+    # PostgreSQL arrays may round-trip through Float32 storage. This tolerance
+    # accepts representation noise only, not a semantic query change.
+    return all(
+        math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-7)
+        for left, right in zip(stored, expected)
+    )
 
 
 def _segment_vector_id(
