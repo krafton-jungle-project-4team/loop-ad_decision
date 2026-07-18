@@ -26,6 +26,11 @@ SAFE_VISUAL_DIRECTIONS = (
     "traveler reviewing an accommodation booking on a mobile device",
     "neutral accommodation planning composition",
 )
+SAFE_EMAIL_VISUAL_DIRECTIONS = (
+    "editorial destination story with a hero and two travel sections",
+    "eight accommodation offer cards using verified catalog images",
+    "concise four-accommodation comparison using verified catalog images",
+)
 
 
 @dataclass(frozen=True)
@@ -288,8 +293,14 @@ class GenerationStrategyPlanner:
             if audience_focus
             else "promotion"
         )
-        visual_direction = SAFE_VISUAL_DIRECTIONS[
-            (option_index - 1) % len(SAFE_VISUAL_DIRECTIONS)
+        visual_directions = (
+            SAFE_EMAIL_VISUAL_DIRECTIONS
+            if generation_context.promotion_objective.get("channel")
+            == ContentChannel.EMAIL.value
+            else SAFE_VISUAL_DIRECTIONS
+        )
+        visual_direction = visual_directions[
+            (option_index - 1) % len(visual_directions)
         ]
         return GenerationStrategyPlan(
             strategy_key=(

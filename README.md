@@ -64,6 +64,27 @@ and follow the shared Loop-Ad logging standard from the Dashboard API reference.
 - [외부 데이터셋 세그먼트 추천 검증](docs/external_segment_backtest.md): Airbnb,
   Booking.com, Synerise의 서로 다른 결과 계약으로 추천의 외부 일반화를 검증한다.
 
+### 이메일 3종 로컬 미리보기
+
+V2 handoff bundle을 이용해 설명형·8숙소형·비교형 이메일을 생성·검증한다.
+
+```bash
+.venv/bin/python scripts/render_email_variant_previews.py \
+  --bundle-root "/absolute/path/to/brand-context-handoff-demo_project-v2"
+```
+
+결과는 `artifacts/email-variant-previews/index.html`에서 확인한다. 실행 중
+OpenAI, Gemini, DB, S3를 호출하지 않으며 bundle의 checksum을 검증한다.
+`*.production.html`은 공개 이미지 URL과 placeholder를 보존한 production renderer의
+출력이고, `*.local.html`은 오프라인 미리보기를 위해 이미지만 로컬
+`assets/`로 치환한 복사본이다.
+
+운영 생성에서는 설명형의 독립 프로모션 hero만 Gemini 생성 대상이다.
+8숙소형과 비교형은 검증된 V2 catalog 이미지를 재사용하며, 특정
+숙소 asset이 누락된 경우 사실과 다른 생성 사진으로 대체하지 않고 실패한다.
+Gemini 요청이 여러 개면 최대 3개까지 병렬 실행하며, 팔레트·무드보드·
+콜라주 생성을 금지하고 인물이 필요한 경우 20~39세 성인만 표현하도록 제한한다.
+
 ## Full-source Sealed Evaluation
 
 2026-07-15 평가는 Kaggle Expedia Hotel Recommendations의 `train.csv` 원본 전체를

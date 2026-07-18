@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from app.generation.image_prompt_builder import RichImagePromptBuilder
+from dataclasses import replace
+from types import SimpleNamespace
+
+from app.generation.image_prompt_builder import (
+    MAX_RICH_IMAGE_PROMPT_LENGTH,
+    RichImagePromptBuilder,
+)
 from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionPromptInput,
@@ -35,6 +41,15 @@ def test_rich_image_prompt_uses_verified_context_and_guardrails() -> None:
     assert "확인되지 않은 할인율" in image_prompt
     assert "no visible text" in image_prompt
     assert "do not depict discounts, prices, room inventory" in image_prompt
+    assert "color palette" in image_prompt
+    assert "color swatches" in image_prompt
+    assert "contact sheet" in image_prompt
+    assert "mood board" in image_prompt
+    assert "collage" in image_prompt
+    assert "clearly adult travelers aged 20 to 39" in image_prompt
+    assert "never children, teenagers, middle-aged people, or elderly people" in (
+        image_prompt
+    )
 
 
 def test_rich_image_prompt_ignores_provider_facilities_without_visual_context() -> None:
@@ -54,6 +69,92 @@ def test_rich_image_prompt_ignores_provider_facilities_without_visual_context() 
     assert "rooftop pool" not in image_prompt
     assert "spa" not in image_prompt
     assert "no visible text" in image_prompt
+
+
+def test_rich_image_prompt_hides_raw_brand_colors_and_selected_asset_id() -> None:
+    prompt_result = PromptBuilder().build(
+        prompt_input(
+            hotel_profile={
+                "visual_context": {
+                    "scene": "sunlit coastal hotel exterior",
+                    "style": ["bright", "calm"],
+                }
+            }
+        )
+    )
+    assert prompt_result.generation_context is not None
+    assert prompt_result.strategy_plan is not None
+    selected_asset_id = "brand_asset_private_jeju_hero"
+    brand_context = SimpleNamespace(
+        guardrails=SimpleNamespace(
+            approved_colours=("#0F55C8", "#FFFFFF"),
+            approved_image_styles=("editorial photography",),
+        ),
+        documents=(
+            SimpleNamespace(
+                source_kind="brand_asset",
+                source_id=selected_asset_id,
+                document_text="Calm coastal sunlight.",
+            ),
+        ),
+        selected_asset_id=selected_asset_id,
+    )
+    prompt_result = replace(
+        prompt_result,
+        generation_context=replace(
+            prompt_result.generation_context,
+            brand_context=brand_context,
+        ),
+        strategy_plan=replace(
+            prompt_result.strategy_plan,
+            audience_focus=(),
+            visual_direction=(),
+        ),
+    )
+
+    image_prompt = RichImagePromptBuilder().build(
+        prompt_result,
+        provider_visual_concept="Editorial composition using #0F55C8 accents.",
+    )
+
+    assert "#0F55C8" not in image_prompt
+    assert "#FFFFFF" not in image_prompt
+    assert selected_asset_id not in image_prompt
+    assert "selected_asset_id" not in image_prompt
+    assert "Approved brand visual direction" in image_prompt
+    assert "editorial photography" in image_prompt
+
+
+def test_required_image_guardrails_survive_max_length_compaction() -> None:
+    prompt_result = PromptBuilder().build(
+        prompt_input(
+            hotel_profile={
+                "visual_context": {
+                    "scene": "sunlit coastal hotel travel scene " * 200,
+                    "style": ["premium editorial photography"] * 100,
+                }
+            }
+        )
+    )
+
+    image_prompt = RichImagePromptBuilder().build(
+        prompt_result,
+        provider_visual_concept="cinematic summer travel composition " * 200,
+    )
+
+    assert len(image_prompt) == MAX_RICH_IMAGE_PROMPT_LENGTH == 1200
+    assert "color palette" in image_prompt
+    assert "color swatches" in image_prompt
+    assert "contact sheet" in image_prompt
+    assert "mood board" in image_prompt
+    assert "collage" in image_prompt
+    assert "clearly adult travelers aged 20 to 39" in image_prompt
+    assert "never children, teenagers, middle-aged people, or elderly people" in (
+        image_prompt
+    )
+    assert image_prompt.endswith(
+        "generation constraints=확인되지 않은 할인율, 확인되지 않은 객실 재고."
+    )
 
 
 def prompt_input(*, hotel_profile: dict[str, object]) -> GenerationPromptInput:
