@@ -13,8 +13,8 @@ from fastapi.testclient import TestClient
 from psycopg import errors
 from psycopg import sql
 
+from app.audience_allocation import SegmentAudienceAllocationError
 from app.config import load_settings
-from tests.config_env import required_env_values
 from app.decision.audience_snapshots import AudienceSnapshotRepository
 from app.decision.next_loop_service import (
     NextLoopConflictError,
@@ -53,6 +53,7 @@ from app.generation.service import (
     NextLoopFocusGenerationRequest,
     NextLoopFocusGenerationResult,
 )
+from tests.config_env import required_env_values
 
 
 DEFAULT_ROW = object()
@@ -263,6 +264,35 @@ def test_next_loop_api_maps_service_errors(
     )
 
     assert response.status_code == expected_status
+
+
+def test_next_loop_api_preserves_empty_audience_conflict_detail() -> None:
+    client = make_client(
+        FakeNextLoopService(
+            exc=SegmentAudienceAllocationError(
+                code="segment_audience_allocation_empty",
+                promotion_id="promo_banner_001",
+                segment_id="seg_luxury",
+                reason="confirmation allocation produced zero final users",
+            )
+        )
+    )
+
+    response = client.post(
+        "/decision/v1/promotion-runs/prun_banner_001_loop_1/next-loop",
+        json={
+            "failed_segment_ids": ["seg_luxury"],
+            "failed_ad_experiment_ids": ["adexp_luxury_001"],
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == {
+        "code": "segment_audience_allocation_empty",
+        "promotion_id": "promo_banner_001",
+        "segment_id": "seg_luxury",
+        "reason": "confirmation allocation produced zero final users",
+    }
 
 
 def test_next_loop_api_wires_repositories_and_commits_noop(
