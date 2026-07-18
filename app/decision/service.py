@@ -14,6 +14,7 @@ from app.audience_contract import (
     SEGMENT_AUDIENCE_CONTRACT,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
+    contract_score_threshold,
 )
 from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
@@ -1690,7 +1691,7 @@ def _target_snapshot_matches_compiled(
         semantic_query_vector_hash(compiled),
         compiled.query_compiler_version,
         compiled.query_compiler_hash,
-        Decimal(str(compiled.score_threshold)),
+        contract_score_threshold(compiled.score_threshold),
         compiled.template_id,
         compiled.template_version,
         compiled.template_semantic_hash,
