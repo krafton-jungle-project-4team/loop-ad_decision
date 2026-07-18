@@ -47,6 +47,7 @@ from app.analysis.service import (
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
+    _analysis_id,
     _bounded_next_loop_lineage_id,
 )
 from app.analysis.vector_service import (
@@ -650,6 +651,16 @@ def test_service_creates_new_analysis_id_for_repeated_ai_recommendations() -> No
     assert {
         suggestion.analysis_id for suggestion in second.segment_suggestions
     } == {second.analysis.analysis_id}
+
+
+def test_initial_analysis_id_fits_contract_for_max_length_promotion_id() -> None:
+    analysis_id = _analysis_id(
+        promotion_id="p" * 100,
+        next_loop_context=None,
+    )
+
+    assert len(analysis_id) == 100
+    assert re.fullmatch(r"analysis_p{78}_run_[0-9a-f]{8}", analysis_id)
 
 
 def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:

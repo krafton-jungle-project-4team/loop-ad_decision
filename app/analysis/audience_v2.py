@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.audience_contract import (
@@ -405,6 +405,18 @@ class AudienceV2Coordinator:
             hard_match_user_count=hard_match_count,
             estimated_score_pass_rate=estimated_score_pass_rate,
         )
+        # Final members have passed both the hard predicates and score threshold.
+        # Treat them as an authoritative lower bound when the aggregate pre-count
+        # lags behind the materialized search population.
+        behavior_match_count = max(
+            hard_match_count,
+            search_result.final_user_count,
+        )
+        if behavior_match_count != search_result.hard_match_user_count:
+            search_result = replace(
+                search_result,
+                hard_match_user_count=behavior_match_count,
+            )
         snapshot_id = self._snapshot_repository.save_completed(
             AudienceSnapshotWrite(
                 analysis_id=analysis_id,
@@ -431,7 +443,7 @@ class AudienceV2Coordinator:
             vector_generation_id=context.vector_generation_id,
             vector_version=spec.vector_version,
             total_eligible_user_count=context.corpus_user_count,
-            matching_user_count=hard_match_count,
+            matching_user_count=behavior_match_count,
             selected_user_count=final_user_count,
             selection_method=search_result.method.value,
             estimated_recall=audit.estimated_recall if audit else 1.0,

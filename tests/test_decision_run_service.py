@@ -6,6 +6,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.audience_contract import contract_score_threshold
 from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
     semantic_query_vector_hash,
@@ -123,6 +124,39 @@ def test_run_service_uses_target_contract_and_ignores_analysis_audience_mode() -
     )
 
     assert "audience_scope" not in repos.runs.inserted[0].goal_snapshot_json
+
+
+def test_v2_run_accepts_data_contract_score_threshold_precision() -> None:
+    rule_json = segment_audience_rule_json(candidate_type="benefit_value_seeker")
+    target = target_segment_record(
+        audience_snapshot_id="snapshot_family",
+        rule_json=rule_json,
+    )
+    compiled = compile_registered_segment_audience(
+        segment_id=target.segment_id,
+        rule_json=rule_json,
+    )
+
+    assert target.audience_score_threshold == contract_score_threshold(
+        compiled.score_threshold
+    )
+    assert target.audience_score_threshold != Decimal(
+        str(compiled.score_threshold)
+    )
+
+    service, repos = make_service(target_segments=[target])
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_ids=["seg_family_trip"],
+        ),
+    )
+
+    assert response.segment_ids == ["seg_family_trip"]
+    assert len(repos.runs.inserted) == 1
 
 
 def test_v2_run_requires_explicit_card_source_without_breaking_legacy_fallback() -> None:
@@ -2436,7 +2470,9 @@ def target_segment_record(
             compiled.query_compiler_hash if compiled else None
         ),
         audience_score_threshold=(
-            Decimal(str(compiled.score_threshold)) if compiled else None
+            contract_score_threshold(compiled.score_threshold)
+            if compiled
+            else None
         ),
         audience_metadata_json=(
             _audience_metadata(compiled) if compiled else None
@@ -2444,13 +2480,14 @@ def target_segment_record(
     )
 
 
-def segment_audience_rule_json() -> dict[str, object]:
+def segment_audience_rule_json(
+    *,
+    candidate_type: str = "intent_matched",
+) -> dict[str, object]:
     return {
         "audience_resolution_contract": "segment_audience.v1",
         "segment_audience_spec": dict(
-            RegisteredSegmentAudienceBinder().bind(
-                candidate_type="intent_matched"
-            )
+            RegisteredSegmentAudienceBinder().bind(candidate_type=candidate_type)
         ),
     }
 

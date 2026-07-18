@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping, Sequence
 
 from app.analysis.behavior_manifest import behavior_manifest_hash
@@ -89,6 +90,7 @@ CUSTOM_STRUCTURED_PROPERTY_KEYS = frozenset(
 CUSTOM_STRUCTURED_PROPERTY_OPERATORS = frozenset(
     {"equals", "contains", "exists", "gte", "lte"}
 )
+SCORE_THRESHOLD_QUANTUM = Decimal("0.000001")
 _QUERY_COMPILER_SEMANTICS = {
     "version": SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
     "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
@@ -105,6 +107,14 @@ SEGMENT_AUDIENCE_QUERY_COMPILER_HASH = hashlib.sha256(
         separators=(",", ":"),
     ).encode("utf-8")
 ).hexdigest()
+
+
+def contract_score_threshold(value: float | Decimal) -> Decimal:
+    """Normalize to the NUMERIC(10, 6) precision in the data contract."""
+    return Decimal(str(value)).quantize(
+        SCORE_THRESHOLD_QUANTUM,
+        rounding=ROUND_HALF_UP,
+    )
 
 
 class SegmentAudienceContractError(RuntimeError):

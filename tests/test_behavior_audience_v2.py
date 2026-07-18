@@ -21,6 +21,7 @@ from app.analysis.audience_snapshot_repository import (
     AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
     AudienceSnapshotWrite,
     _input_fingerprint,
+    _spec_fingerprint,
 )
 from app.analysis.behavior_vector_schema import (
     CandidateCalibration,
@@ -551,6 +552,30 @@ def test_coordinator_batches_three_segments_once() -> None:
     assert len(snapshots.writes) == 3
 
 
+def test_coordinator_uses_final_members_as_behavior_match_lower_bound() -> None:
+    search = _BatchCoordinatorSearchRepository(
+        hard_match_count=0,
+        materialized_member_count=2,
+    )
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+        calibration_provider=_TestCalibrationProvider(),
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis",
+        promotion=_analysis_promotion(),
+        segments=(_v2_segment("segment"),),
+    )["segment"]
+
+    assert prepared.matching_user_count == 2
+    assert prepared.selected_user_count == 2
+    assert snapshots.writes[0].search_result.hard_match_user_count == 2
+
+
 def test_six_registered_templates_build_expected_exact_snapshot_members() -> None:
     schema = HotelBookingBehaviorSchemaV2()
     artifact = load_bundled_semantic_selection(segment_id="demo_validation")
@@ -1072,6 +1097,128 @@ def test_snapshot_bulk_copies_materialized_members_without_python_list() -> None
     assert "calibration_hash" in snapshot_insert[0]
 
 
+def test_snapshot_explicit_members_use_postgres_array_parameters() -> None:
+    db = _SnapshotWriteDb(actual_member_count=2)
+    repository = AnalysisAudienceSnapshotRepository(db)
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    spec = HotelBookingBehaviorSchemaV2().compile_candidate(
+        candidate_type="promotion_responsive",
+        intent=_intent(),
+        calibration=CandidateCalibration(0.5, "test.v1"),
+    )
+
+    snapshot_id = repository.save_completed(
+        AudienceSnapshotWrite(
+            analysis_id="analysis",
+            project_id="project",
+            campaign_id="campaign",
+            promotion_id="promotion",
+            segment_id="segment",
+            segment_vector_id="segment_vector",
+            vector_generation_id="uvgen_test",
+            source_cutoff=now,
+            window_start=now - timedelta(days=90),
+            window_end=now,
+            spec=spec,
+            search_result=AudienceSearchResult(
+                method=AudienceSearchMethod.EXACT,
+                members=(
+                    SearchCandidate("user_1", 0.9, 1),
+                    SearchCandidate("user_2", 0.8, 2),
+                ),
+                corpus_user_count=2,
+                hard_match_user_count=2,
+                requested_k=2,
+                recall_audit=None,
+                policy_version="audience_search.v2",
+            ),
+            min_sample_size=1,
+        )
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in db.executed
+        if "FROM unnest(" in query
+    )
+    assert params == (
+        [snapshot_id, snapshot_id],
+        ["user_1", "user_2"],
+        [Decimal("0.9"), Decimal("0.8")],
+        ["exact", "exact"],
+        [1, 2],
+    )
+    assert all(isinstance(value, list) for value in params)
+
+
+def test_snapshot_binding_uses_contract_score_threshold_precision() -> None:
+    segment = _v2_segment("segment", candidate_type="benefit_value_seeker")
+    compiled = compile_registered_segment_audience(
+        segment_id=segment.segment_id,
+        rule_json=segment.rule_json,
+    )
+    stored_score_threshold = Decimal(str(compiled.score_threshold)).quantize(
+        Decimal("0.000001")
+    )
+    assert stored_score_threshold != Decimal(str(compiled.score_threshold))
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    repository = AnalysisAudienceSnapshotRepository(
+        _SnapshotBindingDb(
+            {
+                "snapshot_id": "snapshot",
+                "segment_vector_id": "segment-vector",
+                "vector_generation_id": "generation",
+                "source_cutoff": now,
+                "window_start": now - timedelta(days=90),
+                "window_end": now,
+                "eligible_user_count": 100,
+                "behavior_match_count": 20,
+                "final_user_count": 10,
+                "selection_method": "exact",
+                "estimated_recall": Decimal("1"),
+                "recall_lower_bound": Decimal("1"),
+                "recall_target": Decimal("1"),
+                "meets_min_sample_size": True,
+                "snapshot_status": "completed",
+                "project_id": "project",
+                "campaign_id": "campaign",
+                "promotion_id": "promotion",
+                "segment_id": segment.segment_id,
+                "schema_version": compiled.schema_version,
+                "vector_version": compiled.vector_version,
+                "manifest_hash": compiled.manifest_hash,
+                "calibration_version": compiled.calibration_version,
+                "calibration_hash": compiled.calibration_hash,
+                "audience_resolution_contract": (
+                    compiled.audience_resolution_contract
+                ),
+                "segment_audience_spec_hash": compiled.segment_audience_spec_hash,
+                "query_vector_hash": semantic_query_vector_hash(compiled),
+                "query_compiler_version": compiled.query_compiler_version,
+                "query_compiler_hash": compiled.query_compiler_hash,
+                "score_threshold": stored_score_threshold,
+                "metadata_json": {
+                    "spec_fingerprint": _spec_fingerprint(compiled),
+                },
+                "generation_status": "activated",
+                "generation_is_active": True,
+                "actual_member_count": 10,
+            }
+        )
+    )
+
+    bound = repository.require_binding(
+        snapshot_id="snapshot",
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+        segment_id=segment.segment_id,
+        spec=compiled,
+    )
+
+    assert bound.snapshot_id == "snapshot"
+
+
 def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision() -> None:
     now = datetime(2026, 7, 17, tzinfo=UTC)
     spec = HotelBookingBehaviorSchemaV2().compile_candidate(
@@ -1157,18 +1304,24 @@ def test_assignment_reuses_preallocated_run_target_snapshots_without_winner_sear
     assert response.matching_mode == "analysis_snapshot_reuse"
     assert response.assignment_mode == "analysis_snapshot"
     assert response.input_stability == "snapshotted"
-    assert response.assignment_count == 2
+    assert response.assignment_count == 3
     assert {row.user_id: row.segment_id for row in assignments.rows} == {
         "user_1": "seg_b",
         "user_2": "seg_a",
+        "user_3": "seg_b",
+    }
+    assert {
+        row.user_id: row.similarity_score for row in assignments.rows
+    } == {
+        "user_1": Decimal("0.900000"),
+        "user_2": Decimal("0.000000"),
+        "user_3": None,
     }
     assert all(
         row.assignment_source == AssignmentSource.ANALYSIS_SNAPSHOT.value
         for row in assignments.rows
     )
     assert snapshots.consume_calls == 1
-
-
 def test_vector_search_sync_is_incremental_and_advances_complete_cutoff() -> None:
     repository = _SyncRepository()
     first = UserBehaviorVectorSearchSyncService(repository).sync(
@@ -1465,9 +1618,16 @@ class _TestCalibrationProvider:
 
 
 class _BatchCoordinatorSearchRepository:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        hard_match_count: int = 10,
+        materialized_member_count: int = 2,
+    ) -> None:
         self.batch_call_count = 0
         self.individual_call_count = 0
+        self.hard_match_count = hard_match_count
+        self.materialized_member_count = materialized_member_count
         now = datetime(2026, 7, 16, tzinfo=UTC)
         self.context = AudienceSearchContext(
             vector_generation_id="uvgen_active",
@@ -1483,17 +1643,19 @@ class _BatchCoordinatorSearchRepository:
 
     def count_hard_matches_batch(self, *, requests, **_kwargs: object):
         self.batch_call_count += 1
-        return {request.segment_id: 10 for request in requests}
+        return {
+            request.segment_id: self.hard_match_count for request in requests
+        }
 
     def count_hard_matches(self, **_kwargs: object) -> int:
         self.individual_call_count += 1
-        return 10
+        return self.hard_match_count
 
     def estimate_score_pass_rate(self, **_kwargs: object) -> float:
         return 0.5
 
     def materialize_exact_members(self, **_kwargs: object) -> int:
-        return 2
+        return self.materialized_member_count
 
 
 class _SemanticCorpusSearchRepository:
@@ -1689,16 +1851,28 @@ class _SearchSqlPostgres:
 
 
 class _SnapshotWriteDb:
-    def __init__(self) -> None:
+    def __init__(self, *, actual_member_count: int = 800) -> None:
+        self.actual_member_count = actual_member_count
         self.executed: list[tuple[str, tuple[object, ...]]] = []
 
     def fetchone(self, query: str, _params: object = ()):
         if "SELECT count(*) AS actual_member_count" in query:
-            return {"actual_member_count": 800}
+            return {"actual_member_count": self.actual_member_count}
         return None
 
     def execute(self, query: str, params: object = ()) -> None:
         self.executed.append((query, tuple(params)))
+
+
+class _SnapshotBindingDb:
+    def __init__(self, row: dict[str, object]) -> None:
+        self.row = row
+
+    def fetchone(self, _query: str, _params: object = ()) -> dict[str, object]:
+        return self.row
+
+    def execute(self, _query: str, _params: object = ()) -> None:
+        raise AssertionError("snapshot binding validation must be read-only")
 
 
 class _RunReader:
@@ -1740,7 +1914,8 @@ class _SnapshotReader:
         # Final allocation snapshots are already mutually exclusive.
         return [
             AudienceSnapshotMember("user_1", "seg_b", Decimal("0.9")),
-            AudienceSnapshotMember("user_2", "seg_a", Decimal("0.8")),
+            AudienceSnapshotMember("user_2", "seg_a", Decimal("-0.25")),
+            AudienceSnapshotMember("user_3", "seg_b", None),
         ]
 
 

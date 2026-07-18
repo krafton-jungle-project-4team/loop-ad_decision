@@ -1776,7 +1776,12 @@ def _analysis_id(
     next_loop_context: NextLoopAnalysisContext | None,
 ) -> str:
     if next_loop_context is None:
-        return f"analysis_{promotion_id}_run_{uuid.uuid4().hex[:8]}"
+        suffix = f"_run_{uuid.uuid4().hex[:8]}"
+        max_promotion_id_length = 100 - len("analysis_") - len(suffix)
+        bounded_promotion_id = (
+            promotion_id[:max_promotion_id_length].rstrip("_") or "promotion"
+        )
+        return f"analysis_{bounded_promotion_id}{suffix}"
     return _bounded_next_loop_lineage_id(
         prefix="analysis",
         promotion_id=promotion_id,
