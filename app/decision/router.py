@@ -218,6 +218,11 @@ def get_segment_assignment_service(
             ),
             reranker=SegmentCandidateReranker(),
             audience_snapshot_repository=AudienceSnapshotRepository(executor),
+            promotion_analysis_repository=PromotionAnalysisRepository(executor),
+            promotion_evaluation_repository=PromotionEvaluationRepository(executor),
+            evaluation_metric_repository=EvaluationMetricRepository(
+                clickhouse_client
+            ),
         )
         connection.commit()
     except Exception:

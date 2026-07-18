@@ -9,6 +9,7 @@ from decimal import Decimal
 from typing import Any, Literal, Mapping, Protocol, Sequence
 
 from app.audience_contract import (
+    LEGACY_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_CONTRACT,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
@@ -694,10 +695,8 @@ class PromotionAnalysisService:
             candidate.definition
             for candidate in selected_candidates
             if audience_resolutions[candidate.segment_id].is_v2
-            and (
-                refresh_segment_suggestions
-                or next_loop_context is not None
-            )
+            and refresh_segment_suggestions
+            and next_loop_context is None
         ]
         v2_segments_to_reuse = [
             candidate.definition
@@ -725,19 +724,6 @@ class PromotionAnalysisService:
             and self._audience_v2_coordinator is not None
             else {}
         )
-        if (
-            v2_segments_to_prepare
-            and persist_target_segments
-            and next_loop_context is not None
-        ):
-            prepared_v2.update(
-                self._allocate_recommendation_audiences(
-                    analysis_id=analysis_id,
-                    promotion=promotion,
-                    segments=v2_segments_to_prepare,
-                    source_analysis_id=analysis_id,
-                )
-            )
         if v2_segments_to_reuse and self._audience_v2_coordinator is not None:
             prepared_v2.update(
                 self._allocate_recommendation_audiences(
@@ -756,8 +742,8 @@ class PromotionAnalysisService:
                 and (
                     refresh_segment_suggestions
                     or persist_target_segments
-                    or next_loop_context is not None
                 )
+                and next_loop_context is None
             )
             audience_v2 = (
                 prepared_v2.get(candidate.segment_id)
@@ -782,6 +768,19 @@ class PromotionAnalysisService:
                 status=target_status,
                 segment_vector_id=segment_vector_id,
             )
+            if next_loop_context is not None and is_v2_candidate:
+                retry_rule_json = dict(target_segment.rule_json)
+                retry_rule_json.pop("segment_audience_spec", None)
+                retry_rule_json["audience_resolution_contract"] = (
+                    LEGACY_AUDIENCE_CONTRACT
+                )
+                retry_rule_json["next_loop_audience_source"] = (
+                    "failed_source_assignments"
+                )
+                target_segment = replace(
+                    target_segment,
+                    rule_json=retry_rule_json,
+                )
             if audience_v2 is not None:
                 evidence = dict(target_segment.data_evidence_json)
                 candidate_generation_user_count = int(

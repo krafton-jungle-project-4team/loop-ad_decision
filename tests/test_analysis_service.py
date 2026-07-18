@@ -1156,7 +1156,7 @@ def test_v2_confirmation_rejects_missing_recommendation_snapshot() -> None:
     assert coordinator.prepare_many_calls == 0
 
 
-def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None:
+def test_v2_next_loop_uses_failed_source_assignments_without_reallocation() -> None:
     promotion = promotion_record(channel="onsite_banner")
     segment_id = "seg_ai_next_loop_funnel"
     segment = _v2_ai_segment(
@@ -1188,11 +1188,14 @@ def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None
     )
 
     target = result.target_segments[0]
-    assert target.audience_snapshot_id == f"final_snapshot_{segment_id}"
-    assert target.allocation_plan_id == "allocation_test"
-    assert allocation_service.confirm_calls[0]["source_analysis_id"] == (
-        result.analysis.analysis_id
+    assert target.audience_snapshot_id is None
+    assert target.allocation_plan_id is None
+    assert target.rule_json["audience_resolution_contract"] == "legacy"
+    assert target.rule_json["next_loop_audience_source"] == (
+        "failed_source_assignments"
     )
+    assert allocation_service.confirm_calls == []
+    assert coordinator.prepare_many_calls == []
     assert analysis_repository.saved.target_segments == result.target_segments
 
 
