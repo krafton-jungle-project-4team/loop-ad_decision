@@ -1242,12 +1242,12 @@ def make_preparation_activation_service(
                 target_segment_record(
                     analysis_id="analysis_banner_loop_2",
                     segment_id="seg_family_trip",
-                    status="approved",
+                    status="planned",
                 ),
                 target_segment_record(
                     analysis_id="analysis_banner_loop_2",
                     segment_id="seg_mobile_user",
-                    status="approved",
+                    status="planned",
                 ),
             ]
         ),
@@ -1291,6 +1291,68 @@ def test_v2_preparation_activation_binds_final_snapshots_before_activation() -> 
     }
     assert repos.preparations.record is not None
     assert repos.preparations.record.status == "activated"
+    assert repos.target_segments.status_updates == []
+
+
+def test_preparation_activation_approves_planned_target_segments() -> None:
+    service, repos = make_preparation_activation_service()
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
+    assert repos.target_segments.status_updates == [
+        ("analysis_banner_loop_2", "seg_family_trip", "approved"),
+        ("analysis_banner_loop_2", "seg_mobile_user", "approved"),
+    ]
+    assert {segment.status for segment in repos.target_segments.segments} == {
+        "approved"
+    }
+
+
+def test_preparation_activation_rejects_non_approvable_target_segment() -> None:
+    targets = [
+        target_segment_record(
+            analysis_id="analysis_banner_loop_2",
+            segment_id="seg_family_trip",
+            status="rejected",
+        ),
+        target_segment_record(
+            analysis_id="analysis_banner_loop_2",
+            segment_id="seg_mobile_user",
+            status="planned",
+        ),
+    ]
+    service, repos = make_preparation_activation_service(target_segments=targets)
+
+    with pytest.raises(RunValidationError, match="segment_ids"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.target_segments.status_updates == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_rejects_concurrent_target_status_change() -> None:
+    service, repos = make_preparation_activation_service()
+    repos.target_segments.transition_status = (  # type: ignore[method-assign]
+        lambda **_kwargs: False
+    )
+
+    with pytest.raises(RunConflictError, match="status changed"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.target_segments.status_updates == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
 
 
 def test_preparation_activation_is_disabled_by_default_without_writes() -> None:
@@ -1437,6 +1499,7 @@ def test_preparation_activation_rejects_invalid_generation_candidate_scope(
     assert repos.runs.inserted == []
     assert repos.ad_experiments.inserted_batches == []
     assert repos.preparations.activated_calls == []
+    assert repos.target_segments.status_updates == []
 
 
 @pytest.mark.parametrize(
@@ -1968,6 +2031,7 @@ class FakePromotionTargetSegmentRepository:
         self.segments = segments
         self.calls: list[str] = []
         self.approved_calls: list[tuple[str, list[str] | None]] = []
+        self.status_updates: list[tuple[str, str, str]] = []
 
     def list_for_analysis(
         self,
@@ -1999,6 +2063,37 @@ class FakePromotionTargetSegmentRepository:
             and segment.segment_id in requested_ids
             and segment.status == "approved"
         ]
+
+    def transition_status(
+        self,
+        *,
+        analysis_id: str,
+        segment_id: str,
+        expected_status: str,
+        next_status: str,
+    ) -> bool:
+        matching_segment = next(
+            (
+                segment
+                for segment in self.segments
+                if segment.analysis_id == analysis_id
+                and segment.segment_id == segment_id
+                and segment.status == expected_status
+            ),
+            None,
+        )
+        if matching_segment is None:
+            return False
+        self.status_updates.append((analysis_id, segment_id, next_status))
+        self.segments = [
+            replace(segment, status=next_status)
+            if segment.analysis_id == analysis_id
+            and segment.segment_id == segment_id
+            else segment
+            for segment in self.segments
+        ]
+        return True
+
 
 class FakeContentCandidateRepository:
     def __init__(self, candidates: list[ContentCandidateRecord]) -> None:

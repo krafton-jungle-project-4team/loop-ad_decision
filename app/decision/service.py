@@ -552,6 +552,7 @@ class PromotionRunService:
             analysis,
             promotion,
             segment_ids=expected_segment_ids,
+            allow_planned=True,
         )
         audience_contract = _require_uniform_target_audience_contract(
             target_segments
@@ -578,6 +579,12 @@ class PromotionRunService:
             preparation=preparation,
             source_run=source_run,
             promotion=promotion,
+        )
+        self._approve_planned_target_segments(target_segments)
+        target_segments = self._load_target_segments(
+            analysis,
+            promotion,
+            segment_ids=expected_segment_ids,
         )
 
         promotion_run_id = build_promotion_run_id(
@@ -1071,13 +1078,31 @@ class PromotionRunService:
         *,
         segment_ids: Sequence[str] | None,
         explicit_source: bool = False,
+        allow_planned: bool = False,
     ) -> list[PromotionTargetSegmentRecord]:
-        target_segments = (
-            self._promotion_target_segment_repository.list_approved_for_analysis(
-                analysis.analysis_id,
-                segment_ids,
+        if allow_planned:
+            requested_segment_ids = set(segment_ids or ())
+            analysis_target_segments = (
+                self._promotion_target_segment_repository.list_for_analysis(
+                    analysis.analysis_id
+                )
             )
-        )
+            target_segments = [
+                segment
+                for segment in analysis_target_segments
+                if segment.status in {"approved", "planned"}
+                and (
+                    segment_ids is None
+                    or segment.segment_id in requested_segment_ids
+                )
+            ]
+        else:
+            target_segments = (
+                self._promotion_target_segment_repository.list_approved_for_analysis(
+                    analysis.analysis_id,
+                    segment_ids,
+                )
+            )
         target_segments = [
             segment
             for segment in target_segments
@@ -1130,6 +1155,24 @@ class PromotionRunService:
                 "segment_ids must match approved promotion_target_segments"
             )
         return target_segments
+
+    def _approve_planned_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
+    ) -> None:
+        for segment in target_segments:
+            if segment.status != "planned":
+                continue
+            transitioned = self._promotion_target_segment_repository.transition_status(
+                analysis_id=segment.analysis_id,
+                segment_id=segment.segment_id,
+                expected_status="planned",
+                next_status="approved",
+            )
+            if not transitioned:
+                raise RunConflictError(
+                    "next-loop target segment status changed during activation"
+                )
 
     def _validate_generation_segment_snapshot(
         self,

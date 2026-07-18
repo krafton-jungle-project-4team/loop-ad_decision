@@ -393,6 +393,46 @@ def test_target_segment_repository_lists_all_approved_records_when_ids_omitted()
     assert call.params == ("analysis_banner_001",)
 
 
+def test_target_segment_repository_transitions_only_expected_status() -> None:
+    db = FakePostgresExecutor(fetchone_result={"status": "approved"})
+    repo = PromotionTargetSegmentRepository(db)
+
+    transitioned = repo.transition_status(
+        analysis_id="analysis_banner_001",
+        segment_id="seg_family_trip",
+        expected_status="planned",
+        next_status="approved",
+    )
+
+    assert transitioned is True
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "fetchone"
+    assert "update promotion_target_segments" in sql
+    assert "and status = %s" in sql
+    assert "returning status" in sql
+    assert call.params == (
+        "approved",
+        "analysis_banner_001",
+        "seg_family_trip",
+        "planned",
+    )
+
+
+def test_target_segment_repository_reports_failed_status_transition() -> None:
+    db = FakePostgresExecutor(fetchone_result=None)
+    repo = PromotionTargetSegmentRepository(db)
+
+    transitioned = repo.transition_status(
+        analysis_id="analysis_banner_001",
+        segment_id="seg_family_trip",
+        expected_status="planned",
+        next_status="approved",
+    )
+
+    assert transitioned is False
+
+
 def test_content_candidate_repository_lists_approved_or_active_with_segment_keys() -> None:
     db = FakePostgresExecutor(
         fetchall_result=[
