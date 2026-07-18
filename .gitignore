@@ -12,6 +12,7 @@ venv/
 .env
 .env.local
 .env.*.local
+*.md
 artifacts/
 evaluation_manifests/**/*.execution-started.json
 evaluation_manifests/**/*.execution-started.json.lock
