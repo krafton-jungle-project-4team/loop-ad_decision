@@ -7,6 +7,7 @@ import pytest
 
 from app.generation.prompt_builder import (
     GenerationPromptInput,
+    PromotionOfferLink,
     PromotionPromptInput,
     TargetSegmentPromptInput,
 )
@@ -252,6 +253,60 @@ def test_submit_persists_requested_row_before_commit_and_wake() -> None:
         "seg_repeat_hotel_no_booking"
     ]
     assert len(record.request_fingerprint or "") == 64
+
+
+def test_generation_snapshot_preserves_offer_links_and_verified_catalog() -> None:
+    promotion = replace(
+        promotion_input(),
+        channel=ContentChannel.EMAIL,
+        offer_links=(
+            PromotionOfferLink(
+                offer_id="jeju-ocean-breeze-006",
+                destination_url=(
+                    "https://demo-shoppingmall.dev.loop-ad.org/"
+                    "hotel/jeju-ocean-breeze-006"
+                ),
+            ),
+        ),
+    )
+    offer_catalog = {
+        "schema_version": "stayloop.promotion-price-catalog.v1",
+        "catalog_id": "black-friday-hotels",
+        "catalog_version": "v2",
+        "hotels": [
+            {
+                "offer_id": "jeju-ocean-breeze-006",
+                "hotel_name": "Jeju Ocean Breeze Resort",
+                "destination_id": "jeju",
+                "currency": "KRW",
+                "sale_price_per_night": 278000,
+                "original_price_per_night": 342000,
+                "discount_rate_percent": 19,
+                "image_path": "/stayloop/promotions/jeju-resort-exterior.png",
+                "asset_id": "hotel-jeju-ocean-breeze-006-hero",
+            }
+        ],
+    }
+
+    snapshot = build_generation_input_snapshot(
+        request=generation_request(content_option_count=3),
+        promotion=promotion,
+        target_segments=[target_segment_input()],
+        offer_catalog=offer_catalog,
+    )
+    prompt_inputs = prompt_inputs_from_snapshot(snapshot)
+
+    assert snapshot["promotion"]["offer_links"] == (
+        {
+            "offer_id": "jeju-ocean-breeze-006",
+            "destination_url": (
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                "hotel/jeju-ocean-breeze-006"
+            ),
+        },
+    )
+    assert prompt_inputs[0].promotion.offer_links == promotion.offer_links
+    assert prompt_inputs[0].offer_catalog == offer_catalog
 
 
 def test_submit_rejects_reserved_internal_idempotency_key_prefix() -> None:

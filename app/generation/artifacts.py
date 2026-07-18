@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Mapping, Protocol
 from urllib.parse import urlsplit
 
+from app.generation.email_variants import (
+    OFFER_CARDS_VARIANT,
+    email_required_placeholders,
+)
 from app.generation.schemas import ContentChannel, CreativeFormat
 
 
@@ -289,11 +293,9 @@ def source_for_channel(
             "subject": required_value(content_values, "subject"),
             "preheader": required_value(content_values, "preheader"),
             "text_body": required_value(content_values, "body"),
-            "required_placeholders": [
-                "{{redirect_url}}",
-                "{{open_pixel_url}}",
-                "{{unsubscribe_url}}",
-            ],
+            "required_placeholders": list(
+                email_required_placeholders(content_values)
+            ),
         }
     if channel == ContentChannel.SMS:
         return {
@@ -518,6 +520,8 @@ def render_creative_html(
 
 
 def render_email_html(content_values: Mapping[str, str | None]) -> str:
+    if content_values.get("variant_type") == OFFER_CARDS_VARIANT:
+        return render_offer_cards_email(content_values)
     subject = html.escape(required_value(content_values, "subject"))
     preheader = html.escape(required_value(content_values, "preheader"))
     body = html.escape(required_value(content_values, "body"))
@@ -578,8 +582,149 @@ def render_email_html(content_values: Mapping[str, str | None]) -> str:
         channel=ContentChannel.EMAIL,
         html_body=html_body,
         image_url=image_url,
+        content_values=content_values,
     )
     return html_body
+
+
+def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
+    subject = html.escape(required_value(content_values, "subject"))
+    preheader = html.escape(required_value(content_values, "preheader"))
+    body = html.escape(required_value(content_values, "body"))
+    cta = html.escape(str(content_values.get("cta") or "프로모션 전체 보기"))
+    image_url = escaped_absolute_image_url(content_values)
+    raw_offers = content_values.get("offers")
+    if not isinstance(raw_offers, list) or not raw_offers:
+        raise ArtifactRenderError("offer card email requires offers")
+    rows: list[str] = []
+    for offset in range(0, len(raw_offers), 2):
+        pair = raw_offers[offset : offset + 2]
+        cells = [
+            _render_offer_card_cell(raw_offer, position=offset + index + 1)
+            for index, raw_offer in enumerate(pair)
+        ]
+        if len(cells) == 1:
+            cells.append(
+                '<td width="50%" valign="top" style="width:50%;padding:7px;"></td>'
+            )
+        rows.extend(
+            [
+                "              <tr>",
+                *cells,
+                "              </tr>",
+            ]
+        )
+    html_body = "\n".join(
+        [
+            "<!doctype html>",
+            '<html lang="ko">',
+            "<head>",
+            '  <meta charset="utf-8">',
+            '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+            f"  {_creative_source_meta(ContentChannel.EMAIL, content_values)}",
+            f"  <title>{subject}</title>",
+            "</head>",
+            '<body style="margin:0;padding:0;background:#eef3fb;font-family:Arial,Helvetica,sans-serif;color:#10233f;">',
+            f'  <div style="display:none;max-height:0;max-width:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>',
+            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#eef3fb;">',
+            "    <tr>",
+            '      <td align="center" style="padding:24px 10px;">',
+            '        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse;background:#ffffff;border-radius:18px;overflow:hidden;">',
+            "          <tr>",
+            '            <td style="padding:15px 24px;font-size:12px;line-height:18px;color:#66758a;">STAYLOOP · 광고</td>',
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:0;">',
+            f'              <img src="{image_url}" width="600" alt="{subject}" style="display:block;width:100%;max-width:600px;height:auto;border:0;line-height:100%;outline:none;text-decoration:none;" />',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:26px 28px 12px;text-align:center;">',
+            f'              <h1 style="margin:0 0 10px;font-size:28px;line-height:36px;color:#10233f;">{subject}</h1>',
+            f'              <p style="margin:0;font-size:15px;line-height:24px;color:#53657d;">{body}</p>',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:5px 13px 18px;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;">',
+            *rows,
+            "              </table>",
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td align="center" style="padding:0 28px 30px;">',
+            f'              <a href="{{{{redirect_url}}}}" style="display:inline-block;padding:14px 26px;border-radius:8px;background:#1668e3;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-decoration:none;">{cta}</a>',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:18px 24px;border-top:1px solid #e5eaf1;font-size:12px;line-height:18px;color:#718096;text-align:center;">',
+            '              표시된 금액은 1객실 1박 기준입니다. 본 메일은 광고성 정보입니다.<br>수신을 원하지 않으면 <a href="{{unsubscribe_url}}" style="color:#53657d;text-decoration:underline;">수신 거부</a>를 선택하세요.',
+            "            </td>",
+            "          </tr>",
+            "        </table>",
+            "      </td>",
+            "    </tr>",
+            "  </table>",
+            '  <img src="{{open_pixel_url}}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;" />',
+            "</body>",
+            "</html>",
+        ]
+    )
+    validate_rendered_creative(
+        channel=ContentChannel.EMAIL,
+        html_body=html_body,
+        image_url=image_url,
+        content_values=content_values,
+    )
+    return html_body
+
+
+def _render_offer_card_cell(raw_offer: object, *, position: int) -> str:
+    if not isinstance(raw_offer, Mapping):
+        raise ArtifactRenderError("offer card entry must be an object")
+    hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
+    destination = html.escape(_destination_label(raw_offer.get("destination_id")))
+    image_url = escaped_absolute_url(
+        required_value(raw_offer, "image_url"),
+        label="offer image_url",
+    )
+    placeholder = required_value(raw_offer, "redirect_placeholder")
+    expected_placeholder = f"{{{{offer_redirect_url_{position}}}}}"
+    if placeholder != expected_placeholder:
+        raise ArtifactRenderError("offer redirect placeholder order is invalid")
+    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
+    original_price = _optional_won_price(raw_offer.get("original_price_per_night"))
+    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
+    badge = (
+        f'<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#e8f1ff;color:#0f55c8;font-size:11px;font-weight:700;">{discount_rate} 할인</span>'
+        if discount_rate
+        else '<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#edf2f7;color:#53657d;font-size:11px;font-weight:700;">특별가</span>'
+    )
+    original_html = (
+        f'<span style="margin-left:6px;color:#8896a8;font-size:12px;text-decoration:line-through;">{original_price}</span>'
+        if original_price
+        else ""
+    )
+    return "\n".join(
+        [
+            '<td width="50%" valign="top" style="width:50%;padding:7px;">',
+            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;border:1px solid #dfe6ef;border-radius:12px;overflow:hidden;">',
+            "    <tr>",
+            f'      <td><img src="{image_url}" width="260" alt="{hotel_name}" style="display:block;width:100%;height:150px;object-fit:cover;border:0;" /></td>',
+            "    </tr>",
+            "    <tr>",
+            '      <td style="padding:14px 14px 16px;">',
+            f'        <div style="margin-bottom:7px;">{badge}</div>',
+            f'        <strong style="display:block;min-height:42px;font-size:15px;line-height:21px;color:#10233f;">{hotel_name}</strong>',
+            f'        <span style="display:block;margin:4px 0 12px;font-size:12px;line-height:18px;color:#718096;">{destination}</span>',
+            f'        <div style="margin-bottom:12px;"><strong style="color:#e74773;font-size:18px;">{sale_price}</strong>{original_html}<span style="color:#718096;font-size:11px;"> / 박</span></div>',
+            f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#1668e3;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">숙소 확인하기</a>',
+            "      </td>",
+            "    </tr>",
+            "  </table>",
+            "</td>",
+        ]
+    )
 
 
 def render_banner_html(content_values: Mapping[str, str | None]) -> str:
@@ -632,6 +777,7 @@ def render_banner_html(content_values: Mapping[str, str | None]) -> str:
         channel=ContentChannel.ONSITE_BANNER,
         html_body=html_body,
         image_url=image_url,
+        content_values=content_values,
     )
     return html_body
 
@@ -937,11 +1083,55 @@ def escaped_absolute_image_url(
     return html.escape(image_url, quote=True)
 
 
+def escaped_absolute_url(value: str, *, label: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ArtifactRenderError(f"{label} must be an absolute HTTPS URL")
+    if parsed.username or parsed.password:
+        raise ArtifactRenderError(f"{label} must not contain credentials")
+    return html.escape(value, quote=True)
+
+
+def _destination_label(value: object) -> str:
+    labels = {"jeju": "제주", "okinawa": "오키나와"}
+    destination_id = str(value or "").strip().casefold()
+    return labels.get(destination_id, destination_id or "추천 여행지")
+
+
+def _won_price(value: object) -> str:
+    try:
+        amount = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactRenderError("offer sale price must be an integer") from exc
+    if amount < 0:
+        raise ArtifactRenderError("offer sale price must not be negative")
+    return f"{amount:,}원"
+
+
+def _optional_won_price(value: object) -> str | None:
+    if value is None:
+        return None
+    return _won_price(value)
+
+
+def _optional_percentage(value: object) -> str | None:
+    if value is None:
+        return None
+    try:
+        percentage = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ArtifactRenderError("offer discount rate must be an integer") from exc
+    if percentage < 0 or percentage > 100:
+        raise ArtifactRenderError("offer discount rate must be between 0 and 100")
+    return f"{percentage}%"
+
+
 def validate_rendered_creative(
     *,
     channel: ContentChannel,
     html_body: str,
     image_url: str,
+    content_values: Mapping[str, Any],
 ) -> None:
     if image_url not in html_body:
         raise ArtifactRenderError("rendered HTML does not reference image_url")
@@ -949,9 +1139,7 @@ def validate_rendered_creative(
         required_tokens = (
             'role="presentation"',
             'width="600"',
-            "{{redirect_url}}",
-            "{{open_pixel_url}}",
-            "{{unsubscribe_url}}",
+            *email_required_placeholders(content_values),
             "광고",
             "수신 거부",
         )

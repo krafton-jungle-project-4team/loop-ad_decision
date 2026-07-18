@@ -1,5 +1,6 @@
 from datetime import datetime
 from enum import StrEnum
+import re
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -144,7 +145,25 @@ class EmailHtmlSource(BaseModel):
     ) -> tuple[str, ...]:
         legacy = ("{{redirect_url}}", "{{open_pixel_url}}")
         current = (*legacy, "{{unsubscribe_url}}")
-        if placeholders not in {legacy, current}:
+        if placeholders in {legacy, current}:
+            return placeholders
+        if len(placeholders) < 4 or placeholders[0] != "{{redirect_url}}":
+            raise ValueError("email HTML placeholders do not match a supported contract")
+        if placeholders[-2:] != ("{{open_pixel_url}}", "{{unsubscribe_url}}"):
+            raise ValueError("email HTML placeholders do not match a supported contract")
+        offer_placeholders = placeholders[1:-2]
+        expected_offer_placeholders = tuple(
+            f"{{{{offer_redirect_url_{index}}}}}"
+            for index in range(1, len(offer_placeholders) + 1)
+        )
+        if (
+            len(offer_placeholders) > 8
+            or offer_placeholders != expected_offer_placeholders
+            or any(
+                re.fullmatch(r"\{\{offer_redirect_url_[1-8]\}\}", value) is None
+                for value in offer_placeholders
+            )
+        ):
             raise ValueError("email HTML placeholders do not match a supported contract")
         return placeholders
 
