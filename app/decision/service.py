@@ -1355,7 +1355,7 @@ class PromotionRunService:
                 RunAudienceTargetBindingWrite(
                     target_analysis_id=target.analysis_id,
                     segment_id=target.segment_id,
-                    allocation_plan_id=target.allocation_plan_id,
+                    allocation_plan_id=str(target.allocation_plan_id),
                     final_snapshot_id=target.audience_snapshot_id,
                 )
             )
