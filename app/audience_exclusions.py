@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg import errors
@@ -8,6 +9,9 @@ from psycopg import errors
 
 POSTGRES_EXCLUSION_RELATION = "promotion_audience_exclusion_members"
 CLICKHOUSE_EXCLUSION_RELATION = "promotion_audience_exclusion_active"
+CLICKHOUSE_EXCLUSION_PROJECTION_RELATION = (
+    "promotion_audience_exclusion_projection"
+)
 EXCLUSION_REVISION_RELATION = "promotion_audience_exclusion_state"
 CLICKHOUSE_PROJECTION_REVISION_RELATION = (
     "promotion_audience_exclusion_projection_status"
@@ -71,12 +75,27 @@ class PostgresExecutor(Protocol):
     ) -> Mapping[str, Any] | None:
         ...
 
+    def fetchall(
+        self,
+        query: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> list[Mapping[str, Any]]:
+        ...
+
 
 class ClickHouseClient(Protocol):
     def query(
         self,
         query: str,
         parameters: Mapping[str, Any] | None = None,
+    ) -> Any:
+        ...
+
+    def insert(
+        self,
+        table: str,
+        data: Sequence[Sequence[Any]],
+        column_names: Sequence[str],
     ) -> Any:
         ...
 
@@ -147,6 +166,14 @@ class PromotionAudienceExclusionRepository:
             project_id=project_id,
             promotion_id=promotion_id,
         )
+        if projection < revision:
+            projection = self._synchronize_projection(
+                project_id=project_id,
+                campaign_id=campaign_id,
+                promotion_id=promotion_id,
+                revision=revision,
+                excluded_user_count=excluded_user_count,
+            )
         context = PromotionAudienceExclusionContext(
             project_id=project_id,
             campaign_id=campaign_id,
@@ -157,6 +184,82 @@ class PromotionAudienceExclusionRepository:
         )
         context.require_projection_ready()
         return context
+
+    def _synchronize_projection(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        revision: int,
+        excluded_user_count: int,
+    ) -> int:
+        members = self._postgres.fetchall(
+            f"""
+            SELECT
+                user_id,
+                state,
+                revision,
+                coalesce(released_at, consumed_at, reserved_at) AS updated_at
+            FROM {POSTGRES_EXCLUSION_RELATION}
+            WHERE project_id = %s
+              AND promotion_id = %s
+            ORDER BY user_id ASC
+            """,
+            (project_id, promotion_id),
+        )
+        active_member_count = sum(
+            1
+            for member in members
+            if str(member["state"]) in {"reserved", "consumed"}
+        )
+        if active_member_count != excluded_user_count or (revision > 0 and not members):
+            raise SegmentAudienceExclusionError(
+                code="segment_audience_exclusion_projection_not_ready",
+                promotion_id=promotion_id,
+                reason=(
+                    "PostgreSQL exclusion members do not match the current "
+                    "exclusion revision"
+                ),
+            )
+
+        if members:
+            self._clickhouse.insert(
+                table=CLICKHOUSE_EXCLUSION_PROJECTION_RELATION,
+                data=[
+                    (
+                        project_id,
+                        campaign_id,
+                        promotion_id,
+                        str(member["user_id"]),
+                        str(member["state"]),
+                        int(member["revision"]),
+                        member["updated_at"],
+                    )
+                    for member in members
+                ],
+                column_names=(
+                    "project_id",
+                    "campaign_id",
+                    "promotion_id",
+                    "user_id",
+                    "state",
+                    "exclusion_revision",
+                    "updated_at",
+                ),
+            )
+
+        self._clickhouse.insert(
+            table=CLICKHOUSE_PROJECTION_REVISION_RELATION,
+            data=[(project_id, promotion_id, revision, datetime.now(UTC))],
+            column_names=(
+                "project_id",
+                "promotion_id",
+                "applied_revision",
+                "applied_at",
+            ),
+        )
+        return revision
 
     def _load_projection_revision(
         self,
