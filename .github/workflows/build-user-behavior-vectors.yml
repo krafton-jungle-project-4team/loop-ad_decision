@@ -14,7 +14,7 @@ on:
       window_days:
         description: "Source event lookback window in days"
         required: true
-        default: "90"
+        default: "30"
   schedule:
     - cron: "0 * * * *"
 
@@ -31,7 +31,7 @@ jobs:
           LOOPAD_INTERNAL_API_KEY: ${{ secrets.LOOPAD_INTERNAL_API_KEY }}
           PROJECT_ID: ${{ inputs.project_id || 'demo_project' }}
           VECTOR_VERSION: ${{ inputs.vector_version || 'hotel_behavior.v2' }}
-          WINDOW_DAYS: ${{ inputs.window_days || '90' }}
+          WINDOW_DAYS: ${{ inputs.window_days || '30' }}
         run: |
           test -n "$DECISION_API_URL"
           test -n "$LOOPAD_INTERNAL_API_KEY"

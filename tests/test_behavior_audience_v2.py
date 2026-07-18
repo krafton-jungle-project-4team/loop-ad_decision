@@ -754,6 +754,75 @@ def test_materialized_ann_uses_server_side_relation_and_returns_only_count() -> 
     )
 
 
+def test_materialized_exact_members_use_postgres_array_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    postgres = _SearchSqlPostgres(
+        fetchall_results=[
+            [
+                {
+                    "user_id": "user_1",
+                    "behavior_fit_score": 0.9,
+                    "retrieval_rank": 1,
+                },
+                {
+                    "user_id": "user_2",
+                    "behavior_fit_score": 0.8,
+                    "retrieval_rank": 2,
+                },
+            ]
+        ]
+    )
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=_UnusedRepository(),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_filter_hard_predicates",
+        lambda **kwargs: list(kwargs["candidates"]),
+    )
+
+    repository._materialize_hard_filtered_relation(
+        project_id="project",
+        vector_generation_id="uvgen_frozen",
+        vector_version="hotel_behavior.v2",
+        source_cutoff=datetime(2026, 7, 16, tzinfo=UTC),
+        hard_predicate_keys=("promotion_response",),
+        predicate_parameters={},
+        candidate_relation="audience_exact_candidates",
+        member_relation="audience_exact_members",
+        score_threshold=None,
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(" in query
+    )
+    assert params == (["user_1", "user_2"], [0.9, 0.8], [1, 2])
+
+
+def test_temp_user_ids_use_postgres_array_parameters() -> None:
+    postgres = _SearchSqlPostgres()
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=_UnusedRepository(),
+    )
+
+    repository._replace_temp_user_ids(
+        table_name="audience_ann_candidates",
+        user_ids=("user_1", "user_2"),
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(%s::text[])" in query
+    )
+    assert params == (["user_1", "user_2"],)
+
+
 def test_large_search_falls_back_to_exact_when_recall_gate_fails() -> None:
     repository = _SearchRepository(always_miss=True)
     service = CandidateAudienceSearchService(
@@ -1468,16 +1537,21 @@ class _MaterializedSearchRepository:
 
 
 class _SearchSqlPostgres:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fetchall_results: list[list[dict[str, object]]] | None = None,
+    ) -> None:
         self.executed: list[tuple[str, object]] = []
         self.fetchall_calls: list[tuple[str, tuple[object, ...]]] = []
+        self._fetchall_results = list(fetchall_results or [])
 
     def execute(self, query: str, params: object = ()) -> None:
         self.executed.append((query, params))
 
     def fetchall(self, query: str, params: tuple[object, ...]):
         self.fetchall_calls.append((query, params))
-        return []
+        return self._fetchall_results.pop(0) if self._fetchall_results else []
 
     def fetchone(self, query: str, _params: object = ()):
         if "SELECT count(*) AS row_count" in query:
