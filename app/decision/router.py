@@ -20,7 +20,10 @@ from app.audience_allocation import (
     AudienceAllocationService,
     PostgresAudienceAllocationRepository,
 )
-from app.audience_exclusions import PromotionAudienceExclusionRepository
+from app.audience_exclusions import (
+    PromotionAudienceExclusionRepository,
+    SegmentAudienceExclusionError,
+)
 from app.analysis.repositories import (
     HotelProfileRepository as AnalysisHotelProfileRepository,
     PromotionAnalysisRepository as AnalysisPromotionAnalysisRepository,
@@ -575,6 +578,16 @@ async def create_next_loop(
         raise HTTPException(
             status_code=422,
             detail="segment vector data unavailable",
+        ) from exc
+    except SegmentAudienceExclusionError as exc:
+        status_code = (
+            status.HTTP_422_UNPROCESSABLE_CONTENT
+            if exc.code == "segment_audience_exclusion_contract_missing"
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail=exc.to_detail(),
         ) from exc
     except NextLoopConflictError as exc:
         raise HTTPException(

@@ -27,7 +27,10 @@ from app.generation.brand_context import (
     retrieval_snapshot_from_candidate_metadata,
     validate_brand_guardrails,
 )
-from app.generation.email_variants import build_email_creative_extensions
+from app.generation.email_variants import (
+    build_email_creative_extensions,
+    reusable_catalog_image_url,
+)
 from app.generation.generator import (
     CONTENT_GENERATOR_VERSION,
     ContentGenerator,
@@ -945,6 +948,23 @@ class GenerationService:
                 option_index=index,
                 artifact_identity=identity,
             )
+        creative_extensions: dict[str, Any] = {}
+        reused_catalog_image = False
+        if channel == ContentChannel.EMAIL:
+            creative_extensions = build_email_creative_extensions(
+                option_index=index,
+                landing_url=prompt_input.promotion.landing_url,
+                offer_links=prompt_input.promotion.offer_links,
+                offer_catalog=prompt_input.offer_catalog,
+            )
+            catalog_image_url = reusable_catalog_image_url(creative_extensions)
+            if catalog_image_url is not None:
+                generated_content = replace(
+                    generated_content,
+                    image_url=catalog_image_url,
+                    image_artifact=None,
+                )
+                reused_catalog_image = True
         content_values = generated_content.to_record_values(channel)
         validate_brand_guardrails(
             generation_context.brand_context,
@@ -963,27 +983,17 @@ class GenerationService:
             ImageGenerationStatus.NOT_REQUIRED.value
             if channel == ContentChannel.SMS
             else (
-                ImageGenerationStatus.PENDING.value
-                if staged_generation
-                else (
-                    ImageGenerationStatus.COMPLETED.value
-                    if content_values["image_url"]
-                    else ImageGenerationStatus.PENDING.value
-                )
+                ImageGenerationStatus.COMPLETED.value
+                if reused_catalog_image
+                or (not staged_generation and content_values["image_url"])
+                else ImageGenerationStatus.PENDING.value
             )
         )
         render_content_values = _content_values_with_generated_renderer(
             content_values,
             generated_content,
         )
-        creative_extensions: dict[str, Any] = {}
-        if channel == ContentChannel.EMAIL:
-            creative_extensions = build_email_creative_extensions(
-                option_index=index,
-                landing_url=prompt_input.promotion.landing_url,
-                offer_links=prompt_input.promotion.offer_links,
-                offer_catalog=prompt_input.offer_catalog,
-            )
+        if creative_extensions:
             render_content_values.update(creative_extensions)
         creative_metadata = pending_creative_metadata(
             channel=channel,
@@ -1054,7 +1064,11 @@ class GenerationService:
         )
         if checkpoint is not None:
             checkpoint(pending_candidate)
-        if staged_generation and channel != ContentChannel.SMS:
+        if (
+            staged_generation
+            and channel != ContentChannel.SMS
+            and not reused_catalog_image
+        ):
             generated_content = _ensure_staged_image(
                 content_generator=self._content_generator,
                 channel=channel,
@@ -1633,6 +1647,8 @@ def _content_values_with_candidate_renderer(
             "variant_type",
             "link_targets",
             "offers",
+            "featured_offers",
+            "comparison_offers",
             "catalog",
         ):
             field_value = creative.get(field_name)

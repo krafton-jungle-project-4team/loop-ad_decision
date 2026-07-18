@@ -96,6 +96,66 @@ def generation_request(
     )
 
 
+def _email_generation_prompt_input(
+    *,
+    content_option_count: int,
+) -> GenerationPromptInput:
+    request = generation_request(content_option_count=content_option_count)
+    offer_links = tuple(
+        PromotionOfferLink(
+            offer_id=offer_id,
+            destination_url=(
+                f"https://demo-shoppingmall.dev.loop-ad.org/hotel/{offer_id}"
+            ),
+        )
+        for offer_id in (
+            "jeju-ocean-breeze-006",
+            "okinawa-naha-terrace-017",
+        )
+    )
+    catalog_hotels = [
+        {
+            "offer_id": link.offer_id,
+            "hotel_name": f"StayLoop {index}",
+            "destination_id": (
+                "jeju" if link.offer_id.startswith("jeju-") else "okinawa"
+            ),
+            "currency": "KRW",
+            "sale_price_per_night": 100000 + index * 10000,
+            "original_price_per_night": 120000 + index * 10000,
+            "discount_rate_percent": 15,
+            "image_path": f"/stayloop/promotions/hotel-{index}.png",
+            "asset_id": f"hotel-{index}-hero",
+        }
+        for index, link in enumerate(offer_links, start=1)
+    ]
+    return GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.EMAIL,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Promote Jeju and Okinawa hotels.",
+            landing_url=(
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                "promotions/black-friday"
+            ),
+            offer_links=offer_links,
+        ),
+        target_segment=target_segment_input(),
+        offer_catalog={
+            "schema_version": "stayloop.promotion-price-catalog.v1",
+            "catalog_id": "black-friday-hotels",
+            "catalog_version": "v2",
+            "hotels": catalog_hotels,
+        },
+    )
+
+
 def test_generation_service_persists_run_and_content_candidates() -> None:
     generation_run_repository = FakeGenerationRunRepository()
     content_candidate_repository = FakeContentCandidateRepository()
@@ -338,9 +398,20 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
         candidate.metadata_json["creative"]["variant_type"]
         for candidate in result.content_candidates
     ]
-    assert variants == ["offer_cards", "visual_poster", "text_poster"]
-    card_creative = result.content_candidates[0].metadata_json["creative"]
+    assert variants == ["editorial", "offer_cards", "comparison"]
+    editorial_creative = result.content_candidates[0].metadata_json["creative"]
+    assert len(editorial_creative["featured_offers"]) == 2
+    assert editorial_creative["renderer"]["template_version"] == (
+        "email.editorial.v1"
+    )
+    assert editorial_creative["link_targets"] == [
+        {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
+    ]
+    card_creative = result.content_candidates[1].metadata_json["creative"]
     assert len(card_creative["link_targets"]) == 3
+    assert card_creative["renderer"]["template_version"] == (
+        "email.offer-cards.v2"
+    )
     assert card_creative["source"]["required_placeholders"] == [
         "{{redirect_url}}",
         "{{offer_redirect_url_1}}",
@@ -348,10 +419,79 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
         "{{open_pixel_url}}",
         "{{unsubscribe_url}}",
     ]
-    for candidate in result.content_candidates[1:]:
-        assert candidate.metadata_json["creative"]["link_targets"] == [
-            {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
-        ]
+    comparison_creative = result.content_candidates[2].metadata_json["creative"]
+    assert len(comparison_creative["comparison_offers"]) == 2
+    assert comparison_creative["renderer"]["template_version"] == (
+        "email.comparison.v1"
+    )
+    assert comparison_creative["link_targets"] == [
+        {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
+    ]
+
+
+def test_durable_staged_email_reuses_catalog_images_without_extra_generation() -> None:
+    prompt_input = _email_generation_prompt_input(content_option_count=3)
+    generator = ConcurrentEmailStagedContentGenerator(
+        expected_image_candidate_count=1
+    )
+
+    result = GenerationService(content_generator=generator).execute_durable(
+        generation_id="generation_email_catalog_image_reuse",
+        prompt_inputs=[prompt_input],
+    )
+
+    candidates = result.content_candidates
+    assert [
+        candidate.metadata_json["creative"]["variant_type"]
+        for candidate in candidates
+    ] == ["editorial", "offer_cards", "comparison"]
+    assert generator.ensure_image_content_ids == [candidates[0].content_id]
+    assert generator.max_active_images == 1
+
+    catalog_image_url = (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "stayloop/promotions/hotel-1.png"
+    )
+    assert candidates[0].image_url == (
+        f"https://assets.example.test/{candidates[0].content_id}.png"
+    )
+    assert [candidate.image_url for candidate in candidates[1:]] == [
+        catalog_image_url,
+        catalog_image_url,
+    ]
+    assert all(
+        candidate.image_generation_status == "completed"
+        and candidate.artifact_status == "published"
+        for candidate in candidates
+    )
+
+
+def test_durable_staged_email_generates_multiple_editorial_images_in_parallel() -> None:
+    prompt_input = _email_generation_prompt_input(content_option_count=4)
+    generator = ConcurrentEmailStagedContentGenerator(
+        expected_image_candidate_count=2
+    )
+
+    result = GenerationService(content_generator=generator).execute_durable(
+        generation_id="generation_email_parallel_editorial_images",
+        prompt_inputs=[prompt_input],
+    )
+
+    candidates = result.content_candidates
+    assert [
+        candidate.metadata_json["creative"]["variant_type"]
+        for candidate in candidates
+    ] == ["editorial", "offer_cards", "comparison", "editorial"]
+    assert set(generator.ensure_image_content_ids) == {
+        candidates[0].content_id,
+        candidates[3].content_id,
+    }
+    assert generator.max_active_images == 2
+    assert all(
+        candidate.image_generation_status == "completed"
+        and candidate.artifact_status == "published"
+        for candidate in candidates
+    )
 
 
 def test_durable_execution_builds_staged_candidates_in_parallel() -> None:
@@ -2096,6 +2236,73 @@ class ConcurrentStagedContentGenerator:
                     f"https://assets.example.test/{artifact_identity.content_id}.png"
                 ),
                 sha256="d" * 64,
+                bytes=321,
+                content_type="image/png",
+            )
+            return replace(
+                content,
+                image_url=stored.public_url,
+                image_artifact=stored,
+            )
+        finally:
+            with self._lock:
+                self._active_images -= 1
+
+
+class ConcurrentEmailStagedContentGenerator:
+    version = "concurrent-email-staged-test.v1"
+
+    def __init__(self, *, expected_image_candidate_count: int) -> None:
+        self._barrier = threading.Barrier(expected_image_candidate_count)
+        self._lock = threading.Lock()
+        self._active_images = 0
+        self.max_active_images = 0
+        self.ensure_image_content_ids: list[str] = []
+
+    def generate_source(
+        self,
+        *,
+        prompt_input: GenerationPromptInput,
+        prompt_result: PromptBuildResult,
+        option_index: int,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        del prompt_result, artifact_identity
+        return GeneratedContent(
+            subject=f"여름 숙소 추천 {option_index}",
+            preheader="제주와 오키나와 숙소를 확인해보세요.",
+            body="여행 일정에 맞는 숙소와 예약 조건을 비교해보세요.",
+            cta="숙소 보기",
+            image_prompt=(
+                f"hotel image option {option_index}, no visible text"
+            ),
+            landing_url=prompt_input.promotion.landing_url,
+        )
+
+    def ensure_image(
+        self,
+        *,
+        channel: ContentChannel,
+        content: GeneratedContent,
+        artifact_identity: ArtifactIdentity,
+    ) -> GeneratedContent:
+        assert channel == ContentChannel.EMAIL
+        with self._lock:
+            self.ensure_image_content_ids.append(artifact_identity.content_id)
+            self._active_images += 1
+            self.max_active_images = max(
+                self.max_active_images,
+                self._active_images,
+            )
+        try:
+            self._barrier.wait(timeout=5)
+            stored = StoredAsset(
+                storage_key=f"genai/{artifact_identity.content_id}/image.png",
+                public_url=(
+                    f"https://assets.example.test/"
+                    f"{artifact_identity.content_id}.png"
+                ),
+                sha256="e" * 64,
                 bytes=321,
                 content_type="image/png",
             )

@@ -10,6 +10,8 @@ from typing import Any, Iterator, Mapping, Protocol
 from urllib.parse import urlsplit
 
 from app.generation.email_variants import (
+    COMPARISON_VARIANT,
+    EDITORIAL_VARIANT,
     OFFER_CARDS_VARIANT,
     email_required_placeholders,
 )
@@ -27,7 +29,8 @@ BANNER_TEMPLATE_VERSION = "banner.overlay.v1"
 LEGACY_RENDERER_VERSION = "generation.renderer.v1"
 LEGACY_EMAIL_TEMPLATE_VERSION = "email.promotion.v1"
 LEGACY_BANNER_TEMPLATE_VERSION = "banner.overlay.v1"
-CREATIVE_SOURCE_SCHEMA_VERSION = "creative.source.v2"
+CREATIVE_SOURCE_SCHEMA_VERSION = "creative.source.v3"
+PREVIOUS_CREATIVE_SOURCE_SCHEMA_VERSION = "creative.source.v2"
 LEGACY_CREATIVE_SOURCE_SCHEMA_VERSION = "creative.source.v1"
 CREATIVE_SOURCE_META_NAME = "loopad:creative-source"
 RECOVERED_IMAGE_PROMPT_PREFIX = "recovered-sha256:"
@@ -38,6 +41,14 @@ CREATIVE_SOURCE_FIELDS = (
     "body",
     "cta",
     "image_url",
+)
+CREATIVE_CONTRACT_FIELDS = (
+    "variant_type",
+    "link_targets",
+    "offers",
+    "featured_offers",
+    "comparison_offers",
+    "catalog",
 )
 _CREATIVE_SOURCE_META_PATTERN = re.compile(
     rf'<meta name="{re.escape(CREATIVE_SOURCE_META_NAME)}" content="([A-Za-z0-9_-]+)">'
@@ -520,8 +531,13 @@ def render_creative_html(
 
 
 def render_email_html(content_values: Mapping[str, str | None]) -> str:
-    if content_values.get("variant_type") == OFFER_CARDS_VARIANT:
+    variant_type = content_values.get("variant_type")
+    if variant_type == EDITORIAL_VARIANT:
+        return render_editorial_email(content_values)
+    if variant_type == OFFER_CARDS_VARIANT:
         return render_offer_cards_email(content_values)
+    if variant_type == COMPARISON_VARIANT:
+        return render_comparison_email(content_values)
     subject = html.escape(required_value(content_values, "subject"))
     preheader = html.escape(required_value(content_values, "preheader"))
     body = html.escape(required_value(content_values, "body"))
@@ -587,33 +603,212 @@ def render_email_html(content_values: Mapping[str, str | None]) -> str:
     return html_body
 
 
+def render_editorial_email(content_values: Mapping[str, Any]) -> str:
+    subject = html.escape(required_value(content_values, "subject"))
+    preheader = html.escape(required_value(content_values, "preheader"))
+    body = html.escape(required_value(content_values, "body"))
+    cta = html.escape(str(content_values.get("cta") or "여름 프로모션 보기"))
+    image_url = escaped_absolute_image_url(content_values)
+    raw_featured_offers = content_values.get("featured_offers")
+    if not isinstance(raw_featured_offers, list) or not raw_featured_offers:
+        raise ArtifactRenderError("editorial email requires featured_offers")
+    story_sections = [
+        _render_editorial_offer_section(raw_offer, position=index)
+        for index, raw_offer in enumerate(raw_featured_offers, start=1)
+    ]
+    html_body = "\n".join(
+        [
+            "<!doctype html>",
+            '<html lang="ko">',
+            "<head>",
+            '  <meta charset="utf-8">',
+            '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+            f"  {_creative_source_meta(ContentChannel.EMAIL, content_values)}",
+            f"  <title>{subject}</title>",
+            "</head>",
+            '<body style="margin:0;padding:0;background:#eef3fb;font-family:Arial,Helvetica,sans-serif;color:#10233f;">',
+            f'  <div style="display:none;max-height:0;max-width:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>',
+            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#eef3fb;">',
+            "    <tr>",
+            '      <td align="center" style="padding:24px 10px;">',
+            '        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse;background:#ffffff;border-radius:18px;overflow:hidden;">',
+            "          <tr>",
+            '            <td style="padding:18px 28px;font-size:12px;line-height:18px;color:#66758a;"><strong style="color:#0F55C8;font-size:16px;">StayLoop</strong><span style="float:right;">[광고] 여름 여행 큐레이션</span></td>',
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:0;">',
+            f'              <img src="{image_url}" width="600" alt="{subject}" style="display:block;width:100%;max-width:600px;height:auto;border:0;line-height:100%;outline:none;text-decoration:none;" />',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:32px 34px 24px;">',
+            '              <p style="margin:0 0 10px;color:#0F55C8;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;">JEJU · OKINAWA SUMMER EDIT</p>',
+            f'              <h1 style="margin:0 0 14px;font-size:30px;line-height:39px;color:#10233f;">{subject}</h1>',
+            f'              <p style="margin:0;font-size:16px;line-height:27px;color:#53657d;">{body}</p>',
+            "            </td>",
+            "          </tr>",
+            *story_sections,
+            "          <tr>",
+            '            <td style="padding:10px 28px 24px;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#f5f8fc;border-radius:12px;">',
+            "                <tr>",
+            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">🌊 여행의 리듬</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">풍경과 휴식 중 먼저 원하는 여행을 정해보세요.</span></td>',
+            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">📅 조기 예약</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">가격과 할인율을 같은 조건으로 비교하세요.</span></td>',
+            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">💬 추천 기준</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">내 여행 방식에 맞는 숙소를 선택해보세요.</span></td>',
+            "                </tr>",
+            "              </table>",
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td align="center" style="padding:4px 32px 34px;">',
+            '              <h2 style="margin:0 0 8px;font-size:22px;line-height:30px;color:#10233f;">제주와 오키나와, 어디로 떠날까요?</h2>',
+            '              <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#718096;">전체 숙소의 가격과 할인 혜택을 한눈에 비교해보세요.</p>',
+            f'              <a href="{{{{redirect_url}}}}" style="display:block;padding:14px 24px;border-radius:8px;background:#0F55C8;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-align:center;text-decoration:none;">{cta} →</a>',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:18px 24px;border-top:1px solid #e5eaf1;font-size:12px;line-height:18px;color:#718096;text-align:center;">',
+            '              표시된 금액은 1객실 1박 기준입니다. 본 메일은 광고성 정보입니다.<br>수신을 원하지 않으면 <a href="{{unsubscribe_url}}" style="color:#53657d;text-decoration:underline;">수신 거부</a>를 선택하세요.',
+            "            </td>",
+            "          </tr>",
+            "        </table>",
+            "      </td>",
+            "    </tr>",
+            "  </table>",
+            '  <img src="{{open_pixel_url}}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;" />',
+            "</body>",
+            "</html>",
+        ]
+    )
+    validate_rendered_creative(
+        channel=ContentChannel.EMAIL,
+        html_body=html_body,
+        image_url=image_url,
+        content_values=content_values,
+    )
+    return html_body
+
+
+def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
+    if not isinstance(raw_offer, Mapping):
+        raise ArtifactRenderError("editorial featured offer must be an object")
+    hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
+    destination_id = str(raw_offer.get("destination_id") or "").strip().casefold()
+    destination = html.escape(_destination_label(destination_id))
+    image_url = escaped_absolute_url(
+        required_value(raw_offer, "image_url"),
+        label="editorial offer image_url",
+    )
+    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
+    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
+    title, description = _destination_editorial_copy(destination_id)
+    price_copy = f"{sale_price} / 1박"
+    if discount_rate:
+        price_copy = f"{price_copy} · {discount_rate} 할인"
+    image_cell = "\n".join(
+        [
+            '<td width="46%" valign="top" style="width:46%;padding:0;">',
+            f'  <img src="{image_url}" width="276" alt="{hotel_name}" style="display:block;width:100%;height:210px;object-fit:cover;border:0;" />',
+            "</td>",
+        ]
+    )
+    copy_cell = "\n".join(
+        [
+            '<td width="54%" valign="middle" style="width:54%;padding:24px 26px;">',
+            f'  <p style="margin:0 0 8px;color:#0F55C8;font-size:11px;line-height:17px;font-weight:700;letter-spacing:1px;">{position:02d} · {destination}</p>',
+            f'  <h2 style="margin:0 0 10px;font-size:21px;line-height:29px;color:#10233f;">{html.escape(title)}</h2>',
+            f'  <p style="margin:0 0 13px;font-size:14px;line-height:23px;color:#53657d;">{html.escape(description)}</p>',
+            f'  <p style="margin:0;font-size:12px;line-height:19px;color:#718096;"><strong style="color:#10233f;">추천:</strong> {hotel_name}<br>{price_copy}</p>',
+            "</td>",
+        ]
+    )
+    cells = [image_cell, copy_cell] if position % 2 else [copy_cell, image_cell]
+    return "\n".join(
+        [
+            "          <tr>",
+            '            <td style="padding:10px 28px 18px;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#f8fafc;border:1px solid #e5eaf1;border-radius:12px;overflow:hidden;">',
+            "                <tr>",
+            *[f"                  {line}" for cell in cells for line in cell.splitlines()],
+            "                </tr>",
+            "              </table>",
+            "            </td>",
+            "          </tr>",
+        ]
+    )
+
+
+def _destination_editorial_copy(destination_id: str) -> tuple[str, str]:
+    if destination_id == "jeju":
+        return (
+            "바다와 오름 사이, 천천히 시작하는 하루",
+            "제주는 풍경을 따라 움직이는 여행에 잘 어울립니다. "
+            "해안의 여유와 숙소에서 보내는 휴식을 함께 계획해보세요.",
+        )
+    if destination_id == "okinawa":
+        return (
+            "투명한 바다 곁에서, 오래 머무는 휴식",
+            "오키나와에서는 많은 곳을 둘러보기보다 바다 가까운 숙소를 "
+            "중심으로 느긋한 여름 일정을 만들어보세요.",
+        )
+    return (
+        "숙소에서 시작하는 여유로운 여행",
+        "가격과 할인 혜택을 비교하고 내 여행 방식에 맞는 숙소를 찾아보세요.",
+    )
+
+
 def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
     subject = html.escape(required_value(content_values, "subject"))
     preheader = html.escape(required_value(content_values, "preheader"))
     body = html.escape(required_value(content_values, "body"))
     cta = html.escape(str(content_values.get("cta") or "프로모션 전체 보기"))
-    image_url = escaped_absolute_image_url(content_values)
     raw_offers = content_values.get("offers")
     if not isinstance(raw_offers, list) or not raw_offers:
         raise ArtifactRenderError("offer card email requires offers")
+    first_offer = raw_offers[0]
+    if not isinstance(first_offer, Mapping):
+        raise ArtifactRenderError("offer card entry must be an object")
+    image_url = escaped_absolute_url(
+        required_value(first_offer, "image_url"),
+        label="offer image_url",
+    )
+    grouped_offers: dict[str, list[tuple[int, object]]] = {}
+    for original_position, raw_offer in enumerate(raw_offers, start=1):
+        if not isinstance(raw_offer, Mapping):
+            raise ArtifactRenderError("offer card entry must be an object")
+        destination_id = str(raw_offer.get("destination_id") or "").casefold()
+        grouped_offers.setdefault(destination_id, []).append(
+            (original_position, raw_offer)
+        )
     rows: list[str] = []
-    for offset in range(0, len(raw_offers), 2):
-        pair = raw_offers[offset : offset + 2]
-        cells = [
-            _render_offer_card_cell(raw_offer, position=offset + index + 1)
-            for index, raw_offer in enumerate(pair)
-        ]
-        if len(cells) == 1:
-            cells.append(
-                '<td width="50%" valign="top" style="width:50%;padding:7px;"></td>'
-            )
+    for destination_id, destination_offers in grouped_offers.items():
         rows.extend(
             [
                 "              <tr>",
-                *cells,
+                f'                <td colspan="2" style="padding:18px 8px 7px;font-size:20px;line-height:28px;font-weight:700;color:#10233f;">{html.escape(_destination_label(destination_id))} 추천</td>',
                 "              </tr>",
             ]
         )
+        for offset in range(0, len(destination_offers), 2):
+            pair = destination_offers[offset : offset + 2]
+            cells = [
+                _render_offer_card_cell(
+                    raw_offer,
+                    position=original_position,
+                )
+                for original_position, raw_offer in pair
+            ]
+            if len(cells) == 1:
+                cells.append(
+                    '<td width="50%" valign="top" style="width:50%;padding:7px;"></td>'
+                )
+            rows.extend(
+                [
+                    "              <tr>",
+                    *cells,
+                    "              </tr>",
+                ]
+            )
     html_body = "\n".join(
         [
             "<!doctype html>",
@@ -634,12 +829,8 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
             '            <td style="padding:15px 24px;font-size:12px;line-height:18px;color:#66758a;">STAYLOOP · 광고</td>',
             "          </tr>",
             "          <tr>",
-            '            <td style="padding:0;">',
-            f'              <img src="{image_url}" width="600" alt="{subject}" style="display:block;width:100%;max-width:600px;height:auto;border:0;line-height:100%;outline:none;text-decoration:none;" />',
-            "            </td>",
-            "          </tr>",
-            "          <tr>",
-            '            <td style="padding:26px 28px 12px;text-align:center;">',
+            '            <td style="padding:24px 28px 12px;text-align:center;">',
+            '              <p style="margin:0 0 8px;color:#0F55C8;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;">SUMMER STAY COLLECTION</p>',
             f'              <h1 style="margin:0 0 10px;font-size:28px;line-height:36px;color:#10233f;">{subject}</h1>',
             f'              <p style="margin:0;font-size:15px;line-height:24px;color:#53657d;">{body}</p>',
             "            </td>",
@@ -653,7 +844,7 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
             "          </tr>",
             "          <tr>",
             '            <td align="center" style="padding:0 28px 30px;">',
-            f'              <a href="{{{{redirect_url}}}}" style="display:inline-block;padding:14px 26px;border-radius:8px;background:#1668e3;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-decoration:none;">{cta}</a>',
+            f'              <a href="{{{{redirect_url}}}}" style="display:block;padding:14px 26px;border-radius:8px;background:#0F55C8;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-align:center;text-decoration:none;">{cta} →</a>',
             "            </td>",
             "          </tr>",
             "          <tr>",
@@ -718,11 +909,153 @@ def _render_offer_card_cell(raw_offer: object, *, position: int) -> str:
             f'        <strong style="display:block;min-height:42px;font-size:15px;line-height:21px;color:#10233f;">{hotel_name}</strong>',
             f'        <span style="display:block;margin:4px 0 12px;font-size:12px;line-height:18px;color:#718096;">{destination}</span>',
             f'        <div style="margin-bottom:12px;"><strong style="color:#e74773;font-size:18px;">{sale_price}</strong>{original_html}<span style="color:#718096;font-size:11px;"> / 박</span></div>',
-            f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#1668e3;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">숙소 확인하기</a>',
+            f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#0F55C8;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">숙소 확인하기</a>',
             "      </td>",
             "    </tr>",
             "  </table>",
             "</td>",
+        ]
+    )
+
+
+def render_comparison_email(content_values: Mapping[str, Any]) -> str:
+    subject = html.escape(required_value(content_values, "subject"))
+    preheader = html.escape(required_value(content_values, "preheader"))
+    body = html.escape(required_value(content_values, "body"))
+    cta = html.escape(str(content_values.get("cta") or "여름 숙소 비교하기"))
+    raw_comparison_offers = content_values.get("comparison_offers")
+    if not isinstance(raw_comparison_offers, list) or not raw_comparison_offers:
+        raise ArtifactRenderError("comparison email requires comparison_offers")
+    first_offer = raw_comparison_offers[0]
+    if not isinstance(first_offer, Mapping):
+        raise ArtifactRenderError("comparison offer must be an object")
+    image_url = escaped_absolute_url(
+        required_value(first_offer, "image_url"),
+        label="comparison image_url",
+    )
+    destination_positions: dict[str, int] = {}
+    comparison_rows: list[str] = []
+    discount_rates: list[int] = []
+    for raw_offer in raw_comparison_offers:
+        if not isinstance(raw_offer, Mapping):
+            raise ArtifactRenderError("comparison offer must be an object")
+        destination_id = str(raw_offer.get("destination_id") or "").casefold()
+        destination_positions[destination_id] = (
+            destination_positions.get(destination_id, 0) + 1
+        )
+        comparison_rows.append(
+            _render_comparison_offer_row(
+                raw_offer,
+                destination_position=destination_positions[destination_id],
+            )
+        )
+        raw_discount = raw_offer.get("discount_rate_percent")
+        if raw_discount is not None:
+            try:
+                discount_rates.append(int(raw_discount))
+            except (TypeError, ValueError) as exc:
+                raise ArtifactRenderError(
+                    "comparison discount rate must be an integer"
+                ) from exc
+    discount_summary = (
+        f"최대 {max(discount_rates)}% 할인"
+        if discount_rates
+        else "숙소별 특별가"
+    )
+    html_body = "\n".join(
+        [
+            "<!doctype html>",
+            '<html lang="ko">',
+            "<head>",
+            '  <meta charset="utf-8">',
+            '  <meta name="viewport" content="width=device-width, initial-scale=1">',
+            f"  {_creative_source_meta(ContentChannel.EMAIL, content_values)}",
+            f"  <title>{subject}</title>",
+            "</head>",
+            '<body style="margin:0;padding:0;background:#edf2f8;font-family:Arial,Helvetica,sans-serif;color:#ffffff;">',
+            f'  <div style="display:none;max-height:0;max-width:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>',
+            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#edf2f8;">',
+            "    <tr>",
+            '      <td align="center" style="padding:24px 10px;">',
+            '        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse;background:#0d1828;border-radius:18px;overflow:hidden;">',
+            "          <tr>",
+            '            <td style="padding:18px 28px;font-size:12px;line-height:18px;color:#9fb0c7;"><strong style="color:#ffffff;font-size:16px;">StayLoop</strong><span style="float:right;">[광고] SUMMER PICKS</span></td>',
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:34px 34px 28px;text-align:center;background:#111f33;">',
+            '              <p style="margin:0 0 10px;color:#79a9ff;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;">JEJU · OKINAWA</p>',
+            f'              <h1 style="margin:0 0 14px;font-size:31px;line-height:40px;color:#ffffff;">{subject}</h1>',
+            f'              <p style="margin:0 0 12px;font-size:15px;line-height:24px;color:#c7d2e2;">{body}</p>',
+            f'              <p style="margin:0;font-size:14px;line-height:22px;color:#ffffff;">✈️ 인기 여행지&nbsp;&nbsp;·&nbsp;&nbsp;📅 {html.escape(discount_summary)}&nbsp;&nbsp;·&nbsp;&nbsp;🔎 간결한 비교</p>',
+            "            </td>",
+            "          </tr>",
+            *comparison_rows,
+            "          <tr>",
+            '            <td align="center" style="padding:28px 32px 34px;">',
+            '              <h2 style="margin:0 0 8px;font-size:22px;line-height:30px;color:#ffffff;">가격과 위치를 한눈에 비교해보세요</h2>',
+            '              <p style="margin:0 0 18px;font-size:13px;line-height:21px;color:#9fb0c7;">프로모션 페이지에서 전체 숙소와 예약 조건을 확인할 수 있습니다.</p>',
+            f'              <a href="{{{{redirect_url}}}}" style="display:block;padding:14px 24px;border-radius:8px;background:#0F55C8;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-align:center;text-decoration:none;">{cta} →</a>',
+            "            </td>",
+            "          </tr>",
+            "          <tr>",
+            '            <td style="padding:18px 24px;border-top:1px solid #26364d;font-size:12px;line-height:18px;color:#8293aa;text-align:center;">',
+            '              표시된 금액은 1객실 1박 기준입니다. 본 메일은 광고성 정보입니다.<br>수신을 원하지 않으면 <a href="{{unsubscribe_url}}" style="color:#b7c5d8;text-decoration:underline;">수신 거부</a>를 선택하세요.',
+            "            </td>",
+            "          </tr>",
+            "        </table>",
+            "      </td>",
+            "    </tr>",
+            "  </table>",
+            '  <img src="{{open_pixel_url}}" width="1" height="1" alt="" style="display:block;width:1px;height:1px;border:0;" />',
+            "</body>",
+            "</html>",
+        ]
+    )
+    validate_rendered_creative(
+        channel=ContentChannel.EMAIL,
+        html_body=html_body,
+        image_url=image_url,
+        content_values=content_values,
+    )
+    return html_body
+
+
+def _render_comparison_offer_row(
+    raw_offer: Mapping[str, Any],
+    *,
+    destination_position: int,
+) -> str:
+    hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
+    destination = html.escape(
+        _destination_label(raw_offer.get("destination_id"))
+    )
+    image_url = escaped_absolute_url(
+        required_value(raw_offer, "image_url"),
+        label="comparison image_url",
+    )
+    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
+    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
+    price_copy = f"{sale_price} / 1박"
+    if discount_rate:
+        price_copy = f"{price_copy} · {discount_rate} 할인"
+    return "\n".join(
+        [
+            "          <tr>",
+            '            <td style="padding:10px 28px;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#17263a;border:1px solid #293b53;border-radius:12px;overflow:hidden;">',
+            "                <tr>",
+            '                  <td width="46%" valign="middle" style="width:46%;padding:0;">',
+            f'                    <img src="{image_url}" width="250" alt="{hotel_name}" style="display:block;width:100%;height:145px;object-fit:cover;border:0;" />',
+            "                  </td>",
+            '                  <td width="54%" valign="middle" style="width:54%;padding:20px 22px;">',
+            f'                    <p style="margin:0 0 7px;color:#79a9ff;font-size:11px;line-height:17px;font-weight:700;letter-spacing:1px;">{destination.upper()} PICK {destination_position:02d}</p>',
+            f'                    <h3 style="margin:0 0 9px;font-size:18px;line-height:25px;color:#ffffff;">{hotel_name}</h3>',
+            f'                    <p style="margin:0;color:#ffffff;font-size:15px;line-height:23px;font-weight:700;">{price_copy}</p>',
+            "                  </td>",
+            "                </tr>",
+            "              </table>",
+            "            </td>",
+            "          </tr>",
         ]
     )
 
@@ -784,7 +1117,7 @@ def render_banner_html(content_values: Mapping[str, str | None]) -> str:
 
 def _creative_source_meta(
     channel: ContentChannel,
-    content_values: Mapping[str, str | None],
+    content_values: Mapping[str, Any],
 ) -> str:
     values: dict[str, str | None] = {}
     for field_name in CREATIVE_SOURCE_FIELDS:
@@ -806,6 +1139,7 @@ def _creative_source_meta(
             if content_values.get("landing_url")
             else None
         ),
+        "creative_contract_sha256": creative_contract_sha256(content_values),
         "renderer_version": _snapshot_version(
             content_values.get("renderer_version"),
             default=RENDERER_VERSION,
@@ -827,6 +1161,27 @@ def _creative_source_meta(
         f'<meta name="{CREATIVE_SOURCE_META_NAME}" '
         f'content="{encoded.rstrip("=")}">'
     )
+
+
+def creative_contract_sha256(content_values: Mapping[str, Any]) -> str:
+    """Fingerprint variant data without exposing offer destinations in HTML."""
+
+    contract = {
+        field_name: content_values.get(field_name)
+        for field_name in CREATIVE_CONTRACT_FIELDS
+    }
+    try:
+        encoded = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ArtifactRenderError(
+            "creative renderer contract is not JSON-safe"
+        ) from exc
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def content_values_from_rendered_html(
@@ -860,19 +1215,22 @@ def content_values_from_rendered_html(
         "image_prompt_sha256",
         "landing_url_sha256",
     }
-    current_fields = legacy_fields | {
+    previous_fields = legacy_fields | {
         "renderer_version",
         "template_version",
     }
-    expected_fields = (
-        legacy_fields
-        if schema_version == LEGACY_CREATIVE_SOURCE_SCHEMA_VERSION
-        else current_fields
-    )
+    current_fields = previous_fields | {"creative_contract_sha256"}
+    if schema_version == LEGACY_CREATIVE_SOURCE_SCHEMA_VERSION:
+        expected_fields = legacy_fields
+    elif schema_version == PREVIOUS_CREATIVE_SOURCE_SCHEMA_VERSION:
+        expected_fields = previous_fields
+    else:
+        expected_fields = current_fields
     if set(payload) != expected_fields:
         raise ArtifactRenderError("rendered HTML creative source shape is invalid")
     if schema_version not in {
         LEGACY_CREATIVE_SOURCE_SCHEMA_VERSION,
+        PREVIOUS_CREATIVE_SOURCE_SCHEMA_VERSION,
         CREATIVE_SOURCE_SCHEMA_VERSION,
     }:
         raise ArtifactRenderError("rendered HTML creative source version is invalid")
@@ -917,6 +1275,20 @@ def content_values_from_rendered_html(
                 "rendered HTML landing URL fingerprint is invalid"
             ) from exc
     values["landing_url_sha256"] = landing_url_sha256
+
+    creative_contract_sha256_value = payload.get("creative_contract_sha256")
+    if schema_version == CREATIVE_SOURCE_SCHEMA_VERSION:
+        try:
+            creative_contract_sha256_value = _validated_sha256(
+                str(creative_contract_sha256_value)
+            )
+        except ValueError as exc:
+            raise ArtifactRenderError(
+                "rendered HTML creative contract fingerprint is invalid"
+            ) from exc
+    else:
+        creative_contract_sha256_value = None
+    values["creative_contract_sha256"] = creative_contract_sha256_value
 
     if schema_version == LEGACY_CREATIVE_SOURCE_SCHEMA_VERSION:
         renderer_version = LEGACY_RENDERER_VERSION
