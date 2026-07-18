@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 
+from app.decision import audience_snapshots
 from app.decision.audience_snapshots import (
     AudienceSnapshotContractError,
     AudienceSnapshotRepository,
@@ -197,6 +198,65 @@ def test_run_binding_allows_one_card_from_a_multi_target_allocation_plan() -> No
         "segment_audience_allocation_plan_segments" in query
         for query, _params in db.executed
     )
+
+
+def test_run_binding_logs_the_failed_exclusion_invariant(monkeypatch) -> None:
+    warnings = []
+
+    class _Log:
+        def warn(self, event, payload):
+            warnings.append((event, payload))
+
+    invalid_target = {
+        **_target_binding_row(),
+        "reservation_count": 1,
+        "every_member_reserved": False,
+    }
+    db = _Db(fetchone_rows=(invalid_target,))
+    monkeypatch.setattr(audience_snapshots, "log", _Log())
+    repository = AudienceSnapshotRepository(db)
+
+    with pytest.raises(
+        AudienceSnapshotContractError,
+        match="segment_audience_exclusion_binding_invalid: seg_a",
+    ):
+        repository.bind_run_targets(
+            promotion_run_id="run",
+            project_id="project",
+            campaign_id="campaign",
+            promotion_id="promotion",
+            bindings=(
+                RunAudienceTargetBindingWrite(
+                    target_analysis_id="confirmation_a",
+                    segment_id="seg_a",
+                    allocation_plan_id="plan_a",
+                    final_snapshot_id="final_a",
+                ),
+            ),
+        )
+
+    assert warnings == [
+        (
+            "segment_audience_exclusion_binding_invalid",
+            {
+                "segmentId": "seg_a",
+                "failedChecks": [
+                    "reservation_count",
+                    "every_member_reserved",
+                ],
+                "planStatus": "finalized",
+                "snapshotStatus": "completed",
+                "snapshotKind": "final",
+                "audienceReservationState": "reserved",
+                "hasSourceSnapshot": True,
+                "allocationPlanMatches": True,
+                "finalUserCount": 2,
+                "actualMemberCount": 2,
+                "reservationCount": 1,
+                "everyMemberReserved": False,
+            },
+        )
+    ]
 
 
 def test_run_binding_reports_target_already_bound_to_another_run() -> None:
