@@ -450,6 +450,30 @@ def test_coordinator_batches_three_segments_once() -> None:
     assert len(snapshots.writes) == 3
 
 
+def test_coordinator_uses_final_members_as_behavior_match_lower_bound() -> None:
+    search = _BatchCoordinatorSearchRepository(
+        hard_match_count=0,
+        materialized_member_count=2,
+    )
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+        calibration_provider=_TestCalibrationProvider(),
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis",
+        promotion=_analysis_promotion(),
+        segments=(_v2_segment("segment"),),
+    )["segment"]
+
+    assert prepared.matching_user_count == 2
+    assert prepared.selected_user_count == 2
+    assert snapshots.writes[0].search_result.hard_match_user_count == 2
+
+
 def test_six_registered_templates_build_expected_exact_snapshot_members() -> None:
     schema = HotelBookingBehaviorSchemaV2()
     artifact = load_bundled_semantic_selection(segment_id="demo_validation")
@@ -1336,9 +1360,16 @@ class _TestCalibrationProvider:
 
 
 class _BatchCoordinatorSearchRepository:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        hard_match_count: int = 10,
+        materialized_member_count: int = 2,
+    ) -> None:
         self.batch_call_count = 0
         self.individual_call_count = 0
+        self.hard_match_count = hard_match_count
+        self.materialized_member_count = materialized_member_count
         now = datetime(2026, 7, 16, tzinfo=UTC)
         self.context = AudienceSearchContext(
             vector_generation_id="uvgen_active",
@@ -1354,17 +1385,19 @@ class _BatchCoordinatorSearchRepository:
 
     def count_hard_matches_batch(self, *, requests, **_kwargs: object):
         self.batch_call_count += 1
-        return {request.segment_id: 10 for request in requests}
+        return {
+            request.segment_id: self.hard_match_count for request in requests
+        }
 
     def count_hard_matches(self, **_kwargs: object) -> int:
         self.individual_call_count += 1
-        return 10
+        return self.hard_match_count
 
     def estimate_score_pass_rate(self, **_kwargs: object) -> float:
         return 0.5
 
     def materialize_exact_members(self, **_kwargs: object) -> int:
-        return 2
+        return self.materialized_member_count
 
 
 class _SemanticCorpusSearchRepository:
