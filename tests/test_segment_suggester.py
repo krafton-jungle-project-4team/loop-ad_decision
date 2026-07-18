@@ -539,6 +539,61 @@ def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
     assert intent.excluded_behaviors == ("booking_complete",)
 
 
+def test_openai_intent_extractor_guards_positive_actions_from_false_exclusion() -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, payload, timeout_seconds
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "제주 숙소 반복 탐색 후 미예약 고객",
+                    "product": "제주 숙소",
+                    "season": ["여름"],
+                    "destinations": ["제주"],
+                    "benefits": [],
+                    "audience_hints": [],
+                    "channel": "email",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": ["hotel_search"],
+                    "excluded_behaviors": [
+                        "booking_complete",
+                        "hotel_search",
+                        "hotel_detail_view",
+                    ],
+                    "explicit_conditions": [
+                        "최근 제주 숙소를 반복 검색했지만 예약하지 않은 고객"
+                    ],
+                    "requested_candidate_types": ["intent_matched"],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    extractor = OpenAIPromotionIntentExtractor(
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    intent = extractor.extract(
+        promotion_record(message_brief="여름 제주 숙소 예약 프로모션"),
+        segment_instruction="최근 제주 숙소를 반복 검색했지만 예약을 하지 않은 고객",
+    )
+
+    assert intent.season == ("summer",)
+    assert intent.destinations == ("jeju",)
+    assert intent.excluded_behaviors == ("booking_complete",)
+    assert intent.requested_candidate_types == (
+        "target_destination_affinity",
+        "intent_matched",
+    )
+
+
 def test_segment_instruction_does_not_fall_back_to_generic_vector_clusters() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [

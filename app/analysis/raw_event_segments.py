@@ -1686,13 +1686,46 @@ def _intent_from_payload(
         segment_instruction=segment_instruction,
         source=source,
     )
+    payload_seasons = _safe_text_list(payload.get("season"))
+    payload_destinations = _safe_text_list(payload.get("destinations"))
+    payload_benefits = _safe_text_list(payload.get("benefits"))
+    payload_excluded_behaviors = tuple(
+        behavior
+        for behavior in _safe_text_list(payload.get("excluded_behaviors"))
+        if behavior in EXCLUDED_BEHAVIOR_VALUES
+    )
+    payload_candidate_types = tuple(
+        candidate_type
+        for candidate_type in _safe_text_list(
+            payload.get("requested_candidate_types")
+        )
+        if candidate_type in CANDIDATE_TYPE_ORDER
+    )
+
+    # Exclusions are destructive filters. For an operator instruction, only
+    # behaviors tied to an explicit negative clause by the deterministic guard
+    # are allowed. This keeps "searched but did not book" from excluding the
+    # positive search behavior along with booking completion.
+    excluded_behaviors = (
+        fallback.excluded_behaviors
+        if _clean_segment_instruction(segment_instruction)
+        else payload_excluded_behaviors or fallback.excluded_behaviors
+    )
+    requested_candidate_types = tuple(
+        dict.fromkeys(
+            (
+                *fallback.requested_candidate_types,
+                *payload_candidate_types,
+            )
+        )
+    )
     return PromotionIntent(
         summary=_safe_text(payload.get("summary")) or fallback.summary,
         product=_safe_text(payload.get("product")) or fallback.product,
-        season=tuple(_safe_text_list(payload.get("season"))) or fallback.season,
-        destinations=tuple(_safe_text_list(payload.get("destinations")))
+        season=_canonical_seasons(payload_seasons) or fallback.season,
+        destinations=_canonical_destinations(payload_destinations)
         or fallback.destinations,
-        benefits=tuple(_safe_text_list(payload.get("benefits"))) or fallback.benefits,
+        benefits=_canonical_benefits(payload_benefits) or fallback.benefits,
         audience_hints=tuple(
             hint
             for hint in _safe_text_list(payload.get("audience_hints"))
@@ -1704,24 +1737,42 @@ def _intent_from_payload(
         funnel_goal=_safe_text(payload.get("funnel_goal")) or fallback.funnel_goal,
         desired_behaviors=tuple(_safe_text_list(payload.get("desired_behaviors")))
         or fallback.desired_behaviors,
-        excluded_behaviors=tuple(
-            behavior
-            for behavior in _safe_text_list(payload.get("excluded_behaviors"))
-            if behavior in EXCLUDED_BEHAVIOR_VALUES
-        )
-        or fallback.excluded_behaviors,
+        excluded_behaviors=excluded_behaviors,
         explicit_conditions=tuple(_safe_text_list(payload.get("explicit_conditions")))
         or fallback.explicit_conditions,
-        requested_candidate_types=tuple(
-            candidate_type
-            for candidate_type in _safe_text_list(
-                payload.get("requested_candidate_types")
-            )
-            if candidate_type in CANDIDATE_TYPE_ORDER
-        )
-        or fallback.requested_candidate_types,
+        requested_candidate_types=requested_candidate_types,
         source=source,
     )
+
+
+def _canonical_seasons(values: Sequence[str]) -> tuple[str, ...]:
+    if not values:
+        return ()
+    return tuple(dict.fromkeys(_extract_seasons(" ".join(values).lower())))
+
+
+def _canonical_destinations(values: Sequence[str]) -> tuple[str, ...]:
+    if not values:
+        return ()
+    extracted = _extract_destinations(" ".join(values).lower())
+    recognized_aliases = {
+        alias
+        for aliases in DESTINATION_KEYWORDS.values()
+        for alias in aliases
+    }
+    unknown_values = [
+        value.strip().lower()
+        for value in values
+        if value.strip()
+        and not any(alias in value.strip().lower() for alias in recognized_aliases)
+    ]
+    return tuple(dict.fromkeys((*extracted, *unknown_values)))
+
+
+def _canonical_benefits(values: Sequence[str]) -> tuple[str, ...]:
+    if not values:
+        return ()
+    return tuple(dict.fromkeys(_extract_benefits(" ".join(values).lower())))
 
 
 def _fallback_intent(
@@ -1867,7 +1918,19 @@ def _extract_excluded_behaviors(value: str | None) -> list[str]:
     excluded: list[str] = []
     if any(
         term in searchable
-        for term in ("예약 완료", "예약한 고객", "예약한 사람", "booking complete")
+        for term in (
+            "예약 완료",
+            "예약한 고객",
+            "예약한 사람",
+            "예약하지 않은",
+            "예약을 하지 않은",
+            "예약하지않은",
+            "예약하지 않았",
+            "완료하지 않은",
+            "완료하지않은",
+            "booking complete",
+            "without booking",
+        )
     ):
         excluded.append("booking_complete")
     if any(term in searchable for term in ("예약 취소", "booking cancel")):
