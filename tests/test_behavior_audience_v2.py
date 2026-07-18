@@ -20,6 +20,7 @@ from app.analysis.audience_snapshot_repository import (
     AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
     AudienceSnapshotWrite,
     _input_fingerprint,
+    _spec_fingerprint,
 )
 from app.analysis.behavior_vector_schema import (
     CandidateCalibration,
@@ -1049,6 +1050,74 @@ def test_snapshot_explicit_members_use_postgres_array_parameters() -> None:
     assert all(isinstance(value, list) for value in params)
 
 
+def test_snapshot_binding_uses_contract_score_threshold_precision() -> None:
+    segment = _v2_segment("segment", candidate_type="benefit_value_seeker")
+    compiled = compile_registered_segment_audience(
+        segment_id=segment.segment_id,
+        rule_json=segment.rule_json,
+    )
+    stored_score_threshold = Decimal(str(compiled.score_threshold)).quantize(
+        Decimal("0.000001")
+    )
+    assert stored_score_threshold != Decimal(str(compiled.score_threshold))
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    repository = AnalysisAudienceSnapshotRepository(
+        _SnapshotBindingDb(
+            {
+                "snapshot_id": "snapshot",
+                "segment_vector_id": "segment-vector",
+                "vector_generation_id": "generation",
+                "source_cutoff": now,
+                "window_start": now - timedelta(days=90),
+                "window_end": now,
+                "eligible_user_count": 100,
+                "behavior_match_count": 20,
+                "final_user_count": 10,
+                "selection_method": "exact",
+                "estimated_recall": Decimal("1"),
+                "recall_lower_bound": Decimal("1"),
+                "recall_target": Decimal("1"),
+                "meets_min_sample_size": True,
+                "snapshot_status": "completed",
+                "project_id": "project",
+                "campaign_id": "campaign",
+                "promotion_id": "promotion",
+                "segment_id": segment.segment_id,
+                "schema_version": compiled.schema_version,
+                "vector_version": compiled.vector_version,
+                "manifest_hash": compiled.manifest_hash,
+                "calibration_version": compiled.calibration_version,
+                "calibration_hash": compiled.calibration_hash,
+                "audience_resolution_contract": (
+                    compiled.audience_resolution_contract
+                ),
+                "segment_audience_spec_hash": compiled.segment_audience_spec_hash,
+                "query_vector_hash": semantic_query_vector_hash(compiled),
+                "query_compiler_version": compiled.query_compiler_version,
+                "query_compiler_hash": compiled.query_compiler_hash,
+                "score_threshold": stored_score_threshold,
+                "metadata_json": {
+                    "spec_fingerprint": _spec_fingerprint(compiled),
+                },
+                "generation_status": "activated",
+                "generation_is_active": True,
+                "actual_member_count": 10,
+            }
+        )
+    )
+
+    bound = repository.require_binding(
+        snapshot_id="snapshot",
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+        segment_id=segment.segment_id,
+        spec=compiled,
+    )
+
+    assert bound.snapshot_id == "snapshot"
+
+
 def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision() -> None:
     now = datetime(2026, 7, 17, tzinfo=UTC)
     spec = HotelBookingBehaviorSchemaV2().compile_candidate(
@@ -1664,6 +1733,17 @@ class _SnapshotWriteDb:
 
     def execute(self, query: str, params: object = ()) -> None:
         self.executed.append((query, tuple(params)))
+
+
+class _SnapshotBindingDb:
+    def __init__(self, row: dict[str, object]) -> None:
+        self.row = row
+
+    def fetchone(self, _query: str, _params: object = ()) -> dict[str, object]:
+        return self.row
+
+    def execute(self, _query: str, _params: object = ()) -> None:
+        raise AssertionError("snapshot binding validation must be read-only")
 
 
 class _RunReader:
