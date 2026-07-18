@@ -6,6 +6,11 @@ from typing import Any, Mapping
 
 import pytest
 
+from app.audience_contract import (
+    SEGMENT_AUDIENCE_CONTRACT,
+    SegmentAudienceContractError,
+    SegmentDefinitionAudienceAdapter,
+)
 from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
@@ -344,6 +349,41 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         "상위" not in segment.profile_json["display_copy"]["audience_summary"]
         for segment in segments
     )
+    for segment in segments:
+        resolution = SegmentDefinitionAudienceAdapter().resolve(
+            segment_id=segment.segment_id,
+            rule_json=segment.rule_json,
+        )
+        assert resolution.contract == SEGMENT_AUDIENCE_CONTRACT
+        assert resolution.spec is not None
+        assert resolution.spec.candidate_type == segment.rule_json["candidate_type"]
+        assert segment.rule_json["candidate_user_ids"]
+
+
+def test_unregistered_structured_benefit_stops_v2_binding_without_legacy_fallback(
+) -> None:
+    promotion = promotion_record(
+        message_brief="리뷰 기반 추천 혜택으로 숙소 예약 전환을 높인다.",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    assert "review_based_recommendation" in intent.benefits
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(f"review_user_{index}", deal_event_count=1)
+        for index in range(2)
+    ]
+
+    with pytest.raises(SegmentAudienceContractError) as error:
+        generate_raw_event_segment_definitions(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=profiles,
+            max_suggested_segments=6,
+            min_sample_size=2,
+        )
+
+    assert error.value.code == "segment_audience_template_binding_invalid"
 
 
 def test_destination_candidates_exclude_users_without_target_interest() -> None:
