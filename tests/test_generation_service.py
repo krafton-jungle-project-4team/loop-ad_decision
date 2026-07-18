@@ -15,6 +15,7 @@ from app.generation.image_tasks import ImageGenerationJob
 from app.generation.prompt_builder import (
     CANDIDATE_STRATEGY_BLOCK_HEADER,
     GenerationPromptInput,
+    PromotionOfferLink,
     PromotionPromptInput,
     PromptBuildResult,
     TargetSegmentPromptInput,
@@ -270,6 +271,87 @@ def test_durable_execution_requires_and_returns_ready_artifact_fields() -> None:
         "public_url": "https://assets.example.test/banner.png",
     }
     assert result.generation_report_json["status"] == "completed"
+
+
+def test_durable_email_generation_persists_candidate_redirect_contracts() -> None:
+    request = generation_request(content_option_count=3)
+    offer_links = tuple(
+        PromotionOfferLink(
+            offer_id=offer_id,
+            destination_url=(
+                f"https://demo-shoppingmall.dev.loop-ad.org/hotel/{offer_id}"
+            ),
+        )
+        for offer_id in (
+            "jeju-ocean-breeze-006",
+            "okinawa-naha-terrace-017",
+        )
+    )
+    catalog_hotels = [
+        {
+            "offer_id": link.offer_id,
+            "hotel_name": f"StayLoop {index}",
+            "destination_id": (
+                "jeju" if link.offer_id.startswith("jeju-") else "okinawa"
+            ),
+            "currency": "KRW",
+            "sale_price_per_night": 100000 + index * 10000,
+            "original_price_per_night": 120000 + index * 10000,
+            "discount_rate_percent": 15,
+            "image_path": f"/stayloop/promotions/hotel-{index}.png",
+            "asset_id": f"hotel-{index}-hero",
+        }
+        for index, link in enumerate(offer_links, start=1)
+    ]
+    prompt_input = GenerationPromptInput(
+        request=request,
+        promotion=PromotionPromptInput(
+            project_id=request.project_id,
+            campaign_id=request.campaign_id,
+            promotion_id=request.promotion_id,
+            channel=ContentChannel.EMAIL,
+            goal_metric="booking_conversion_rate",
+            goal_target_value="0.030000",
+            goal_basis="all_segments",
+            message_brief="Promote Jeju and Okinawa hotels.",
+            landing_url=(
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                "promotions/black-friday"
+            ),
+            offer_links=offer_links,
+        ),
+        target_segment=target_segment_input(),
+        offer_catalog={
+            "schema_version": "stayloop.promotion-price-catalog.v1",
+            "catalog_id": "black-friday-hotels",
+            "catalog_version": "v2",
+            "hotels": catalog_hotels,
+        },
+    )
+
+    result = GenerationService().execute_durable(
+        generation_id="generation_email_redirect_contract",
+        prompt_inputs=[prompt_input],
+    )
+
+    variants = [
+        candidate.metadata_json["creative"]["variant_type"]
+        for candidate in result.content_candidates
+    ]
+    assert variants == ["offer_cards", "visual_poster", "text_poster"]
+    card_creative = result.content_candidates[0].metadata_json["creative"]
+    assert len(card_creative["link_targets"]) == 3
+    assert card_creative["source"]["required_placeholders"] == [
+        "{{redirect_url}}",
+        "{{offer_redirect_url_1}}",
+        "{{offer_redirect_url_2}}",
+        "{{open_pixel_url}}",
+        "{{unsubscribe_url}}",
+    ]
+    for candidate in result.content_candidates[1:]:
+        assert candidate.metadata_json["creative"]["link_targets"] == [
+            {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
+        ]
 
 
 def test_durable_execution_builds_staged_candidates_in_parallel() -> None:

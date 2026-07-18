@@ -27,6 +27,7 @@ from app.generation.brand_context import (
     retrieval_snapshot_from_candidate_metadata,
     validate_brand_guardrails,
 )
+from app.generation.email_variants import build_email_creative_extensions
 from app.generation.generator import (
     CONTENT_GENERATOR_VERSION,
     ContentGenerator,
@@ -501,6 +502,7 @@ class GenerationService:
                 prompt_input.target_segment for prompt_input in prompt_inputs
             ],
             brand_context=prompt_inputs[0].brand_context,
+            offer_catalog=prompt_inputs[0].offer_catalog,
             model_version=self._generation_model_version,
         )
         input_json.update(
@@ -647,17 +649,22 @@ class GenerationService:
         target_segments: Sequence[TargetSegmentPromptInput],
     ) -> list[GenerationPromptInput]:
         brand_context = self._resolve_brand_context_snapshot(request)
-        if brand_context is None:
-            return self._generation_input_builder.build(
-                request=request,
-                promotion=promotion,
-                target_segments=target_segments,
-            )
-        return self._generation_input_builder.build(
+        offer_catalog = self._resolve_offer_catalog(
             request=request,
             promotion=promotion,
-            target_segments=target_segments,
-            brand_context=brand_context,
+            snapshot=brand_context,
+        )
+        build_values: dict[str, Any] = {
+            "request": request,
+            "promotion": promotion,
+            "target_segments": target_segments,
+        }
+        if brand_context is not None:
+            build_values["brand_context"] = brand_context
+        if offer_catalog is not None:
+            build_values["offer_catalog"] = offer_catalog
+        return self._generation_input_builder.build(
+            **build_values,
         )
 
     def _resolve_brand_context_snapshot(
@@ -669,6 +676,42 @@ class GenerationService:
         return self._brand_context_snapshot_reader.resolve_snapshot(
             project_id=request.project_id,
         )
+
+    def _resolve_offer_catalog(
+        self,
+        *,
+        request: GenerationRequest,
+        promotion: PromotionPromptInput,
+        snapshot: BrandContextSnapshot | None,
+    ) -> Mapping[str, Any] | None:
+        if not promotion.offer_links:
+            return None
+        if promotion.channel != ContentChannel.EMAIL:
+            raise GenerationInputUnavailable(
+                "promotion offer_links are supported only for email generation"
+            )
+        if self._brand_context_snapshot_reader is None or snapshot is None:
+            raise GenerationInputUnavailable(
+                "brand context is required for promotion offer_links"
+            )
+        load_offer_catalog = getattr(
+            self._brand_context_snapshot_reader,
+            "load_offer_catalog",
+            None,
+        )
+        if not callable(load_offer_catalog):
+            raise GenerationInputUnavailable(
+                "brand context offer catalog loader is unavailable"
+            )
+        catalog = load_offer_catalog(
+            project_id=request.project_id,
+            snapshot=snapshot,
+        )
+        if not isinstance(catalog, Mapping):
+            raise GenerationInputUnavailable(
+                "brand context offer catalog is unavailable"
+            )
+        return dict(catalog)
 
     def _build_content_candidate_records(
         self,
@@ -929,12 +972,29 @@ class GenerationService:
                 )
             )
         )
+        render_content_values = _content_values_with_generated_renderer(
+            content_values,
+            generated_content,
+        )
+        creative_extensions: dict[str, Any] = {}
+        if channel == ContentChannel.EMAIL:
+            creative_extensions = build_email_creative_extensions(
+                option_index=index,
+                landing_url=prompt_input.promotion.landing_url,
+                offer_links=prompt_input.promotion.offer_links,
+                offer_catalog=prompt_input.offer_catalog,
+            )
+            render_content_values.update(creative_extensions)
         creative_metadata = pending_creative_metadata(
             channel=channel,
-            content_values=_content_values_with_generated_renderer(
-                content_values,
-                generated_content,
-            ),
+            content_values=render_content_values,
+        )
+        creative_metadata.update(
+            {
+                key: value
+                for key, value in creative_extensions.items()
+                if key != "template_version"
+            }
         )
         creative_metadata["model"] = {
             "provider": _content_generator_provider(self._content_generator),
@@ -1568,6 +1628,16 @@ def _content_values_with_candidate_renderer(
             values["renderer_version"] = str(renderer_version)
         if template_version:
             values["template_version"] = str(template_version)
+    if isinstance(creative, Mapping):
+        for field_name in (
+            "variant_type",
+            "link_targets",
+            "offers",
+            "catalog",
+        ):
+            field_value = creative.get(field_name)
+            if field_value is not None:
+                values[field_name] = field_value
     return values
 
 

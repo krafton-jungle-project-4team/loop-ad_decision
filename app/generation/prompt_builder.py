@@ -6,6 +6,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 from app.content_brief import NormalizedContentBrief, normalize_content_brief
 from app.generation.brand_context import (
@@ -28,6 +29,28 @@ SAFE_VISUAL_DIRECTIONS = (
 
 
 @dataclass(frozen=True)
+class PromotionOfferLink:
+    offer_id: str
+    destination_url: str
+
+    def __post_init__(self) -> None:
+        offer_id = str(self.offer_id).strip()
+        destination_url = str(self.destination_url).strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", offer_id):
+            raise ValueError("promotion offer_id is invalid")
+        parsed = urlsplit(destination_url)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError("promotion offer destination_url is invalid")
+        object.__setattr__(self, "offer_id", offer_id)
+        object.__setattr__(self, "destination_url", destination_url)
+
+
+@dataclass(frozen=True)
 class PromotionPromptInput:
     project_id: str
     campaign_id: str
@@ -40,6 +63,14 @@ class PromotionPromptInput:
     landing_url: str | None
     offer_type: str | None = None
     landing_type: str | None = None
+    offer_links: tuple[PromotionOfferLink, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(self.offer_links) > 8:
+            raise ValueError("promotion offer_links must contain at most 8 items")
+        offer_ids = [offer.offer_id for offer in self.offer_links]
+        if len(offer_ids) != len(set(offer_ids)):
+            raise ValueError("promotion offer_links must not contain duplicate offer_id")
 
 
 @dataclass(frozen=True)
@@ -77,6 +108,11 @@ class GenerationPromptInput:
     promotion: PromotionPromptInput
     target_segment: TargetSegmentPromptInput
     brand_context: BrandContextSnapshot | None = None
+    offer_catalog: Mapping[str, Any] | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 @dataclass(frozen=True)
@@ -275,6 +311,7 @@ class GenerationInputBuilder:
         promotion: PromotionPromptInput,
         target_segments: Sequence[TargetSegmentPromptInput],
         brand_context: BrandContextSnapshot | None = None,
+        offer_catalog: Mapping[str, Any] | None = None,
     ) -> list[GenerationPromptInput]:
         _validate_request_promotion_match(request=request, promotion=promotion)
         if not target_segments:
@@ -292,6 +329,9 @@ class GenerationInputBuilder:
                     promotion=promotion,
                     target_segment=target_segment,
                     brand_context=brand_context,
+                    offer_catalog=(
+                        dict(offer_catalog) if offer_catalog is not None else None
+                    ),
                 )
             )
         return prompt_inputs
