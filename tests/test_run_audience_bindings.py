@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from app.decision.audience_snapshots import (
@@ -136,6 +138,11 @@ def test_run_member_reader_reads_final_binding_without_search_or_winner() -> Non
                 "segment_id": "seg_a",
                 "behavior_fit_score": "0.81",
             },
+            {
+                "user_id": "user_2",
+                "segment_id": "seg_a",
+                "behavior_fit_score": None,
+            },
         )
     )
     repository = AudienceSnapshotRepository(db)
@@ -147,8 +154,12 @@ def test_run_member_reader_reads_final_binding_without_search_or_winner() -> Non
         limit=100,
     )
 
-    assert [(member.user_id, member.segment_id) for member in members] == [
-        ("user_1", "seg_a")
+    assert [
+        (member.user_id, member.segment_id, member.behavior_fit_score)
+        for member in members
+    ] == [
+        ("user_1", "seg_a", Decimal("0.81")),
+        ("user_2", "seg_a", None),
     ]
     query = db.executed[0][0]
     assert "promotion_run_target_bindings" in query

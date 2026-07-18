@@ -1053,7 +1053,7 @@ class PostgresAudienceAllocationRepository:
                         PARTITION BY member.user_id
                         ORDER BY source.priority ASC,
                                  (member.behavior_fit_score - source.score_threshold)
-                                    / source.semantic_margin DESC,
+                                    / source.semantic_margin DESC NULLS LAST,
                                  source.segment_id ASC
                     ) AS winner_rank
                 FROM audience_allocation_sources AS source
