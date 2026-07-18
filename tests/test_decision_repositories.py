@@ -1272,6 +1272,48 @@ def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
     )
 
 
+def test_user_segment_assignment_repository_lists_source_page() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "user_id": "user_002",
+                "segment_id": "seg_family_trip",
+                "ad_experiment_id": "adexp_family_trip_001",
+                "similarity_score": Decimal("0.812345"),
+            }
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    records = repo.list_source_page(
+        promotion_run_id="prun_banner_001_loop_1",
+        ad_experiment_ids=["adexp_family_trip_001"],
+        after_user_id="user_001",
+        limit=100,
+    )
+
+    assert len(records) == 1
+    assert records[0].user_id == "user_002"
+    assert records[0].segment_id == "seg_family_trip"
+    assert records[0].ad_experiment_id == "adexp_family_trip_001"
+    assert records[0].similarity_score == Decimal("0.812345")
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_segment_assignments" in sql
+    assert "promotion_run_id = %s" in sql
+    assert "ad_experiment_id = any(%s)" in sql
+    assert "user_id > %s" in sql
+    assert "order by user_id asc" in sql
+    assert "limit %s" in sql
+    assert call.params == (
+        "prun_banner_001_loop_1",
+        ["adexp_family_trip_001"],
+        "user_001",
+        "user_001",
+        100,
+    )
+
+
 def test_user_behavior_vector_repository_reads_latest_vectors_with_argmax() -> None:
     client = FakeClickHouseClient(
         rows=[
@@ -2077,6 +2119,53 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
         "evaluation_cutoff_at": datetime(
             2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC
         ),
+    }
+
+
+@pytest.mark.parametrize(
+    ("goal_metric", "expected_table", "expected_event"),
+    [
+        (
+            GoalMetric.INFLOW_RATE.value,
+            "promotion_touch_events",
+            "campaign_landing",
+        ),
+        (
+            GoalMetric.BOOKING_CONVERSION_RATE.value,
+            "booking_outcome_events",
+            "booking_complete",
+        ),
+    ],
+)
+def test_evaluation_metric_repository_lists_successful_user_ids(
+    goal_metric: str,
+    expected_table: str,
+    expected_event: str,
+) -> None:
+    cutoff = datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
+    client = FakeClickHouseClient(rows=[("user_001",), ("user_002",)])
+    repo = EvaluationMetricRepository(client)
+
+    successful = repo.list_successful_user_ids(
+        ad_experiment_record(goal_metric=goal_metric),
+        user_ids=["user_001", "user_002", "user_003"],
+        evaluation_cutoff_at=cutoff,
+    )
+
+    assert successful == {"user_001", "user_002"}
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert f"from {expected_table}" in sql
+    assert "select distinct user_id" in sql
+    assert "user_id in {user_ids:array(string)}" in sql
+    assert "notempty(user_id)" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+        "success_event": expected_event,
+        "evaluation_cutoff_at": cutoff,
+        "user_ids": ["user_001", "user_002", "user_003"],
     }
 
 

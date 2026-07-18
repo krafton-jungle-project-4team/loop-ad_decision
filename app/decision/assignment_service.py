@@ -31,12 +31,17 @@ from app.decision.matcher import (
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentReader,
+    EvaluationMetricReader,
+    PromotionAnalysisReader,
+    PromotionEvaluationWriter,
+    PromotionRunRecord,
     PromotionRunWriter,
     SegmentVectorReader,
     SegmentVectorRecord,
     UserBehaviorVectorRecord,
     UserBehaviorVectorReader,
     UserSegmentAssignmentInsertRecord,
+    UserSegmentAssignmentSourceRecord,
     UserSegmentAssignmentWrite,
     UserSegmentAssignmentWriter,
 )
@@ -101,6 +106,12 @@ class SegmentAssignmentAudienceContractError(SegmentAssignmentValidationError):
 class _ExperimentSet:
     non_fallback: list[AdExperimentRecord]
     fallback: AdExperimentRecord | None
+
+
+@dataclass(frozen=True)
+class _NextLoopRetryContext:
+    source_promotion_run_id: str
+    failed_ad_experiment_ids: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -257,6 +268,9 @@ class SegmentAssignmentService:
         user_segment_assignment_repository: UserSegmentAssignmentWriter,
         reranker: SegmentCandidateReranker,
         audience_snapshot_repository: AudienceSnapshotReader,
+        promotion_analysis_repository: PromotionAnalysisReader | None = None,
+        promotion_evaluation_repository: PromotionEvaluationWriter | None = None,
+        evaluation_metric_repository: EvaluationMetricReader | None = None,
     ) -> None:
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
@@ -265,6 +279,9 @@ class SegmentAssignmentService:
         self._user_segment_assignment_repository = user_segment_assignment_repository
         self._reranker = reranker
         self._audience_snapshot_repository = audience_snapshot_repository
+        self._promotion_analysis_repository = promotion_analysis_repository
+        self._promotion_evaluation_repository = promotion_evaluation_repository
+        self._evaluation_metric_repository = evaluation_metric_repository
 
     @log_context_scope
     def build_assignments(
@@ -302,6 +319,16 @@ class SegmentAssignmentService:
                 "at least one non-fallback ad experiment is required"
             )
         log.info("ad_experiments_loaded", {"nonFallbackCount": len(experiments.non_fallback), "hasFallback": experiments.fallback is not None})
+
+        retry_context = self._resolve_next_loop_retry_context(run)
+        if retry_context is not None:
+            return self._build_next_loop_retry_assignments(
+                run=run,
+                experiments=experiments,
+                request=request,
+                retry_context=retry_context,
+                started_at=started_at,
+            )
 
         audience_contract = self._resolve_target_audience_contract(
             promotion_run_id=run.promotion_run_id,
@@ -509,6 +536,299 @@ class SegmentAssignmentService:
             {"diagnostics": response.model_dump(mode="json")},
         )
         log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        return response
+
+    def _resolve_next_loop_retry_context(
+        self,
+        run: PromotionRunRecord,
+    ) -> _NextLoopRetryContext | None:
+        repository = self._promotion_analysis_repository
+        if repository is None:
+            return None
+        analysis = repository.get_by_id(run.analysis_id)
+        if analysis is None:
+            return None
+        raw_context = analysis.input_snapshot_json.get("next_loop")
+        if raw_context is None:
+            return None
+        if not isinstance(raw_context, Mapping):
+            raise SegmentAssignmentValidationError(
+                "next-loop analysis context is invalid"
+            )
+        source_run_id = raw_context.get("source_promotion_run_id")
+        failed_experiment_ids = raw_context.get(
+            "source_failed_ad_experiment_ids"
+        )
+        if not isinstance(source_run_id, str) or not source_run_id.strip():
+            raise SegmentAssignmentValidationError(
+                "next-loop source promotion run is invalid"
+            )
+        if (
+            not isinstance(failed_experiment_ids, list)
+            or not failed_experiment_ids
+            or any(
+                not isinstance(experiment_id, str)
+                or not experiment_id.strip()
+                for experiment_id in failed_experiment_ids
+            )
+        ):
+            raise SegmentAssignmentValidationError(
+                "next-loop failed ad experiments are invalid"
+            )
+        normalized_experiment_ids = tuple(
+            sorted({experiment_id.strip() for experiment_id in failed_experiment_ids})
+        )
+        return _NextLoopRetryContext(
+            source_promotion_run_id=source_run_id.strip(),
+            failed_ad_experiment_ids=normalized_experiment_ids,
+        )
+
+    def _build_next_loop_retry_assignments(
+        self,
+        *,
+        run: PromotionRunRecord,
+        experiments: _ExperimentSet,
+        request: SegmentAssignmentBuildRequest,
+        retry_context: _NextLoopRetryContext,
+        started_at: int,
+    ) -> SegmentAssignmentBuildResponse:
+        evaluation_repository = self._promotion_evaluation_repository
+        metric_repository = self._evaluation_metric_repository
+        if evaluation_repository is None or metric_repository is None:
+            raise SegmentAssignmentValidationError(
+                "next-loop retry assignment repositories are not configured"
+            )
+        if request.user_ids or request.eligible_user_limit is not None:
+            raise SegmentAssignmentValidationError(
+                "next-loop retry assignment does not accept user_ids or a limit"
+            )
+
+        source_run = self._promotion_run_repository.get_by_id(
+            retry_context.source_promotion_run_id
+        )
+        if source_run is None:
+            raise SegmentAssignmentValidationError(
+                "next-loop source promotion run was not found"
+            )
+        if (
+            source_run.project_id != run.project_id
+            or source_run.promotion_id != run.promotion_id
+            or source_run.loop_count + 1 != run.loop_count
+        ):
+            raise SegmentAssignmentValidationError(
+                "next-loop source promotion run does not match the target run"
+            )
+
+        source_experiments = {
+            experiment.ad_experiment_id: experiment
+            for experiment in self._ad_experiment_repository.list_by_run(
+                source_run.promotion_run_id
+            )
+            if experiment.ad_experiment_id
+            in retry_context.failed_ad_experiment_ids
+        }
+        if set(source_experiments) != set(retry_context.failed_ad_experiment_ids):
+            raise SegmentAssignmentValidationError(
+                "next-loop source ad experiments were not found"
+            )
+        target_experiments = {
+            experiment.segment_id: experiment
+            for experiment in experiments.non_fallback
+        }
+        missing_target_segments = sorted(
+            {
+                experiment.segment_id
+                for experiment in source_experiments.values()
+                if experiment.segment_id not in target_experiments
+            }
+        )
+        if missing_target_segments:
+            raise SegmentAssignmentValidationError(
+                "next-loop target experiments are missing segments: "
+                + ", ".join(missing_target_segments)
+            )
+
+        evaluations = {
+            evaluation.ad_experiment_id: evaluation
+            for evaluation in evaluation_repository.list_latest_by_run_ad_experiments(
+                source_run.promotion_run_id
+            )
+            if evaluation.ad_experiment_id
+            in retry_context.failed_ad_experiment_ids
+        }
+        if set(evaluations) != set(retry_context.failed_ad_experiment_ids):
+            raise SegmentAssignmentValidationError(
+                "next-loop source evaluations were not found"
+            )
+        evaluation_cutoffs = {
+            experiment_id: _parse_evaluation_cutoff(
+                evaluations[experiment_id].result_json
+            )
+            for experiment_id in retry_context.failed_ad_experiment_ids
+        }
+
+        assigned_at = datetime.now(UTC)
+        expires_at = (
+            assigned_at + timedelta(days=request.expires_in_days)
+            if request.expires_in_days is not None
+            else None
+        )
+        page_count = 0
+        processed_count = 0
+        retry_user_count = 0
+        assignment_count = 0
+        conflict_count = 0
+        skipped_existing_count = 0
+        successful_user_count = 0
+        segment_counts: dict[str, int] = {}
+        score_buckets = {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
+        after_user_id: str | None = None
+
+        while True:
+            source_assignments = (
+                self._user_segment_assignment_repository.list_source_page(
+                    promotion_run_id=source_run.promotion_run_id,
+                    ad_experiment_ids=retry_context.failed_ad_experiment_ids,
+                    after_user_id=after_user_id,
+                    limit=ASSIGNMENT_PAGE_SIZE,
+                )
+            )
+            if not source_assignments:
+                break
+            page_count += 1
+            processed_count += len(source_assignments)
+            assignments_by_experiment: dict[
+                str, list[UserSegmentAssignmentSourceRecord]
+            ] = defaultdict(list)
+            for source_assignment in source_assignments:
+                assignments_by_experiment[
+                    source_assignment.ad_experiment_id
+                ].append(source_assignment)
+
+            successful_user_ids: set[str] = set()
+            for experiment_id, experiment_assignments in assignments_by_experiment.items():
+                successful_user_ids.update(
+                    metric_repository.list_successful_user_ids(
+                        source_experiments[experiment_id],
+                        user_ids=[
+                            assignment.user_id
+                            for assignment in experiment_assignments
+                        ],
+                        evaluation_cutoff_at=evaluation_cutoffs[experiment_id],
+                    )
+                )
+            successful_user_count += len(successful_user_ids)
+            retry_assignments = [
+                assignment
+                for assignment in source_assignments
+                if assignment.user_id not in successful_user_ids
+            ]
+            retry_user_count += len(retry_assignments)
+            existing_user_ids = (
+                self._user_segment_assignment_repository.list_existing_user_ids(
+                    promotion_run_id=run.promotion_run_id,
+                    user_ids=[assignment.user_id for assignment in retry_assignments],
+                )
+            )
+            skipped_existing_count += len(existing_user_ids)
+            writes: list[UserSegmentAssignmentWrite] = []
+            for source_assignment in retry_assignments:
+                if source_assignment.user_id in existing_user_ids:
+                    continue
+                source_experiment = source_experiments[
+                    source_assignment.ad_experiment_id
+                ]
+                if source_assignment.segment_id != source_experiment.segment_id:
+                    raise SegmentAssignmentValidationError(
+                        "next-loop source assignment segment does not match "
+                        "its experiment"
+                    )
+                target_experiment = target_experiments[
+                    source_experiment.segment_id
+                ]
+                writes.append(
+                    UserSegmentAssignmentWrite(
+                        project_id=run.project_id,
+                        promotion_run_id=run.promotion_run_id,
+                        user_id=source_assignment.user_id,
+                        segment_id=source_experiment.segment_id,
+                        ad_experiment_id=target_experiment.ad_experiment_id,
+                        content_id=target_experiment.content_id,
+                        content_option_id=target_experiment.content_option_id,
+                        similarity_score=source_assignment.similarity_score,
+                        fallback=False,
+                        fallback_reason=None,
+                        assignment_source=AssignmentSource.DECISION_BATCH.value,
+                        assigned_at=assigned_at,
+                        expires_at=expires_at,
+                    )
+                )
+            inserted = self._user_segment_assignment_repository.insert_many(writes)
+            assignment_count += len(inserted)
+            conflict_count += len(writes) - len(inserted)
+            for record in inserted:
+                segment_counts[record.segment_id] = (
+                    segment_counts.get(record.segment_id, 0) + 1
+                )
+                score_buckets[_similarity_score_bucket(record.similarity_score)] += 1
+            after_user_id = source_assignments[-1].user_id
+            if len(source_assignments) < ASSIGNMENT_PAGE_SIZE:
+                break
+
+        if processed_count == 0:
+            raise SegmentAssignmentValidationError(
+                "next-loop source assignments were not found"
+            )
+        if retry_user_count == 0:
+            raise SegmentAssignmentValidationError(
+                "next-loop retry audience is empty because every assigned user succeeded"
+            )
+
+        response = SegmentAssignmentBuildResponse(
+            promotion_run_id=run.promotion_run_id,
+            matching_mode=SNAPSHOT_MATCHING_MODE,
+            vector_version=request.vector_version,
+            ann_candidate_limit=0,
+            ann_candidate_count=0,
+            exact_reranked_pair_count=0,
+            page_count=page_count,
+            processed_user_count=processed_count,
+            assignment_count=assignment_count,
+            insert_conflict_count=conflict_count,
+            segment_assignment_counts=segment_counts,
+            batch_has_fallback=False,
+            fallback_count=0,
+            fallback_rate=0.0 if assignment_count else None,
+            fallback_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+            below_threshold_fallback_count=0,
+            no_candidate_fallback_count=0,
+            invalid_user_vector_fallback_count=0,
+            unassigned_count=0,
+            unassigned_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+            below_threshold_unassigned_count=0,
+            no_candidate_unassigned_count=0,
+            invalid_user_vector_unassigned_count=0,
+            similarity_score_buckets=score_buckets,
+            ann_underfilled_user_count=0,
+            ann_applied=False,
+            ann_not_applied_reason="analysis_snapshot_reuse",
+            skipped_existing_count=skipped_existing_count,
+            insufficient_segment_count=0,
+            completion_scope="current_request",
+            assignment_mode=ASSIGNMENT_MODE_ANALYSIS_SNAPSHOT,
+            input_stability="snapshotted",
+            status="completed",
+        )
+        log.info(
+            "next_loop_retry_assignments_completed",
+            {
+                "sourcePromotionRunId": source_run.promotion_run_id,
+                "successfulUserCount": successful_user_count,
+                "retryUserCount": retry_user_count,
+                "response": response.model_dump(mode="json"),
+                "durationMs": duration_ms(started_at),
+            },
+        )
         return response
 
     def _resolve_target_audience_contract(
@@ -1195,6 +1515,28 @@ def _score_to_decimal(score: float | Decimal | None) -> Decimal | None:
         Decimal("0.000001"),
         rounding=ROUND_HALF_UP,
     )
+
+
+def _parse_evaluation_cutoff(result_json: Mapping[str, Any]) -> datetime:
+    raw_cutoff = result_json.get("evaluation_cutoff_at")
+    if not isinstance(raw_cutoff, str) or not raw_cutoff.strip():
+        raise SegmentAssignmentValidationError(
+            "next-loop source evaluation cutoff is missing"
+        )
+    normalized = raw_cutoff.strip()
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        cutoff = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        raise SegmentAssignmentValidationError(
+            "next-loop source evaluation cutoff is invalid"
+        ) from exc
+    if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+        raise SegmentAssignmentValidationError(
+            "next-loop source evaluation cutoff must include a timezone"
+        )
+    return cutoff.astimezone(UTC)
 
 
 def _similarity_score_bucket(score: Decimal | None) -> str:

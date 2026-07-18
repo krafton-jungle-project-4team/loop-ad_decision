@@ -368,6 +368,14 @@ class UserSegmentAssignmentInsertRecord:
 
 
 @dataclass(frozen=True)
+class UserSegmentAssignmentSourceRecord:
+    user_id: str
+    segment_id: str
+    ad_experiment_id: str
+    similarity_score: Decimal | None
+
+
+@dataclass(frozen=True)
 class PromotionEvaluationWrite:
     evaluation_id: str
     project_id: str
@@ -637,6 +645,16 @@ class UserBehaviorVectorReader(Protocol):
 
 
 class UserSegmentAssignmentWriter(Protocol):
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: Sequence[str],
+        after_user_id: str | None,
+        limit: int,
+    ) -> list[UserSegmentAssignmentSourceRecord]:
+        ...
+
     def list_existing_user_ids(
         self,
         *,
@@ -707,6 +725,15 @@ class NextLoopPreparationWriter(Protocol):
 
 
 class EvaluationMetricReader(Protocol):
+    def list_successful_user_ids(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        user_ids: Sequence[str],
+        evaluation_cutoff_at: datetime,
+    ) -> set[str]:
+        ...
+
     def count_inflow_rate(
         self,
         experiment: AdExperimentRecord,
@@ -1684,6 +1711,51 @@ class UserSegmentAssignmentRepository:
     def __init__(self, db: PostgresExecutor) -> None:
         self._db = db
 
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: Sequence[str],
+        after_user_id: str | None,
+        limit: int,
+    ) -> list[UserSegmentAssignmentSourceRecord]:
+        if not ad_experiment_ids:
+            return []
+        if limit < 1:
+            raise ValueError("limit must be at least 1")
+
+        rows = self._db.fetchall(
+            """
+            SELECT
+                user_id,
+                segment_id,
+                ad_experiment_id,
+                similarity_score
+            FROM user_segment_assignments
+            WHERE promotion_run_id = %s
+              AND ad_experiment_id = ANY(%s)
+              AND (%s::text IS NULL OR user_id > %s)
+            ORDER BY user_id ASC
+            LIMIT %s
+            """,
+            (
+                promotion_run_id,
+                list(ad_experiment_ids),
+                after_user_id,
+                after_user_id,
+                limit,
+            ),
+        )
+        return [
+            UserSegmentAssignmentSourceRecord(
+                user_id=str(row["user_id"]),
+                segment_id=str(row["segment_id"]),
+                ad_experiment_id=str(row["ad_experiment_id"]),
+                similarity_score=row["similarity_score"],
+            )
+            for row in rows
+        ]
+
     def list_existing_user_ids(
         self,
         *,
@@ -2365,6 +2437,53 @@ class NextLoopPreparationRepository:
 class EvaluationMetricRepository:
     def __init__(self, client: ClickHouseClient) -> None:
         self._client = client
+
+    def list_successful_user_ids(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        user_ids: Sequence[str],
+        evaluation_cutoff_at: datetime,
+    ) -> set[str]:
+        if not user_ids:
+            return set()
+        if experiment.goal_metric == "inflow_rate":
+            table = "promotion_touch_events"
+            success_event = "campaign_landing"
+        elif experiment.goal_metric == "booking_conversion_rate":
+            table = "booking_outcome_events"
+            success_event = "booking_complete"
+        else:
+            raise ValueError(
+                f"unsupported goal metric: {experiment.goal_metric}"
+            )
+
+        result = self._client.query(
+            f"""
+            SELECT DISTINCT user_id
+            FROM {table}
+            WHERE project_id = {{project_id:String}}
+              AND promotion_run_id = {{promotion_run_id:String}}
+              AND ad_experiment_id = {{ad_experiment_id:String}}
+              AND event_name = {{success_event:String}}
+              AND event_time <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
+              AND user_id IN {{user_ids:Array(String)}}
+              AND notEmpty(user_id)
+            ORDER BY user_id ASC
+            """,
+            parameters={
+                "project_id": experiment.project_id,
+                "promotion_run_id": experiment.promotion_run_id,
+                "ad_experiment_id": experiment.ad_experiment_id,
+                "success_event": success_event,
+                "evaluation_cutoff_at": evaluation_cutoff_at,
+                "user_ids": list(user_ids),
+            },
+        )
+        return {
+            str(_clickhouse_value(row, "user_id", 0))
+            for row in _clickhouse_rows(result)
+        }
 
     def count_inflow_rate(
         self,
