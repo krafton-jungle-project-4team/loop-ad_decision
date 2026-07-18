@@ -252,6 +252,17 @@ def compile_registered_segment_audience(
             "registered audience compiler requires segment_audience.v1",
         )
     behavior_schema = schema or HotelBookingBehaviorSchemaV2()
+    if resolution.spec.is_custom_structured:
+        try:
+            return behavior_schema.compile_custom_segment_audience(
+                spec=resolution.spec,
+            )
+        except ValueError as exc:
+            raise _contract_error(
+                "segment_audience_manifest_mismatch",
+                segment_id,
+                str(exc),
+            ) from exc
     calibration = (provider or _DEFAULT_SEMANTIC_SELECTION_PROVIDER).require(
         segment_id=segment_id,
         spec=resolution.spec,

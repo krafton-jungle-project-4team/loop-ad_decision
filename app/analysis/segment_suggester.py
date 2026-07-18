@@ -292,7 +292,12 @@ class VectorClusterSegmentSuggester:
         self._vector_version = vector_version
 
     @log_context_scope
-    def suggest_segments(self, *, promotion: PromotionRecord) -> list[SegmentDefinitionRecord]:
+    def suggest_segments(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segment_instruction: str | None = None,
+    ) -> list[SegmentDefinitionRecord]:
         started_at = now_ms()
         log.assign_context(
             {
@@ -301,9 +306,18 @@ class VectorClusterSegmentSuggester:
                 "promotionId": promotion.promotion_id,
             }
         )
-        log.info("started", {"promotion": promotion})
+        log.info(
+            "started",
+            {
+                "hasSegmentInstruction": bool(segment_instruction),
+                "segmentInstructionLength": len(segment_instruction or ""),
+            },
+        )
         sample_seed = _promotion_sample_seed(promotion)
-        raw_event_segments = self._suggest_raw_event_segments(promotion=promotion)
+        raw_event_segments = self._suggest_raw_event_segments(
+            promotion=promotion,
+            segment_instruction=segment_instruction,
+        )
         if raw_event_segments:
             response = raw_event_segments[: self._max_suggested_segments]
             log.info(
@@ -315,16 +329,34 @@ class VectorClusterSegmentSuggester:
             )
             log.info(
                 "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
+                {
+                    "suggestedSegmentCount": len(response),
+                    "segmentIds": [segment.segment_id for segment in response],
+                    "durationMs": duration_ms(started_at),
+                },
             )
             return response
+
+        if segment_instruction:
+            log.info(
+                "segment_instruction_candidates_empty",
+                {
+                    "segmentInstructionLength": len(segment_instruction),
+                    "fallback": "disabled",
+                },
+            )
+            log.info(
+                "completed",
+                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
+            )
+            return []
 
         user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
             log.warn("user_vector_sample_insufficient", {"userVectorCount": len(user_vectors), "minClusterSize": self._min_cluster_size})
             log.info(
                 "completed",
-                {"response": raw_event_segments, "durationMs": duration_ms(started_at)},
+                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
             )
             return raw_event_segments
 
@@ -337,7 +369,7 @@ class VectorClusterSegmentSuggester:
             log.warn("vector_clusters_empty", {"userVectorCount": len(user_vectors)})
             log.info(
                 "completed",
-                {"response": raw_event_segments, "durationMs": duration_ms(started_at)},
+                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
             )
             return raw_event_segments
 
@@ -381,13 +413,21 @@ class VectorClusterSegmentSuggester:
                 "promotionVectorBasis": promotion_intent.basis,
             },
         )
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        log.info(
+            "completed",
+            {
+                "suggestedSegmentCount": len(response),
+                "segmentIds": [segment.segment_id for segment in response],
+                "durationMs": duration_ms(started_at),
+            },
+        )
         return response
 
     def _suggest_raw_event_segments(
         self,
         *,
         promotion: PromotionRecord,
+        segment_instruction: str | None = None,
     ) -> list[SegmentDefinitionRecord]:
         if (
             self._raw_event_signal_repository is None
@@ -395,7 +435,10 @@ class VectorClusterSegmentSuggester:
         ):
             return []
         try:
-            intent = self._promotion_intent_extractor.extract(promotion)
+            intent = self._promotion_intent_extractor.extract(
+                promotion,
+                segment_instruction=segment_instruction,
+            )
             compilation = compile_raw_event_intent(intent)
             profiles = self._raw_event_signal_repository.list_raw_event_user_signals(
                 project_id=promotion.project_id,
@@ -409,7 +452,11 @@ class VectorClusterSegmentSuggester:
                 {
                     "userSignalCount": len(profiles),
                     "vectorVersion": self._vector_version,
-                    "intent": intent.to_json(),
+                    "intentSource": intent.source,
+                    "destinationCount": len(intent.destinations),
+                    "seasonCount": len(intent.season),
+                    "desiredBehaviorCount": len(intent.desired_behaviors),
+                    "requestedCandidateTypes": list(intent.requested_candidate_types),
                     "compiledConditionCount": len(compilation.compiled_conditions),
                 },
             )

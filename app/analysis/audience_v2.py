@@ -223,6 +223,20 @@ class AudienceV2Coordinator:
                 reason="AudienceV2Coordinator requires segment_audience.v1",
             )
         audience_spec = resolution.spec
+        if audience_spec.is_custom_structured:
+            try:
+                return (
+                    audience_spec,
+                    self._schema.compile_custom_segment_audience(
+                        spec=audience_spec,
+                    ),
+                )
+            except ValueError as exc:
+                raise SegmentAudienceContractError(
+                    code="segment_audience_manifest_mismatch",
+                    segment_id=segment.segment_id,
+                    reason=str(exc),
+                ) from exc
         calibration = self._calibration_provider.require(
             segment_id=segment.segment_id,
             spec=audience_spec,

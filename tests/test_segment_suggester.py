@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from decimal import Decimal
 from typing import Any, Mapping
@@ -14,6 +15,7 @@ from app.audience_contract import (
 from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
+    OpenAIPromotionIntentExtractor,
     compile_raw_event_intent,
     generate_raw_event_segment_candidate_pool,
     generate_raw_event_segment_definitions,
@@ -158,6 +160,8 @@ def raw_signal(
     destination_values: tuple[str, ...] = (),
     checkin_dates: tuple[str, ...] = (),
     hotel_market_values: tuple[str, ...] = (),
+    age_group_values: tuple[str, ...] = (),
+    gender_values: tuple[str, ...] = (),
 ) -> RawEventUserSignalRecord:
     event_count = max(
         1,
@@ -196,8 +200,8 @@ def raw_signal(
         checkin_dates=checkin_dates,
         hotel_market_values=hotel_market_values,
         hotel_cluster_values=(),
-        age_group_values=(),
-        gender_values=(),
+        age_group_values=age_group_values,
+        gender_values=gender_values,
         preferred_category_values=(),
         destination_match_count=destination_match_count,
         season_match_count=season_match_count,
@@ -384,6 +388,236 @@ def test_unregistered_structured_benefit_stops_v2_binding_without_legacy_fallbac
         )
 
     assert error.value.code == "segment_audience_template_binding_invalid"
+
+
+def test_raw_event_suggester_applies_segment_instruction_to_intent() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [user_vector("jeju_001", vector_values(0))]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "jeju_001",
+                hotel_search_count=2,
+                hotel_detail_view_count=1,
+                destination_match_count=2,
+                destination_values=("제주 호텔",),
+            ),
+            raw_signal(
+                "jeju_booked_001",
+                hotel_search_count=2,
+                hotel_detail_view_count=1,
+                booking_complete_count=1,
+                destination_match_count=2,
+                destination_values=("제주 호텔",),
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=1,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(message_brief="숙소 예약 프로모션"),
+        segment_instruction="최근 제주 숙소를 검색하거나 호텔을 본 고객, 예약 완료 고객은 빼줘",
+    )
+
+    assert segments
+    assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
+    assert vector_reader.calls == []
+    assert all(
+        "jeju" in segment.profile_json["promotion_intent"]["destinations"]
+        for segment in segments
+    )
+    assert all(
+        segment.profile_json["promotion_intent"]["excluded_behaviors"]
+        == ["booking_complete"]
+        for segment in segments
+    )
+    assert all(
+        segment.rule_json["candidate_user_ids"] == ["jeju_001"]
+        for segment in segments
+    )
+    assert {
+        segment.rule_json["candidate_type"] for segment in segments
+    } == {"intent_matched"}
+
+
+def test_raw_event_suggester_applies_demographic_instruction_to_profiles() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "matched_001",
+                hotel_search_count=2,
+                age_group_values=("20대",),
+                gender_values=("여성",),
+            ),
+            raw_signal(
+                "wrong_age_001",
+                hotel_search_count=2,
+                age_group_values=("40대",),
+                gender_values=("여성",),
+            ),
+            raw_signal(
+                "missing_profile_001",
+                hotel_search_count=2,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=1,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(message_brief="숙소 예약 프로모션"),
+        segment_instruction="최근 호텔을 검색한 20대 여성 고객",
+    )
+
+    assert len(segments) == 1
+    assert segments[0].rule_json["candidate_type"] == "intent_matched"
+    assert segments[0].rule_json["candidate_user_ids"] == ["matched_001"]
+    assert "profile_hint" in segments[0].rule_json["compiled_conditions"]
+
+
+def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
+    captured: dict[str, Any] = {}
+
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        captured["payload"] = payload
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "제주 예약 이탈 고객",
+                    "product": "hotel",
+                    "season": [],
+                    "destinations": ["jeju"],
+                    "benefits": [],
+                    "audience_hints": [],
+                    "channel": "onsite_banner",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": ["booking_start_without_complete"],
+                    "excluded_behaviors": ["booking_complete"],
+                    "explicit_conditions": ["제주", "예약 미완료"],
+                    "requested_candidate_types": ["funnel_recovery"],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    extractor = OpenAIPromotionIntentExtractor(
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    intent = extractor.extract(
+        promotion_record(message_brief="제주 숙소 예약 프로모션"),
+        segment_instruction="예약을 시작했지만 완료하지 않은 고객만 찾아줘",
+    )
+
+    request_text = captured["payload"]["input"][1]["content"][0]["text"]
+    assert "예약을 시작했지만 완료하지 않은 고객만 찾아줘" in request_text
+    assert intent.requested_candidate_types == ("funnel_recovery",)
+    assert intent.excluded_behaviors == ("booking_complete",)
+
+
+def test_openai_intent_extractor_guards_positive_actions_from_false_exclusion() -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, payload, timeout_seconds
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "제주 숙소 반복 탐색 후 미예약 고객",
+                    "product": "제주 숙소",
+                    "season": ["여름"],
+                    "destinations": ["제주"],
+                    "benefits": [],
+                    "audience_hints": [],
+                    "channel": "email",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": ["hotel_search"],
+                    "excluded_behaviors": [
+                        "booking_complete",
+                        "hotel_search",
+                        "hotel_detail_view",
+                    ],
+                    "explicit_conditions": [
+                        "최근 제주 숙소를 반복 검색했지만 예약하지 않은 고객"
+                    ],
+                    "requested_candidate_types": ["intent_matched"],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    extractor = OpenAIPromotionIntentExtractor(
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    intent = extractor.extract(
+        promotion_record(message_brief="여름 제주 숙소 예약 프로모션"),
+        segment_instruction="최근 제주 숙소를 반복 검색했지만 예약을 하지 않은 고객",
+    )
+
+    assert intent.season == ("summer",)
+    assert intent.destinations == ("jeju",)
+    assert intent.excluded_behaviors == ("booking_complete",)
+    assert intent.requested_candidate_types == (
+        "target_destination_affinity",
+        "intent_matched",
+    )
+
+
+def test_segment_instruction_does_not_fall_back_to_generic_vector_clusters() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("vector_001", vector_values(0)),
+            user_vector("vector_002", vector_values(0)),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=FakeRawEventSignalRepository([]),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=1,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(message_brief="숙소 예약 프로모션"),
+        segment_instruction="최근 제주 숙소를 검색한 고객",
+    )
+
+    assert segments == []
+    assert vector_reader.calls == []
 
 
 def test_destination_candidates_exclude_users_without_target_interest() -> None:

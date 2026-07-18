@@ -22,6 +22,7 @@ from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 ALLOCATION_POLICY_VERSION = "hotel_segment_allocation.v1"
 ALLOCATION_PREVIEW_VERSION = "audience_allocation_preview.v1"
 ALLOCATION_POLICY_PRIORITY = {
+    "custom_structured": -1,
     "target_destination_affinity": 0,
     "funnel_recovery": 1,
     "benefit_value_seeker": 2,
