@@ -8,6 +8,10 @@ from datetime import date
 from typing import Mapping, Sequence
 
 from app.audience_contract import (
+    CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+    CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_HASH,
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
     LEGACY_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_QUERY_COMPILER_HASH,
@@ -67,6 +71,22 @@ USER_BEHAVIOR_VECTORIZER_SEMANTIC_HASH = hashlib.sha256(
 ).hexdigest()
 DESTINATION_BLOCK_START = 16
 DESTINATION_BLOCK_SIZE = 16
+CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION = "custom_structured_query.v1"
+_CUSTOM_STRUCTURED_QUERY_COMPILER_SEMANTICS = {
+    "version": CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION,
+    "manifest_hash": HOTEL_BEHAVIOR_MANIFEST_HASH,
+    "membership": "validated_structured_conditions_are_authoritative",
+    "vector_role": "ordering_and_allocation_tiebreak_only",
+    "score_threshold": -1.0,
+    "semantic_margin": 2.0,
+}
+CUSTOM_STRUCTURED_QUERY_COMPILER_HASH = hashlib.sha256(
+    json.dumps(
+        _CUSTOM_STRUCTURED_QUERY_COMPILER_SEMANTICS,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -472,6 +492,76 @@ class HotelBookingBehaviorSchemaV2:
             user_vectorizer_semantic_hash=(
                 calibration.user_vectorizer_semantic_hash
             ),
+        )
+
+    def compile_custom_segment_audience(
+        self,
+        *,
+        spec: SegmentAudienceSpec,
+    ) -> CandidateBehaviorSpec:
+        """Compile an allowlisted custom predicate without semantic-anchor inference.
+
+        Exact structured predicates decide membership. The behavior vector only
+        orders already-matching users and resolves overlap during allocation.
+        """
+        if not spec.is_custom_structured:
+            raise ValueError("custom audience compiler requires a custom template")
+        if spec.template_semantic_hash != CUSTOM_STRUCTURED_TEMPLATE_HASH:
+            raise ValueError("custom audience template hash does not match")
+        if spec.semantic_selection_policy_id != CUSTOM_STRUCTURED_SELECTION_POLICY_ID:
+            raise ValueError("custom audience selection policy does not match")
+        if spec.semantic_anchor_policy_id != CUSTOM_STRUCTURED_ANCHOR_POLICY_ID:
+            raise ValueError("custom audience anchor policy does not match")
+
+        query = [0.0] * VECTOR_DIM
+        for signal_key in spec.query_signal_keys:
+            try:
+                query[_QUERY_DIMENSION_INDICES[signal_key]] = 1.0
+            except KeyError as exc:
+                raise ValueError(
+                    f"unsupported custom segment query signal: {signal_key}"
+                ) from exc
+        for destination_id in spec.destination_ids:
+            _add_signed_hash(query, destination_id)
+        for month in spec.season_months:
+            query[_MONTH_QUERY_INDICES[month]] = 1.0
+
+        active_blocks = {
+            block
+            for block, indices in _BLOCKS.items()
+            if any(query[index] != 0 for index in indices)
+        }
+        weights = {
+            block: 1.0 / len(active_blocks)
+            for block in sorted(active_blocks)
+        }
+        _apply_block_weights(query, weights)
+        return CandidateBehaviorSpec(
+            candidate_type=spec.candidate_type,
+            schema_version=self.schema_version,
+            vector_version=self.vector_version,
+            hard_predicate_keys=spec.hard_predicate_keys,
+            predicate_parameters=spec.predicate_parameters,
+            query_vector=tuple(_l2_normalize(query)),
+            active_blocks=tuple(weights),
+            block_weights=weights,
+            score_threshold=-1.0,
+            calibration_version="custom_structured_exact.v1",
+            manifest_hash=HOTEL_BEHAVIOR_MANIFEST_HASH,
+            calibration_hash=CUSTOM_STRUCTURED_QUERY_COMPILER_HASH,
+            audience_resolution_contract=SEGMENT_AUDIENCE_CONTRACT,
+            segment_audience_spec_hash=spec.spec_hash,
+            query_compiler_version=CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION,
+            query_compiler_hash=CUSTOM_STRUCTURED_QUERY_COMPILER_HASH,
+            template_id=CUSTOM_STRUCTURED_TEMPLATE_ID,
+            template_version=spec.template_version,
+            template_semantic_hash=spec.template_semantic_hash,
+            semantic_selection_policy_id=spec.semantic_selection_policy_id,
+            semantic_anchor_policy_id=spec.semantic_anchor_policy_id,
+            semantic_anchor_hash=CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            semantic_margin=2.0,
+            semantic_selection_status="exact_structured_conditions",
+            business_lift_status="not_applicable_to_direct_segment",
         )
 
 

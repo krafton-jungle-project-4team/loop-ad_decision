@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+from typing import Mapping, Sequence
 
 import pytest
 
@@ -70,6 +71,15 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
 )
 from app.audience_contract import (
+    CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+    CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+    CUSTOM_STRUCTURED_CONDITION_KEY,
+    CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+    CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_HASH,
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+    CUSTOM_STRUCTURED_WINDOW_DAYS,
     SEGMENT_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_QUERY_COMPILER_HASH,
     SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
@@ -188,6 +198,97 @@ def test_three_same_scope_predicates_share_one_batch_aggregate() -> None:
     assert query.count("FROM per_user") == 1
     assert all(f"AS match_{index}" in query for index in range(3))
     assert len(parameters) == 9
+
+
+def test_custom_structured_segment_compiles_exact_conditions_without_semantic_filter() -> None:
+    conditions = [
+        {
+            "event_name": "hotel_detail_view",
+            "label": "제주 호텔 상세 조회",
+            "minimum_count": 1,
+            "maximum_count": None,
+            "destination": "jeju",
+            "checkin_months": [],
+            "property_filters": [],
+        },
+        {
+            "event_name": "booking_start",
+            "label": "제주 예약 시작",
+            "minimum_count": 1,
+            "maximum_count": None,
+            "destination": "jeju",
+            "checkin_months": [],
+            "property_filters": [],
+        },
+        {
+            "event_name": "booking_complete",
+            "label": "예약 완료 없음",
+            "minimum_count": 0,
+            "maximum_count": 0,
+            "destination": None,
+            "checkin_months": [],
+            "property_filters": [],
+        },
+    ]
+    rule_json = _custom_structured_rule(
+        conditions=conditions,
+        query_signal_keys=(
+            "booking_start_intensity",
+            "booking_start_without_complete",
+            "hotel_detail_view_intensity",
+        ),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="custom_segment",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.is_custom_structured
+    assert resolution.spec.destination_ids == ("jeju",)
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    assert compiled.hard_predicate_keys == (CUSTOM_STRUCTURED_CONDITION_KEY,)
+    assert compiled.score_threshold == -1.0
+    assert compiled.semantic_margin == 2.0
+    assert compiled.semantic_selection_status == "exact_structured_conditions"
+
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    # The zero-upper-bound condition emits one count expression for each bound.
+    assert sql.count("countIf(") == 4
+    assert "custom_0_destination_terms" in sql
+    assert "custom_1_destination_terms" in sql
+    assert "custom_2_maximum_count" in sql
+
+
+def test_custom_structured_segment_rejects_unsupported_event() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "arbitrary_sql_event",
+                "label": "허용되지 않은 이벤트",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [],
+            }
+        ],
+        query_signal_keys=("hotel_consideration_intensity",),
+    )
+
+    with pytest.raises(SegmentAudienceContractError) as error:
+        SegmentDefinitionAudienceAdapter().resolve(
+            segment_id="invalid_custom_segment",
+            rule_json=rule_json,
+        )
+
+    assert error.value.code == "segment_audience_parameters_invalid"
 
 
 def test_batch_and_individual_destination_exploration_share_canonical_values() -> None:
@@ -1446,6 +1547,34 @@ def _analysis_promotion() -> AnalysisPromotionRecord:
         landing_url=None,
         message_brief=None,
     )
+
+
+def _custom_structured_rule(
+    *,
+    conditions: Sequence[Mapping[str, object]],
+    query_signal_keys: Sequence[str],
+) -> dict[str, object]:
+    return {
+        "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
+        "segment_audience_spec": {
+            "schema_version": "hotel_behavior.v2",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+            "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "condition_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+            "query_signal_keys": list(query_signal_keys),
+            "hard_predicate_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+            "parameters": {
+                "lookback_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+                "conditions": list(conditions),
+            },
+            "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+            "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+            "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+        },
+    }
 
 
 def _v2_segment(

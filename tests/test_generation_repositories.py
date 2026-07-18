@@ -853,6 +853,58 @@ def test_generation_input_repository_reads_confirmed_target_segments() -> None:
     }
 
 
+def test_generation_input_repository_reads_offer_links_from_promotion_metadata() -> None:
+    cursor = FakeCursor(
+        fetchone_result={
+            "project_id": "demo_project",
+            "campaign_id": "camp_black_friday",
+            "promotion_id": "promo_black_friday",
+            "channel": "email",
+            "goal_metric": "booking_conversion_rate",
+            "goal_target_value": "0.030000",
+            "goal_basis": "all_segments",
+            "message_brief": "Promote Jeju and Okinawa hotels.",
+            "landing_url": (
+                "https://demo-shoppingmall.dev.loop-ad.org/promotions/black-friday"
+            ),
+            "offer_type": "hotel_sale",
+            "landing_type": "promotion",
+            "metadata_json": {
+                "offer_links": [
+                    {
+                        "offer_id": "jeju-ocean-breeze-006",
+                        "destination_url": (
+                            "https://demo-shoppingmall.dev.loop-ad.org/"
+                            "hotel/jeju-ocean-breeze-006"
+                        ),
+                    }
+                ]
+            },
+        }
+    )
+    repository = GenerationInputRepository(FakeConnection(cursor))
+
+    promotion = repository.get_promotion_input(
+        GenerationRequest(
+            project_id="demo_project",
+            campaign_id="camp_black_friday",
+            promotion_id="promo_black_friday",
+            analysis_id="analysis_black_friday",
+            content_option_count=3,
+        )
+    )
+
+    assert promotion is not None
+    assert [link.offer_id for link in promotion.offer_links] == [
+        "jeju-ocean-breeze-006"
+    ]
+    assert promotion.offer_links[0].destination_url.endswith(
+        "/hotel/jeju-ocean-breeze-006"
+    )
+    query, _params = cursor.executed[0]
+    assert "metadata_json" in query
+
+
 def test_generation_input_repository_limits_confirmed_targets_to_requested_segment_ids() -> None:
     cursor = FakeCursor(
         fetchall_result=[

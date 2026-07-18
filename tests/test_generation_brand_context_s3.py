@@ -26,6 +26,9 @@ PHOTO_RECIPE_KEY = (
     f"{PREFIX}{PROJECT_ID}/guidelines/photo-recipe/v1/content.md"
 )
 HOME_HERO_KEY = f"{PREFIX}{PROJECT_ID}/assets/home-hero/v1/original.jpg"
+OFFER_CATALOG_KEY = (
+    f"{PREFIX}{PROJECT_ID}/catalogs/black-friday-hotels/v2/catalog.json"
+)
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 MARKDOWN_CONTENT_TYPE = "text/markdown; charset=utf-8"
 
@@ -117,6 +120,110 @@ def test_s3_loader_loads_only_sms_applicable_guides_without_asset() -> None:
     )
 
     assert [document.source_id for document in documents] == ["brand-voice"]
+
+
+def test_s3_loader_loads_verified_offer_catalog_with_public_image_path() -> None:
+    catalog_bytes = _json_bytes(
+        {
+            "schema_version": "stayloop.promotion-price-catalog.v1",
+            "project_id": PROJECT_ID,
+            "catalog_id": "black-friday-hotels",
+            "catalog_version": "v2",
+            "promotion_label": "제주·오키나와 블랙프라이데이",
+            "price_basis": "one_room_one_night",
+            "currency": "KRW",
+            "hotels": [
+                {
+                    "hotel_id": "jeju-ocean-breeze-006",
+                    "hotel_name": "Jeju Ocean Breeze Resort",
+                    "destination_id": "jeju",
+                    "currency": "KRW",
+                    "sale_price_per_night": 278000,
+                    "original_price_per_night": 342000,
+                    "discount_rate_percent": 19,
+                }
+            ],
+        }
+    )
+    hotel_image_bytes = b"hotel-image"
+    hotel_image_key = (
+        f"{PREFIX}{PROJECT_ID}/assets/"
+        "hotel-jeju-ocean-breeze-006-hero/v2/original.png"
+    )
+    objects = bundle_objects(
+        manifest_patch={
+            "context_version": "v1",
+            "catalogs": [
+                {
+                    "catalog_id": "black-friday-hotels",
+                    **reference(
+                        OFFER_CATALOG_KEY,
+                        catalog_bytes,
+                        JSON_CONTENT_TYPE,
+                        version="v2",
+                    ),
+                    "required": True,
+                    "applies_to": ["email"],
+                }
+            ],
+            "assets": [
+                {
+                    "asset_id": "hotel-jeju-ocean-breeze-006-hero",
+                    **reference(
+                        hotel_image_key,
+                        hotel_image_bytes,
+                        "image/png",
+                        version="v2",
+                    ),
+                    "role": "hotel",
+                    "active": True,
+                    "advertising_use": "demo_only",
+                    "frontend_path": (
+                        "/stayloop/promotions/jeju-resort-exterior.png"
+                    ),
+                    "entity_refs": [
+                        {
+                            "type": "hotel",
+                            "id": "jeju-ocean-breeze-006",
+                            "usage": "primary",
+                        },
+                        {"type": "destination", "id": "jeju"},
+                    ],
+                }
+            ],
+        }
+    )
+    objects[OFFER_CATALOG_KEY] = (catalog_bytes, JSON_CONTENT_TYPE)
+    objects[hotel_image_key] = (hotel_image_bytes, "image/png")
+    loader = S3BrandContextLoader(
+        bucket_name=BUCKET,
+        base_prefix=PREFIX,
+        s3_client=FakeS3Client(objects),
+    )
+    snapshot = loader.resolve_snapshot(project_id=PROJECT_ID)
+    assert snapshot is not None
+
+    catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+    )
+
+    assert catalog is not None
+    assert catalog["catalog_version"] == "v2"
+    assert catalog["hotels"] == [
+        {
+            "offer_id": "jeju-ocean-breeze-006",
+            "hotel_name": "Jeju Ocean Breeze Resort",
+            "destination_id": "jeju",
+            "currency": "KRW",
+            "sale_price_per_night": 278000,
+            "original_price_per_night": 342000,
+            "discount_rate_percent": 19,
+            "image_path": "/stayloop/promotions/jeju-resort-exterior.png",
+            "asset_id": "hotel-jeju-ocean-breeze-006-hero",
+        }
+    ]
+    assert OFFER_CATALOG_KEY in loader._s3_client.get_calls
 
 
 def test_s3_loader_returns_none_when_project_pointer_is_absent() -> None:

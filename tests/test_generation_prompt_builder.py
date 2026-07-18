@@ -376,6 +376,29 @@ def test_generation_context_fingerprint_and_candidate_strategy_are_deterministic
     assert changed_context.brief_fingerprint != context.brief_fingerprint
 
 
+def test_email_candidate_strategies_match_three_renderer_variants() -> None:
+    prompt_input = GenerationPromptInput(
+        request=generation_request(operator_instruction=None),
+        promotion=promotion_input(channel=ContentChannel.EMAIL),
+        target_segment=target_segment_input(),
+    )
+    context = GenerationContextBuilder().build(prompt_input)
+    planner = GenerationStrategyPlanner()
+
+    plans = [
+        planner.build(context, option_index=option_index)
+        for option_index in range(1, 4)
+    ]
+
+    assert [plan.visual_direction for plan in plans] == [
+        ("editorial destination story with a hero and two travel sections",),
+        ("eight accommodation offer cards using verified catalog images",),
+        (
+            "concise four-accommodation comparison using verified catalog images",
+        ),
+    ]
+
+
 def test_strategy_planner_requires_hotel_reference_for_benefit_focus() -> None:
     prompt_input = GenerationPromptInput(
         request=generation_request(operator_instruction=None),

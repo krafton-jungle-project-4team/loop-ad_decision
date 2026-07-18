@@ -6,6 +6,7 @@ from enum import StrEnum
 from statistics import NormalDist
 from typing import Mapping, Protocol, Sequence
 
+from app.audience_contract import CUSTOM_STRUCTURED_TEMPLATE_ID
 from app.analysis.behavior_vector_schema import CandidateBehaviorSpec
 
 
@@ -169,6 +170,17 @@ class CandidateAudienceSearchService:
             raise ValueError("hard match count must not exceed corpus count")
         if not 0.0 <= estimated_score_pass_rate <= 1.0:
             raise ValueError("estimated score pass rate must be between 0 and 1")
+
+        if spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID:
+            return self._exact(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                source_cutoff=source_cutoff,
+                spec=spec,
+                corpus_user_count=corpus_user_count,
+                hard_match_user_count=hard_match_user_count,
+                method=AudienceSearchMethod.EXACT,
+            )
 
         if corpus_user_count <= self._policy.exact_user_limit:
             return self._exact(
