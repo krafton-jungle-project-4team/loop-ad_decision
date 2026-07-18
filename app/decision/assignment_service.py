@@ -639,7 +639,9 @@ class SegmentAssignmentService:
                         ad_experiment_id=experiment.ad_experiment_id,
                         content_id=experiment.content_id,
                         content_option_id=experiment.content_option_id,
-                        similarity_score=member.behavior_fit_score,
+                        similarity_score=_score_to_decimal(
+                            member.behavior_fit_score
+                        ),
                         fallback=False,
                         fallback_reason=None,
                         assignment_source=AssignmentSource.ANALYSIS_SNAPSHOT.value,
@@ -1185,7 +1187,7 @@ def _fallback_reason_count(
     )
 
 
-def _score_to_decimal(score: float | None) -> Decimal | None:
+def _score_to_decimal(score: float | Decimal | None) -> Decimal | None:
     if score is None:
         return None
     clamped_score = min(1.0, max(0.0, float(score)))
