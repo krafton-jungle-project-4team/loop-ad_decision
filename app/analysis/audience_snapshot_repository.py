@@ -348,15 +348,18 @@ class AudienceSnapshotRepository:
                 )
                 """,
                 (
-                    tuple([snapshot_id] * len(chunk)),
-                    tuple(member.user_id for member in chunk),
-                    tuple(Decimal(str(member.behavior_fit_score)) for member in chunk),
-                    tuple([
+                    [snapshot_id] * len(chunk),
+                    [member.user_id for member in chunk],
+                    [
+                        Decimal(str(member.behavior_fit_score))
+                        for member in chunk
+                    ],
+                    [
                         "ann"
                         if write.search_result.method == AudienceSearchMethod.ANN
                         else "exact"
-                    ] * len(chunk)),
-                    tuple(member.retrieval_rank for member in chunk),
+                    ] * len(chunk),
+                    [member.retrieval_rank for member in chunk],
                 ),
             )
         self._require_member_count(

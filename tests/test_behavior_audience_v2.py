@@ -995,6 +995,60 @@ def test_snapshot_bulk_copies_materialized_members_without_python_list() -> None
     assert "calibration_hash" in snapshot_insert[0]
 
 
+def test_snapshot_explicit_members_use_postgres_array_parameters() -> None:
+    db = _SnapshotWriteDb(actual_member_count=2)
+    repository = AnalysisAudienceSnapshotRepository(db)
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    spec = HotelBookingBehaviorSchemaV2().compile_candidate(
+        candidate_type="promotion_responsive",
+        intent=_intent(),
+        calibration=CandidateCalibration(0.5, "test.v1"),
+    )
+
+    snapshot_id = repository.save_completed(
+        AudienceSnapshotWrite(
+            analysis_id="analysis",
+            project_id="project",
+            campaign_id="campaign",
+            promotion_id="promotion",
+            segment_id="segment",
+            segment_vector_id="segment_vector",
+            vector_generation_id="uvgen_test",
+            source_cutoff=now,
+            window_start=now - timedelta(days=90),
+            window_end=now,
+            spec=spec,
+            search_result=AudienceSearchResult(
+                method=AudienceSearchMethod.EXACT,
+                members=(
+                    SearchCandidate("user_1", 0.9, 1),
+                    SearchCandidate("user_2", 0.8, 2),
+                ),
+                corpus_user_count=2,
+                hard_match_user_count=2,
+                requested_k=2,
+                recall_audit=None,
+                policy_version="audience_search.v2",
+            ),
+            min_sample_size=1,
+        )
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in db.executed
+        if "FROM unnest(" in query
+    )
+    assert params == (
+        [snapshot_id, snapshot_id],
+        ["user_1", "user_2"],
+        [Decimal("0.9"), Decimal("0.8")],
+        ["exact", "exact"],
+        [1, 2],
+    )
+    assert all(isinstance(value, list) for value in params)
+
+
 def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision() -> None:
     now = datetime(2026, 7, 17, tzinfo=UTC)
     spec = HotelBookingBehaviorSchemaV2().compile_candidate(
@@ -1080,18 +1134,24 @@ def test_assignment_reuses_preallocated_run_target_snapshots_without_winner_sear
     assert response.matching_mode == "analysis_snapshot_reuse"
     assert response.assignment_mode == "analysis_snapshot"
     assert response.input_stability == "snapshotted"
-    assert response.assignment_count == 2
+    assert response.assignment_count == 3
     assert {row.user_id: row.segment_id for row in assignments.rows} == {
         "user_1": "seg_b",
         "user_2": "seg_a",
+        "user_3": "seg_b",
+    }
+    assert {
+        row.user_id: row.similarity_score for row in assignments.rows
+    } == {
+        "user_1": Decimal("0.900000"),
+        "user_2": Decimal("0.000000"),
+        "user_3": None,
     }
     assert all(
         row.assignment_source == AssignmentSource.ANALYSIS_SNAPSHOT.value
         for row in assignments.rows
     )
     assert snapshots.consume_calls == 1
-
-
 def test_vector_search_sync_is_incremental_and_advances_complete_cutoff() -> None:
     repository = _SyncRepository()
     first = UserBehaviorVectorSearchSyncService(repository).sync(
@@ -1593,12 +1653,13 @@ class _SearchSqlPostgres:
 
 
 class _SnapshotWriteDb:
-    def __init__(self) -> None:
+    def __init__(self, *, actual_member_count: int = 800) -> None:
+        self.actual_member_count = actual_member_count
         self.executed: list[tuple[str, tuple[object, ...]]] = []
 
     def fetchone(self, query: str, _params: object = ()):
         if "SELECT count(*) AS actual_member_count" in query:
-            return {"actual_member_count": 800}
+            return {"actual_member_count": self.actual_member_count}
         return None
 
     def execute(self, query: str, params: object = ()) -> None:
@@ -1644,7 +1705,8 @@ class _SnapshotReader:
         # Final allocation snapshots are already mutually exclusive.
         return [
             AudienceSnapshotMember("user_1", "seg_b", Decimal("0.9")),
-            AudienceSnapshotMember("user_2", "seg_a", Decimal("0.8")),
+            AudienceSnapshotMember("user_2", "seg_a", Decimal("-0.25")),
+            AudienceSnapshotMember("user_3", "seg_b", None),
         ]
 
 

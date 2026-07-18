@@ -113,7 +113,7 @@ def test_allocation_winner_sql_uses_template_priority_then_normalized_fit() -> N
     )
     assert "source.priority ASC" in winner_query
     assert "member.behavior_fit_score - source.score_threshold" in winner_query
-    assert "/ source.semantic_margin DESC" in winner_query
+    assert "/ source.semantic_margin DESC NULLS LAST" in winner_query
     assert "source.segment_id ASC" in winner_query
     assert "promotion_audience_exclusion_members" in winner_query
     assert "NOT EXISTS" in winner_query
