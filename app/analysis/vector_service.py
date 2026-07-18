@@ -114,7 +114,13 @@ class SegmentVectorService:
                 "segmentId": request.segment_id,
             }
         )
-        log.info("started", {"request": request})
+        log.info(
+            "started",
+            {
+                "candidateUserCount": len(request.candidate_user_ids),
+                "vectorVersion": request.vector_version,
+            },
+        )
         existing = self._segment_vector_repository.get_by_segment_snapshot(
             project_id=request.project_id,
             promotion_id=request.promotion_id,
@@ -146,7 +152,13 @@ class SegmentVectorService:
             )
             log.assign_context({"segmentVectorId": response.segment_vector_id})
             log.info("segment_vector_reused", {"source": response.source})
-            log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+            log.info(
+                "completed",
+                {
+                    "source": response.source,
+                    "durationMs": duration_ms(started_at),
+                },
+            )
             return response
 
         reusable = (
@@ -218,7 +230,13 @@ class SegmentVectorService:
         )
         log.assign_context({"segmentVectorId": response.segment_vector_id})
         log.info("segment_vector_created", {"source": source})
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
+        log.info(
+            "completed",
+            {
+                "source": response.source,
+                "durationMs": duration_ms(started_at),
+            },
+        )
         return response
 
 

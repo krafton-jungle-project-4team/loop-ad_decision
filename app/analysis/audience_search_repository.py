@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Mapping, Sequence
 
 from app.analysis.audience_search import SearchCandidate
+from app.audience_contract import CUSTOM_STRUCTURED_PROPERTY_KEYS
 from app.analysis.behavior_manifest import clickhouse_canonical_destination_sql
 from app.analysis.repositories import ClickHouseClient, PostgresExecutor
 from app.audience_exclusions import (
@@ -171,6 +173,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 filter_user_ids=False,
                 restrict_to_vector_population=True,
                 exclude_promotion_users=exclusion_context is not None,
+                predicate_parameters=predicate_parameters,
             )
             + ")",
             parameters={
@@ -187,6 +190,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 "destinations": list(predicate_parameters.get("destinations", ())),
                 "season_months": list(predicate_parameters.get("season_months", ())),
                 "benefit_keys": list(predicate_parameters.get("benefit_keys", ())),
+                **_structured_query_parameters(predicate_parameters),
                 **_clickhouse_exclusion_parameters(exclusion_context),
             },
         )
@@ -284,6 +288,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 restrict_to_vector_population=True,
                 deterministic_sample=True,
                 exclude_promotion_users=exclusion_context is not None,
+                predicate_parameters=predicate_parameters,
             )
             + " LIMIT {sample_size:UInt32}",
             parameters={
@@ -304,6 +309,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     f"{project_id}:{vector_generation_id}:{source_cutoff.isoformat()}"
                 ),
                 "sample_size": sample_size,
+                **_structured_query_parameters(predicate_parameters),
                 **_clickhouse_exclusion_parameters(exclusion_context),
             },
         )
@@ -986,6 +992,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 _hard_predicate_query(
                     hard_predicate_keys,
                     exclude_promotion_users=exclusion_context is not None,
+                    predicate_parameters=predicate_parameters,
                 ),
                 parameters={
                     "project_id": project_id,
@@ -1004,6 +1011,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     "benefit_keys": list(
                         predicate_parameters.get("benefit_keys", ())
                     ),
+                    **_structured_query_parameters(predicate_parameters),
                     **_clickhouse_exclusion_parameters(exclusion_context),
                 },
             )
@@ -1276,6 +1284,187 @@ def _hard_predicate_batch_query(
     return query, parameters
 
 
+_DESTINATION_ALIAS_GROUPS = (
+    ("제주", "jeju"),
+    ("오키나와", "okinawa"),
+    ("삿포로", "sapporo"),
+    ("도쿄", "tokyo"),
+    ("오사카", "osaka"),
+    ("부산", "busan"),
+    ("서울", "seoul"),
+    ("다낭", "da nang", "danang"),
+)
+
+
+def _structured_having_conditions(
+    predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+) -> list[str]:
+    conditions = _structured_conditions(predicate_parameters)
+    result: list[str] = []
+    destination_text = "concat(" + ", ' ', ".join(
+        (
+            "ifNull(JSONExtractString(properties_json, 'destination_id'), '')",
+            "ifNull(JSONExtractString(properties_json, 'destination_name'), '')",
+            "ifNull(JSONExtractString(properties_json, 'hotel_city'), '')",
+            "ifNull(JSONExtractString(properties_json, 'hotel_country'), '')",
+        )
+    ) + ")"
+    for index, condition in enumerate(conditions):
+        prefix = f"custom_{index}"
+        event_predicates = [
+            f"event_name = {{{prefix}_event_name:String}}",
+        ]
+        if condition.get("destination"):
+            event_predicates.append(
+                "arrayExists(term -> positionCaseInsensitiveUTF8("
+                f"{destination_text}, term) > 0, "
+                f"{{{prefix}_destination_terms:Array(String)}})"
+            )
+        if condition.get("checkin_months"):
+            event_predicates.append(
+                "toMonth(parseDateTimeBestEffortOrNull(nullIf("
+                "JSONExtractString(properties_json, 'checkin_date'), ''))) "
+                f"IN {{{prefix}_checkin_months:Array(UInt8)}}"
+            )
+        for filter_index, property_filter in enumerate(
+            condition.get("property_filters", ())
+        ):
+            event_predicates.append(
+                _structured_property_predicate(
+                    property_filter,
+                    parameter_name=f"{prefix}_property_{filter_index}",
+                )
+            )
+        event_match = " AND ".join(
+            f"({predicate})" for predicate in event_predicates
+        )
+        count_expression = f"countIf({event_match})"
+        bounds = [f"{count_expression} >= {{{prefix}_minimum_count:UInt32}}"]
+        if condition.get("maximum_count") is not None:
+            bounds.append(
+                f"{count_expression} <= {{{prefix}_maximum_count:UInt32}}"
+            )
+        result.append(" AND ".join(f"({bound})" for bound in bounds))
+    return result
+
+
+def _structured_query_parameters(
+    predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+) -> dict[str, Any]:
+    if "structured_conditions_json" not in predicate_parameters:
+        return {}
+    parameters: dict[str, Any] = {}
+    for index, condition in enumerate(_structured_conditions(predicate_parameters)):
+        prefix = f"custom_{index}"
+        parameters[f"{prefix}_event_name"] = str(condition["event_name"])
+        parameters[f"{prefix}_minimum_count"] = int(condition["minimum_count"])
+        if condition.get("maximum_count") is not None:
+            parameters[f"{prefix}_maximum_count"] = int(condition["maximum_count"])
+        if condition.get("destination"):
+            parameters[f"{prefix}_destination_terms"] = list(
+                _destination_search_terms(str(condition["destination"]))
+            )
+        if condition.get("checkin_months"):
+            parameters[f"{prefix}_checkin_months"] = [
+                int(month) for month in condition["checkin_months"]
+            ]
+        for filter_index, property_filter in enumerate(
+            condition.get("property_filters", ())
+        ):
+            operator = str(property_filter["operator"])
+            if operator == "exists":
+                continue
+            raw_value = str(property_filter["value"])
+            parameter_name = f"{prefix}_property_{filter_index}"
+            if (
+                operator == "equals"
+                and property_filter["key"]
+                in {"free_cancellation", "breakfast_included"}
+                and raw_value.lower() in {"true", "false", "1", "0"}
+            ):
+                parameters[parameter_name] = (
+                    "1" if raw_value.lower() in {"true", "1"} else "0"
+                )
+            else:
+                parameters[parameter_name] = (
+                    float(raw_value)
+                    if operator in {"gte", "lte"}
+                    else raw_value
+                )
+    return parameters
+
+
+def _structured_conditions(
+    predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+) -> tuple[Mapping[str, Any], ...]:
+    serialized_values = predicate_parameters.get("structured_conditions_json", ())
+    if len(serialized_values) != 1 or not isinstance(serialized_values[0], str):
+        raise ValueError("structured conditions payload is missing")
+    try:
+        payload = json.loads(serialized_values[0])
+    except json.JSONDecodeError as exc:
+        raise ValueError("structured conditions payload is invalid") from exc
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("structured conditions payload must be a non-empty array")
+    return tuple(
+        condition
+        for condition in payload
+        if isinstance(condition, Mapping)
+    )
+
+
+def _structured_property_predicate(
+    property_filter: Mapping[str, Any],
+    *,
+    parameter_name: str,
+) -> str:
+    key = str(property_filter["key"])
+    if key not in CUSTOM_STRUCTURED_PROPERTY_KEYS:
+        raise ValueError(f"unsupported structured property key: {key}")
+    operator = str(property_filter["operator"])
+    extracted = f"ifNull(JSONExtractString(properties_json, '{key}'), '')"
+    if operator == "exists":
+        return f"nullIf({extracted}, '') IS NOT NULL"
+    if operator == "contains":
+        return (
+            f"positionCaseInsensitiveUTF8({extracted}, "
+            f"{{{parameter_name}:String}}) > 0"
+        )
+    if operator in {"gte", "lte"}:
+        comparison = ">=" if operator == "gte" else "<="
+        return (
+            f"toFloat64OrNull(nullIf({extracted}, '')) {comparison} "
+            f"{{{parameter_name}:Float64}}"
+        )
+    if operator != "equals":
+        raise ValueError(f"unsupported structured property operator: {operator}")
+    if key in {"free_cancellation", "breakfast_included"}:
+        return (
+            f"toUInt8OrZero({extracted}) = "
+            f"toUInt8OrZero({{{parameter_name}:String}})"
+        )
+    return f"lowerUTF8({extracted}) = lowerUTF8({{{parameter_name}:String}})"
+
+
+def _destination_search_terms(destination: str) -> tuple[str, ...]:
+    normalized_values = [
+        value.strip().lower()
+        for value in destination.replace("，", ",")
+        .replace("/", ",")
+        .replace("·", ",")
+        .split(",")
+        if value.strip()
+    ]
+    terms: set[str] = set()
+    for value in normalized_values:
+        aliases = next(
+            (group for group in _DESTINATION_ALIAS_GROUPS if value in group),
+            (value,),
+        )
+        terms.update(aliases)
+    return tuple(sorted(terms))
+
+
 def _hard_predicate_query(
     keys: Sequence[str],
     *,
@@ -1283,6 +1472,7 @@ def _hard_predicate_query(
     restrict_to_vector_population: bool = False,
     deterministic_sample: bool = False,
     exclude_promotion_users: bool = False,
+    predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]] | None = None,
 ) -> str:
     supported = {
         "hotel_product_interest",
@@ -1293,6 +1483,7 @@ def _hard_predicate_query(
         "general_destination_exploration",
         "recent_destination_search",
         "season_match",
+        "structured_conditions",
     }
     unknown = sorted(set(keys) - supported)
     if unknown:
@@ -1363,6 +1554,10 @@ def _hard_predicate_query(
                 "countIf(toMonth(parseDateTimeBestEffortOrNull("
                 "JSONExtractString(properties_json, 'checkin_date'))) "
                 "IN {season_months:Array(UInt8)}) > 0"
+            )
+        elif key == "structured_conditions":
+            conditions.extend(
+                _structured_having_conditions(predicate_parameters or {})
             )
     having = " AND ".join(f"({condition})" for condition in conditions) or "1"
     user_filter = (
