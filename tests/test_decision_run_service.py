@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 
@@ -297,6 +298,53 @@ def test_v2_run_uses_only_the_selected_card_source_and_snapshot() -> None:
     assert [(item.segment_id, item.final_snapshot_id) for item in bindings] == [
         ("seg_a", "final_a")
     ]
+
+
+def test_v2_run_normalizes_postgres_uuid_allocation_plan_id() -> None:
+    analysis = analysis_record(analysis_id="analysis_confirm_a")
+    generation = generation_record(
+        analysis_id=analysis.analysis_id,
+        generation_id="generation_a",
+        target_segment_ids=["seg_a"],
+    )
+    plan_id = UUID("c15768c1-544c-4d7f-bae5-835a17fc6359")
+    target = replace(
+        target_segment_record(
+            analysis_id=analysis.analysis_id,
+            segment_id="seg_a",
+            audience_snapshot_id="final_a",
+            rule_json=segment_audience_rule_json(),
+        ),
+        allocation_plan_id=plan_id,
+    )
+    service, repos = make_service(
+        analysis=analysis,
+        latest_analysis=analysis,
+        generation=generation,
+        latest_generation=generation,
+        target_segments=[target],
+        candidates=[
+            content_candidate_record(
+                analysis_id=analysis.analysis_id,
+                generation_id=generation.generation_id,
+                segment_id="seg_a",
+                content_id="content_a",
+                content_option_id="option_a",
+            )
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id=analysis.analysis_id,
+            generation_id=generation.generation_id,
+            segment_ids=["seg_a"],
+        ),
+    )
+
+    binding = repos.run_audience_bindings.bindings[response.promotion_run_id][0]
+    assert binding.allocation_plan_id == str(plan_id)
 
 
 def test_run_service_rejects_invalid_v2_snapshot_before_writes() -> None:
