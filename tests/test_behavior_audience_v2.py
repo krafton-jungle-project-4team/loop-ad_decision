@@ -95,9 +95,11 @@ from app.decision.repositories import (
 from app.decision.schemas import AssignmentSource, SegmentAssignmentBuildRequest
 from app.internal.user_behavior_vector_search_sync import (
     SearchVectorRevision,
+    UserBehaviorVectorSearchSyncRepository,
     UserBehaviorVectorSearchSyncService,
     VectorSearchGeneration,
     VectorSyncCursor,
+    _validate_revision,
 )
 
 
@@ -1038,6 +1040,64 @@ def test_failed_vector_generation_preserves_previous_active_generation() -> None
 
     assert result.status == "failed"
     assert result.active_generation_id == "uvgen_previous"
+
+
+def test_vector_revision_window_compares_at_clickhouse_utc_millisecond_precision(
+) -> None:
+    repository = _SyncRepository()
+    generation = replace(
+        repository.generation,
+        window_start=repository.generation.window_start.replace(microsecond=123_456),
+        window_end=repository.generation.window_end.replace(microsecond=654_321),
+    )
+    revision = replace(
+        repository.revisions[0],
+        window_start=generation.window_start.replace(
+            tzinfo=None,
+            microsecond=123_000,
+        ),
+        window_end=generation.window_end.replace(
+            tzinfo=None,
+            microsecond=654_000,
+        ),
+    )
+
+    _validate_revision(revision, generation)
+
+    with pytest.raises(
+        ValueError,
+        match="search vector revision does not belong to generation",
+    ):
+        _validate_revision(
+            replace(
+                revision,
+                window_end=revision.window_end + timedelta(milliseconds=1),
+            ),
+            generation,
+        )
+
+
+def test_vector_revision_bulk_upsert_uses_postgres_array_parameters() -> None:
+    class RecordingPostgres:
+        params: tuple[object, ...] | None = None
+
+        def execute(self, _query: str, params: tuple[object, ...] = ()) -> None:
+            self.params = params
+
+    source = _SyncRepository()
+    postgres = RecordingPostgres()
+    repository = UserBehaviorVectorSearchSyncRepository(
+        clickhouse=object(),
+        postgres=postgres,
+    )
+
+    repository.bulk_upsert_revisions(
+        generation=source.generation,
+        revisions=source.revisions,
+    )
+
+    assert postgres.params is not None
+    assert all(isinstance(value, list) for value in postgres.params[5:])
 
 
 def test_assignment_snapshot_contract_accepts_superseded_consistent_generation() -> None:
