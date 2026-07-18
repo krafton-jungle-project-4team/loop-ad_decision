@@ -5,13 +5,16 @@ import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
-from decimal import Decimal
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.analysis.audience_search import AudienceSearchMethod, AudienceSearchResult
 from app.analysis.behavior_vector_schema import CandidateBehaviorSpec
 from app.analysis.semantic_selection import semantic_query_vector_hash
 from app.audience_exclusions import PromotionAudienceExclusionContext
+
+
+SCORE_THRESHOLD_QUANTUM = Decimal("0.000001")
 
 
 class AudienceSnapshotBindingError(RuntimeError):
@@ -210,7 +213,7 @@ class AudienceSnapshotRepository:
                 write.search_result.policy_version,
                 write.spec.calibration_version,
                 write.spec.calibration_hash,
-                Decimal(str(write.spec.score_threshold)),
+                _contract_score_threshold(write.spec.score_threshold),
                 write.source_cutoff,
                 write.window_start,
                 write.window_end,
@@ -451,7 +454,7 @@ class AudienceSnapshotRepository:
             _query_vector_hash(spec),
             spec.query_compiler_version,
             spec.query_compiler_hash,
-            Decimal(str(spec.score_threshold)),
+            _contract_score_threshold(spec.score_threshold),
             _spec_fingerprint(spec),
         )
         metadata = row["metadata_json"]
@@ -472,7 +475,7 @@ class AudienceSnapshotRepository:
             str(row["query_vector_hash"]),
             str(row["query_compiler_version"]),
             str(row["query_compiler_hash"]),
-            Decimal(str(row["score_threshold"])),
+            _contract_score_threshold(row["score_threshold"]),
             str(metadata.get("spec_fingerprint", "")),
         )
         if actual_identity != expected_identity:
@@ -579,6 +582,14 @@ def _input_fingerprint(write: AudienceSnapshotWrite) -> str:
 
 def _query_vector_hash(spec: CandidateBehaviorSpec) -> str:
     return semantic_query_vector_hash(spec)
+
+
+def _contract_score_threshold(value: float | Decimal) -> Decimal:
+    """Normalize to the NUMERIC(10, 6) precision defined by the Data Contract."""
+    return Decimal(str(value)).quantize(
+        SCORE_THRESHOLD_QUANTUM,
+        rounding=ROUND_HALF_UP,
+    )
 
 
 def _spec_fingerprint(spec: CandidateBehaviorSpec) -> str:
