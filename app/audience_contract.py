@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping, Sequence
 
 from app.analysis.behavior_manifest import behavior_manifest_hash
@@ -19,6 +20,7 @@ LEGACY_AUDIENCE_CONTRACT = "legacy"
 SEGMENT_AUDIENCE_CONTRACT = "segment_audience.v1"
 SEGMENT_AUDIENCE_SCHEMA_VERSION = "hotel_behavior.v2"
 SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION = "segment_behavior_query.v2"
+SCORE_THRESHOLD_QUANTUM = Decimal("0.000001")
 _QUERY_COMPILER_SEMANTICS = {
     "version": SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
     "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
@@ -35,6 +37,14 @@ SEGMENT_AUDIENCE_QUERY_COMPILER_HASH = hashlib.sha256(
         separators=(",", ":"),
     ).encode("utf-8")
 ).hexdigest()
+
+
+def contract_score_threshold(value: float | Decimal) -> Decimal:
+    """Normalize to the NUMERIC(10, 6) precision in the data contract."""
+    return Decimal(str(value)).quantize(
+        SCORE_THRESHOLD_QUANTUM,
+        rounding=ROUND_HALF_UP,
+    )
 
 
 class SegmentAudienceContractError(RuntimeError):
