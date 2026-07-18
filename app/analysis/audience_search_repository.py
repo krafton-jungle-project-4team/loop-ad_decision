@@ -902,9 +902,9 @@ class PgClickHouseAudienceVectorSearchRepository:
                     )
                     """,
                     (
-                        tuple(member.user_id for member in matched),
-                        tuple(member.behavior_fit_score for member in matched),
-                        tuple(member.retrieval_rank for member in matched),
+                        [member.user_id for member in matched],
+                        [member.behavior_fit_score for member in matched],
+                        [member.retrieval_rank for member in matched],
                     ),
                 )
             after_user_id = str(rows[-1]["user_id"])
@@ -954,7 +954,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 "SELECT DISTINCT rows.user_id "
                 "FROM unnest(%s::text[]) AS rows(user_id) "
                 "ON CONFLICT (user_id) DO NOTHING",
-                (tuple(chunk),),
+                (list(chunk),),
             )
 
     def _filter_hard_predicates(
