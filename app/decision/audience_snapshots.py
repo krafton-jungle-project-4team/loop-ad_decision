@@ -15,6 +15,7 @@ from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
     semantic_query_vector_hash,
 )
+from app.logging import log
 
 
 class PostgresExecutor(Protocol):
@@ -332,22 +333,49 @@ class AudienceSnapshotRepository:
         row: Mapping[str, Any],
         binding: RunAudienceTargetBindingWrite,
     ) -> None:
-        if (
-            str(row["plan_status"]) not in {"finalized", "locked"}
-            or str(row["snapshot_status"]) != "completed"
-            or str(row["snapshot_kind"]) != "final"
-            or not row["source_snapshot_id"]
-            or str(row["snapshot_allocation_plan_id"])
-            != binding.allocation_plan_id
-            or int(row["final_user_count"]) <= 0
-            or int(row["actual_member_count"]) != int(row["final_user_count"])
-            or int(row["reservation_count"]) != int(row["final_user_count"])
-            or not bool(row["every_member_reserved"])
-        ):
-            raise AudienceSnapshotContractError(
-                "segment_audience_exclusion_binding_invalid: "
-                + binding.segment_id
-            )
+        final_user_count = int(row["final_user_count"])
+        actual_member_count = int(row["actual_member_count"])
+        reservation_count = int(row["reservation_count"])
+        checks = {
+            "plan_status": str(row["plan_status"]) in {"finalized", "locked"},
+            "snapshot_status": str(row["snapshot_status"]) == "completed",
+            "snapshot_kind": str(row["snapshot_kind"]) == "final",
+            "source_snapshot": bool(row["source_snapshot_id"]),
+            "allocation_plan": (
+                str(row["snapshot_allocation_plan_id"])
+                == binding.allocation_plan_id
+            ),
+            "final_user_count": final_user_count > 0,
+            "actual_member_count": actual_member_count == final_user_count,
+            "reservation_count": reservation_count == final_user_count,
+            "every_member_reserved": bool(row["every_member_reserved"]),
+        }
+        failed_checks = [name for name, passed in checks.items() if not passed]
+        if not failed_checks:
+            return
+
+        log.warn(
+            "segment_audience_exclusion_binding_invalid",
+            {
+                "segmentId": binding.segment_id,
+                "failedChecks": failed_checks,
+                "planStatus": str(row["plan_status"]),
+                "snapshotStatus": str(row["snapshot_status"]),
+                "snapshotKind": str(row["snapshot_kind"]),
+                "audienceReservationState": str(
+                    row["audience_reservation_state"]
+                ),
+                "hasSourceSnapshot": bool(row["source_snapshot_id"]),
+                "allocationPlanMatches": checks["allocation_plan"],
+                "finalUserCount": final_user_count,
+                "actualMemberCount": actual_member_count,
+                "reservationCount": reservation_count,
+                "everyMemberReserved": bool(row["every_member_reserved"]),
+            },
+        )
+        raise AudienceSnapshotContractError(
+            "segment_audience_exclusion_binding_invalid: " + binding.segment_id
+        )
 
     def _advance_exclusion_revision(self, promotion_id: str) -> int:
         row = self._db.fetchone(
