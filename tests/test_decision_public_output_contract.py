@@ -246,6 +246,15 @@ def test_manual_next_loop_switch_is_off_until_explicitly_enabled() -> None:
     assert _manual_next_loop_enabled(request) is True
 
 
+def test_manual_next_loop_switch_is_enabled_in_dev_and_local() -> None:
+    for env in ("dev", "local"):
+        environ = valid_env()
+        environ["LOOPAD_ENV"] = env
+        app = create_app(settings=load_settings(environ))
+
+        assert _manual_next_loop_enabled(SimpleNamespace(app=app)) is True
+
+
 def test_decision_routes_exclude_dashboard_reads_and_hot_paths() -> None:
     app = create_app(settings=load_settings(valid_env()))
     routes = {
