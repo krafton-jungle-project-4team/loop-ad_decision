@@ -1646,6 +1646,7 @@ def _content_values_with_candidate_renderer(
         for field_name in (
             "variant_type",
             "link_targets",
+            "hero_image_url",
             "offers",
             "featured_offers",
             "comparison_offers",

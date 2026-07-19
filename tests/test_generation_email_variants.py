@@ -32,7 +32,7 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     )
 
     assert extensions["variant_type"] == EDITORIAL_VARIANT
-    assert extensions["template_version"] == "email.editorial.v1"
+    assert extensions["template_version"] == "email.editorial.v2"
     assert len(extensions["featured_offers"]) == 2
     assert [
         offer["destination_id"] for offer in extensions["featured_offers"]
@@ -40,12 +40,18 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     assert extensions["link_targets"] == [
         {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
     ]
-    assert reusable_catalog_image_url(extensions) is None
+    assert extensions["hero_image_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "stayloop/promotions/hotel-2.png"
+    )
+    assert reusable_catalog_image_url(extensions) == extensions["hero_image_url"]
 
-    rendered = render_email_html(_content_values(extensions))
+    content_values = _content_values(extensions)
+    content_values["image_url"] = reusable_catalog_image_url(extensions)
+    rendered = render_email_html(content_values)
     source = source_for_channel(
         channel=ContentChannel.EMAIL,
-        content_values=_content_values(extensions),
+        content_values=content_values,
     )
     EmailHtmlSource.model_validate(source)
 
@@ -54,7 +60,9 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     assert "투명한 바다 곁에서" in rendered
     assert "StayLoop Hotel 1" in rendered
     assert "StayLoop Hotel 5" in rendered
-    assert "https://gen-ai.asset.dev.loop-ad.org/genai/hero.png" in rendered
+    assert extensions["hero_image_url"] in rendered
+    assert "https://gen-ai.asset.dev.loop-ad.org/genai/hero.png" not in rendered
+    assert "height:210px;object-fit:cover" not in rendered
     assert "{{offer_redirect_url_1}}" not in rendered
 
 

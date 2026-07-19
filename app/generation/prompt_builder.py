@@ -76,6 +76,11 @@ class PromotionPromptInput:
         offer_ids = [offer.offer_id for offer in self.offer_links]
         if len(offer_ids) != len(set(offer_ids)):
             raise ValueError("promotion offer_links must not contain duplicate offer_id")
+        destination_urls = [offer.destination_url for offer in self.offer_links]
+        if len(destination_urls) != len(set(destination_urls)):
+            raise ValueError(
+                "promotion offer_links must not contain duplicate destination_url"
+            )
 
 
 @dataclass(frozen=True)

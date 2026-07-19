@@ -402,7 +402,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     editorial_creative = result.content_candidates[0].metadata_json["creative"]
     assert len(editorial_creative["featured_offers"]) == 2
     assert editorial_creative["renderer"]["template_version"] == (
-        "email.editorial.v1"
+        "email.editorial.v2"
     )
     assert editorial_creative["link_targets"] == [
         {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
@@ -445,17 +445,15 @@ def test_durable_staged_email_reuses_catalog_images_without_extra_generation() -
         candidate.metadata_json["creative"]["variant_type"]
         for candidate in candidates
     ] == ["editorial", "offer_cards", "comparison"]
-    assert generator.ensure_image_content_ids == [candidates[0].content_id]
-    assert generator.max_active_images == 1
+    assert generator.ensure_image_content_ids == []
+    assert generator.max_active_images == 0
 
     catalog_image_url = (
         "https://demo-shoppingmall.dev.loop-ad.org/"
         "stayloop/promotions/hotel-1.png"
     )
-    assert candidates[0].image_url == (
-        f"https://assets.example.test/{candidates[0].content_id}.png"
-    )
-    assert [candidate.image_url for candidate in candidates[1:]] == [
+    assert [candidate.image_url for candidate in candidates] == [
+        catalog_image_url,
         catalog_image_url,
         catalog_image_url,
     ]
@@ -466,7 +464,7 @@ def test_durable_staged_email_reuses_catalog_images_without_extra_generation() -
     )
 
 
-def test_durable_staged_email_generates_multiple_editorial_images_in_parallel() -> None:
+def test_durable_staged_email_reuses_images_for_repeated_editorial_variants() -> None:
     prompt_input = _email_generation_prompt_input(content_option_count=4)
     generator = ConcurrentEmailStagedContentGenerator(
         expected_image_candidate_count=2
@@ -482,11 +480,8 @@ def test_durable_staged_email_generates_multiple_editorial_images_in_parallel() 
         candidate.metadata_json["creative"]["variant_type"]
         for candidate in candidates
     ] == ["editorial", "offer_cards", "comparison", "editorial"]
-    assert set(generator.ensure_image_content_ids) == {
-        candidates[0].content_id,
-        candidates[3].content_id,
-    }
-    assert generator.max_active_images == 2
+    assert generator.ensure_image_content_ids == []
+    assert generator.max_active_images == 0
     assert all(
         candidate.image_generation_status == "completed"
         and candidate.artifact_status == "published"

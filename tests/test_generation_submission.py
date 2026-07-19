@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from app.generation.brand_context import BrandContextSnapshot
 from app.generation.prompt_builder import (
     GenerationPromptInput,
     PromotionOfferLink,
@@ -55,6 +56,28 @@ def promotion_input() -> PromotionPromptInput:
         message_brief="Drive summer hotel bookings.",
         landing_url="https://demo-stay.example.com/summer",
     )
+
+
+def offer_catalog(*offer_ids: str) -> dict[str, Any]:
+    return {
+        "schema_version": "stayloop.promotion-price-catalog.v1",
+        "catalog_id": "black-friday-hotels",
+        "catalog_version": "v2",
+        "hotels": [
+            {
+                "offer_id": offer_id,
+                "hotel_name": offer_id.replace("-", " ").title(),
+                "destination_id": "jeju",
+                "currency": "KRW",
+                "sale_price_per_night": 278000,
+                "original_price_per_night": 342000,
+                "discount_rate_percent": 19,
+                "image_path": f"/stayloop/promotions/{offer_id}.png",
+                "asset_id": f"hotel-{offer_id}-hero",
+            }
+            for offer_id in offer_ids
+        ],
+    }
 
 
 def target_segment_input(
@@ -144,16 +167,20 @@ class FakeInputReader:
         *,
         promotion: PromotionPromptInput | None,
         target_segments: list[TargetSegmentPromptInput],
+        promotion_error: ValueError | None = None,
     ) -> None:
         self.events = events
         self.promotion = promotion
         self.target_segments = target_segments
+        self.promotion_error = promotion_error
 
     def get_promotion_input(
         self,
         _request: GenerationRequest,
     ) -> PromotionPromptInput | None:
         self.events.append("read:promotion")
+        if self.promotion_error is not None:
+            raise self.promotion_error
         return self.promotion
 
     def list_target_segment_inputs(
@@ -179,6 +206,39 @@ class FakeCoordinator:
         self.wake_count += 1
 
 
+class FakeBrandContextRepository:
+    def __init__(
+        self,
+        events: list[str],
+        *,
+        catalog: dict[str, Any],
+    ) -> None:
+        self.events = events
+        self.catalog = catalog
+        self.snapshot = BrandContextSnapshot(
+            context_version="v2",
+            manifest_key="brand-context/hotel-client-a/manifests/v2/manifest.json",
+            manifest_sha256="a" * 64,
+            guide_version="v2",
+            asset_manifest_version="v2",
+            catalog_version="v2",
+        )
+
+    def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot:
+        self.events.append(f"read:brand-context:{project_id}")
+        return self.snapshot
+
+    def load_offer_catalog(
+        self,
+        *,
+        project_id: str,
+        snapshot: BrandContextSnapshot,
+    ) -> dict[str, Any]:
+        assert snapshot is self.snapshot
+        self.events.append(f"read:offer-catalog:{project_id}")
+        return self.catalog
+
+
 def build_service(
     *,
     events: list[str],
@@ -187,6 +247,8 @@ def build_service(
     promotion: PromotionPromptInput | None = None,
     target_segments: list[TargetSegmentPromptInput] | None = None,
     coordinator: FakeCoordinator | None = None,
+    brand_context_repository: FakeBrandContextRepository | None = None,
+    promotion_error: ValueError | None = None,
 ) -> tuple[
     GenerationSubmissionService,
     FakeConnection,
@@ -204,12 +266,14 @@ def build_service(
             if target_segments is not None
             else [target_segment_input()]
         ),
+        promotion_error=promotion_error,
     )
     return (
         GenerationSubmissionService(
             connection=connection,
             generation_run_repository=repository,
             generation_input_reader=input_reader,
+            brand_context_repository=brand_context_repository,
             coordinator=coordinator,
         ),
         connection,
@@ -307,6 +371,178 @@ def test_generation_snapshot_preserves_offer_links_and_verified_catalog() -> Non
     )
     assert prompt_inputs[0].promotion.offer_links == promotion.offer_links
     assert prompt_inputs[0].offer_catalog == offer_catalog
+
+
+def test_submit_accepts_email_offer_link_from_current_catalog() -> None:
+    events: list[str] = []
+    offer_id = "jeju-ocean-breeze-006"
+    promotion = replace(
+        promotion_input(),
+        channel=ContentChannel.EMAIL,
+        offer_links=(
+            PromotionOfferLink(
+                offer_id=offer_id,
+                destination_url=(
+                    "https://demo-shoppingmall.dev.loop-ad.org/hotel/"
+                    f"{offer_id}"
+                ),
+            ),
+        ),
+    )
+    brand_context_repository = FakeBrandContextRepository(
+        events,
+        catalog=offer_catalog(offer_id),
+    )
+    service, connection, repository, coordinator = build_service(
+        events=events,
+        promotion=promotion,
+        brand_context_repository=brand_context_repository,
+    )
+
+    response = service.submit(
+        generation_request(),
+        idempotency_key="email-offer-link",
+    )
+
+    assert response.status is GenerationStatus.REQUESTED
+    assert events == [
+        "read:brand-context:hotel-client-a",
+        "read:promotion",
+        "read:offer-catalog:hotel-client-a",
+        "read:targets",
+        "persist:requested",
+        "commit",
+        "wake",
+    ]
+    assert repository.submitted_records[0].input_json["offer_catalog"] == (
+        brand_context_repository.catalog
+    )
+    assert connection.commit_count == 1
+    assert coordinator.wake_count == 1
+
+
+def test_submit_rejects_email_offer_id_missing_from_current_catalog() -> None:
+    events: list[str] = []
+    missing_offer_id = "jeju-missing-hotel-999"
+    promotion = replace(
+        promotion_input(),
+        channel=ContentChannel.EMAIL,
+        offer_links=(
+            PromotionOfferLink(
+                offer_id=missing_offer_id,
+                destination_url=(
+                    "https://demo-shoppingmall.dev.loop-ad.org/hotel/"
+                    f"{missing_offer_id}"
+                ),
+            ),
+        ),
+    )
+    service, connection, repository, coordinator = build_service(
+        events=events,
+        promotion=promotion,
+        brand_context_repository=FakeBrandContextRepository(
+            events,
+            catalog=offer_catalog("jeju-ocean-breeze-006"),
+        ),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match=missing_offer_id):
+        service.submit(generation_request(), idempotency_key="missing-offer")
+
+    assert events == [
+        "read:brand-context:hotel-client-a",
+        "read:promotion",
+        "read:offer-catalog:hotel-client-a",
+    ]
+    assert repository.submitted_records == []
+    assert connection.commit_count == 0
+    assert coordinator.wake_count == 0
+
+
+def test_submit_rejects_noncanonical_email_offer_destination_url() -> None:
+    events: list[str] = []
+    offer_id = "jeju-ocean-breeze-006"
+    promotion = replace(
+        promotion_input(),
+        channel=ContentChannel.EMAIL,
+        offer_links=(
+            PromotionOfferLink(
+                offer_id=offer_id,
+                destination_url=(
+                    "https://demo-shoppingmall.dev.loop-ad.org/promotions/summer"
+                ),
+            ),
+        ),
+    )
+    service, connection, repository, coordinator = build_service(
+        events=events,
+        promotion=promotion,
+        brand_context_repository=FakeBrandContextRepository(
+            events,
+            catalog=offer_catalog(offer_id),
+        ),
+    )
+
+    with pytest.raises(GenerationInputUnavailable, match="canonical"):
+        service.submit(generation_request(), idempotency_key="wrong-destination")
+
+    assert events == [
+        "read:brand-context:hotel-client-a",
+        "read:promotion",
+        "read:offer-catalog:hotel-client-a",
+    ]
+    assert repository.submitted_records == []
+    assert connection.commit_count == 0
+    assert coordinator.wake_count == 0
+
+
+def test_promotion_input_rejects_duplicate_offer_destination_urls() -> None:
+    duplicate_url = (
+        "https://demo-shoppingmall.dev.loop-ad.org/hotel/jeju-ocean-breeze-006"
+    )
+
+    with pytest.raises(ValueError, match="duplicate destination_url"):
+        replace(
+            promotion_input(),
+            channel=ContentChannel.EMAIL,
+            offer_links=(
+                PromotionOfferLink(
+                    offer_id="jeju-ocean-breeze-006",
+                    destination_url=duplicate_url,
+                ),
+                PromotionOfferLink(
+                    offer_id="jeju-aewol-sunset-007",
+                    destination_url=duplicate_url,
+                ),
+            ),
+        )
+
+
+def test_submit_preserves_email_without_offer_links_for_backward_compatibility() -> None:
+    events: list[str] = []
+    service, connection, repository, coordinator = build_service(
+        events=events,
+        promotion=replace(promotion_input(), channel=ContentChannel.EMAIL),
+    )
+
+    response = service.submit(
+        generation_request(),
+        idempotency_key="legacy-email-without-offers",
+    )
+
+    assert response.status is GenerationStatus.REQUESTED
+    assert events == [
+        "read:promotion",
+        "read:targets",
+        "persist:requested",
+        "commit",
+        "wake",
+    ]
+    assert repository.submitted_records[0].input_json["promotion"][
+        "offer_links"
+    ] == ()
+    assert connection.commit_count == 1
+    assert coordinator.wake_count == 1
 
 
 def test_submit_rejects_reserved_internal_idempotency_key_prefix() -> None:
@@ -438,6 +674,27 @@ def test_submit_rejects_missing_promotion_before_persisting() -> None:
 
     with pytest.raises(GenerationInputUnavailable, match="promotion input"):
         service.submit(generation_request(), idempotency_key="stable-key")
+
+    assert events == ["read:promotion"]
+    assert repository.submitted_records == []
+    assert connection.commit_count == 0
+    assert coordinator.wake_count == 0
+
+
+def test_submit_maps_invalid_stored_offer_links_to_input_unavailable() -> None:
+    events: list[str] = []
+    service, connection, repository, coordinator = build_service(
+        events=events,
+        promotion_error=ValueError(
+            "promotion offer_links must not contain duplicate destination_url"
+        ),
+    )
+
+    with pytest.raises(
+        GenerationInputUnavailable,
+        match="duplicate destination_url",
+    ):
+        service.submit(generation_request(), idempotency_key="invalid-offer-links")
 
     assert events == ["read:promotion"]
     assert repository.submitted_records == []
