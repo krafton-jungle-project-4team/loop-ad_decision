@@ -14,6 +14,7 @@ venv/
 .env.*.local
 *.md
 !/README.md
+!/docs/dashboard-promotion-offer-url-handoff.md
 artifacts/
 evaluation_manifests/**/*.execution-started.json
 evaluation_manifests/**/*.execution-started.json.lock

@@ -886,6 +886,18 @@ class GenerationService:
             generation_id=generation_id,
             content_id=content_id,
         )
+        catalog_only_email_images = bool(
+            channel == ContentChannel.EMAIL
+            and prompt_input.promotion.offer_links
+        )
+        if (
+            channel == ContentChannel.EMAIL
+            and prompt_input.promotion.project_id == DEMO_PROJECT_ID
+            and not catalog_only_email_images
+        ):
+            raise GenerationInputUnavailable(
+                "demo email generation requires catalog-backed offer_links"
+            )
         existing_candidate = existing_by_id.get(content_id)
         if existing_candidate is not None:
             _validate_existing_candidate_identity(
@@ -899,7 +911,10 @@ class GenerationService:
             )
             if _candidate_is_ready(existing_candidate):
                 return existing_candidate
-            if _candidate_can_resume_image(existing_candidate):
+            if (
+                _candidate_can_resume_image(existing_candidate)
+                and not catalog_only_email_images
+            ):
                 generated_content = _generated_content_from_candidate(
                     existing_candidate
                 )
@@ -1069,6 +1084,11 @@ class GenerationService:
             and channel != ContentChannel.SMS
             and not reused_catalog_image
         ):
+            if catalog_only_email_images:
+                raise RuntimeError(
+                    "catalog-driven email generation cannot fall back to "
+                    "provider image generation"
+                )
             generated_content = _ensure_staged_image(
                 content_generator=self._content_generator,
                 channel=channel,

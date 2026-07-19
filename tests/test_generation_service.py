@@ -489,6 +489,71 @@ def test_durable_staged_email_reuses_images_for_repeated_editorial_variants() ->
     )
 
 
+def test_durable_staged_email_retry_never_falls_back_to_generated_image() -> None:
+    prompt_input = _email_generation_prompt_input(content_option_count=1)
+    generator = ConcurrentEmailStagedContentGenerator(
+        expected_image_candidate_count=1
+    )
+    service = GenerationService(content_generator=generator)
+    generation_id = "generation_email_catalog_only_retry"
+
+    completed = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+    ).content_candidates[0]
+    interrupted = replace(
+        completed,
+        image_url=None,
+        image_generation_status="pending",
+        artifact_status="pending",
+    )
+
+    retried = service.execute_durable(
+        generation_id=generation_id,
+        prompt_inputs=[prompt_input],
+        existing_candidates=[interrupted],
+    ).content_candidates[0]
+
+    assert generator.ensure_image_content_ids == []
+    assert retried.image_url == (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "stayloop/promotions/hotel-1.png"
+    )
+    assert retried.image_generation_status == "completed"
+    assert retried.artifact_status == "published"
+
+
+def test_durable_demo_email_without_catalog_links_fails_without_image_fallback() -> None:
+    prompt_input = _email_generation_prompt_input(content_option_count=1)
+    demo_request = prompt_input.request.model_copy(
+        update={"project_id": DEMO_PROJECT_ID}
+    )
+    prompt_input = replace(
+        prompt_input,
+        request=demo_request,
+        promotion=replace(
+            prompt_input.promotion,
+            project_id=DEMO_PROJECT_ID,
+            offer_links=(),
+        ),
+        offer_catalog=None,
+    )
+    generator = ConcurrentEmailStagedContentGenerator(
+        expected_image_candidate_count=1
+    )
+
+    with pytest.raises(
+        GenerationInputUnavailable,
+        match="catalog-backed offer_links",
+    ):
+        GenerationService(content_generator=generator).execute_durable(
+            generation_id="generation_demo_email_without_catalog",
+            prompt_inputs=[prompt_input],
+        )
+
+    assert generator.ensure_image_content_ids == []
+
+
 def test_durable_execution_builds_staged_candidates_in_parallel() -> None:
     request = generation_request(content_option_count=3)
     prompt_input = GenerationPromptInput(
