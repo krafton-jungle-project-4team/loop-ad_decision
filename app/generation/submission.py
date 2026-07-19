@@ -29,6 +29,7 @@ from app.generation.schemas import (
     GenerationStatus,
 )
 from app.logging import log
+from app.promotion_offers.service import canonical_offer_destination_url
 
 
 GENERATION_REQUEST_SCHEMA_VERSION = "generation.request.v1"
@@ -134,7 +135,12 @@ class GenerationSubmissionService:
             if self._brand_context_repository is not None
             else None
         )
-        promotion = self._generation_input_reader.get_promotion_input(request)
+        try:
+            promotion = self._generation_input_reader.get_promotion_input(request)
+        except ValueError as exc:
+            raise GenerationInputUnavailable(
+                f"promotion input is invalid: {exc}"
+            ) from exc
         if promotion is None:
             raise GenerationInputUnavailable(
                 "promotion input was not found for generation"
@@ -405,10 +411,17 @@ def _submission_offer_catalog(
     snapshot: BrandContextSnapshot | None,
 ) -> Mapping[str, Any] | None:
     if not promotion.offer_links:
+        # Dashboard enforces at least one selection for the new catalog flow.
+        # Keep pre-catalog email promotions generatable during the migration.
         return None
     if promotion.channel != ContentChannel.EMAIL:
         raise GenerationInputUnavailable(
             "promotion offer_links are supported only for email generation"
+        )
+    destination_urls = [link.destination_url for link in promotion.offer_links]
+    if len(destination_urls) != len(set(destination_urls)):
+        raise GenerationInputUnavailable(
+            "promotion offer_links must not contain duplicate destination_url"
         )
     if repository is None or snapshot is None:
         raise GenerationInputUnavailable(
@@ -424,7 +437,52 @@ def _submission_offer_catalog(
         raise GenerationInputUnavailable(
             "brand context offer catalog is unavailable"
         )
+    _validate_submission_offer_links(
+        offer_links=promotion.offer_links,
+        catalog=catalog,
+    )
     return dict(catalog)
+
+
+def _validate_submission_offer_links(
+    *,
+    offer_links: Sequence[PromotionOfferLink],
+    catalog: Mapping[str, Any],
+) -> None:
+    raw_hotels = catalog.get("hotels")
+    if not isinstance(raw_hotels, Sequence) or isinstance(
+        raw_hotels,
+        (str, bytes),
+    ):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog hotels are unavailable"
+        )
+
+    available_offer_ids = {
+        offer_id.strip()
+        for hotel in raw_hotels
+        if isinstance(hotel, Mapping)
+        and isinstance((offer_id := hotel.get("offer_id")), str)
+        and offer_id.strip()
+    }
+    missing_offer_ids = sorted(
+        link.offer_id
+        for link in offer_links
+        if link.offer_id not in available_offer_ids
+    )
+    if missing_offer_ids:
+        raise GenerationInputUnavailable(
+            "promotion offer_id is not available in the current brand context "
+            f"offer catalog: {', '.join(missing_offer_ids)}"
+        )
+
+    for link in offer_links:
+        canonical_url = canonical_offer_destination_url(link.offer_id)
+        if link.destination_url != canonical_url:
+            raise GenerationInputUnavailable(
+                "promotion offer destination_url must match the canonical URL "
+                f"for offer_id {link.offer_id}"
+            )
 
 
 def _offer_links_from_snapshot(value: object) -> tuple[PromotionOfferLink, ...]:
