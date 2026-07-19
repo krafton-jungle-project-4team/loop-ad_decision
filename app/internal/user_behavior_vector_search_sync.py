@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -325,11 +325,11 @@ class UserBehaviorVectorSearchSyncRepository:
                 generation.vector_version,
                 generation.window_start,
                 generation.window_end,
-                tuple(revision.user_id for revision in revisions),
-                tuple(_vector_literal(revision.vector_values) for revision in revisions),
-                tuple(revision.vector_row_id for revision in revisions),
-                tuple(revision.updated_at for revision in revisions),
-                tuple(revision.ingested_at for revision in revisions),
+                [revision.user_id for revision in revisions],
+                [_vector_literal(revision.vector_values) for revision in revisions],
+                [revision.vector_row_id for revision in revisions],
+                [revision.updated_at for revision in revisions],
+                [revision.ingested_at for revision in revisions],
             ),
         )
 
@@ -672,11 +672,18 @@ def _validate_revision(
     revision: SearchVectorRevision,
     generation: VectorSearchGeneration,
 ) -> None:
+    revision_window = (
+        _normalize_vector_window(revision.window_start),
+        _normalize_vector_window(revision.window_end),
+    )
+    generation_window = (
+        _normalize_vector_window(generation.window_start),
+        _normalize_vector_window(generation.window_end),
+    )
     if (
         revision.project_id != generation.project_id
         or revision.vector_version != generation.vector_version
-        or revision.window_start != generation.window_start
-        or revision.window_end != generation.window_end
+        or revision_window != generation_window
     ):
         raise ValueError("search vector revision does not belong to generation")
     if revision.vector_dim != VECTOR_DIM or len(revision.vector_values) != VECTOR_DIM:
@@ -689,3 +696,12 @@ def _validate_revision(
 
 def _vector_literal(values: Sequence[float]) -> str:
     return "[" + ",".join(format(float(value), ".17g") for value in values) + "]"
+
+
+def _normalize_vector_window(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        utc_value = value.replace(tzinfo=timezone.utc)
+    else:
+        utc_value = value.astimezone(timezone.utc)
+    millisecond = (utc_value.microsecond // 1000) * 1000
+    return utc_value.replace(microsecond=millisecond)
