@@ -16,7 +16,7 @@ EMAIL_VARIANT_SEQUENCE = (
     OFFER_CARDS_VARIANT,
     COMPARISON_VARIANT,
 )
-EDITORIAL_TEMPLATE_VERSION = "email.editorial.v1"
+EDITORIAL_TEMPLATE_VERSION = "email.editorial.v2"
 OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v2"
 COMPARISON_TEMPLATE_VERSION = "email.comparison.v1"
 PRIMARY_REDIRECT_PLACEHOLDER = "{{redirect_url}}"
@@ -112,14 +112,19 @@ def build_email_creative_extensions(
         ),
     }
     if variant_type == EDITORIAL_VARIANT:
+        featured_offers = _select_destination_offers(
+            offers,
+            per_destination=1,
+            maximum=2,
+        )
         extensions.update(
             {
                 "template_version": EDITORIAL_TEMPLATE_VERSION,
-                "featured_offers": _select_destination_offers(
+                "hero_image_url": _select_editorial_hero_image_url(
                     offers,
-                    per_destination=1,
-                    maximum=2,
+                    featured_offers,
                 ),
+                "featured_offers": featured_offers,
             }
         )
     elif variant_type == OFFER_CARDS_VARIANT:
@@ -149,6 +154,11 @@ def reusable_catalog_image_url(
     """Return a renderer-used catalog image for variants that need no new hero."""
 
     variant_type = str(creative_extensions.get("variant_type") or "")
+    if variant_type == EDITORIAL_VARIANT:
+        return _validated_catalog_image_url(
+            creative_extensions.get("hero_image_url"),
+            variant_type=variant_type,
+        )
     collection_key = {
         OFFER_CARDS_VARIANT: "offers",
         COMPARISON_VARIANT: "comparison_offers",
@@ -161,7 +171,36 @@ def reusable_catalog_image_url(
     first_offer = raw_offers[0]
     if not isinstance(first_offer, Mapping):
         raise ValueError(f"{variant_type} catalog image entry must be an object")
-    image_url = str(first_offer.get("image_url") or "").strip()
+    return _validated_catalog_image_url(
+        first_offer.get("image_url"),
+        variant_type=variant_type,
+    )
+
+
+def _select_editorial_hero_image_url(
+    offers: Sequence[Mapping[str, Any]],
+    featured_offers: Sequence[Mapping[str, Any]],
+) -> str:
+    featured_offer_ids = {
+        str(offer.get("offer_id") or "") for offer in featured_offers
+    }
+    hero_offer = next(
+        (
+            offer
+            for offer in offers
+            if str(offer.get("offer_id") or "") not in featured_offer_ids
+        ),
+        offers[0],
+    )
+    return _required_text(hero_offer, "image_url")
+
+
+def _validated_catalog_image_url(
+    raw_image_url: object,
+    *,
+    variant_type: str,
+) -> str:
+    image_url = str(raw_image_url or "").strip()
     parsed = urlsplit(image_url)
     if (
         parsed.scheme != "https"

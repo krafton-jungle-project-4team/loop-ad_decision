@@ -134,6 +134,7 @@ async def request_logging_middleware(
 ) -> Response:
     started_at = now_ms()
     request_id = _request_id(request)
+    request.state.request_id = request_id
     previous_context = _replace_context(
         {
             "requestId": request_id,

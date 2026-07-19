@@ -45,6 +45,7 @@ CREATIVE_SOURCE_FIELDS = (
 CREATIVE_CONTRACT_FIELDS = (
     "variant_type",
     "link_targets",
+    "hero_image_url",
     "offers",
     "featured_offers",
     "comparison_offers",
@@ -707,8 +708,8 @@ def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
         price_copy = f"{price_copy} · {discount_rate} 할인"
     image_cell = "\n".join(
         [
-            '<td width="46%" valign="top" style="width:46%;padding:0;">',
-            f'  <img src="{image_url}" width="276" alt="{hotel_name}" style="display:block;width:100%;height:210px;object-fit:cover;border:0;" />',
+            '<td width="46%" valign="middle" style="width:46%;padding:0;">',
+            f'  <img src="{image_url}" width="276" alt="{hotel_name}" style="display:block;width:100%;height:auto;border:0;" />',
             "</td>",
         ]
     )
