@@ -484,13 +484,14 @@ class PromotionTargetSegmentReader(Protocol):
     ) -> list[PromotionTargetSegmentRecord]:
         ...
 
-    def update_status(
+    def transition_status(
         self,
         *,
         analysis_id: str,
         segment_id: str,
-        status: str,
-    ) -> None:
+        expected_status: str,
+        next_status: str,
+    ) -> bool:
         ...
 
 
@@ -975,22 +976,26 @@ class PromotionTargetSegmentRepository:
         )
         return [PromotionTargetSegmentRecord(**row) for row in rows]
 
-    def update_status(
+    def transition_status(
         self,
         *,
         analysis_id: str,
         segment_id: str,
-        status: str,
-    ) -> None:
-        self._db.execute(
+        expected_status: str,
+        next_status: str,
+    ) -> bool:
+        row = self._db.fetchone(
             """
             UPDATE promotion_target_segments
             SET status = %s
             WHERE analysis_id = %s
               AND segment_id = %s
+              AND status = %s
+            RETURNING status
             """,
-            (status, analysis_id, segment_id),
+            (next_status, analysis_id, segment_id, expected_status),
         )
+        return row is not None
 
 
 class GenerationRunRepository:
