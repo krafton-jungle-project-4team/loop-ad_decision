@@ -2058,8 +2058,6 @@ def _display_copy_from_report(
     report: Mapping[str, Any],
 ) -> dict[str, Any]:
     enhanced = dict(display_copy)
-    if title := _text_value(report.get("title")):
-        enhanced["title"] = title
     why_recommended = _text_list(report.get("why_recommended"))
     if why_recommended:
         enhanced["reason"] = why_recommended[0]

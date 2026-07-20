@@ -96,11 +96,29 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
     assert response.actual_value == Decimal("0.200000")
     assert response.status == PromotionEvaluationStatus.GOAL_NOT_MET
     assert response.next_loop_required is True
+    assert response.feedback is not None
+    assert "예약 완료 단계" in response.feedback
+    assert "10.00%p" in response.feedback
     inserted = repos.evaluations.inserted[0]
     assert inserted.next_loop_required is True
     assert inserted.result_json["event_names"] == {
         "numerator": "booking_complete",
         "denominator": "promotion_click",
+    }
+    assert inserted.result_json["diagnosis"] == {
+        "version": "dec.evaluation-diagnosis.v1",
+        "status": "goal_not_met",
+        "summary": response.feedback,
+        "observed_bottleneck": "promotion_response_to_booking_complete",
+        "evidence": [
+            "광고 반응 고객 10명 중 예약 완료 2명",
+            "목표 대비 10.00%p 부족",
+        ],
+        "improvement_directions": [
+            "확인 가능한 숙박 혜택과 예약 조건을 본문 상단에 명확하게 제시",
+            "예약 완료 행동으로 이어지는 CTA와 랜딩 맥락의 일치도 강화",
+        ],
+        "gap_percentage_points": "10.00",
     }
     assert repos.experiments.status_updates == []
     assert repos.experiments.experiment is not None

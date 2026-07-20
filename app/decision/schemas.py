@@ -221,8 +221,13 @@ class PromotionRunAdExperimentResult(BaseModel):
 
     ad_experiment_id: str = Field(min_length=1)
     segment_id: str = Field(min_length=1)
+    target_value: Decimal
     actual_value: Decimal
+    numerator_count: int = Field(ge=0)
+    denominator_count: int = Field(ge=0)
+    sample_size: int = Field(ge=0)
     status: PromotionEvaluationStatus
+    feedback: str | None = None
 
 
 class PromotionRunEvaluateResponse(BaseModel):
