@@ -8,6 +8,10 @@ from datetime import date
 from typing import Mapping, Sequence
 
 from app.audience_contract import (
+    CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
+    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
     CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
     CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
     CUSTOM_STRUCTURED_TEMPLATE_HASH,
@@ -83,6 +87,22 @@ _CUSTOM_STRUCTURED_QUERY_COMPILER_SEMANTICS = {
 CUSTOM_STRUCTURED_QUERY_COMPILER_HASH = hashlib.sha256(
     json.dumps(
         _CUSTOM_STRUCTURED_QUERY_COMPILER_SEMANTICS,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_VERSION = "custom_source_refinement_query.v1"
+_CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_SEMANTICS = {
+    "version": CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_VERSION,
+    "manifest_hash": HOTEL_BEHAVIOR_MANIFEST_HASH,
+    "membership": "source_user_ids_with_optional_validated_structured_conditions",
+    "vector_role": "ordering_and_allocation_tiebreak_only",
+    "score_threshold": -1.0,
+    "semantic_margin": 2.0,
+}
+CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_HASH = hashlib.sha256(
+    json.dumps(
+        _CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_SEMANTICS,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -506,11 +526,27 @@ class HotelBookingBehaviorSchemaV2:
         """
         if not spec.is_custom_structured:
             raise ValueError("custom audience compiler requires a custom template")
-        if spec.template_semantic_hash != CUSTOM_STRUCTURED_TEMPLATE_HASH:
+        if spec.template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
+            expected_template_hash = CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH
+            expected_selection_policy = CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
+            expected_anchor_policy = CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID
+            query_compiler_version = CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_VERSION
+            query_compiler_hash = CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_HASH
+            calibration_version = "custom_source_refinement_exact.v1"
+            semantic_selection_status = "exact_source_refinement"
+        else:
+            expected_template_hash = CUSTOM_STRUCTURED_TEMPLATE_HASH
+            expected_selection_policy = CUSTOM_STRUCTURED_SELECTION_POLICY_ID
+            expected_anchor_policy = CUSTOM_STRUCTURED_ANCHOR_POLICY_ID
+            query_compiler_version = CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION
+            query_compiler_hash = CUSTOM_STRUCTURED_QUERY_COMPILER_HASH
+            calibration_version = "custom_structured_exact.v1"
+            semantic_selection_status = "exact_structured_conditions"
+        if spec.template_semantic_hash != expected_template_hash:
             raise ValueError("custom audience template hash does not match")
-        if spec.semantic_selection_policy_id != CUSTOM_STRUCTURED_SELECTION_POLICY_ID:
+        if spec.semantic_selection_policy_id != expected_selection_policy:
             raise ValueError("custom audience selection policy does not match")
-        if spec.semantic_anchor_policy_id != CUSTOM_STRUCTURED_ANCHOR_POLICY_ID:
+        if spec.semantic_anchor_policy_id != expected_anchor_policy:
             raise ValueError("custom audience anchor policy does not match")
 
         query = [0.0] * VECTOR_DIM
@@ -546,21 +582,21 @@ class HotelBookingBehaviorSchemaV2:
             active_blocks=tuple(weights),
             block_weights=weights,
             score_threshold=-1.0,
-            calibration_version="custom_structured_exact.v1",
+            calibration_version=calibration_version,
             manifest_hash=HOTEL_BEHAVIOR_MANIFEST_HASH,
-            calibration_hash=CUSTOM_STRUCTURED_QUERY_COMPILER_HASH,
+            calibration_hash=query_compiler_hash,
             audience_resolution_contract=SEGMENT_AUDIENCE_CONTRACT,
             segment_audience_spec_hash=spec.spec_hash,
-            query_compiler_version=CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION,
-            query_compiler_hash=CUSTOM_STRUCTURED_QUERY_COMPILER_HASH,
+            query_compiler_version=query_compiler_version,
+            query_compiler_hash=query_compiler_hash,
             template_id=CUSTOM_STRUCTURED_TEMPLATE_ID,
             template_version=spec.template_version,
             template_semantic_hash=spec.template_semantic_hash,
             semantic_selection_policy_id=spec.semantic_selection_policy_id,
             semantic_anchor_policy_id=spec.semantic_anchor_policy_id,
-            semantic_anchor_hash=CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            semantic_anchor_hash=expected_template_hash,
             semantic_margin=2.0,
-            semantic_selection_status="exact_structured_conditions",
+            semantic_selection_status=semantic_selection_status,
             business_lift_status="not_applicable_to_direct_segment",
         )
 

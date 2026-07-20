@@ -73,6 +73,12 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
 )
 from app.audience_contract import (
+    CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+    CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
+    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
     CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
     CUSTOM_STRUCTURED_CANDIDATE_TYPE,
     CUSTOM_STRUCTURED_CONDITION_KEY,
@@ -273,6 +279,80 @@ def test_custom_structured_segment_compiles_exact_conditions_without_semantic_fi
     assert "custom_0_destination_terms" in sql
     assert "custom_1_destination_terms" in sql
     assert "custom_2_maximum_count" in sql
+
+
+def test_source_refinement_intersects_structured_conditions_with_source_users() -> None:
+    conditions = [
+        {
+            "event_name": "hotel_detail_view",
+            "label": "호텔 상세 조회 2회 이상",
+            "minimum_count": 2,
+            "maximum_count": None,
+            "destination": None,
+            "checkin_months": [],
+            "property_filters": [],
+        }
+    ]
+    rule_json = _custom_structured_rule(
+        conditions=conditions,
+        query_signal_keys=("hotel_detail_view_intensity",),
+        base_user_ids=("user_001", "user_002"),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="source_refinement",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.base_user_ids == ("user_001", "user_002")
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    assert compiled.hard_predicate_keys == (
+        CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+        CUSTOM_STRUCTURED_CONDITION_KEY,
+    )
+    assert compiled.semantic_selection_status == "exact_source_refinement"
+    assert compiled.predicate_parameters["base_user_ids"] == (
+        "user_001",
+        "user_002",
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        filter_user_ids=False,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    assert "user_id IN {base_user_ids:Array(String)}" in sql
+
+
+def test_source_membership_can_reuse_the_exact_ai_audience_without_extra_conditions() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[],
+        query_signal_keys=("hotel_consideration_intensity",),
+        base_user_ids=("user_001", "user_002"),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="source_membership",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.custom_conditions == ()
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    assert compiled.hard_predicate_keys == (
+        CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        filter_user_ids=False,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    assert "user_id IN {base_user_ids:Array(String)}" in sql
+    assert "HAVING 1" in sql
 
 
 def test_custom_structured_segment_rejects_unsupported_event() -> None:
@@ -1574,25 +1654,60 @@ def _custom_structured_rule(
     *,
     conditions: Sequence[Mapping[str, object]],
     query_signal_keys: Sequence[str],
+    base_user_ids: Sequence[str] = (),
 ) -> dict[str, object]:
+    is_source_refinement = bool(base_user_ids)
+    condition_keys = (
+        [
+            CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+            *([CUSTOM_STRUCTURED_CONDITION_KEY] if conditions else []),
+        ]
+        if is_source_refinement
+        else [CUSTOM_STRUCTURED_CONDITION_KEY]
+    )
     return {
         "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
         "segment_audience_spec": {
             "schema_version": "hotel_behavior.v2",
             "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
-            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
-            "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            "template_version": (
+                CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_TEMPLATE_VERSION
+            ),
+            "template_semantic_hash": (
+                CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_TEMPLATE_HASH
+            ),
             "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
-            "condition_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+            "condition_keys": condition_keys,
             "query_signal_keys": list(query_signal_keys),
-            "hard_predicate_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+            "hard_predicate_keys": condition_keys,
             "parameters": {
                 "lookback_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
                 "conditions": list(conditions),
+                **(
+                    {"base_user_ids": list(base_user_ids)}
+                    if is_source_refinement
+                    else {}
+                ),
             },
-            "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
-            "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
-            "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+            "parameter_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_PARAMETER_POLICY_ID
+            ),
+            "semantic_selection_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_SELECTION_POLICY_ID
+            ),
+            "semantic_anchor_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_ANCHOR_POLICY_ID
+            ),
             "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
         },
     }
