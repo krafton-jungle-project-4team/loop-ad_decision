@@ -44,6 +44,7 @@ def test_promotion_run_evaluation_aggregates_all_segments_mixed_status() -> None
                 segment_id="seg_luxury",
                 status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
                 actual_value=Decimal("0.100000"),
+                feedback="예약 완료 단계에서 목표 대비 20.00%p 낮습니다.",
             ),
         ],
     )
@@ -62,6 +63,14 @@ def test_promotion_run_evaluation_aggregates_all_segments_mixed_status() -> None
         PromotionEvaluationStatus.GOAL_MET,
         PromotionEvaluationStatus.GOAL_NOT_MET,
     ]
+    failed_result = response.ad_experiment_results[1]
+    assert failed_result.target_value == Decimal("0.300000")
+    assert failed_result.numerator_count == 2
+    assert failed_result.denominator_count == 10
+    assert failed_result.sample_size == 10
+    assert failed_result.feedback == (
+        "예약 완료 단계에서 목표 대비 20.00%p 낮습니다."
+    )
     inserted = repos.evaluations.inserted[0]
     assert inserted.metric == GoalMetric.BOOKING_CONVERSION_RATE.value
     assert inserted.target_value == Decimal("0.300000")
@@ -535,6 +544,7 @@ def evaluation_record(
     actual_value: Decimal = Decimal("0.200000"),
     numerator_count: int = 2,
     denominator_count: int = 10,
+    feedback: str | None = None,
 ) -> PromotionEvaluationWrite:
     return PromotionEvaluationWrite(
         evaluation_id=f"eval_{ad_experiment_id}",
@@ -554,7 +564,7 @@ def evaluation_record(
         sample_size=denominator_count,
         basis=GoalBasis.ALL_SEGMENTS.value,
         status=status,
-        feedback=None,
+        feedback=feedback,
         next_loop_required=status == PromotionEvaluationStatus.GOAL_NOT_MET.value,
         result_json={
             "status": status,
