@@ -298,7 +298,13 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
 
     assert vector_reader.calls == []
     assert raw_reader.calls[0]["vector_version"] == "v1"
-    assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
+    assert raw_reader.calls[0]["destination_terms"] == (
+        "jeju",
+        "jeju-do",
+        "jeju island",
+        "제주",
+        "제주도",
+    )
     assert raw_reader.calls[0]["season_months"] == (6, 7, 8)
     assert len(segments) == 3
     candidate_types = [
@@ -390,6 +396,85 @@ def test_unregistered_structured_benefit_stops_v2_binding_without_legacy_fallbac
     assert error.value.code == "segment_audience_template_binding_invalid"
 
 
+def test_raw_event_suggester_does_not_replace_contract_error_with_vector_clusters(
+) -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("vector_001", vector_values(0)),
+            user_vector("vector_002", vector_values(0)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(f"review_user_{index}", deal_event_count=1)
+            for index in range(2)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    with pytest.raises(SegmentAudienceContractError) as error:
+        suggester.suggest_segments(
+            promotion=promotion_record(
+                message_brief="리뷰 기반 추천 혜택으로 숙소 예약 전환을 높인다.",
+            )
+        )
+
+    assert error.value.code == "segment_audience_template_binding_invalid"
+    assert vector_reader.calls == []
+
+
+def test_raw_event_suggester_uses_manifest_destination_aliases_for_okinawa(
+) -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("vector_001", vector_values(0)),
+            user_vector("vector_002", vector_values(0)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                f"okinawa_user_{index}",
+                hotel_search_count=2,
+                hotel_detail_view_count=1,
+                destination_match_count=2,
+                destination_values=("오키나와 숙소",),
+            )
+            for index in range(2)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="오키나와 숙소 예약 전환을 높인다.",
+        )
+    )
+
+    assert len(segments) == 1
+    assert raw_reader.calls[0]["destination_terms"] == ("okinawa", "오키나와")
+    assert vector_reader.calls == []
+    assert segments[0].profile_json["promotion_intent"]["destinations"] == [
+        "okinawa"
+    ]
+
+
 def test_raw_event_suggester_applies_segment_instruction_to_intent() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [user_vector("jeju_001", vector_values(0))]
@@ -429,7 +514,13 @@ def test_raw_event_suggester_applies_segment_instruction_to_intent() -> None:
     )
 
     assert segments
-    assert raw_reader.calls[0]["destination_terms"] == ("jeju", "제주")
+    assert raw_reader.calls[0]["destination_terms"] == (
+        "jeju",
+        "jeju-do",
+        "jeju island",
+        "제주",
+        "제주도",
+    )
     assert vector_reader.calls == []
     assert all(
         "jeju" in segment.profile_json["promotion_intent"]["destinations"]
@@ -618,6 +709,30 @@ def test_segment_instruction_does_not_fall_back_to_generic_vector_clusters() -> 
 
     assert segments == []
     assert vector_reader.calls == []
+
+
+def test_empty_raw_event_candidates_keep_vector_fallback_for_generic_request() -> None:
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("vector_001", vector_values(0)),
+            user_vector("vector_002", vector_values(0)),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=FakeRawEventSignalRepository([]),
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=1,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(promotion=promotion_record())
+
+    assert len(segments) == 1
+    assert segments[0].rule_json["source"] == "user_vector_clustering"
+    assert vector_reader.calls
 
 
 def test_destination_candidates_exclude_users_without_target_interest() -> None:
@@ -1527,7 +1642,13 @@ def test_raw_event_suggester_requests_vector_window_signals() -> None:
         {
             "project_id": "hotel-client-a",
             "vector_version": "v1",
-            "destination_terms": ("jeju", "제주"),
+            "destination_terms": (
+                "jeju",
+                "jeju-do",
+                "jeju island",
+                "제주",
+                "제주도",
+            ),
             "season_months": (6, 7, 8),
             "limit": 20,
         }

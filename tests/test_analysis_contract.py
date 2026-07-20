@@ -6,6 +6,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 
+from app.audience_contract import SegmentAudienceContractError
 from app.analysis.repositories import (
     PromotionAnalysisWrite,
     PromotionTargetSegmentWrite,
@@ -207,6 +208,14 @@ def test_segment_recommendation_maps_service_errors() -> None:
     cases = [
         (PromotionNotFoundError("promotion not found"), 404),
         (SegmentSelectionError("no active segment candidates matched analysis request"), 422),
+        (
+            SegmentAudienceContractError(
+                code="segment_audience_template_binding_invalid",
+                segment_id="seg_invalid_destination",
+                reason="unregistered canonical destination: unknown",
+            ),
+            422,
+        ),
     ]
 
     for exc, expected_status in cases:

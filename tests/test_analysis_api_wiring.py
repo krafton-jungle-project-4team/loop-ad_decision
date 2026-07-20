@@ -497,6 +497,8 @@ class RecordingClickHouseClient:
     def query(self, query: str, parameters: Any = None) -> "ClickHouseResult":
         self.queries.append((query, parameters))
         sql = compact_sql(query)
+        if "from raw_events" in sql:
+            return ClickHouseResult([])
         if "from user_behavior_vectors" in sql and "user_id in" in sql:
             return ClickHouseResult(self.user_vector_rows)
         return ClickHouseResult([])
