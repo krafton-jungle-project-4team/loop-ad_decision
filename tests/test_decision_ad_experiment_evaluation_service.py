@@ -13,6 +13,7 @@ from app.decision.evaluation_service import (
 )
 from app.decision.repositories import (
     AdExperimentRecord,
+    EvaluationFunnelRecord,
     MetricCountRecord,
     PromotionEvaluationWrite,
     PromotionRunRecord,
@@ -84,7 +85,17 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
                 "min_sample_size": "10",
             }
         ),
-        counts=MetricCountRecord(numerator_count=2, denominator_count=10),
+        counts=MetricCountRecord(
+            numerator_count=2,
+            denominator_count=10,
+            funnel=EvaluationFunnelRecord(
+                response_count=10,
+                hotel_search_count=9,
+                hotel_detail_view_count=8,
+                booking_start_count=5,
+                booking_complete_count=2,
+            ),
+        ),
     )
     service = make_service(repos)
 
@@ -97,7 +108,7 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
     assert response.status == PromotionEvaluationStatus.GOAL_NOT_MET
     assert response.next_loop_required is True
     assert response.feedback is not None
-    assert "예약 완료 단계" in response.feedback
+    assert "예약 시작에서 예약 완료" in response.feedback
     assert "10.00%p" in response.feedback
     inserted = repos.evaluations.inserted[0]
     assert inserted.next_loop_required is True
@@ -105,21 +116,36 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
         "numerator": "booking_complete",
         "denominator": "promotion_click",
     }
-    assert inserted.result_json["diagnosis"] == {
-        "version": "dec.evaluation-diagnosis.v1",
-        "status": "goal_not_met",
-        "summary": response.feedback,
-        "observed_bottleneck": "promotion_response_to_booking_complete",
-        "evidence": [
-            "광고 반응 고객 10명 중 예약 완료 2명",
-            "목표 대비 10.00%p 부족",
-        ],
-        "improvement_directions": [
-            "확인 가능한 숙박 혜택과 예약 조건을 본문 상단에 명확하게 제시",
-            "예약 완료 행동으로 이어지는 CTA와 랜딩 맥락의 일치도 강화",
-        ],
-        "gap_percentage_points": "10.00",
+    diagnosis = inserted.result_json["diagnosis"]
+    assert diagnosis["version"] == "dec.evaluation-diagnosis.v2"
+    assert diagnosis["status"] == "goal_not_met"
+    assert diagnosis["summary"] == response.feedback
+    assert diagnosis["observed_bottleneck"] == (
+        "booking_start_to_booking_complete"
+    )
+    assert diagnosis["largest_dropoff"] == {
+        "from_stage_key": "booking_start",
+        "from_stage_label": "예약 시작",
+        "to_stage_key": "booking_complete",
+        "to_stage_label": "예약 완료",
+        "from_count": 5,
+        "to_count": 2,
+        "dropoff_count": 3,
+        "dropoff_rate": "0.600000",
     }
+    assert [stage["user_count"] for stage in diagnosis["funnel"]["stages"]] == [
+        10,
+        9,
+        8,
+        5,
+        2,
+    ]
+    assert diagnosis["evidence_strength"]["level"] == "limited"
+    assert diagnosis["data_origin"] == {
+        "kind": "observed",
+        "label": "수집 이벤트",
+    }
+    assert "상세 실패 이벤트" in diagnosis["limitations"][-1]
     assert repos.experiments.status_updates == []
     assert repos.experiments.experiment is not None
     assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
@@ -163,6 +189,42 @@ def test_ad_experiment_evaluation_preserves_denominator_when_no_bookings() -> No
     assert response.denominator_count == 10
     assert response.sample_size == 10
     assert response.status == PromotionEvaluationStatus.GOAL_NOT_MET
+
+
+def test_ad_experiment_evaluation_marks_fixture_backed_funnel() -> None:
+    repos = FakeEvaluationRepos(
+        run=promotion_run_record(
+            goal_snapshot_json={
+                "goal_target_value": "0.300000",
+                "min_sample_size": 1,
+            }
+        ),
+        counts=MetricCountRecord(
+            numerator_count=20,
+            denominator_count=100,
+            funnel=EvaluationFunnelRecord(
+                response_count=100,
+                hotel_search_count=90,
+                hotel_detail_view_count=80,
+                booking_start_count=70,
+                booking_complete_count=20,
+                fixture_response_count=100,
+            ),
+        ),
+    )
+
+    service = make_service(repos)
+    service.evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    diagnosis = repos.evaluations.inserted[0].result_json["diagnosis"]
+    assert diagnosis["data_origin"] == {
+        "kind": "demo_fixture",
+        "label": "시연 데이터",
+    }
+    assert diagnosis["evidence_strength"]["level"] == "sufficient"
 
 
 def test_ad_experiment_evaluation_marks_denominator_zero_insufficient() -> None:

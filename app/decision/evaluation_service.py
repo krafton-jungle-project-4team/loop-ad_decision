@@ -9,6 +9,7 @@ from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
+    EvaluationFunnelRecord,
     EvaluationMetricReader,
     MetricCountRecord,
     PromotionEvaluationRecord,
@@ -34,9 +35,10 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
 DECIMAL_SCALE = Decimal("0.000001")
-EVALUATOR_VERSION = "dec.target-threshold-evaluator.v1"
-METRIC_SQL_VERSION = "dec.evaluation-metric-sql.v1"
+EVALUATOR_VERSION = "dec.target-threshold-evaluator.v2"
+METRIC_SQL_VERSION = "dec.evaluation-metric-sql.v2"
 EVALUATION_MODE = "target_threshold"
+DETAILED_DIAGNOSIS_MIN_SAMPLE_SIZE = 30
 
 
 def _normalize_utc_milliseconds(value: datetime, *, field_name: str) -> datetime:
@@ -198,6 +200,7 @@ class AdExperimentEvaluationService:
         )
         diagnosis = _build_evaluation_diagnosis(
             metric=metric,
+            channel=experiment.channel,
             status=status,
             target_value=target_value,
             actual_value=actual_value,
@@ -733,6 +736,39 @@ def _validate_metric_counts(counts: MetricCountRecord) -> None:
         raise AdExperimentEvaluationValidationError(
             "metric numerator_count must not exceed denominator_count"
         )
+    if counts.funnel is None:
+        return
+
+    funnel_counts = (
+        counts.funnel.response_count,
+        counts.funnel.hotel_search_count,
+        counts.funnel.hotel_detail_view_count,
+        counts.funnel.booking_start_count,
+        counts.funnel.booking_complete_count,
+    )
+    if any(value < 0 for value in funnel_counts):
+        raise AdExperimentEvaluationValidationError(
+            "evaluation funnel counts must not be negative"
+        )
+    if any(
+        current < following
+        for current, following in zip(funnel_counts, funnel_counts[1:])
+    ):
+        raise AdExperimentEvaluationValidationError(
+            "evaluation funnel counts must be monotonically non-increasing"
+        )
+    if counts.funnel.response_count != counts.denominator_count:
+        raise AdExperimentEvaluationValidationError(
+            "evaluation funnel response_count must match denominator_count"
+        )
+    if counts.funnel.booking_complete_count != counts.numerator_count:
+        raise AdExperimentEvaluationValidationError(
+            "evaluation funnel booking_complete_count must match numerator_count"
+        )
+    if not 0 <= counts.funnel.fixture_response_count <= counts.funnel.response_count:
+        raise AdExperimentEvaluationValidationError(
+            "evaluation funnel fixture_response_count is invalid"
+        )
 
 
 def _validate_metric_rate(actual_value: Decimal) -> None:
@@ -851,6 +887,7 @@ def _build_result_json(
 def _build_evaluation_diagnosis(
     *,
     metric: str,
+    channel: str,
     status: str,
     target_value: Decimal,
     actual_value: Decimal,
@@ -863,6 +900,27 @@ def _build_evaluation_diagnosis(
     ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     actual_percent = _format_percent(actual_value)
     target_percent = _format_percent(target_value)
+    funnel = _build_evaluation_funnel(
+        metric=metric,
+        channel=channel,
+        counts=counts,
+    )
+    largest_dropoff = funnel["largest_dropoff"]
+    evidence_strength = _evaluation_evidence_strength(
+        sample_size=counts.denominator_count,
+        min_sample_size=min_sample_size,
+    )
+    limitations = [
+        "동일 광고 실험에 귀속된 유효 이벤트의 고유 사용자만 집계했습니다."
+    ]
+    if evidence_strength["level"] == "limited":
+        limitations.append(
+            f"관측 표본이 {counts.denominator_count}명으로 적어 이탈 구간은 참고 수준입니다."
+        )
+    if counts.funnel is None and metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
+        limitations.append(
+            "중간 숙박 행동 이벤트가 없어 광고 반응과 예약 완료만 비교했습니다."
+        )
 
     if counts.denominator_count == 0:
         summary = (
@@ -904,21 +962,41 @@ def _build_evaluation_diagnosis(
         ]
         directions = ["현재 메시지와 고객군 전략 유지"]
     elif metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
+        if largest_dropoff is None:
+            bottleneck_summary = "중간 단계의 이탈 구간은 아직 확인되지 않았습니다."
+            bottleneck = "measurement_unavailable"
+        else:
+            bottleneck_summary = (
+                f"가장 큰 관측 이탈은 {largest_dropoff['from_stage_label']}에서 "
+                f"{largest_dropoff['to_stage_label']} 단계로 넘어가는 구간으로, "
+                f"{largest_dropoff['from_count']}명 중 "
+                f"{largest_dropoff['dropoff_count']}명"
+                f"({_format_ratio_percent(largest_dropoff['dropoff_rate'])})이 "
+                "다음 단계에 도달하지 않았습니다."
+            )
+            bottleneck = (
+                f"{largest_dropoff['from_stage_key']}_to_"
+                f"{largest_dropoff['to_stage_key']}"
+            )
         summary = (
             f"예약 완료율 {actual_percent}로 목표 {target_percent}보다 "
-            f"{gap_percentage_points}%p 낮습니다. 측정상 병목은 광고 반응 이후 "
-            "예약 완료 단계입니다. 다음 광고에서는 확인 가능한 숙박 혜택과 "
-            "예약 행동 유도를 더 분명하게 제시하세요."
+            f"{gap_percentage_points}%p 낮습니다. {bottleneck_summary}"
         )
-        bottleneck = "promotion_response_to_booking_complete"
         evidence = [
             f"광고 반응 고객 {counts.denominator_count}명 중 예약 완료 {counts.numerator_count}명",
             f"목표 대비 {gap_percentage_points}%p 부족",
         ]
-        directions = [
-            "확인 가능한 숙박 혜택과 예약 조건을 본문 상단에 명확하게 제시",
-            "예약 완료 행동으로 이어지는 CTA와 랜딩 맥락의 일치도 강화",
-        ]
+        if largest_dropoff is not None:
+            evidence.insert(
+                1,
+                f"{largest_dropoff['from_stage_label']} {largest_dropoff['from_count']}명 중 "
+                f"{largest_dropoff['to_stage_label']} {largest_dropoff['to_count']}명",
+            )
+        directions = _bottleneck_improvement_directions(bottleneck)
+        if bottleneck == "booking_start_to_booking_complete":
+            limitations.append(
+                "결제 오류, 가격 변경, 객실 소진 같은 상세 실패 이벤트가 없어 직접 원인은 확정할 수 없습니다."
+            )
     else:
         summary = (
             f"랜딩 도달률 {actual_percent}로 목표 {target_percent}보다 "
@@ -937,14 +1015,205 @@ def _build_evaluation_diagnosis(
         ]
 
     return {
-        "version": "dec.evaluation-diagnosis.v1",
+        "version": "dec.evaluation-diagnosis.v2",
         "status": status,
         "summary": summary,
         "observed_bottleneck": bottleneck,
+        "largest_dropoff": largest_dropoff,
         "evidence": evidence,
         "improvement_directions": directions,
         "gap_percentage_points": str(gap_percentage_points),
+        "evidence_strength": evidence_strength,
+        "limitations": limitations,
+        "data_origin": _evaluation_data_origin(counts.funnel),
+        "funnel": funnel,
     }
+
+
+def _build_evaluation_funnel(
+    *,
+    metric: str,
+    channel: str,
+    counts: MetricCountRecord,
+) -> dict[str, Any]:
+    if metric == GoalMetric.INFLOW_RATE.value:
+        raw_stages = [
+            ("campaign_redirect_click", "광고 링크 클릭", counts.denominator_count),
+            ("campaign_landing", "랜딩 도달", counts.numerator_count),
+        ]
+        counting_method = "attribution_key_reach"
+    elif counts.funnel is not None:
+        raw_stages = _booking_funnel_stages(channel, counts.funnel)
+        counting_method = "cumulative_user_reach_after_ad_response"
+    else:
+        raw_stages = [
+            (
+                _booking_conversion_denominator_event(channel),
+                _booking_response_label(channel),
+                counts.denominator_count,
+            ),
+            ("booking_complete", "예약 완료", counts.numerator_count),
+        ]
+        counting_method = "metric_endpoints_only"
+
+    stages: list[dict[str, Any]] = []
+    largest_dropoff: dict[str, Any] | None = None
+    largest_dropoff_rank: tuple[Decimal, int] | None = None
+    for index, (key, label, user_count) in enumerate(raw_stages):
+        previous = stages[index - 1] if index > 0 else None
+        if previous is None:
+            conversion_rate = None
+            dropoff_count = None
+            dropoff_rate = None
+        else:
+            previous_count = int(previous["user_count"])
+            dropoff_count = max(previous_count - user_count, 0)
+            conversion_rate = _ratio_string(user_count, previous_count)
+            dropoff_rate = _ratio_string(dropoff_count, previous_count)
+            if previous_count > 0 and dropoff_count > 0 and dropoff_rate is not None:
+                rank = (Decimal(dropoff_rate), dropoff_count)
+                if largest_dropoff_rank is None or rank > largest_dropoff_rank:
+                    largest_dropoff_rank = rank
+                    largest_dropoff = {
+                        "from_stage_key": previous["key"],
+                        "from_stage_label": previous["label"],
+                        "to_stage_key": key,
+                        "to_stage_label": label,
+                        "from_count": previous_count,
+                        "to_count": user_count,
+                        "dropoff_count": dropoff_count,
+                        "dropoff_rate": dropoff_rate,
+                    }
+        stages.append(
+            {
+                "key": key,
+                "label": label,
+                "user_count": user_count,
+                "conversion_rate_from_previous": conversion_rate,
+                "dropoff_count_from_previous": dropoff_count,
+                "dropoff_rate_from_previous": dropoff_rate,
+            }
+        )
+
+    return {
+        "counting_method": counting_method,
+        "stages": stages,
+        "largest_dropoff": largest_dropoff,
+    }
+
+
+def _booking_funnel_stages(
+    channel: str,
+    funnel: EvaluationFunnelRecord,
+) -> list[tuple[str, str, int]]:
+    return [
+        (
+            _booking_conversion_denominator_event(channel),
+            _booking_response_label(channel),
+            funnel.response_count,
+        ),
+        ("hotel_search", "숙소 탐색", funnel.hotel_search_count),
+        ("hotel_detail_view", "숙소 상세 조회", funnel.hotel_detail_view_count),
+        ("booking_start", "예약 시작", funnel.booking_start_count),
+        ("booking_complete", "예약 완료", funnel.booking_complete_count),
+    ]
+
+
+def _booking_response_label(channel: str) -> str:
+    if channel == Channel.EMAIL.value:
+        return "광고 랜딩 도달"
+    return "광고 클릭"
+
+
+def _ratio_string(numerator: int, denominator: int) -> str | None:
+    if denominator <= 0:
+        return None
+    return str(
+        (Decimal(numerator) / Decimal(denominator)).quantize(
+            DECIMAL_SCALE,
+            rounding=ROUND_HALF_UP,
+        )
+    )
+
+
+def _format_ratio_percent(value: str) -> str:
+    return _format_percent(Decimal(value))
+
+
+def _evaluation_evidence_strength(
+    *,
+    sample_size: int,
+    min_sample_size: int,
+) -> dict[str, Any]:
+    if sample_size == 0:
+        return {
+            "level": "unavailable",
+            "sample_size": sample_size,
+            "reason": "평가 기준 행동이 없습니다.",
+        }
+    if sample_size < min_sample_size:
+        return {
+            "level": "insufficient",
+            "sample_size": sample_size,
+            "reason": f"최소 평가 표본 {min_sample_size}명보다 적습니다.",
+        }
+    if sample_size < DETAILED_DIAGNOSIS_MIN_SAMPLE_SIZE:
+        return {
+            "level": "limited",
+            "sample_size": sample_size,
+            "reason": (
+                f"원인 진단 참고 기준 {DETAILED_DIAGNOSIS_MIN_SAMPLE_SIZE}명보다 적습니다."
+            ),
+        }
+    return {
+        "level": "sufficient",
+        "sample_size": sample_size,
+        "reason": "단계별 이탈을 비교할 수 있는 관측 표본이 확보되었습니다.",
+    }
+
+
+def _evaluation_data_origin(
+    funnel: EvaluationFunnelRecord | None,
+) -> dict[str, str]:
+    if funnel is None or funnel.response_count == 0:
+        return {"kind": "observed", "label": "수집 이벤트"}
+    if funnel.fixture_response_count == funnel.response_count:
+        return {"kind": "demo_fixture", "label": "시연 데이터"}
+    if funnel.fixture_response_count > 0:
+        return {"kind": "mixed", "label": "수집·시연 혼합 데이터"}
+    return {"kind": "observed", "label": "수집 이벤트"}
+
+
+def _bottleneck_improvement_directions(bottleneck: str) -> list[str]:
+    directions_by_bottleneck = {
+        "campaign_landing_to_hotel_search": [
+            "랜딩 첫 화면에서 목적지·할인·예약 조건이 바로 보이는지 확인",
+            "숙소 검색으로 이어지는 CTA와 랜딩 동선을 점검",
+        ],
+        "promotion_click_to_hotel_search": [
+            "광고 메시지와 랜딩의 목적지·혜택 정보가 일치하는지 확인",
+            "숙소 검색으로 이어지는 CTA와 랜딩 동선을 점검",
+        ],
+        "hotel_search_to_hotel_detail_view": [
+            "검색 결과에서 가격·혜택·객실 가능 여부가 충분히 구분되는지 확인",
+            "추천 숙소 정렬과 상세 진입 동선을 점검",
+        ],
+        "hotel_detail_view_to_booking_start": [
+            "상세 화면의 총 결제금액·취소 조건·객실 가능 여부를 명확히 제시",
+            "예약 시작 CTA의 위치와 메시지를 점검",
+        ],
+        "booking_start_to_booking_complete": [
+            "결제 실패·가격 변경·객실 소진 이벤트를 추가 수집해 직접 원인을 확인",
+            "예약 단계 입력 항목과 결제 완료 동선을 점검",
+        ],
+    }
+    return directions_by_bottleneck.get(
+        bottleneck,
+        [
+            "광고 반응부터 예약 완료까지 이벤트 수집 상태 확인",
+            "가장 이탈이 큰 화면의 메시지와 다음 행동 동선 점검",
+        ],
+    )
 
 
 def _format_percent(value: Decimal) -> str:
@@ -957,7 +1226,7 @@ def _format_percent(value: Decimal) -> str:
 
 def _metric_source(metric: str) -> str:
     if metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
-        return "promotion_touch_events + booking_outcome_events"
+        return "promotion_touch_events + raw_events + booking_outcome_events"
     return "promotion_touch_events"
 
 
