@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 from app.analysis.behavior_manifest import (
-    canonical_destination_id,
+    executable_destination_id,
     load_behavior_manifest,
+    manifest_intent_benefit_keys,
 )
 
 
@@ -20,16 +20,7 @@ MAX_SEASON_MONTHS = 12
 MAX_BENEFIT_KEYS = 4
 
 _MANIFEST = load_behavior_manifest()
-_REGISTERED_DESTINATION_IDS = frozenset(
-    str(value) for value in _MANIFEST["destination_aliases"]
-)
-_REGISTERED_BENEFIT_KEYS = frozenset(
-    str(value) for value in _MANIFEST["intent_benefit_query_dimensions"]
-)
-_REGISTERED_DESTINATION_ID_PATTERNS = tuple(
-    re.compile(str(value))
-    for value in _MANIFEST["canonical_destination_id_patterns"]
-)
+_REGISTERED_BENEFIT_KEYS = frozenset(manifest_intent_benefit_keys())
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,14 +233,8 @@ def require_registered_template(template_id: str) -> SegmentAudienceTemplate:
 def canonical_destination_ids(values: Sequence[str]) -> tuple[str, ...]:
     canonical: set[str] = set()
     for value in values:
-        normalized = canonical_destination_id(str(value))
-        if not normalized or (
-            normalized not in _REGISTERED_DESTINATION_IDS
-            and not any(
-                pattern.fullmatch(normalized)
-                for pattern in _REGISTERED_DESTINATION_ID_PATTERNS
-            )
-        ):
+        normalized = executable_destination_id(str(value))
+        if normalized is None:
             raise ValueError(f"unregistered canonical destination: {value}")
         canonical.add(normalized)
     return tuple(sorted(canonical))
