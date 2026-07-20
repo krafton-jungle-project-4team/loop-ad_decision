@@ -47,15 +47,31 @@ def canonical_destination_id(value: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def destination_alias_lookup() -> Mapping[str, str]:
-    aliases: dict[str, str] = {}
+def destination_alias_groups() -> Mapping[str, tuple[str, ...]]:
+    groups: dict[str, tuple[str, ...]] = {}
     manifest = load_behavior_manifest()
     for canonical, values in manifest["destination_aliases"].items():
         canonical_id = _normalize_text(str(canonical))
         if not canonical_id:
             raise BehaviorManifestError("canonical destination id must not be empty")
-        for value in (canonical, *values):
-            alias = _normalize_text(str(value))
+        aliases = tuple(
+            dict.fromkeys(
+                alias
+                for value in (canonical, *values)
+                if (alias := _normalize_text(str(value)))
+            )
+        )
+        if not aliases:
+            raise BehaviorManifestError("destination aliases must not be empty")
+        groups[canonical_id] = aliases
+    return MappingProxyType(groups)
+
+
+@lru_cache(maxsize=1)
+def destination_alias_lookup() -> Mapping[str, str]:
+    aliases: dict[str, str] = {}
+    for canonical_id, values in destination_alias_groups().items():
+        for alias in values:
             previous = aliases.setdefault(alias, canonical_id)
             if previous != canonical_id:
                 raise BehaviorManifestError(

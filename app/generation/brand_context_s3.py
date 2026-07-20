@@ -17,7 +17,7 @@ from app.generation.errors import (
     RetryableGenerationError,
 )
 from app.generation.schemas import ContentChannel
-from app.logging import log
+from app.logging import duration_ms, log, now_ms
 
 
 BRAND_CONTEXT_POINTER_SCHEMA_VERSION = "loopad.brand-context-pointer.v1"
@@ -401,66 +401,122 @@ class S3BrandContextLoader:
         optional: bool = False,
         expected_content_type: str | None = None,
     ) -> bytes | None:
+        started_at = now_ms()
+        provider_context = {
+            "endpoint": "get_object",
+            "objectKey": key,
+            "provider": "aws_s3",
+        }
+        log.info("provider_request_prepared", provider_context)
         try:
             response = self._client().get_object(Bucket=self._bucket_name, Key=key)
         except Exception as exc:
             if optional and _is_s3_not_found(exc):
+                log.info(
+                    "provider_request_completed",
+                    {
+                        **provider_context,
+                        "durationMs": duration_ms(started_at),
+                        "outcome": "not_found",
+                    },
+                )
                 return None
             if _is_s3_not_found(exc):
-                raise PermanentGenerationError(
+                error = PermanentGenerationError(
                     code="brand_context_object_missing",
                     safe_message="A required brand context object was not found.",
-                ) from exc
-            raise RetryableGenerationError(
-                code="brand_context_read_failed",
-                safe_message="Brand context storage could not be read temporarily.",
-            ) from exc
-        if not isinstance(response, Mapping):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
+                )
+            else:
+                error = RetryableGenerationError(
+                    code="brand_context_read_failed",
+                    safe_message="Brand context storage could not be read temporarily.",
+                )
+            log.warn(
+                "provider_request_failed",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": error,
+                },
             )
-        if expected_content_type is not None and not _content_types_match(
-            response.get("ContentType"),
-            expected_content_type,
-        ):
-            raise PermanentGenerationError(
-                code="brand_context_object_content_type_mismatch",
-                safe_message=(
-                    "A brand context object content type did not match its manifest."
-                ),
-            )
-        body = response.get("Body")
-        reader = getattr(body, "read", None)
-        if not callable(reader):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
-            )
+            raise error from exc
+
         try:
-            data = reader(max_bytes + 1)
-        except Exception as exc:
-            raise RetryableGenerationError(
-                code="brand_context_read_failed",
-                safe_message="Brand context storage could not be read temporarily.",
-            ) from exc
-        finally:
-            closer = getattr(body, "close", None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
-        if not isinstance(data, bytes):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
+            if not isinstance(response, Mapping):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            if expected_content_type is not None and not _content_types_match(
+                response.get("ContentType"),
+                expected_content_type,
+            ):
+                raise PermanentGenerationError(
+                    code="brand_context_object_content_type_mismatch",
+                    safe_message=(
+                        "A brand context object content type did not match its manifest."
+                    ),
+                )
+            body = response.get("Body")
+            reader = getattr(body, "read", None)
+            if not callable(reader):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            try:
+                data = reader(max_bytes + 1)
+            except Exception as exc:
+                raise RetryableGenerationError(
+                    code="brand_context_read_failed",
+                    safe_message="Brand context storage could not be read temporarily.",
+                ) from exc
+            finally:
+                closer = getattr(body, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+            if not isinstance(data, bytes):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            if len(data) > max_bytes:
+                raise PermanentGenerationError(
+                    code="brand_context_object_too_large",
+                    safe_message="A brand context object exceeded its size limit.",
+                )
+        except RetryableGenerationError as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": exc,
+                },
             )
-        if len(data) > max_bytes:
-            raise PermanentGenerationError(
-                code="brand_context_object_too_large",
-                safe_message="A brand context object exceeded its size limit.",
+            raise
+        except PermanentGenerationError as exc:
+            log.warn(
+                "provider_response_invalid",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": exc,
+                },
             )
+            raise
+
+        log.info(
+            "provider_request_completed",
+            {
+                **provider_context,
+                "durationMs": duration_ms(started_at),
+                "responseBytes": len(data),
+            },
+        )
         return data
 
     def _client(self) -> Any:

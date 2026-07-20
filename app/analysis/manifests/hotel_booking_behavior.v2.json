@@ -11,7 +11,7 @@
     "maximum_days": 3650,
     "end_exclusive": true
   },
-  "destination_alias_version": "hotel_destination_alias.v1",
+  "destination_alias_version": "hotel_destination_alias.v2",
   "canonical_destination_id_patterns": ["^[0-9]{1,20}$"],
   "destination_aliases": {
     "jeju": ["jeju", "jeju-do", "jeju island", "제주", "제주도"],
@@ -20,6 +20,8 @@
     "gangneung": ["gangneung", "강릉", "강릉시"],
     "gyeongju": ["gyeongju", "경주", "경주시"],
     "incheon": ["incheon", "인천", "인천광역시"],
+    "okinawa": ["okinawa", "오키나와"],
+    "japan": ["japan", "일본", "도쿄", "오사카", "삿포로"],
     "sokcho": ["sokcho", "속초", "속초시"],
     "yeosu": ["yeosu", "여수", "여수시"]
   },

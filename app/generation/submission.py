@@ -28,7 +28,7 @@ from app.generation.schemas import (
     GenerationRequest,
     GenerationStatus,
 )
-from app.logging import log
+from app.logging import duration_ms, log, log_context_scope, now_ms
 from app.promotion_offers.service import canonical_offer_destination_url
 
 
@@ -116,14 +116,42 @@ class GenerationSubmissionService:
         self._model_version = model_version
         self._coordinator = coordinator
 
+    @log_context_scope
     def submit(
         self,
         request: GenerationRequest,
         *,
         idempotency_key: str,
     ) -> GenerationAcceptedResponse:
-        key = normalize_idempotency_key(idempotency_key)
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "analysisId": request.analysis_id,
+                "campaignId": request.campaign_id,
+                "projectId": request.project_id,
+                "promotionId": request.promotion_id,
+            }
+        )
+        log.info(
+            "started",
+            {
+                "contentOptionCount": request.content_option_count,
+                "hasOperatorInstruction": bool(request.operator_instruction),
+            },
+        )
+        try:
+            key = normalize_idempotency_key(idempotency_key)
+        except ValueError as exc:
+            log.warn(
+                "generation_request_invalid",
+                {"err": exc, "reason": "idempotency_key_invalid"},
+            )
+            raise
         if self._coordinator is not None and not self._coordinator.accepting:
+            log.warn(
+                "generation_submission_unavailable",
+                {"reason": "worker_shutting_down"},
+            )
             raise GenerationSubmissionUnavailable(
                 "generation worker is shutting down"
             )
@@ -138,10 +166,15 @@ class GenerationSubmissionService:
         try:
             promotion = self._generation_input_reader.get_promotion_input(request)
         except ValueError as exc:
+            log.warn(
+                "generation_promotion_input_invalid",
+                {"err": exc},
+            )
             raise GenerationInputUnavailable(
                 f"promotion input is invalid: {exc}"
             ) from exc
         if promotion is None:
+            log.warn("generation_promotion_input_not_found")
             raise GenerationInputUnavailable(
                 "promotion input was not found for generation"
             )
@@ -155,6 +188,7 @@ class GenerationSubmissionService:
             request
         )
         if not target_segments:
+            log.warn("generation_target_segments_empty")
             raise GenerationInputUnavailable(
                 "confirmed promotion_target_segments are required for generation"
             )
@@ -199,12 +233,14 @@ class GenerationSubmissionService:
                 persisted.get("request_fingerprint") or ""
             )
             if persisted_fingerprint != fingerprint:
+                log.warn("generation_idempotency_conflict")
                 raise GenerationIdempotencyConflict(
                     "idempotency key was already used for a different generation request"
                 )
             self._connection.commit()
         except GenerationIdempotencyMismatch as exc:
             self._connection.rollback()
+            log.warn("generation_idempotency_conflict", {"err": exc})
             raise GenerationIdempotencyConflict(
                 "idempotency key was already used for a different generation request"
             ) from exc
@@ -229,12 +265,20 @@ class GenerationSubmissionService:
             promotion_id=str(persisted["promotion_id"]),
             status=status,
         )
+        log.assign_context({"generationId": response.generation_id})
         log.info(
             "generation_request_accepted",
             {
-                "generationId": response.generation_id,
                 "status": response.status.value,
                 "created": created,
+            },
+        )
+        log.info(
+            "completed",
+            {
+                "created": created,
+                "durationMs": duration_ms(started_at),
+                "status": response.status.value,
             },
         )
         return response
