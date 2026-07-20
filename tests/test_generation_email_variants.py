@@ -32,7 +32,7 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     )
 
     assert extensions["variant_type"] == EDITORIAL_VARIANT
-    assert extensions["template_version"] == "email.editorial.v2"
+    assert extensions["template_version"] == "email.editorial.v3"
     assert len(extensions["featured_offers"]) == 2
     assert [
         offer["destination_id"] for offer in extensions["featured_offers"]
@@ -56,8 +56,11 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     EmailHtmlSource.model_validate(source)
 
     assert "JEJU · OKINAWA SUMMER EDIT" in rendered
-    assert "바다와 오름 사이" in rendered
-    assert "투명한 바다 곁에서" in rendered
+    assert "바다와 오름 사이,<br>천천히 시작하는 하루" in rendered
+    assert "투명한 바다 곁에서,<br>오래 머무는 휴식" in rendered
+    assert "background:#151515" in rendered
+    assert "background:#222222" in rendered
+    assert "background:#f8fafc" not in rendered
     assert "StayLoop Hotel 1" in rendered
     assert "StayLoop Hotel 5" in rendered
     assert extensions["hero_image_url"] in rendered
