@@ -28,6 +28,13 @@ CUSTOM_STRUCTURED_PARAMETER_POLICY_ID = "custom_structured_parameters.v1"
 CUSTOM_STRUCTURED_SELECTION_POLICY_ID = "exact_predicate_membership.v1"
 CUSTOM_STRUCTURED_ANCHOR_POLICY_ID = "structured_conditions_no_anchor.v1"
 CUSTOM_STRUCTURED_CONDITION_KEY = "structured_conditions"
+CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION = 2
+CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID = "custom_structured_parameters.v2"
+CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID = "source_refinement_exact_membership.v1"
+CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID = (
+    "source_membership_with_optional_structured_conditions.v1"
+)
+CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY = "source_audience_membership"
 _CUSTOM_STRUCTURED_TEMPLATE_SEMANTICS = {
     "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
     "conditions": "allowlisted_event_property_count_conjunction",
@@ -40,6 +47,23 @@ _CUSTOM_STRUCTURED_TEMPLATE_SEMANTICS = {
 CUSTOM_STRUCTURED_TEMPLATE_HASH = hashlib.sha256(
     json.dumps(
         _CUSTOM_STRUCTURED_TEMPLATE_SEMANTICS,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
+_CUSTOM_SOURCE_REFINEMENT_TEMPLATE_SEMANTICS = {
+    "base_membership": "canonical_source_suggestion_user_ids",
+    "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+    "conditions": "optional_allowlisted_event_property_count_conjunction",
+    "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+    "selection": "source_membership_with_optional_exact_predicate_membership",
+    "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+    "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+    "window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+}
+CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH = hashlib.sha256(
+    json.dumps(
+        _CUSTOM_SOURCE_REFINEMENT_TEMPLATE_SEMANTICS,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -152,10 +176,15 @@ class SegmentAudienceSpec:
     observation_window_days: int
     spec_hash: str
     custom_conditions: tuple[Mapping[str, Any], ...] = ()
+    base_user_ids: tuple[str, ...] = ()
 
     @property
     def is_custom_structured(self) -> bool:
         return self.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+
+    @property
+    def is_source_refinement(self) -> bool:
+        return bool(self.base_user_ids)
 
     @property
     def predicate_parameters(self) -> Mapping[str, Sequence[str] | Sequence[int]]:
@@ -173,6 +202,8 @@ class SegmentAudienceSpec:
                     separators=(",", ":"),
                 ),
             )
+        if self.is_source_refinement:
+            parameters["base_user_ids"] = self.base_user_ids
         return parameters
 
 
@@ -439,15 +470,37 @@ def _parse_custom_structured_spec(
     schema_version: str,
     raw_spec: Mapping[str, Any],
 ) -> SegmentAudienceSpec:
-    expected_static = {
-        "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
-        "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
-        "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
-        "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
-        "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
-        "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
-        "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
-    }
+    template_version = raw_spec.get("template_version")
+    if template_version == CUSTOM_STRUCTURED_TEMPLATE_VERSION:
+        expected_static = {
+            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+            "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+            "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+            "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+        }
+        is_source_refinement = False
+    elif template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
+        expected_static = {
+            "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+            "template_semantic_hash": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "parameter_policy_id": CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
+            "semantic_selection_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
+            ),
+            "semantic_anchor_policy_id": CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
+            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+        }
+        is_source_refinement = True
+    else:
+        raise _error(
+            "segment_audience_template_binding_mismatch",
+            segment_id,
+            "template_version does not match a supported custom structured template",
+        )
     for field_name, expected in expected_static.items():
         if raw_spec.get(field_name) != expected:
             raise _error(
@@ -455,20 +508,6 @@ def _parse_custom_structured_spec(
                 segment_id,
                 f"{field_name} does not match the custom structured template",
             )
-
-    condition_keys = _required_text_tuple(raw_spec, "condition_keys", segment_id)
-    hard_predicate_keys = _required_text_tuple(
-        raw_spec,
-        "hard_predicate_keys",
-        segment_id,
-    )
-    expected_keys = (CUSTOM_STRUCTURED_CONDITION_KEY,)
-    if condition_keys != expected_keys or hard_predicate_keys != expected_keys:
-        raise _error(
-            "segment_audience_template_binding_mismatch",
-            segment_id,
-            "custom structured segments require the structured_conditions predicate",
-        )
 
     raw_parameters = raw_spec.get("parameters")
     if not isinstance(raw_parameters, Mapping):
@@ -487,7 +526,34 @@ def _parse_custom_structured_spec(
     custom_conditions = _canonical_custom_conditions(
         raw_parameters.get("conditions"),
         segment_id=segment_id,
+        allow_empty=is_source_refinement,
     )
+    base_user_ids = (
+        _canonical_source_user_ids(
+            raw_parameters.get("base_user_ids"),
+            segment_id=segment_id,
+        )
+        if template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+        else ()
+    )
+    expected_keys = (
+        (CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,)
+        + ((CUSTOM_STRUCTURED_CONDITION_KEY,) if custom_conditions else ())
+        if is_source_refinement
+        else (CUSTOM_STRUCTURED_CONDITION_KEY,)
+    )
+    condition_keys = _required_text_tuple(raw_spec, "condition_keys", segment_id)
+    hard_predicate_keys = _required_text_tuple(
+        raw_spec,
+        "hard_predicate_keys",
+        segment_id,
+    )
+    if condition_keys != expected_keys or hard_predicate_keys != expected_keys:
+        raise _error(
+            "segment_audience_template_binding_mismatch",
+            segment_id,
+            "custom structured predicates do not match the template version",
+        )
     query_signal_keys = _custom_query_signal_keys(custom_conditions)
     raw_query_signal_keys = _required_text_tuple(
         raw_spec,
@@ -529,6 +595,11 @@ def _parse_custom_structured_spec(
         "parameters": {
             "lookback_days": lookback_days,
             "conditions": list(custom_conditions),
+            **(
+                {"base_user_ids": list(base_user_ids)}
+                if base_user_ids
+                else {}
+            ),
         },
     }
     serialized = json.dumps(
@@ -541,8 +612,8 @@ def _parse_custom_structured_spec(
         segment_id=segment_id,
         schema_version=schema_version,
         template_id=CUSTOM_STRUCTURED_TEMPLATE_ID,
-        template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
-        template_semantic_hash=CUSTOM_STRUCTURED_TEMPLATE_HASH,
+        template_version=int(template_version),
+        template_semantic_hash=str(expected_static["template_semantic_hash"]),
         candidate_type=CUSTOM_STRUCTURED_CANDIDATE_TYPE,
         condition_keys=condition_keys,
         query_signal_keys=query_signal_keys,
@@ -550,29 +621,60 @@ def _parse_custom_structured_spec(
         destination_ids=destination_ids,
         season_months=season_months,
         benefit_keys=(),
-        parameter_policy_id=CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
-        semantic_selection_policy_id=CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
-        semantic_anchor_policy_id=CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+        parameter_policy_id=str(expected_static["parameter_policy_id"]),
+        semantic_selection_policy_id=str(
+            expected_static["semantic_selection_policy_id"]
+        ),
+        semantic_anchor_policy_id=str(expected_static["semantic_anchor_policy_id"]),
         observation_window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
         spec_hash=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         custom_conditions=custom_conditions,
+        base_user_ids=base_user_ids,
     )
+
+
+def _canonical_source_user_ids(
+    value: Any,
+    *,
+    segment_id: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not 1 <= len(value) <= 5_000
+    ):
+        raise _error(
+            "segment_audience_parameters_invalid",
+            segment_id,
+            "source refinement requires between 1 and 5000 base_user_ids",
+        )
+    user_ids = tuple(sorted({str(item).strip() for item in value if str(item).strip()}))
+    if not user_ids or len(user_ids) != len(value) or tuple(value) != user_ids:
+        raise _error(
+            "segment_audience_parameters_not_canonical",
+            segment_id,
+            "base_user_ids must be non-empty, unique, and canonically sorted",
+        )
+    return user_ids
 
 
 def _canonical_custom_conditions(
     value: Any,
     *,
     segment_id: str,
+    allow_empty: bool = False,
 ) -> tuple[Mapping[str, Any], ...]:
+    minimum_items = 0 if allow_empty else 1
     if (
         not isinstance(value, Sequence)
         or isinstance(value, (str, bytes))
-        or not 1 <= len(value) <= 8
+        or not minimum_items <= len(value) <= 8
     ):
         raise _error(
             "segment_audience_parameters_invalid",
             segment_id,
-            "custom structured conditions must contain between 1 and 8 items",
+            "custom structured conditions must contain between "
+            f"{minimum_items} and 8 items",
         )
     conditions: list[dict[str, Any]] = []
     for index, item in enumerate(value):
