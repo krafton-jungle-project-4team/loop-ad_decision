@@ -39,7 +39,7 @@ BUNDLED_SEMANTIC_SELECTION_PATH = (
     / "hotel_behavior_v2_segment_audience_templates_v1.json"
 )
 BUNDLED_SEMANTIC_SELECTION_SHA256 = (
-    "ccc9d1c61419b8910ed3588ee5973cad8ab19e3af399f6b45f4d55c86d5421cf"
+    "65060ff8aff2565fd5c2942ad0f9a6fa92104ad4a6f4ac0bcba7ba9658578e7c"
 )
 
 

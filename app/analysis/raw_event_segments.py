@@ -18,6 +18,7 @@ from app.analysis.audience_selection import (
     AudienceSelectionPolicyProtocol,
     all_matching_audience_selection_policy,
 )
+from app.analysis.behavior_manifest import destination_alias_groups
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -146,15 +147,7 @@ SEASON_MONTHS: Mapping[str, tuple[int, ...]] = {
     "winter": (12, 1, 2),
 }
 
-DESTINATION_KEYWORDS: Mapping[str, tuple[str, ...]] = {
-    "jeju": ("jeju", "제주"),
-    "okinawa": ("okinawa", "오키나와"),
-    "japan": ("japan", "일본", "도쿄", "오사카", "삿포로"),
-    "busan": ("busan", "부산"),
-    "seoul": ("seoul", "서울"),
-    "gangneung": ("gangneung", "강릉"),
-    "yeosu": ("yeosu", "여수"),
-}
+DESTINATION_ALIASES = destination_alias_groups()
 
 
 class PromotionIntentExtractor(Protocol):
@@ -710,7 +703,7 @@ def destination_terms_from_intent(intent: PromotionIntent) -> tuple[str, ...]:
     terms: list[str] = []
     for destination in intent.destinations:
         normalized = destination.strip().lower()
-        terms.extend(DESTINATION_KEYWORDS.get(normalized, (normalized,)))
+        terms.extend(DESTINATION_ALIASES.get(normalized, (normalized,)))
     return tuple(dict.fromkeys(term for term in terms if term))
 
 
@@ -1757,7 +1750,7 @@ def _canonical_destinations(values: Sequence[str]) -> tuple[str, ...]:
     extracted = _extract_destinations(" ".join(values).lower())
     recognized_aliases = {
         alias
-        for aliases in DESTINATION_KEYWORDS.values()
+        for aliases in DESTINATION_ALIASES.values()
         for alias in aliases
     }
     unknown_values = [
@@ -1961,7 +1954,7 @@ def _extract_seasons(searchable: str) -> list[str]:
 
 def _extract_destinations(searchable: str) -> list[str]:
     destinations: list[str] = []
-    for canonical, aliases in DESTINATION_KEYWORDS.items():
+    for canonical, aliases in DESTINATION_ALIASES.items():
         if any(alias in searchable for alias in aliases):
             destinations.append(canonical)
     return destinations

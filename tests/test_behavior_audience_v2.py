@@ -146,10 +146,14 @@ def test_manifest_fixes_all_dimensions_and_destination_alias_sql() -> None:
     assert behavior_manifest_hash() == HOTEL_BEHAVIOR_MANIFEST_HASH
     assert canonical_destination(" 제주도 ") == "jeju"
     assert signed_hash_coordinate("제주도") == signed_hash_coordinate("jeju")
+    assert canonical_destination(" 오키나와 ") == "okinawa"
+    assert signed_hash_coordinate("오키나와") == signed_hash_coordinate("okinawa")
     sql = clickhouse_canonical_destination_sql("destination_value")
     assert "multiIf(" in sql
     assert "'제주도'" in sql
     assert "'jeju'" in sql
+    assert "'오키나와'" in sql
+    assert "'okinawa'" in sql
 
     names = [str(item["name"]) for item in manifest["dimensions"]]
     ordered = order_vector_terms_by_manifest({name: name for name in names})
