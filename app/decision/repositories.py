@@ -336,9 +336,19 @@ class UserBehaviorVectorRecord:
     source: str
 
 
+class EvaluationFunnelRecord(NamedTuple):
+    response_count: int
+    hotel_search_count: int
+    hotel_detail_view_count: int
+    booking_start_count: int
+    booking_complete_count: int
+    fixture_response_count: int = 0
+
+
 class MetricCountRecord(NamedTuple):
     numerator_count: int
     denominator_count: int
+    funnel: EvaluationFunnelRecord | None = None
 
 
 @dataclass(frozen=True)
@@ -2533,27 +2543,94 @@ class EvaluationMetricRepository:
         denominator_event_name = _booking_conversion_denominator_event(experiment)
         result = self._client.query(
             """
-            SELECT
-                (
-                    SELECT countDistinct(user_id)
-                    FROM booking_outcome_events
-                    WHERE project_id = {project_id:String}
-                      AND promotion_run_id IS NOT NULL
-                      AND ad_experiment_id IS NOT NULL
-                      AND promotion_run_id = {promotion_run_id:String}
-                      AND ad_experiment_id = {ad_experiment_id:String}
-                      AND event_name = 'booking_complete'
-                      AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
-                ) AS numerator_count,
-                (
-                    SELECT countDistinct(user_id)
+            WITH
+                toDateTime64(0, 3, 'UTC') AS no_event,
+                response_users AS (
+                    SELECT
+                        user_id,
+                        min(event_time) AS response_at,
+                        max(source = 'fixture') AS fixture_response
                     FROM promotion_touch_events
                     WHERE project_id = {project_id:String}
                       AND promotion_run_id = {promotion_run_id:String}
                       AND ad_experiment_id = {ad_experiment_id:String}
                       AND event_name = {denominator_event_name:String}
                       AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
-                ) AS denominator_count
+                      AND notEmpty(user_id)
+                    GROUP BY user_id
+                ),
+                browsing_users AS (
+                    SELECT
+                        user_id,
+                        maxIf(
+                            event_time,
+                            event_name IN ('hotel_search', 'hotel_click', 'hotel_detail_view')
+                        ) AS hotel_search_or_later_at,
+                        maxIf(
+                            event_time,
+                            event_name = 'hotel_detail_view'
+                        ) AS hotel_detail_view_at
+                    FROM raw_events
+                    WHERE project_id = {project_id:String}
+                      AND validation_status = 'valid'
+                      AND JSONExtractString(properties_json, 'promotion_run_id') =
+                          {promotion_run_id:String}
+                      AND JSONExtractString(properties_json, 'ad_experiment_id') =
+                          {ad_experiment_id:String}
+                      AND event_name IN ('hotel_search', 'hotel_click', 'hotel_detail_view')
+                      AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
+                      AND notEmpty(user_id)
+                    GROUP BY user_id
+                ),
+                booking_users AS (
+                    SELECT
+                        user_id,
+                        maxIf(event_time, event_name = 'booking_start') AS booking_start_at,
+                        maxIf(event_time, event_name = 'booking_complete') AS booking_complete_at
+                    FROM booking_outcome_events
+                    WHERE project_id = {project_id:String}
+                      AND promotion_run_id = {promotion_run_id:String}
+                      AND ad_experiment_id = {ad_experiment_id:String}
+                      AND event_name IN ('booking_start', 'booking_complete')
+                      AND event_time <= {evaluation_cutoff_at:DateTime64(3, 'UTC')}
+                      AND notEmpty(user_id)
+                    GROUP BY user_id
+                ),
+                user_progress AS (
+                    SELECT
+                        responses.user_id AS user_id,
+                        responses.response_at AS response_at,
+                        responses.fixture_response AS fixture_response,
+                        greatest(
+                            ifNull(browsing.hotel_search_or_later_at, no_event),
+                            ifNull(browsing.hotel_detail_view_at, no_event),
+                            ifNull(bookings.booking_start_at, no_event),
+                            ifNull(bookings.booking_complete_at, no_event)
+                        ) AS hotel_search_or_later_at,
+                        greatest(
+                            ifNull(browsing.hotel_detail_view_at, no_event),
+                            ifNull(bookings.booking_start_at, no_event),
+                            ifNull(bookings.booking_complete_at, no_event)
+                        ) AS hotel_detail_view_or_later_at,
+                        greatest(
+                            ifNull(bookings.booking_start_at, no_event),
+                            ifNull(bookings.booking_complete_at, no_event)
+                        ) AS booking_start_or_later_at,
+                        ifNull(bookings.booking_complete_at, no_event) AS booking_complete_at
+                    FROM response_users AS responses
+                    LEFT JOIN browsing_users AS browsing USING (user_id)
+                    LEFT JOIN booking_users AS bookings USING (user_id)
+                )
+            SELECT
+                countIf(booking_complete_at >= response_at) AS numerator_count,
+                count() AS denominator_count,
+                count() AS response_count,
+                countIf(hotel_search_or_later_at >= response_at) AS hotel_search_count,
+                countIf(hotel_detail_view_or_later_at >= response_at) AS hotel_detail_view_count,
+                countIf(booking_start_or_later_at >= response_at) AS booking_start_count,
+                countIf(booking_complete_at >= response_at) AS booking_complete_count,
+                countIf(fixture_response = 1) AS fixture_response_count
+            FROM user_progress
             """,
             parameters={
                 "project_id": experiment.project_id,
@@ -2563,7 +2640,7 @@ class EvaluationMetricRepository:
                 "evaluation_cutoff_at": evaluation_cutoff_at,
             },
         )
-        return _metric_count_from_result(result)
+        return _booking_metric_count_from_result(result)
 
 
 def _next_loop_preparation_record_or_none(
@@ -2668,6 +2745,33 @@ def _metric_count_from_result(result: Any) -> MetricCountRecord:
     return MetricCountRecord(
         numerator_count=int(_clickhouse_value(row, "numerator_count", 0)),
         denominator_count=int(_clickhouse_value(row, "denominator_count", 1)),
+    )
+
+
+def _booking_metric_count_from_result(result: Any) -> MetricCountRecord:
+    rows = _clickhouse_rows(result)
+    if not rows:
+        empty_funnel = EvaluationFunnelRecord(0, 0, 0, 0, 0, 0)
+        return MetricCountRecord(0, 0, empty_funnel)
+    row = rows[0]
+    funnel = EvaluationFunnelRecord(
+        response_count=int(_clickhouse_value(row, "response_count", 2)),
+        hotel_search_count=int(_clickhouse_value(row, "hotel_search_count", 3)),
+        hotel_detail_view_count=int(
+            _clickhouse_value(row, "hotel_detail_view_count", 4)
+        ),
+        booking_start_count=int(_clickhouse_value(row, "booking_start_count", 5)),
+        booking_complete_count=int(
+            _clickhouse_value(row, "booking_complete_count", 6)
+        ),
+        fixture_response_count=int(
+            _clickhouse_value(row, "fixture_response_count", 7)
+        ),
+    )
+    return MetricCountRecord(
+        numerator_count=int(_clickhouse_value(row, "numerator_count", 0)),
+        denominator_count=int(_clickhouse_value(row, "denominator_count", 1)),
+        funnel=funnel,
     )
 
 

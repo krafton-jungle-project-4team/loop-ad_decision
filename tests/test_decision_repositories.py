@@ -14,6 +14,7 @@ from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
     ContentCandidateRepository,
+    EvaluationFunnelRecord,
     EvaluationMetricRepository,
     GenerationRunRepository,
     NextLoopPreparationConflictError,
@@ -2210,7 +2211,7 @@ def test_evaluation_metric_repository_lists_successful_user_ids(
 
 
 def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_keys() -> None:
-    client = FakeClickHouseClient(rows=[(0, 10)])
+    client = FakeClickHouseClient(rows=[(0, 10, 10, 8, 7, 4, 0, 0)])
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
@@ -2220,17 +2221,26 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
 
     assert counts.numerator_count == 0
     assert counts.denominator_count == 10
+    assert counts.funnel == EvaluationFunnelRecord(
+        response_count=10,
+        hotel_search_count=8,
+        hotel_detail_view_count=7,
+        booking_start_count=4,
+        booking_complete_count=0,
+        fixture_response_count=0,
+    )
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "from booking_outcome_events" in sql
     assert "from promotion_touch_events" in sql
+    assert "from raw_events" in sql
     assert "booking_complete" in sql
     assert "denominator_event_name:string" in sql
-    assert "promotion_run_id is not null" in sql
-    assert "ad_experiment_id is not null" in sql
+    assert "validation_status = 'valid'" in sql
+    assert "countif(hotel_search_or_later_at >= response_at)" in sql
     assert sql.count(
         "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}"
-    ) == 2
+    ) == 3
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
@@ -2243,7 +2253,7 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
 
 
 def test_evaluation_metric_repository_counts_email_booking_conversion_from_landings() -> None:
-    client = FakeClickHouseClient(rows=[(1, 2)])
+    client = FakeClickHouseClient(rows=[(1, 2, 2, 2, 2, 1, 1, 2)])
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
@@ -2256,6 +2266,8 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
 
     assert counts.numerator_count == 1
     assert counts.denominator_count == 2
+    assert counts.funnel is not None
+    assert counts.funnel.fixture_response_count == 2
     call = client.calls[0]
     assert call.params["denominator_event_name"] == "campaign_landing"
 
