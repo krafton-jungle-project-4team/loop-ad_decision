@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.generation.brand_context import BrandGuardrails
 from app.generation.brand_context_s3 import S3BrandContextLoader
@@ -233,7 +234,17 @@ def test_s3_loader_returns_none_when_project_pointer_is_absent() -> None:
         s3_client=FakeS3Client({}),
     )
 
-    assert loader.resolve_snapshot(project_id=PROJECT_ID) is None
+    with capture_logs() as logs:
+        assert loader.resolve_snapshot(project_id=PROJECT_ID) is None
+
+    completed = next(
+        record
+        for record in logs
+        if record["event"] == "provider_request_completed"
+    )
+    assert completed["provider"] == "aws_s3"
+    assert completed["endpoint"] == "get_object"
+    assert completed["outcome"] == "not_found"
 
 
 def test_s3_loader_accepts_json_content_type_without_charset() -> None:
