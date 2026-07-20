@@ -1354,6 +1354,10 @@ def _structured_query_parameters(
     if "structured_conditions_json" not in predicate_parameters:
         return {}
     parameters: dict[str, Any] = {}
+    if "base_user_ids" in predicate_parameters:
+        parameters["base_user_ids"] = list(
+            predicate_parameters.get("base_user_ids", ())
+        )
     for index, condition in enumerate(_structured_conditions(predicate_parameters)):
         prefix = f"custom_{index}"
         parameters[f"{prefix}_event_name"] = str(condition["event_name"])
@@ -1483,6 +1487,7 @@ def _hard_predicate_query(
         "general_destination_exploration",
         "recent_destination_search",
         "season_match",
+        "source_audience_membership",
         "structured_conditions",
     }
     unknown = sorted(set(keys) - supported)
@@ -1555,6 +1560,8 @@ def _hard_predicate_query(
                 "JSONExtractString(properties_json, 'checkin_date'))) "
                 "IN {season_months:Array(UInt8)}) > 0"
             )
+        elif key == "source_audience_membership":
+            continue
         elif key == "structured_conditions":
             conditions.extend(
                 _structured_having_conditions(predicate_parameters or {})
@@ -1562,6 +1569,11 @@ def _hard_predicate_query(
     having = " AND ".join(f"({condition})" for condition in conditions) or "1"
     user_filter = (
         "AND user_id IN {user_ids:Array(String)}" if filter_user_ids else ""
+    )
+    source_user_filter = (
+        "AND user_id IN {base_user_ids:Array(String)}"
+        if "source_audience_membership" in keys
+        else ""
     )
     vector_population_filter = ""
     if restrict_to_vector_population:
@@ -1597,6 +1609,7 @@ def _hard_predicate_query(
         {_clickhouse_exclusion_join(exclude_promotion_users)}
         WHERE project_id = {{project_id:String}}
           {user_filter}
+          {source_user_filter}
           {vector_population_filter}
           AND validation_status = 'valid'
           AND received_at <= toDateTime64(
