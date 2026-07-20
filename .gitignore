@@ -15,6 +15,7 @@ venv/
 *.md
 !/README.md
 !/docs/dashboard-promotion-offer-url-handoff.md
+!/.codex/skills/loopad-log-tracer/SKILL.md
 artifacts/
 evaluation_manifests/**/*.execution-started.json
 evaluation_manifests/**/*.execution-started.json.lock
