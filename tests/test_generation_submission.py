@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.generation.brand_context import BrandContextSnapshot
 from app.generation.prompt_builder import (
@@ -286,10 +287,11 @@ def test_submit_persists_requested_row_before_commit_and_wake() -> None:
     events: list[str] = []
     service, connection, repository, coordinator = build_service(events=events)
 
-    response = service.submit(
-        generation_request(),
-        idempotency_key=" generation:banner:001 ",
-    )
+    with capture_logs() as logs:
+        response = service.submit(
+            generation_request(),
+            idempotency_key=" generation:banner:001 ",
+        )
 
     assert events == [
         "read:promotion",
@@ -303,6 +305,10 @@ def test_submit_persists_requested_row_before_commit_and_wake() -> None:
     assert coordinator.wake_count == 1
     assert response.status is GenerationStatus.REQUESTED
     assert response.promotion_id == "promo_banner_001"
+    completed = next(record for record in logs if record["event"] == "completed")
+    assert completed["status"] == "requested"
+    assert completed["created"] is True
+    assert "generation:banner:001" not in str(logs)
 
     record = repository.submitted_records[0]
     assert record.status == GenerationStatus.REQUESTED.value

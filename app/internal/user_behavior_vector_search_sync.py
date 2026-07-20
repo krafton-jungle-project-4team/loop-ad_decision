@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Mapping, Protocol, Sequence
 
+from app.logging import duration_ms, log, log_context_scope, now_ms
+
 
 VECTOR_DIM = 64
 GENERATION_ACTIVATION_LOCK_NAMESPACE = (
@@ -508,6 +510,7 @@ class UserBehaviorVectorSearchSyncService:
     def __init__(self, repository: UserBehaviorVectorSearchSyncRepository) -> None:
         self._repository = repository
 
+    @log_context_scope
     def sync(
         self,
         *,
@@ -517,6 +520,18 @@ class UserBehaviorVectorSearchSyncService:
         batch_size: int,
         max_batches: int,
     ) -> UserBehaviorVectorSearchSyncResult:
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "projectId": project_id,
+                "vectorGenerationId": vector_generation_id,
+                "vectorVersion": vector_version,
+            }
+        )
+        log.info(
+            "started",
+            {"batchSize": batch_size, "maxBatches": max_batches},
+        )
         generation = self._repository.get_generation(
             vector_generation_id=vector_generation_id
         )
@@ -524,16 +539,46 @@ class UserBehaviorVectorSearchSyncService:
             generation.project_id != project_id
             or generation.vector_version != vector_version
         ):
+            log.warn(
+                "vector_search_generation_mismatch",
+                {
+                    "actualProjectId": generation.project_id,
+                    "actualVectorVersion": generation.vector_version,
+                },
+            )
             raise RuntimeError("vector generation does not belong to this project/version")
         if generation.status == "failed":
-            return self._result(generation, status="failed")
+            log.info(
+                "vector_search_sync_skipped",
+                {"reason": "generation_already_failed"},
+            )
+            return self._completed_result(
+                generation,
+                status="failed",
+                started_at=started_at,
+                processed_batch_count=0,
+            )
         if generation.status == "activated":
-            return self._result(generation, status="activated")
+            log.info(
+                "vector_search_sync_skipped",
+                {"reason": "generation_already_activated"},
+            )
+            return self._completed_result(
+                generation,
+                status="activated",
+                started_at=started_at,
+                processed_batch_count=0,
+            )
         if generation.status != "in_progress":
+            log.warn(
+                "vector_search_generation_not_syncable",
+                {"status": generation.status},
+            )
             raise RuntimeError("vector generation is not syncable")
 
         exhausted = False
-        for _ in range(max_batches):
+        processed_batch_count = 0
+        for batch_index in range(max_batches):
             generation = self._repository.get_generation(
                 vector_generation_id=vector_generation_id
             )
@@ -550,6 +595,14 @@ class UserBehaviorVectorSearchSyncService:
                     revisions=revisions,
                 )
             except ValueError as exc:
+                log.warn(
+                    "vector_search_revision_invalid",
+                    {
+                        "batchIndex": batch_index,
+                        "err": exc,
+                        "revisionCount": len(revisions),
+                    },
+                )
                 self._repository.mark_failed(
                     vector_generation_id=vector_generation_id,
                     invalid_user_count=1,
@@ -558,10 +611,27 @@ class UserBehaviorVectorSearchSyncService:
                 failed = self._repository.get_generation(
                     vector_generation_id=vector_generation_id
                 )
-                return self._result(failed, status="failed")
+                log.info(
+                    "vector_search_generation_failed",
+                    {"reason": "revision_invalid"},
+                )
+                return self._completed_result(
+                    failed,
+                    status="failed",
+                    started_at=started_at,
+                    processed_batch_count=processed_batch_count,
+                )
             self._repository.save_progress(
                 generation=generation,
                 last_user_id=revisions[-1].user_id,
+            )
+            processed_batch_count += 1
+            log.info(
+                "vector_search_sync_batch_completed",
+                {
+                    "batchIndex": batch_index,
+                    "revisionCount": len(revisions),
+                },
             )
             if len(revisions) < batch_size:
                 exhausted = True
@@ -571,7 +641,12 @@ class UserBehaviorVectorSearchSyncService:
             vector_generation_id=vector_generation_id
         )
         if not exhausted:
-            return self._result(generation, status="in_progress")
+            return self._completed_result(
+                generation,
+                status="in_progress",
+                started_at=started_at,
+                processed_batch_count=processed_batch_count,
+            )
 
         source_user_count = self._repository.count_source_users(
             generation=generation
@@ -584,6 +659,15 @@ class UserBehaviorVectorSearchSyncService:
             or synced_user_count != generation.expected_user_count
             or generation.invalid_user_count != 0
         ):
+            log.warn(
+                "vector_search_generation_completeness_mismatch",
+                {
+                    "expectedUserCount": generation.expected_user_count,
+                    "invalidUserCount": generation.invalid_user_count,
+                    "sourceUserCount": source_user_count,
+                    "syncedUserCount": synced_user_count,
+                },
+            )
             self._repository.mark_failed(
                 vector_generation_id=vector_generation_id,
                 invalid_user_count=generation.invalid_user_count,
@@ -596,15 +680,58 @@ class UserBehaviorVectorSearchSyncService:
             failed = self._repository.get_generation(
                 vector_generation_id=vector_generation_id
             )
-            return self._result(failed, status="failed")
+            log.info(
+                "vector_search_generation_failed",
+                {"reason": "completeness_mismatch"},
+            )
+            return self._completed_result(
+                failed,
+                status="failed",
+                started_at=started_at,
+                processed_batch_count=processed_batch_count,
+            )
 
         self._repository.activate_generation(generation=generation)
         activated = self._repository.get_generation(
             vector_generation_id=vector_generation_id
         )
         if activated.status != "activated":
+            log.warn(
+                "vector_search_generation_activation_mismatch",
+                {"status": activated.status},
+            )
             raise RuntimeError("complete vector generation could not be activated")
-        return self._result(activated, status="activated")
+        log.info(
+            "vector_search_generation_activated",
+            {"expectedUserCount": activated.expected_user_count},
+        )
+        return self._completed_result(
+            activated,
+            status="activated",
+            started_at=started_at,
+            processed_batch_count=processed_batch_count,
+        )
+
+    def _completed_result(
+        self,
+        generation: VectorSearchGeneration,
+        *,
+        status: str,
+        started_at: float,
+        processed_batch_count: int,
+    ) -> UserBehaviorVectorSearchSyncResult:
+        result = self._result(generation, status=status)
+        log.info(
+            "completed",
+            {
+                "durationMs": duration_ms(started_at),
+                "expectedUserCount": result.expected_user_count,
+                "processedBatchCount": processed_batch_count,
+                "status": result.status,
+                "syncedUserCount": result.synced_user_count,
+            },
+        )
+        return result
 
     def _result(
         self,

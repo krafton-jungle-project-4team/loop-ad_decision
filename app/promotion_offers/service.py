@@ -10,6 +10,7 @@ from app.generation.errors import (
     PermanentGenerationError,
     RetryableGenerationError,
 )
+from app.logging import duration_ms, log, log_context_scope, now_ms
 from app.promotion_offers.schemas import (
     PromotionOfferCatalogResponse,
     PromotionOfferResponse,
@@ -53,41 +54,78 @@ class PromotionOfferCatalogService:
     def __init__(self, loader: PromotionOfferCatalogLoader) -> None:
         self._loader = loader
 
+    @log_context_scope
     def list_offers(self, *, project_id: str) -> PromotionOfferCatalogResponse:
-        project_id = _validated_project_id(project_id)
+        started_at = now_ms()
+        log.info("started", {"projectIdLength": len(str(project_id))})
+        try:
+            project_id = _validated_project_id(project_id)
+        except PromotionOfferCatalogInvalidProjectId as exc:
+            log.warn("promotion_offer_project_id_invalid", {"err": exc})
+            raise
+        log.assign_context({"projectId": project_id})
         try:
             snapshot = self._loader.resolve_snapshot(project_id=project_id)
             if snapshot is None:
+                log.warn(
+                    "promotion_offer_catalog_not_found",
+                    {"reason": "brand_context_snapshot_missing"},
+                )
                 raise PromotionOfferCatalogNotFound
             catalog = self._loader.load_offer_catalog(
                 project_id=project_id,
                 snapshot=snapshot,
             )
             if catalog is None:
+                log.warn(
+                    "promotion_offer_catalog_not_found",
+                    {"reason": "offer_catalog_missing"},
+                )
                 raise PromotionOfferCatalogNotFound
         except PromotionOfferCatalogNotFound:
             raise
         except RetryableGenerationError as exc:
+            log.warn("promotion_offer_catalog_unavailable", {"err": exc})
             raise PromotionOfferCatalogUnavailable from exc
         except PermanentGenerationError as exc:
             if exc.code == "brand_context_object_missing":
+                log.warn(
+                    "promotion_offer_catalog_not_found",
+                    {"err": exc, "reason": "catalog_object_missing"},
+                )
                 raise PromotionOfferCatalogNotFound from exc
+            log.warn("promotion_offer_catalog_unavailable", {"err": exc})
             raise PromotionOfferCatalogUnavailable from exc
         except ValueError as exc:
+            log.warn("promotion_offer_catalog_unavailable", {"err": exc})
             raise PromotionOfferCatalogUnavailable from exc
 
         catalog_id = _required_text(catalog.get("catalog_id"))
         catalog_version = _required_text(catalog.get("catalog_version"))
         if catalog_id is None or catalog_version is None:
+            log.warn(
+                "promotion_offer_catalog_invalid",
+                {"reason": "catalog_identity_missing"},
+            )
             raise PromotionOfferCatalogUnavailable
 
         offers = _normalised_offers(catalog.get("hotels"))
-        return PromotionOfferCatalogResponse(
+        response = PromotionOfferCatalogResponse(
             project_id=project_id,
             catalog_id=catalog_id,
             catalog_version=catalog_version,
             offers=offers,
         )
+        log.info(
+            "completed",
+            {
+                "catalogId": response.catalog_id,
+                "catalogVersion": response.catalog_version,
+                "durationMs": duration_ms(started_at),
+                "offerCount": len(response.offers),
+            },
+        )
+        return response
 
 
 def canonical_offer_destination_url(offer_id: str) -> str:

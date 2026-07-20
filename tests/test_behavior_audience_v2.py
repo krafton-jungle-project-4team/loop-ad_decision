@@ -8,6 +8,7 @@ import json
 from typing import Mapping, Sequence
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.analysis.audience_search import (
     AudienceSearchResult,
@@ -1325,28 +1326,32 @@ def test_assignment_reuses_preallocated_run_target_snapshots_without_winner_sear
     assert snapshots.consume_calls == 1
 def test_vector_search_sync_is_incremental_and_advances_complete_cutoff() -> None:
     repository = _SyncRepository()
-    first = UserBehaviorVectorSearchSyncService(repository).sync(
-        project_id="project",
-        vector_version="hotel_behavior.v2",
-        vector_generation_id="uvgen_test",
-        batch_size=1,
-        max_batches=1,
-    )
+    with capture_logs() as logs:
+        first = UserBehaviorVectorSearchSyncService(repository).sync(
+            project_id="project",
+            vector_version="hotel_behavior.v2",
+            vector_generation_id="uvgen_test",
+            batch_size=1,
+            max_batches=1,
+        )
+        result = UserBehaviorVectorSearchSyncService(repository).sync(
+            project_id="project",
+            vector_version="hotel_behavior.v2",
+            vector_generation_id="uvgen_test",
+            batch_size=1,
+            max_batches=2,
+        )
     assert first.status == "in_progress"
     assert first.synced_user_count == 1
-
-    result = UserBehaviorVectorSearchSyncService(repository).sync(
-        project_id="project",
-        vector_version="hotel_behavior.v2",
-        vector_generation_id="uvgen_test",
-        batch_size=1,
-        max_batches=2,
-    )
     assert result.status == "activated"
     assert result.synced_vector_count == 2
     assert result.source_cutoff == repository.generation.window_end
     assert [row.user_id for row in repository.upserted] == ["user_1", "user_2"]
     assert result.active_generation_id == "uvgen_test"
+    completed = [record for record in logs if record["event"] == "completed"][-1]
+    assert completed["status"] == "activated"
+    assert completed["processedBatchCount"] == 1
+    assert "user_2" not in str(logs)
 
 
 def test_failed_vector_generation_preserves_previous_active_generation() -> None:

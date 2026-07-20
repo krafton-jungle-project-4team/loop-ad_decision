@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.generation.brand_context import BrandContextSnapshot
 from app.generation.errors import (
@@ -74,9 +75,10 @@ def test_service_returns_sorted_deduplicated_usable_offers() -> None:
         }
     )
 
-    result = PromotionOfferCatalogService(loader).list_offers(
-        project_id="demo_project"
-    )
+    with capture_logs() as logs:
+        result = PromotionOfferCatalogService(loader).list_offers(
+            project_id="demo_project"
+        )
 
     assert result.project_id == "demo_project"
     assert result.catalog_id == "black-friday-hotels"
@@ -93,6 +95,9 @@ def test_service_returns_sorted_deduplicated_usable_offers() -> None:
         "https://demo-shoppingmall.dev.loop-ad.org"
         "/hotel/jeju-ocean-breeze-006"
     )
+    completed = next(record for record in logs if record["event"] == "completed")
+    assert completed["catalogId"] == "black-friday-hotels"
+    assert completed["offerCount"] == 2
 
 
 def test_service_allows_an_empty_filtered_offer_list() -> None:
