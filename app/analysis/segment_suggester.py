@@ -458,6 +458,9 @@ class VectorClusterSegmentSuggester:
                     "desiredBehaviorCount": len(intent.desired_behaviors),
                     "requestedCandidateTypes": list(intent.requested_candidate_types),
                     "compiledConditionCount": len(compilation.compiled_conditions),
+                    "unsupportedConditionCount": len(
+                        compilation.unsupported_conditions
+                    ),
                 },
             )
             return generate_raw_event_segment_definitions(

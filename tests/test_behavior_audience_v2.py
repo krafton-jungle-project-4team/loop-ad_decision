@@ -36,6 +36,7 @@ from app.analysis.behavior_manifest import (
     BehaviorManifestError,
     behavior_manifest_hash,
     clickhouse_canonical_destination_sql,
+    executable_destination_id,
     load_behavior_manifest,
     order_vector_terms_by_manifest,
 )
@@ -149,6 +150,8 @@ def test_manifest_fixes_all_dimensions_and_destination_alias_sql() -> None:
     assert signed_hash_coordinate("제주도") == signed_hash_coordinate("jeju")
     assert canonical_destination(" 오키나와 ") == "okinawa"
     assert signed_hash_coordinate("오키나와") == signed_hash_coordinate("okinawa")
+    assert executable_destination_id("8250") == "8250"
+    assert executable_destination_id("발리") is None
     sql = clickhouse_canonical_destination_sql("destination_value")
     assert "multiIf(" in sql
     assert "'제주도'" in sql
@@ -494,6 +497,14 @@ def test_registered_template_parameters_canonicalize_before_hash_and_query() -> 
         second_compiled.segment_audience_spec_hash
     )
     assert first_compiled.query_vector == second_compiled.query_vector
+
+
+def test_registered_template_rejects_unregistered_benefit_key() -> None:
+    with pytest.raises(ValueError, match="unregistered benefit key"):
+        RegisteredSegmentAudienceBinder().bind(
+            candidate_type="benefit_value_seeker",
+            benefit_keys=("review_based_recommendation",),
+        )
 
 
 def test_query_compiler_hash_is_not_coupled_to_unrelated_template_registry(
