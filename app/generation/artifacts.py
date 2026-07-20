@@ -627,14 +627,14 @@ def render_editorial_email(content_values: Mapping[str, Any]) -> str:
             f"  {_creative_source_meta(ContentChannel.EMAIL, content_values)}",
             f"  <title>{subject}</title>",
             "</head>",
-            '<body style="margin:0;padding:0;background:#eef3fb;font-family:Arial,Helvetica,sans-serif;color:#10233f;">',
+            '<body style="margin:0;padding:0;background:#151515;font-family:Arial,Helvetica,sans-serif;color:#f7f7f8;">',
             f'  <div style="display:none;max-height:0;max-width:0;overflow:hidden;opacity:0;color:transparent;">{preheader}</div>',
-            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#eef3fb;">',
+            '  <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#151515;">',
             "    <tr>",
             '      <td align="center" style="padding:24px 10px;">',
-            '        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse;background:#ffffff;border-radius:18px;overflow:hidden;">',
+            '        <table role="presentation" width="600" cellspacing="0" cellpadding="0" border="0" style="width:100%;max-width:600px;border-collapse:collapse;background:#222222;border-radius:18px;overflow:hidden;">',
             "          <tr>",
-            '            <td style="padding:18px 28px;font-size:12px;line-height:18px;color:#66758a;"><strong style="color:#0F55C8;font-size:16px;">StayLoop</strong><span style="float:right;">[광고] 여름 여행 큐레이션</span></td>',
+            '            <td style="padding:20px 28px;border-bottom:1px solid #363636;font-size:12px;line-height:18px;color:#929292;"><strong style="color:#0F55C8;font-size:17px;">StayLoop</strong><span style="float:right;">[광고] 여름 여행 큐레이션</span></td>',
             "          </tr>",
             "          <tr>",
             '            <td style="padding:0;">',
@@ -642,34 +642,34 @@ def render_editorial_email(content_values: Mapping[str, Any]) -> str:
             "            </td>",
             "          </tr>",
             "          <tr>",
-            '            <td style="padding:32px 34px 24px;">',
-            '              <p style="margin:0 0 10px;color:#0F55C8;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;">JEJU · OKINAWA SUMMER EDIT</p>',
-            f'              <h1 style="margin:0 0 14px;font-size:30px;line-height:39px;color:#10233f;">{subject}</h1>',
-            f'              <p style="margin:0;font-size:16px;line-height:27px;color:#53657d;">{body}</p>',
+            '            <td align="center" style="padding:30px 34px 28px;">',
+            '              <p style="margin:0 0 8px;color:#999999;font-size:12px;line-height:18px;font-weight:700;letter-spacing:1px;">JEJU · OKINAWA SUMMER EDIT</p>',
+            f'              <h1 style="margin:0 0 10px;font-size:30px;line-height:39px;color:#ffffff;">{subject}</h1>',
+            f'              <p style="margin:0;font-size:15px;line-height:25px;color:#e5e5e5;">{body}</p>',
             "            </td>",
             "          </tr>",
             *story_sections,
             "          <tr>",
-            '            <td style="padding:10px 28px 24px;">',
-            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#f5f8fc;border-radius:12px;">',
+            '            <td style="padding:26px 28px 28px;border-top:1px solid #363636;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:14px 0;">',
             "                <tr>",
-            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">🌊 여행의 리듬</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">풍경과 휴식 중 먼저 원하는 여행을 정해보세요.</span></td>',
-            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">📅 조기 예약</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">가격과 할인율을 같은 조건으로 비교하세요.</span></td>',
-            '                  <td width="33.33%" valign="top" style="padding:16px 10px;text-align:center;"><strong style="font-size:13px;">💬 추천 기준</strong><br><span style="font-size:11px;line-height:17px;color:#718096;">내 여행 방식에 맞는 숙소를 선택해보세요.</span></td>',
+            '                  <td width="33.33%" valign="top" style="padding:12px 0 0;border-top:2px solid #3b3b3b;text-align:left;"><strong style="display:block;margin:0 0 8px;color:#ffffff;font-size:13px;line-height:19px;">🌊 여행의 리듬</strong><span style="font-size:11px;line-height:17px;color:#9b9b9b;">풍경과 휴식 중 먼저 원하는 여행을 정해보세요.</span></td>',
+            '                  <td width="33.33%" valign="top" style="padding:12px 0 0;border-top:2px solid #3b3b3b;text-align:left;"><strong style="display:block;margin:0 0 8px;color:#ffffff;font-size:13px;line-height:19px;">📅 조기 예약</strong><span style="font-size:11px;line-height:17px;color:#9b9b9b;">가격과 할인율을 같은 조건으로 비교하세요.</span></td>',
+            '                  <td width="33.33%" valign="top" style="padding:12px 0 0;border-top:2px solid #3b3b3b;text-align:left;"><strong style="display:block;margin:0 0 8px;color:#ffffff;font-size:13px;line-height:19px;">💬 추천 기준</strong><span style="font-size:11px;line-height:17px;color:#9b9b9b;">내 여행 방식에 맞는 숙소를 선택해보세요.</span></td>',
             "                </tr>",
             "              </table>",
             "            </td>",
             "          </tr>",
             "          <tr>",
-            '            <td align="center" style="padding:4px 32px 34px;">',
-            '              <h2 style="margin:0 0 8px;font-size:22px;line-height:30px;color:#10233f;">제주와 오키나와, 어디로 떠날까요?</h2>',
-            '              <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#718096;">전체 숙소의 가격과 할인 혜택을 한눈에 비교해보세요.</p>',
+            '            <td align="center" style="padding:30px 32px 34px;border-top:1px solid #363636;">',
+            '              <h2 style="margin:0 0 8px;font-size:22px;line-height:30px;color:#ffffff;">제주와 오키나와, 어디로 떠날까요?</h2>',
+            '              <p style="margin:0 0 18px;font-size:14px;line-height:22px;color:#9b9b9b;">전체 숙소의 가격과 할인 혜택을 한눈에 비교해보세요.</p>',
             f'              <a href="{{{{redirect_url}}}}" style="display:block;padding:14px 24px;border-radius:8px;background:#0F55C8;color:#ffffff;font-size:15px;line-height:20px;font-weight:700;text-align:center;text-decoration:none;">{cta} →</a>',
             "            </td>",
             "          </tr>",
             "          <tr>",
-            '            <td style="padding:18px 24px;border-top:1px solid #e5eaf1;font-size:12px;line-height:18px;color:#718096;text-align:center;">',
-            '              표시된 금액은 1객실 1박 기준입니다. 본 메일은 광고성 정보입니다.<br>수신을 원하지 않으면 <a href="{{unsubscribe_url}}" style="color:#53657d;text-decoration:underline;">수신 거부</a>를 선택하세요.',
+            '            <td style="padding:18px 24px;border-top:1px solid #363636;font-size:12px;line-height:18px;color:#858585;text-align:center;">',
+            '              표시된 금액은 1객실 1박 기준입니다. 본 메일은 광고성 정보입니다.<br>수신을 원하지 않으면 <a href="{{unsubscribe_url}}" style="color:#9b9b9b;text-decoration:underline;">수신 거부</a>를 선택하세요.',
             "            </td>",
             "          </tr>",
             "        </table>",
@@ -713,13 +713,14 @@ def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
             "</td>",
         ]
     )
+    title_html = _editorial_title_html(title)
     copy_cell = "\n".join(
         [
-            '<td width="54%" valign="middle" style="width:54%;padding:24px 26px;">',
-            f'  <p style="margin:0 0 8px;color:#0F55C8;font-size:11px;line-height:17px;font-weight:700;letter-spacing:1px;">{position:02d} · {destination}</p>',
-            f'  <h2 style="margin:0 0 10px;font-size:21px;line-height:29px;color:#10233f;">{html.escape(title)}</h2>',
-            f'  <p style="margin:0 0 13px;font-size:14px;line-height:23px;color:#53657d;">{html.escape(description)}</p>',
-            f'  <p style="margin:0;font-size:12px;line-height:19px;color:#718096;"><strong style="color:#10233f;">추천:</strong> {hotel_name}<br>{price_copy}</p>',
+            '<td width="54%" valign="middle" style="width:54%;padding:24px 22px;">',
+            f'  <p style="margin:0 0 8px;color:#929292;font-size:11px;line-height:17px;font-weight:700;letter-spacing:1px;">{position:02d} · {destination}</p>',
+            f'  <h2 style="margin:0 0 10px;font-size:20px;line-height:28px;color:#ffffff;">{title_html}</h2>',
+            f'  <p style="margin:0 0 13px;font-size:13px;line-height:22px;color:#e3e3e3;">{html.escape(description)}</p>',
+            f'  <p style="margin:0;font-size:12px;line-height:19px;color:#929292;"><strong style="color:#e5e5e5;">추천:</strong> {hotel_name}<br>{price_copy}</p>',
             "</td>",
         ]
     )
@@ -727,8 +728,8 @@ def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
     return "\n".join(
         [
             "          <tr>",
-            '            <td style="padding:10px 28px 18px;">',
-            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:separate;border-spacing:0;background:#f8fafc;border:1px solid #e5eaf1;border-radius:12px;overflow:hidden;">',
+            '            <td style="padding:0 28px;">',
+            '              <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="width:100%;border-collapse:collapse;background:#222222;border-top:1px solid #363636;">',
             "                <tr>",
             *[f"                  {line}" for cell in cells for line in cell.splitlines()],
             "                </tr>",
@@ -737,6 +738,13 @@ def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
             "          </tr>",
         ]
     )
+
+
+def _editorial_title_html(title: str) -> str:
+    leading, separator, trailing = title.partition(", ")
+    if not separator:
+        return html.escape(title)
+    return f"{html.escape(leading + ',')}<br>{html.escape(trailing)}"
 
 
 def _destination_editorial_copy(destination_id: str) -> tuple[str, str]:
