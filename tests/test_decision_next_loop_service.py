@@ -102,6 +102,40 @@ def test_next_loop_prepares_focus_generation_for_goal_not_met_segments_only() ->
     assert repos.preparations.calls == []
 
 
+def test_next_loop_uses_evaluation_feedback_for_analysis_and_generation() -> None:
+    feedback = (
+        "예약 완료율 10.00%로 목표 30.00%보다 20.00%p 낮습니다. "
+        "예약 완료 행동 유도를 더 분명하게 제시하세요."
+    )
+    repos = FakeNextLoopRepos(
+        evaluations=[
+            evaluation_record(
+                ad_experiment_id="adexp_luxury_001",
+                segment_id="seg_luxury",
+                status=PromotionEvaluationStatus.GOAL_NOT_MET.value,
+                feedback=feedback,
+            )
+        ]
+    )
+    service = make_service(repos)
+
+    service.create_next_loop(
+        promotion_run_id="prun_banner_001_loop_1",
+        request=NextLoopRequest(
+            failed_segment_ids=["seg_luxury"],
+            failed_ad_experiment_ids=["adexp_luxury_001"],
+            operator_instruction="무료 취소 혜택을 유지해줘.",
+        ),
+    )
+
+    expected_instruction = (
+        "무료 취소 혜택을 유지해줘. 이전 실험 평가: "
+        f"seg_luxury: {feedback}"
+    )
+    assert repos.analysis_gateway.calls[0][-2] == expected_instruction
+    assert repos.generation_gateway.calls[0][-1] == expected_instruction
+
+
 def test_next_loop_allows_created_fallback_ad_experiment() -> None:
     repos = FakeNextLoopRepos(
         run_creator=FakeRunCreator(
@@ -1888,6 +1922,7 @@ def evaluation_record(
     ad_experiment_id: str,
     segment_id: str,
     status: str,
+    feedback: str | None = None,
 ) -> PromotionEvaluationRecord:
     return PromotionEvaluationRecord(
         evaluation_id=f"eval_{ad_experiment_id}",
@@ -1907,7 +1942,7 @@ def evaluation_record(
         sample_size=10,
         basis="all_segments",
         status=status,
-        feedback=None,
+        feedback=feedback,
         next_loop_required=status == PromotionEvaluationStatus.GOAL_NOT_MET.value,
         result_json={"status_reason": status},
     )
