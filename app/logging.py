@@ -292,7 +292,9 @@ def _to_jsonable(value: Any) -> Any:
         return _to_jsonable(model_dump())
     if isinstance(value, Mapping):
         return {
-            _snake_to_camel(str(key)): _to_jsonable(item)
+            _snake_to_camel(str(key)): (
+                "[Redacted]" if _is_secret_field(str(key)) else _to_jsonable(item)
+            )
             for key, item in value.items()
             if item is not None
         }
@@ -308,6 +310,20 @@ def _snake_to_camel(value: str) -> str:
     if len(parts) == 1:
         return value
     return parts[0] + "".join(part[:1].upper() + part[1:] for part in parts[1:])
+
+
+def _is_secret_field(value: str) -> bool:
+    normalized = "".join(character for character in value.lower() if character.isalnum())
+    return (
+        normalized in {"authorization", "cookie"}
+        or normalized.endswith("authorizationheader")
+        or normalized.endswith("cookieheader")
+        or normalized.endswith("apikey")
+        or normalized.endswith("password")
+        or normalized.endswith("sdkkey")
+        or normalized.endswith("token")
+        or normalized.endswith("writekey")
+    )
 
 
 _CONTEXT_FIELD_NAMES = {
