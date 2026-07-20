@@ -471,13 +471,13 @@ class VectorClusterSegmentSuggester:
                 audience_selection_policy=self._audience_selection_policy,
             )
         except Exception as exc:
-            log.warn(
+            log.error(
                 "raw_event_intent_segments_failed",
                 {
                     "err": exc,
                 },
             )
-            return []
+            raise
 
     def _load_user_vectors(
         self,
