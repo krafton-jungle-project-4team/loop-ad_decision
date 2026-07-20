@@ -86,6 +86,7 @@ from app.audience_contract import (
     SEGMENT_AUDIENCE_SCHEMA_VERSION,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
+    contract_score_threshold,
 )
 from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.vector_service import SegmentVectorBuildResult
@@ -2066,7 +2067,7 @@ def _snapshot_contract_row(
         "query_vector_hash": semantic_query_vector_hash(compiled),
         "query_compiler_version": compiled.query_compiler_version,
         "query_compiler_hash": compiled.query_compiler_hash,
-        "score_threshold": Decimal(str(compiled.score_threshold)),
+        "score_threshold": contract_score_threshold(compiled.score_threshold),
         "matcher_version": "exact_cosine_rerank.v2",
         "search_policy_version": "audience_search.v2",
         "metadata_json": {

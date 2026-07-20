@@ -196,6 +196,14 @@ class AdExperimentEvaluationService:
             sample_size=sample_size,
             min_sample_size=min_sample_size,
         )
+        diagnosis = _build_evaluation_diagnosis(
+            metric=metric,
+            status=status,
+            target_value=target_value,
+            actual_value=actual_value,
+            counts=counts,
+            min_sample_size=min_sample_size,
+        )
         next_loop_required = status == PromotionEvaluationStatus.GOAL_NOT_MET.value
         evaluation_id = build_bounded_decision_id(
             "eval",
@@ -221,7 +229,11 @@ class AdExperimentEvaluationService:
             sample_size=sample_size,
             basis=GoalBasis.ALL_SEGMENTS.value,
             status=status,
-            feedback=None,
+            feedback=(
+                None
+                if status == PromotionEvaluationStatus.GOAL_MET.value
+                else diagnosis["summary"]
+            ),
             next_loop_required=next_loop_required,
             result_json=_build_result_json(
                 experiment=experiment,
@@ -231,6 +243,7 @@ class AdExperimentEvaluationService:
                 min_sample_size=min_sample_size,
                 status=status,
                 context=context,
+                diagnosis=diagnosis,
             ),
         )
         self._promotion_evaluation_repository.insert(evaluation)
@@ -420,8 +433,13 @@ class PromotionRunEvaluationService:
                 PromotionRunAdExperimentResult(
                     ad_experiment_id=item["ad_experiment_id"],
                     segment_id=item["segment_id"],
+                    target_value=Decimal(item["target_value"]),
                     actual_value=Decimal(item["actual_value"]),
+                    numerator_count=item["numerator_count"],
+                    denominator_count=item["denominator_count"],
+                    sample_size=item["sample_size"],
                     status=PromotionEvaluationStatus(item["status"]),
+                    feedback=item["feedback"],
                 )
                 for item in aggregate.result_json["ad_experiment_results"]
             ],
@@ -691,6 +709,8 @@ def _evaluation_summary(
         "numerator_count": evaluation.numerator_count,
         "denominator_count": evaluation.denominator_count,
         "sample_size": evaluation.sample_size,
+        "feedback": evaluation.feedback,
+        "diagnosis": evaluation.result_json.get("diagnosis"),
     }
 
 
@@ -807,6 +827,7 @@ def _build_result_json(
     min_sample_size: int,
     status: str,
     context: EvaluationContext,
+    diagnosis: Mapping[str, Any],
 ) -> dict[str, Any]:
     return {
         **_evaluation_context_json(context, evaluation_scope="ad_experiment"),
@@ -823,7 +844,115 @@ def _build_result_json(
         "actual_value": str(actual_value),
         "numerator_count": counts.numerator_count,
         "denominator_count": counts.denominator_count,
+        "diagnosis": dict(diagnosis),
     }
+
+
+def _build_evaluation_diagnosis(
+    *,
+    metric: str,
+    status: str,
+    target_value: Decimal,
+    actual_value: Decimal,
+    counts: MetricCountRecord,
+    min_sample_size: int,
+) -> dict[str, Any]:
+    gap_percentage_points = max(
+        (target_value - actual_value) * Decimal("100"),
+        Decimal("0"),
+    ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    actual_percent = _format_percent(actual_value)
+    target_percent = _format_percent(target_value)
+
+    if counts.denominator_count == 0:
+        summary = (
+            "평가 기준 행동이 아직 0건이라 성과 원인을 판단할 수 없습니다. "
+            "광고 발송 상태와 링크·SDK 이벤트 수집을 확인한 뒤 다시 평가하세요."
+        )
+        bottleneck = "measurement_unavailable"
+        evidence = [
+            "평가 기준 행동 0건",
+            f"최소 평가 표본 {min_sample_size}명",
+        ]
+        directions = [
+            "광고 발송 및 노출 상태 확인",
+            "링크 이동과 성과 이벤트 수집 경로 확인",
+        ]
+    elif counts.denominator_count < min_sample_size:
+        summary = (
+            f"현재 평가 표본은 {counts.denominator_count}명으로 최소 기준 "
+            f"{min_sample_size}명보다 적어 성과 원인을 확정할 수 없습니다. "
+            "표본이 쌓인 뒤 다시 평가하세요."
+        )
+        bottleneck = "sample_size_below_minimum"
+        evidence = [
+            f"현재 평가 표본 {counts.denominator_count}명",
+            f"최소 평가 표본 {min_sample_size}명",
+        ]
+        directions = [
+            "현재 실험을 유지해 평가 표본 확보",
+            "발송 및 성과 이벤트 누락 여부 확인",
+        ]
+    elif status == PromotionEvaluationStatus.GOAL_MET.value:
+        summary = (
+            f"실제 성과 {actual_percent}로 목표 {target_percent}를 달성했습니다."
+        )
+        bottleneck = "none"
+        evidence = [
+            f"성공 {counts.numerator_count}건 / 기준 행동 {counts.denominator_count}건",
+            f"실제 성과 {actual_percent} / 목표 {target_percent}",
+        ]
+        directions = ["현재 메시지와 고객군 전략 유지"]
+    elif metric == GoalMetric.BOOKING_CONVERSION_RATE.value:
+        summary = (
+            f"예약 완료율 {actual_percent}로 목표 {target_percent}보다 "
+            f"{gap_percentage_points}%p 낮습니다. 측정상 병목은 광고 반응 이후 "
+            "예약 완료 단계입니다. 다음 광고에서는 확인 가능한 숙박 혜택과 "
+            "예약 행동 유도를 더 분명하게 제시하세요."
+        )
+        bottleneck = "promotion_response_to_booking_complete"
+        evidence = [
+            f"광고 반응 고객 {counts.denominator_count}명 중 예약 완료 {counts.numerator_count}명",
+            f"목표 대비 {gap_percentage_points}%p 부족",
+        ]
+        directions = [
+            "확인 가능한 숙박 혜택과 예약 조건을 본문 상단에 명확하게 제시",
+            "예약 완료 행동으로 이어지는 CTA와 랜딩 맥락의 일치도 강화",
+        ]
+    else:
+        summary = (
+            f"랜딩 도달률 {actual_percent}로 목표 {target_percent}보다 "
+            f"{gap_percentage_points}%p 낮습니다. 측정상 병목은 광고 클릭 이후 "
+            "랜딩 도달 단계입니다. 링크 동작을 확인하고 CTA와 랜딩 내용을 "
+            "더 일관되게 구성하세요."
+        )
+        bottleneck = "redirect_click_to_campaign_landing"
+        evidence = [
+            f"광고 클릭 {counts.denominator_count}건 중 랜딩 도달 {counts.numerator_count}건",
+            f"목표 대비 {gap_percentage_points}%p 부족",
+        ]
+        directions = [
+            "리다이렉트 링크와 랜딩 페이지 정상 동작 확인",
+            "CTA 문구와 연결되는 랜딩 내용의 일치도 강화",
+        ]
+
+    return {
+        "version": "dec.evaluation-diagnosis.v1",
+        "status": status,
+        "summary": summary,
+        "observed_bottleneck": bottleneck,
+        "evidence": evidence,
+        "improvement_directions": directions,
+        "gap_percentage_points": str(gap_percentage_points),
+    }
+
+
+def _format_percent(value: Decimal) -> str:
+    percent = (value * Decimal("100")).quantize(
+        Decimal("0.01"),
+        rounding=ROUND_HALF_UP,
+    )
+    return f"{percent}%"
 
 
 def _metric_source(metric: str) -> str:

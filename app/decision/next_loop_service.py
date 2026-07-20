@@ -48,6 +48,7 @@ from app.logging import duration_ms, log, log_context_scope, now_ms
 COMPLETED_STATUS = "completed"
 FAILED_STATUS = "failed"
 MANUAL_CONTENT_OPTION_COUNT = 3
+MAX_OPERATOR_INSTRUCTION_LENGTH = 2_000
 SELECTABLE_CANDIDATE_STATUSES = frozenset({"draft", "approved", "active"})
 EXHAUSTED_CANDIDATE_STATUSES = frozenset({"rejected", "archived"})
 KNOWN_CANDIDATE_STATUSES = (
@@ -501,7 +502,7 @@ class NextLoopService:
             raise NextLoopValidationError(
                 "failed_segment_ids must stay within the previous promotion_run scope"
             )
-        _validate_failed_ids(
+        selected_sources = _validate_failed_ids(
             failed_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
             experiments=experiments,
@@ -511,6 +512,10 @@ class NextLoopService:
                 )
             ),
         )
+        effective_instruction = _instruction_with_evaluation_feedback(
+            operator_instruction=request.operator_instruction,
+            selected_sources=selected_sources,
+        )
         attempt_no = _next_loop_generation_attempt_no(
             attempts=self._generation_run_repository.list_next_loop_generation_attempts(
                 previous_run.promotion_run_id
@@ -519,7 +524,7 @@ class NextLoopService:
             loop_count=next_loop_count,
             focus_segment_ids=failed_segment_ids,
             failed_ad_experiment_ids=failed_ad_experiment_ids,
-            operator_instruction=request.operator_instruction,
+            operator_instruction=effective_instruction,
             candidate_status=ContentCandidateStatus.APPROVED,
             content_option_count=1,
         )
@@ -533,7 +538,7 @@ class NextLoopService:
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             attempt_no=attempt_no,
-            operator_instruction=request.operator_instruction,
+            operator_instruction=effective_instruction,
             target_status="approved",
         )
         log.assign_context({"analysisId": analysis_result.analysis_id})
@@ -553,7 +558,7 @@ class NextLoopService:
             attempt_no=attempt_no,
             source_promotion_run_id=previous_run.promotion_run_id,
             source_generation_id=previous_run.generation_id,
-            operator_instruction=request.operator_instruction,
+            operator_instruction=effective_instruction,
         )
         log.assign_context({"generationId": generation_result.generation_id})
         log.info("next_loop_generation_created", {"generation": generation_result})
@@ -660,6 +665,10 @@ class NextLoopService:
         source_evaluation_ids = sorted(
             evaluation.evaluation_id for _experiment, evaluation in selected_sources
         )
+        effective_instruction = _instruction_with_evaluation_feedback(
+            operator_instruction=request.operator_instruction,
+            selected_sources=selected_sources,
+        )
 
         active = self._next_loop_preparation_repository.get_active_by_source_run(
             previous_run.promotion_run_id
@@ -672,7 +681,7 @@ class NextLoopService:
                 failed_segment_ids=failed_segment_ids,
                 failed_ad_experiment_ids=failed_ad_experiment_ids,
                 source_evaluation_ids=source_evaluation_ids,
-                operator_instruction=request.operator_instruction,
+                operator_instruction=effective_instruction,
             )
 
         next_preparation_attempt_no = (
@@ -694,7 +703,7 @@ class NextLoopService:
                 loop_count=next_loop_count,
                 focus_segment_ids=failed_segment_ids,
                 failed_ad_experiment_ids=failed_ad_experiment_ids,
-                operator_instruction=request.operator_instruction,
+                operator_instruction=effective_instruction,
                 candidate_status=ContentCandidateStatus.DRAFT,
                 content_option_count=MANUAL_CONTENT_OPTION_COUNT,
             ),
@@ -709,7 +718,7 @@ class NextLoopService:
             source_promotion_run_id=previous_run.promotion_run_id,
             source_failed_ad_experiment_ids=failed_ad_experiment_ids,
             attempt_no=attempt_no,
-            operator_instruction=request.operator_instruction,
+            operator_instruction=effective_instruction,
             target_status="planned",
         )
         _validate_gateway_segments(
@@ -727,7 +736,7 @@ class NextLoopService:
             attempt_no=attempt_no,
             source_promotion_run_id=previous_run.promotion_run_id,
             source_generation_id=previous_run.generation_id,
-            operator_instruction=request.operator_instruction,
+            operator_instruction=effective_instruction,
         )
         _validate_generation_completed(generation_result)
         _validate_gateway_segments(
@@ -1377,6 +1386,33 @@ def _normalize_instruction(value: str | None) -> str | None:
         return None
     normalized = " ".join(value.split())
     return normalized or None
+
+
+def _instruction_with_evaluation_feedback(
+    *,
+    operator_instruction: str | None,
+    selected_sources: Sequence[
+        tuple[AdExperimentRecord, PromotionEvaluationRecord]
+    ],
+) -> str | None:
+    parts: list[str] = []
+    if normalized_operator := _normalize_instruction(operator_instruction):
+        parts.append(normalized_operator)
+
+    feedback_items: list[str] = []
+    for experiment, evaluation in sorted(
+        selected_sources,
+        key=lambda item: item[0].segment_id,
+    ):
+        feedback = _normalize_instruction(evaluation.feedback)
+        if feedback is not None:
+            feedback_items.append(f"{experiment.segment_id}: {feedback}")
+    if feedback_items:
+        parts.append("이전 실험 평가: " + " | ".join(feedback_items))
+
+    if not parts:
+        return None
+    return " ".join(parts)[:MAX_OPERATOR_INSTRUCTION_LENGTH].rstrip()
 
 
 def _manual_preparation_response(

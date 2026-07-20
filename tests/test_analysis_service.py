@@ -49,6 +49,7 @@ from app.analysis.service import (
     SegmentSelectionError,
     _analysis_id,
     _bounded_next_loop_lineage_id,
+    _display_copy_from_report,
 )
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
@@ -428,6 +429,24 @@ class ConcurrentSegmentReportGenerator:
         segment_id = report_input.segment.segment_id
         self.calls.append(segment_id)
         return {"source": "test", "title": segment_id}
+
+
+def test_report_enrichment_preserves_strategy_specific_card_title() -> None:
+    display_copy = {
+        "title": "예약 직전 이탈 고객",
+        "reason": "예약 단계에서 이탈한 고객입니다.",
+    }
+
+    enriched = _display_copy_from_report(
+        display_copy=display_copy,
+        report={
+            "title": "예약을 시작한 고객",
+            "why_recommended": ["예약을 완료하도록 다시 안내하기 적합합니다."],
+        },
+    )
+
+    assert enriched["title"] == "예약 직전 이탈 고객"
+    assert enriched["reason"] == "예약을 완료하도록 다시 안내하기 적합합니다."
 
 
 def promotion_record(
