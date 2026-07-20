@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -44,6 +45,28 @@ def canonical_destination_id(value: str) -> str:
     if not normalized:
         return ""
     return destination_alias_lookup().get(normalized, normalized)
+
+
+@lru_cache(maxsize=1)
+def canonical_destination_id_patterns() -> tuple[re.Pattern[str], ...]:
+    return tuple(
+        re.compile(str(value))
+        for value in load_behavior_manifest()[
+            "canonical_destination_id_patterns"
+        ]
+    )
+
+
+def executable_destination_id(value: str) -> str | None:
+    canonical_id = canonical_destination_id(value)
+    if not canonical_id:
+        return None
+    if canonical_id in destination_alias_groups() or any(
+        pattern.fullmatch(canonical_id)
+        for pattern in canonical_destination_id_patterns()
+    ):
+        return canonical_id
+    return None
 
 
 @lru_cache(maxsize=1)

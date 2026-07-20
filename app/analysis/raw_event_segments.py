@@ -20,6 +20,7 @@ from app.analysis.audience_selection import (
 )
 from app.analysis.behavior_manifest import (
     destination_alias_groups,
+    executable_destination_id,
     manifest_intent_benefit_keys,
 )
 from app.analysis.repositories import (
@@ -28,6 +29,7 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
 )
 from app.analysis.segment_audience_templates import (
+    MAX_DESTINATION_IDS,
     RegisteredSegmentAudienceBinder,
 )
 from app.analysis.segment_performance import (
@@ -207,6 +209,7 @@ class PromotionIntent:
     funnel_goal: str
     desired_behaviors: tuple[str, ...]
     explicit_conditions: tuple[str, ...]
+    unsupported_conditions: tuple[str, ...] = ()
     excluded_behaviors: tuple[str, ...] = ()
     requested_candidate_types: tuple[str, ...] = ()
     source: str = "deterministic"
@@ -225,6 +228,7 @@ class PromotionIntent:
             "goal_metric": self.goal_metric,
             "funnel_goal": self.funnel_goal,
             "desired_behaviors": list(self.desired_behaviors),
+            "unsupported_conditions": list(self.unsupported_conditions),
             "excluded_behaviors": list(self.excluded_behaviors),
             "explicit_conditions": list(self.explicit_conditions),
             "requested_candidate_types": list(self.requested_candidate_types),
@@ -456,7 +460,7 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
             weight=0.18,
         )
     ]
-    unsupported: list[str] = []
+    unsupported = list(intent.unsupported_conditions)
 
     if intent.destinations:
         conditions.append(
@@ -1721,8 +1725,14 @@ def _intent_from_payload(
         source=source,
     )
     payload_seasons = _safe_text_list(payload.get("season"))
-    payload_destinations = _safe_text_list(payload.get("destinations"))
-    payload_benefits = _safe_text_list(payload.get("benefits"))
+    payload_destinations, unsupported_destinations = (
+        _partition_executable_destinations(
+            _safe_text_list(payload.get("destinations"))
+        )
+    )
+    payload_benefits, unsupported_benefits = _partition_executable_benefits(
+        _safe_text_list(payload.get("benefits"))
+    )
     payload_excluded_behaviors = tuple(
         behavior
         for behavior in _safe_text_list(payload.get("excluded_behaviors"))
@@ -1753,13 +1763,21 @@ def _intent_from_payload(
             )
         )
     )
+    unsupported_conditions = tuple(
+        dict.fromkeys(
+            (
+                *fallback.unsupported_conditions,
+                *(f"destination:{value}" for value in unsupported_destinations),
+                *(f"benefit:{value}" for value in unsupported_benefits),
+            )
+        )
+    )
     return PromotionIntent(
         summary=_safe_text(payload.get("summary")) or fallback.summary,
         product=_safe_text(payload.get("product")) or fallback.product,
         season=_canonical_seasons(payload_seasons) or fallback.season,
-        destinations=_canonical_destinations(payload_destinations)
-        or fallback.destinations,
-        benefits=_canonical_benefits(payload_benefits) or fallback.benefits,
+        destinations=payload_destinations or fallback.destinations,
+        benefits=payload_benefits or fallback.benefits,
         audience_hints=tuple(
             hint
             for hint in _safe_text_list(payload.get("audience_hints"))
@@ -1771,6 +1789,7 @@ def _intent_from_payload(
         funnel_goal=_safe_text(payload.get("funnel_goal")) or fallback.funnel_goal,
         desired_behaviors=tuple(_safe_text_list(payload.get("desired_behaviors")))
         or fallback.desired_behaviors,
+        unsupported_conditions=unsupported_conditions,
         excluded_behaviors=excluded_behaviors,
         explicit_conditions=tuple(_safe_text_list(payload.get("explicit_conditions")))
         or fallback.explicit_conditions,
@@ -1785,28 +1804,58 @@ def _canonical_seasons(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(dict.fromkeys(_extract_seasons(" ".join(values).lower())))
 
 
-def _canonical_destinations(values: Sequence[str]) -> tuple[str, ...]:
-    if not values:
-        return ()
-    extracted = _extract_destinations(" ".join(values).lower())
+def _partition_executable_destinations(
+    values: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    normalized_values = tuple(
+        normalized
+        for value in values
+        if (normalized := " ".join(str(value).strip().casefold().split()))
+    )
+    if not normalized_values:
+        return (), ()
+    extracted = list(_extract_destinations(" ".join(normalized_values)))
     recognized_aliases = {
         alias
         for aliases in DESTINATION_ALIASES.values()
         for alias in aliases
     }
-    unknown_values = [
-        value.strip().lower()
+    unsupported: list[str] = []
+    for value in normalized_values:
+        if any(alias in value for alias in recognized_aliases):
+            continue
+        destination_id = executable_destination_id(value)
+        if destination_id is None:
+            unsupported.append(value)
+            continue
+        extracted.append(destination_id)
+    executable = tuple(dict.fromkeys(extracted))
+    overflow = executable[MAX_DESTINATION_IDS:]
+    return (
+        executable[:MAX_DESTINATION_IDS],
+        tuple(dict.fromkeys((*unsupported, *overflow))),
+    )
+
+
+def _partition_executable_benefits(
+    values: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    normalized_values = tuple(
+        normalized
         for value in values
-        if value.strip()
-        and not any(alias in value.strip().lower() for alias in recognized_aliases)
-    ]
-    return tuple(dict.fromkeys((*extracted, *unknown_values)))
-
-
-def _canonical_benefits(values: Sequence[str]) -> tuple[str, ...]:
-    if not values:
-        return ()
-    return tuple(dict.fromkeys(_extract_benefits(" ".join(values).lower())))
+        if (normalized := " ".join(str(value).strip().casefold().split()))
+    )
+    if not normalized_values:
+        return (), ()
+    executable = tuple(
+        dict.fromkeys(_extract_benefits(" ".join(normalized_values)))
+    )
+    unsupported = tuple(
+        value
+        for value in normalized_values
+        if not _extract_benefits(value)
+    )
+    return executable, tuple(dict.fromkeys(unsupported))
 
 
 def _fallback_intent(
@@ -1820,7 +1869,9 @@ def _fallback_intent(
         segment_instruction=segment_instruction,
     )
     season = _extract_seasons(searchable)
-    destinations = _extract_destinations(searchable)
+    destinations, unsupported_destinations = (
+        _partition_executable_destinations(_extract_destinations(searchable))
+    )
     benefits = _extract_benefits(searchable)
     desired_behaviors = ["hotel_detail_view"]
     if promotion.goal_metric == "booking_conversion_rate":
@@ -1851,6 +1902,9 @@ def _fallback_intent(
         goal_metric=promotion.goal_metric,
         funnel_goal=_funnel_goal(promotion.goal_metric),
         desired_behaviors=tuple(dict.fromkeys(desired_behaviors)),
+        unsupported_conditions=tuple(
+            f"destination:{value}" for value in unsupported_destinations
+        ),
         excluded_behaviors=tuple(excluded_behaviors),
         explicit_conditions=tuple(dict.fromkeys(explicit_conditions)),
         requested_candidate_types=tuple(requested_candidate_types),

@@ -457,6 +457,131 @@ def test_raw_event_suggester_does_not_fallback_for_descriptive_review_copy(
     assert vector_reader.calls == []
 
 
+def test_raw_event_suggester_ignores_unsupported_natural_language_conditions(
+) -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, payload, timeout_seconds
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "발리 숙소 후기 추천 고객",
+                    "product": "hotel",
+                    "season": [],
+                    "destinations": ["발리"],
+                    "benefits": ["review_based_recommendation"],
+                    "audience_hints": [],
+                    "channel": "onsite_banner",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": [
+                        "hotel_detail_view",
+                        "pet_friendly_interest",
+                    ],
+                    "excluded_behaviors": [],
+                    "explicit_conditions": [
+                        "발리",
+                        "후기 기반 추천",
+                        "반려동물 동반",
+                    ],
+                    "requested_candidate_types": [],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    vector_reader = FakeUserBehaviorVectorRepository(
+        [
+            user_vector("vector_001", vector_values(0)),
+            user_vector("vector_002", vector_values(0)),
+        ]
+    )
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(f"hotel_user_{index}", hotel_search_count=1)
+            for index in range(2)
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=vector_reader,
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=OpenAIPromotionIntentExtractor(
+            api_key="test-key",
+            model="gpt-test",
+            transport=transport,
+        ),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "발리 숙소의 후기 기반 추천과 반려동물 동반 혜택을 강조합니다."
+            ),
+        )
+    )
+
+    assert len(segments) == 1
+    assert raw_reader.calls[0]["destination_terms"] == ()
+    assert vector_reader.calls == []
+    intent = segments[0].profile_json["promotion_intent"]
+    assert intent["destinations"] == []
+    assert intent["benefits"] == []
+    assert intent["unsupported_conditions"] == [
+        "destination:발리",
+        "benefit:review_based_recommendation",
+    ]
+    assert segments[0].profile_json["compiled_intent"][
+        "unsupported_conditions"
+    ] == [
+        "destination:발리",
+        "benefit:review_based_recommendation",
+        "pet_friendly_interest",
+    ]
+    assert segments[0].rule_json["segment_audience_spec"]["parameters"] == {
+        "destination_ids": [],
+        "season_months": [],
+        "benefit_keys": [],
+    }
+
+
+def test_deterministic_intent_caps_destinations_at_template_limit() -> None:
+    intent = DeterministicPromotionIntentExtractor().extract(
+        promotion_record(
+            message_brief=(
+                "제주 서울 부산 강릉 경주 인천 오키나와 일본 속초 여수 "
+                "숙소 프로모션"
+            ),
+        )
+    )
+
+    assert intent.destinations == (
+        "jeju",
+        "seoul",
+        "busan",
+        "gangneung",
+        "gyeongju",
+        "incheon",
+        "okinawa",
+        "japan",
+    )
+    assert intent.unsupported_conditions == (
+        "destination:sokcho",
+        "destination:yeosu",
+    )
+    assert compile_raw_event_intent(intent).unsupported_conditions == (
+        "destination:sokcho",
+        "destination:yeosu",
+    )
+
+
 def test_raw_event_suggester_uses_manifest_destination_aliases_for_okinawa(
 ) -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
