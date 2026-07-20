@@ -10,6 +10,7 @@ from typing import Any, Mapping, Sequence
 from app.analysis.behavior_manifest import (
     canonical_destination_id,
     load_behavior_manifest,
+    manifest_intent_benefit_keys,
 )
 
 
@@ -23,9 +24,7 @@ _MANIFEST = load_behavior_manifest()
 _REGISTERED_DESTINATION_IDS = frozenset(
     str(value) for value in _MANIFEST["destination_aliases"]
 )
-_REGISTERED_BENEFIT_KEYS = frozenset(
-    str(value) for value in _MANIFEST["intent_benefit_query_dimensions"]
-)
+_REGISTERED_BENEFIT_KEYS = frozenset(manifest_intent_benefit_keys())
 _REGISTERED_DESTINATION_ID_PATTERNS = tuple(
     re.compile(str(value))
     for value in _MANIFEST["canonical_destination_id_patterns"]

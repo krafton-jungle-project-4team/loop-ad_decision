@@ -13,6 +13,7 @@ from app.audience_contract import (
     SegmentDefinitionAudienceAdapter,
 )
 from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
+from app.analysis.behavior_manifest import manifest_intent_benefit_keys
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
     OpenAIPromotionIntentExtractor,
@@ -370,33 +371,47 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         assert segment.rule_json["candidate_user_ids"]
 
 
-def test_unregistered_structured_benefit_stops_v2_binding_without_legacy_fallback(
+def test_review_copy_keeps_only_manifest_registered_executable_benefits(
 ) -> None:
     promotion = promotion_record(
-        message_brief="리뷰 기반 추천 혜택으로 숙소 예약 전환을 높인다.",
+        message_brief=(
+            "여름 휴가를 준비하는 20~30대 사용자를 대상으로 제주/오키나와 "
+            "숙소 예약을 유도합니다. 인기 여행지, 조기 예약 할인, "
+            "후기 기반 추천을 강조합니다."
+        ),
     )
     intent = DeterministicPromotionIntentExtractor().extract(promotion)
-    assert "review_based_recommendation" in intent.benefits
+    assert intent.benefits == ("discount", "early_booking")
     compilation = compile_raw_event_intent(intent)
     profiles = [
-        raw_signal(f"review_user_{index}", deal_event_count=1)
+        raw_signal(
+            f"review_user_{index}",
+            deal_event_count=1,
+            destination_match_count=1,
+        )
         for index in range(2)
     ]
 
-    with pytest.raises(SegmentAudienceContractError) as error:
-        generate_raw_event_segment_definitions(
-            promotion=promotion,
-            intent=intent,
-            compilation=compilation,
-            profiles=profiles,
-            max_suggested_segments=6,
-            min_sample_size=2,
-        )
+    segments = generate_raw_event_segment_definitions(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        max_suggested_segments=6,
+        min_sample_size=2,
+    )
 
-    assert error.value.code == "segment_audience_template_binding_invalid"
+    benefit_segment = next(
+        segment
+        for segment in segments
+        if segment.rule_json["candidate_type"] == "benefit_value_seeker"
+    )
+    assert benefit_segment.rule_json["segment_audience_spec"]["parameters"][
+        "benefit_keys"
+    ] == ["discount", "early_booking"]
 
 
-def test_raw_event_suggester_does_not_replace_contract_error_with_vector_clusters(
+def test_raw_event_suggester_does_not_fallback_for_descriptive_review_copy(
 ) -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [
@@ -406,7 +421,11 @@ def test_raw_event_suggester_does_not_replace_contract_error_with_vector_cluster
     )
     raw_reader = FakeRawEventSignalRepository(
         [
-            raw_signal(f"review_user_{index}", deal_event_count=1)
+            raw_signal(
+                f"review_user_{index}",
+                deal_event_count=1,
+                destination_match_count=1,
+            )
             for index in range(2)
         ]
     )
@@ -420,14 +439,21 @@ def test_raw_event_suggester_does_not_replace_contract_error_with_vector_cluster
         min_cluster_size=2,
     )
 
-    with pytest.raises(SegmentAudienceContractError) as error:
-        suggester.suggest_segments(
-            promotion=promotion_record(
-                message_brief="리뷰 기반 추천 혜택으로 숙소 예약 전환을 높인다.",
-            )
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "제주와 오키나와 숙소의 조기 예약 할인을 안내하고 "
+                "후기 기반 추천을 강조합니다."
+            ),
         )
+    )
 
-    assert error.value.code == "segment_audience_template_binding_invalid"
+    assert segments
+    assert all(
+        "review_based_recommendation"
+        not in segment.profile_json["promotion_intent"]["benefits"]
+        for segment in segments
+    )
     assert vector_reader.calls == []
 
 
@@ -625,7 +651,13 @@ def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
     )
 
     request_text = captured["payload"]["input"][1]["content"][0]["text"]
+    benefit_schema = captured["payload"]["text"]["format"]["schema"][
+        "properties"
+    ]["benefits"]
     assert "예약을 시작했지만 완료하지 않은 고객만 찾아줘" in request_text
+    assert tuple(benefit_schema["items"]["enum"]) == (
+        manifest_intent_benefit_keys()
+    )
     assert intent.requested_candidate_types == ("funnel_recovery",)
     assert intent.excluded_behaviors == ("booking_complete",)
 

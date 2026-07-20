@@ -18,7 +18,10 @@ from app.analysis.audience_selection import (
     AudienceSelectionPolicyProtocol,
     all_matching_audience_selection_policy,
 )
-from app.analysis.behavior_manifest import destination_alias_groups
+from app.analysis.behavior_manifest import (
+    destination_alias_groups,
+    manifest_intent_benefit_keys,
+)
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -73,6 +76,37 @@ AUDIENCE_HINT_VALUES = (
     "female",
     "travel_ready",
 )
+EXECUTABLE_BENEFIT_KEYS = manifest_intent_benefit_keys()
+BENEFIT_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "discount": (
+        "discount",
+        "deal",
+        "sale",
+        "할인",
+        "특가",
+        "블랙프라이데이",
+        "black friday",
+    ),
+    "early_booking": (
+        "early_booking",
+        "early booking",
+        "early",
+        "조기 예약",
+        "조기",
+        "얼리버드",
+        "얼리",
+    ),
+    "free_cancellation": (
+        "free_cancellation",
+        "free cancellation",
+        "무료 취소",
+    ),
+    "breakfast_included": (
+        "breakfast_included",
+        "breakfast",
+        "조식",
+    ),
+}
 
 DEFAULT_SCORE_WEIGHTS: Mapping[str, float] = {
     "promotion_condition_match": 0.15,
@@ -1642,7 +1676,14 @@ def _intent_schema() -> dict[str, Any]:
             "product": {"type": "string"},
             "season": array_schema,
             "destinations": array_schema,
-            "benefits": array_schema,
+            "benefits": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": list(EXECUTABLE_BENEFIT_KEYS),
+                },
+                "maxItems": len(EXECUTABLE_BENEFIT_KEYS),
+            },
             "audience_hints": {
                 "type": "array",
                 "items": {"type": "string", "enum": list(AUDIENCE_HINT_VALUES)},
@@ -1961,30 +2002,14 @@ def _extract_destinations(searchable: str) -> list[str]:
 
 
 def _extract_benefits(searchable: str) -> list[str]:
-    benefits: list[str] = []
-    if any(
-        term in searchable
-        for term in (
-            "discount",
-            "deal",
-            "sale",
-            "할인",
-            "특가",
-            "혜택",
-            "블랙프라이데이",
-            "black friday",
+    return [
+        benefit_key
+        for benefit_key in EXECUTABLE_BENEFIT_KEYS
+        if any(
+            alias in searchable
+            for alias in BENEFIT_ALIASES.get(benefit_key, (benefit_key,))
         )
-    ):
-        benefits.append("discount")
-    if any(term in searchable for term in ("early", "조기", "얼리")):
-        benefits.append("early_booking")
-    if any(term in searchable for term in ("review", "후기", "추천")):
-        benefits.append("review_based_recommendation")
-    if any(term in searchable for term in ("free cancellation", "무료 취소")):
-        benefits.append("free_cancellation")
-    if any(term in searchable for term in ("breakfast", "조식")):
-        benefits.append("breakfast_included")
-    return benefits
+    ]
 
 
 def _extract_audience_hints(searchable: str) -> list[str]:

@@ -162,6 +162,15 @@ def manifest_season_query_indices() -> Mapping[str, int]:
     )
 
 
+def manifest_intent_benefit_keys() -> tuple[str, ...]:
+    return tuple(
+        str(benefit).strip().casefold()
+        for benefit in load_behavior_manifest()[
+            "intent_benefit_query_dimensions"
+        ]
+    )
+
+
 def manifest_intent_benefit_query_indices() -> Mapping[str, tuple[int, ...]]:
     manifest = load_behavior_manifest()
     indices = {

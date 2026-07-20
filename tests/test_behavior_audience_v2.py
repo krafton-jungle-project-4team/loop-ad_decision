@@ -496,6 +496,14 @@ def test_registered_template_parameters_canonicalize_before_hash_and_query() -> 
     assert first_compiled.query_vector == second_compiled.query_vector
 
 
+def test_registered_template_rejects_unregistered_benefit_key() -> None:
+    with pytest.raises(ValueError, match="unregistered benefit key"):
+        RegisteredSegmentAudienceBinder().bind(
+            candidate_type="benefit_value_seeker",
+            benefit_keys=("review_based_recommendation",),
+        )
+
+
 def test_query_compiler_hash_is_not_coupled_to_unrelated_template_registry(
 ) -> None:
     compiler_semantics = {
