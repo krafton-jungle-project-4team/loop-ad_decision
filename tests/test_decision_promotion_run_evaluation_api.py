@@ -159,7 +159,12 @@ def test_running_experiment_can_be_reevaluated_after_insufficient_data(
     monkeypatch,
 ) -> None:
     connection = RecordingConnection()
-    clickhouse_client = RecordingClickHouseClient(rows=[(1, 5), (1, 10)])
+    clickhouse_client = RecordingClickHouseClient(
+        rows=[
+            (1, 5, 5, 4, 3, 2, 1, 0),
+            (1, 10, 10, 8, 6, 3, 1, 0),
+        ]
+    )
     monkeypatch.setattr(
         "app.decision.router.create_postgres_connection",
         lambda _settings: connection,
@@ -265,7 +270,12 @@ def test_promotion_run_metric_guard_rolls_back_partial_request(monkeypatch) -> N
         }
     )
     connection = RecordingConnection(ad_experiment_rows=experiments)
-    clickhouse_client = RecordingClickHouseClient(rows=[(4, 10), (11, 10)])
+    clickhouse_client = RecordingClickHouseClient(
+        rows=[
+            (4, 10, 10, 9, 8, 6, 4, 0),
+            (11, 10, 10, 10, 10, 10, 10, 0),
+        ]
+    )
     monkeypatch.setattr(
         "app.decision.router.create_postgres_connection",
         lambda _settings: connection,
@@ -417,10 +427,10 @@ class RecordingConnection:
 
 
 class RecordingClickHouseClient:
-    def __init__(self, rows: list[tuple[int, int]] | None = None) -> None:
+    def __init__(self, rows: list[tuple[int, ...]] | None = None) -> None:
         self.close_count = 0
         self.queries: list[tuple[str, Any]] = []
-        self.rows = list(rows or [(4, 10)])
+        self.rows = list(rows or [(4, 10, 10, 9, 8, 6, 4, 0)])
 
     def query(self, query: str, parameters: Any = None) -> object:
         self.queries.append((query, parameters))

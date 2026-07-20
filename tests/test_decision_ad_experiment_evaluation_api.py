@@ -119,7 +119,9 @@ def test_ad_experiment_evaluation_api_wires_repositories_and_commits(monkeypatch
         return connection
 
     def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
-        client = RecordingClickHouseClient(rows=[(2, 10)])
+        client = RecordingClickHouseClient(
+            rows=[(2, 10, 10, 8, 6, 4, 2, 0)]
+        )
         clickhouse_clients.append(client)
         return client
 
@@ -167,7 +169,7 @@ def test_ad_experiment_evaluation_api_rolls_back_and_closes_on_failure(
         return connection
 
     def fake_create_clickhouse_client(_settings) -> RecordingClickHouseClient:
-        client = RecordingClickHouseClient(rows=[(0, 0)])
+        client = RecordingClickHouseClient(rows=[(0, 0, 0, 0, 0, 0, 0, 0)])
         clickhouse_clients.append(client)
         return client
 
