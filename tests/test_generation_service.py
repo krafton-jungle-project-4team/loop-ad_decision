@@ -402,7 +402,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     editorial_creative = result.content_candidates[0].metadata_json["creative"]
     assert len(editorial_creative["featured_offers"]) == 2
     assert editorial_creative["renderer"]["template_version"] == (
-        "email.editorial.v2"
+        "email.editorial.v3"
     )
     assert editorial_creative["link_targets"] == [
         {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
