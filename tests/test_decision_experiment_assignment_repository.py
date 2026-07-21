@@ -59,7 +59,20 @@ def test_repository_persists_execution_design_manifest() -> None:
     operation, query, params = db.calls[0]
     assert operation == "fetchone"
     assert "INSERT INTO segment_assignment_executions" in query
+    assert "'preparing'" in query
     assert params[-1] == execution.input_manifest_json
+
+
+def test_repository_finalizes_uplift_execution_once_after_population_writes() -> None:
+    db = _Db()
+    repository = ExperimentAssignmentRepository(db)
+
+    repository.finalize_execution("execution")
+
+    operation, query, params = db.calls[0]
+    assert operation == "execute"
+    assert "finalize_uplift_assignment_execution" in query
+    assert params == ("execution",)
 
 
 def test_repository_bulk_inserts_all_experiment_units() -> None:

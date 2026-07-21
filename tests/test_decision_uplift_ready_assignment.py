@@ -60,6 +60,9 @@ def test_default_all_treatment_records_full_population_and_serves_every_user() -
         unit.outcome_window_start == unit.assigned_at
         for unit in repos.executions.units
     )
+    assert repos.executions.finalized_execution_ids == [
+        response.segment_assignment_execution_id
+    ]
 
 
 def test_randomized_holdout_records_control_but_only_serves_treatment() -> None:
@@ -92,6 +95,9 @@ def test_randomized_holdout_records_control_but_only_serves_treatment() -> None:
         result.treatment_count == result.control_count == 2
         for result in response.allocation_results
     )
+    assert repos.executions.finalized_execution_ids == [
+        response.segment_assignment_execution_id
+    ]
 
 
 def test_randomized_holdout_rejects_small_experiment_before_writes() -> None:
@@ -151,6 +157,9 @@ def test_same_request_reuses_existing_execution_and_arm_results() -> None:
     assert repos.executions.units == first_units
     assert len(repos.assignments.inserted) == first_assignment_count
     assert second.assignment_count == first.assignment_count
+    assert repos.executions.finalized_execution_ids == [
+        first.segment_assignment_execution_id
+    ]
 
 
 def holdout_request() -> SegmentAssignmentBuildRequest:
@@ -252,6 +261,7 @@ class _ExecutionRepository:
     def __init__(self) -> None:
         self.inserted_execution = None
         self.units = []
+        self.finalized_execution_ids = []
 
     def database_clock(self):
         return ASSIGNED_AT
@@ -297,6 +307,9 @@ class _ExecutionRepository:
             )
             for unit in units
         )
+
+    def finalize_execution(self, execution_id):
+        self.finalized_execution_ids.append(execution_id)
 
     def list_units_by_execution(self, execution_id):
         return [

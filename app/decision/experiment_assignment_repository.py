@@ -89,6 +89,12 @@ class ExperimentAssignmentWriter(Protocol):
     def insert_units(self, units: Sequence[AdExperimentUnitWrite]) -> None:
         ...
 
+    def finalize_execution(
+        self,
+        segment_assignment_execution_id: str,
+    ) -> None:
+        ...
+
     def list_units_by_execution(
         self,
         segment_assignment_execution_id: str,
@@ -128,6 +134,7 @@ class ExperimentAssignmentRepository:
             WHERE promotion_run_id = %s
               AND input_manifest_json->>'schema_version' =
                   'segment-assignment-execution.v2'
+              AND uplift_assignment_status = 'finalized'
             ORDER BY created_at ASC, segment_assignment_execution_id ASC
             """,
             (promotion_run_id,),
@@ -149,9 +156,10 @@ class ExperimentAssignmentRepository:
                 matcher_version,
                 vector_version,
                 source_cutoff_at,
-                input_manifest_json
+                input_manifest_json,
+                uplift_assignment_status
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'preparing')
             RETURNING
                 segment_assignment_execution_id,
                 promotion_run_id,
@@ -178,6 +186,15 @@ class ExperimentAssignmentRepository:
         if row is None:
             raise RuntimeError("assignment execution was not inserted")
         return SegmentAssignmentExecutionRecord(**row)
+
+    def finalize_execution(
+        self,
+        segment_assignment_execution_id: str,
+    ) -> None:
+        self._db.execute(
+            "SELECT finalize_uplift_assignment_execution(%s)",
+            (segment_assignment_execution_id,),
+        )
 
     def insert_units(self, units: Sequence[AdExperimentUnitWrite]) -> None:
         for chunk_start in range(0, len(units), self.INSERT_BATCH_SIZE):

@@ -1213,6 +1213,7 @@ class SegmentAssignmentService:
             raise ExperimentDesignConflictError(
                 "serving assignments already exist for the promotion run"
             )
+        repository.finalize_execution(execution_id)
 
         units = [
             _unit_record_from_write(unit)
