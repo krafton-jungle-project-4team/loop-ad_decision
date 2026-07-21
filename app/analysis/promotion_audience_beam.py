@@ -20,14 +20,14 @@ from app.analysis.segment_audience_templates import (
 )
 
 
-PROMOTION_AUDIENCE_BEAM_POLICY_VERSION = "promotion-audience-beam.v1"
+PROMOTION_AUDIENCE_BEAM_POLICY_VERSION = "promotion-audience-beam.v2"
 
 
 @dataclass(frozen=True, slots=True)
 class PromotionAudienceBeamPolicy:
     policy_version: str = PROMOTION_AUDIENCE_BEAM_POLICY_VERSION
     beam_width: int = 8
-    maximum_depth: int = 3
+    maximum_depth: int = 1
     maximum_generated_candidates: int = 50
     maximum_final_candidates: int = 3
     maximum_jaccard_similarity: float = 0.85

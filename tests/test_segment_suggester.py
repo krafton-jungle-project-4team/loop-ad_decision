@@ -1503,8 +1503,9 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
         "bounded_beam_search"
     )
     assert first_profile["beam_search"]["policy_version"] == (
-        "promotion-audience-beam.v1"
+        "promotion-audience-beam.v2"
     )
+    assert first_profile["beam_search"]["depth"] == 1
     estimate = first_profile["performance_estimate"]
     assert estimate["label"] == "행동 기반 예상 예약 전환율"
     assert estimate["is_incremental_effect"] is False

@@ -114,11 +114,13 @@ def test_predicate_registry_is_executable_and_explicit() -> None:
         assert predicate.display_label
 
 
-def test_beam_generates_compound_candidate_and_keeps_mandatory_conditions() -> None:
+def test_default_beam_adds_one_behavior_to_mandatory_conditions() -> None:
     result = _search(_profiles())
 
     assert result.candidates
-    assert any(candidate.depth >= 2 for candidate in result.candidates)
+    assert result.policy.policy_version == "promotion-audience-beam.v2"
+    assert result.policy.maximum_depth == 1
+    assert all(candidate.depth == 1 for candidate in result.candidates)
     assert all(candidate.strategy_key.startswith("beam_") for candidate in result.candidates)
     for candidate in result.candidates:
         ast = build_promotion_audience_ast(
