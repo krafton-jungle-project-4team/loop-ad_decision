@@ -1257,18 +1257,14 @@ def _hard_predicate_batch_query(
                     AND window_end = toDateTime64(
                         parseDateTimeBestEffort({{window_end:String}}), 3, 'UTC'
                     )
-                    AND ingested_at <= toDateTime64(
-                        parseDateTimeBestEffort(
-                            {{source_revision_cutoff:String}}
-                        ), 6, 'UTC'
+                    AND ingested_at <= parseDateTime64BestEffort(
+                        {{source_revision_cutoff:String}}, 6, 'UTC'
                     )
                   GROUP BY user_id
               )
               AND validation_status = 'valid'
-              AND received_at <= toDateTime64(
-                  parseDateTimeBestEffort(
-                      {{raw_event_received_cutoff:String}}
-                  ), 3, 'UTC'
+              AND received_at <= parseDateTime64BestEffort(
+                  {{raw_event_received_cutoff:String}}, 6, 'UTC'
               )
               AND event_time >= toDateTime64(
                   parseDateTimeBestEffort({{window_start:String}}), 3, 'UTC'
@@ -1589,10 +1585,8 @@ def _hard_predicate_query(
                 AND window_end = toDateTime64(
                     parseDateTimeBestEffort({window_end:String}), 3, 'UTC'
                 )
-                AND ingested_at <= toDateTime64(
-                    parseDateTimeBestEffort({source_revision_cutoff:String}),
-                    6,
-                    'UTC'
+                AND ingested_at <= parseDateTime64BestEffort(
+                    {source_revision_cutoff:String}, 6, 'UTC'
                 )
               GROUP BY user_id
           )
@@ -1612,10 +1606,8 @@ def _hard_predicate_query(
           {source_user_filter}
           {vector_population_filter}
           AND validation_status = 'valid'
-          AND received_at <= toDateTime64(
-              parseDateTimeBestEffort({{raw_event_received_cutoff:String}}),
-              3,
-              'UTC'
+          AND received_at <= parseDateTime64BestEffort(
+              {{raw_event_received_cutoff:String}}, 6, 'UTC'
           )
           AND event_time >= toDateTime64(
               parseDateTimeBestEffort({{window_start:String}}), 3, 'UTC'

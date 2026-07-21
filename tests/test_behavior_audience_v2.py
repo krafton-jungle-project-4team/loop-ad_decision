@@ -185,6 +185,16 @@ def test_hard_match_population_is_frozen_by_vector_revision_cutoff() -> None:
     assert "vector_version = {vector_version:String}" in sql
     assert "received_at <=" in sql
     assert "raw_event_received_cutoff" in sql
+    normalized_sql = " ".join(sql.split())
+    assert (
+        "parseDateTime64BestEffort( {source_revision_cutoff:String}, 6, 'UTC' )"
+        in normalized_sql
+    )
+    assert (
+        "parseDateTime64BestEffort( {raw_event_received_cutoff:String}, 6, 'UTC' )"
+        in normalized_sql
+    )
+    assert "parseDateTimeBestEffort({source_revision_cutoff:String})" not in sql
 
 
 def test_hard_match_rate_sample_uses_stable_salted_order() -> None:
@@ -211,6 +221,8 @@ def test_three_same_scope_predicates_share_one_batch_aggregate() -> None:
     )
     assert query.count("FROM raw_events") == 1
     assert query.count("FROM per_user") == 1
+    assert "parseDateTime64BestEffort" in query
+    assert "parseDateTimeBestEffort(\n                            {source_revision_cutoff:String}" not in query
     assert all(f"AS match_{index}" in query for index in range(3))
     assert len(parameters) == 9
 
