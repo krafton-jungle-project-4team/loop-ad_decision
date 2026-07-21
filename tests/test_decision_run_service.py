@@ -90,6 +90,16 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
         "analysis_id": "analysis_banner_001",
         "generation_id": "generation_banner_001",
         "loop_count": 1,
+        "outcome_spec": {
+            "outcome_metric": "booking_conversion_rate",
+            "outcome_event_name": "booking_complete",
+            "outcome_filter": {"destination_ids": []},
+            "outcome_definition_version": "booking-outcome.v1",
+            "uplift_training_eligible": True,
+        },
+        "outcome_spec_hash": (
+            "02d72a181ba9e6c82a0a905444116440f3d7aa4b5b6cfcf27a9d0fc205df711d"
+        ),
     }
     assert repos.runs.inserted[0].segment_scope_json == ("seg_family_trip",)
     assert repos.runs.inserted[0].segment_scope_fingerprint == (

@@ -58,6 +58,14 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
 )
+from app.decision.experiment_assignment_repository import (
+    ExperimentAssignmentRepository,
+)
+from app.decision.experiment_design import (
+    ExperimentDesignConflictError,
+    ExperimentDesignValidationError,
+    RandomizedHoldoutConfigurationError,
+)
 from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
     NextLoopConflictError,
@@ -223,6 +231,10 @@ def get_segment_assignment_service(
             evaluation_metric_repository=EvaluationMetricRepository(
                 clickhouse_client
             ),
+            experiment_assignment_repository=ExperimentAssignmentRepository(
+                executor
+            ),
+            randomization_salt=settings.segment_holdout_randomization_salt,
         )
         connection.commit()
     except Exception:
@@ -502,6 +514,21 @@ async def build_segment_assignments(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=exc.to_detail(),
+        ) from exc
+    except ExperimentDesignConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except RandomizedHoldoutConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except ExperimentDesignValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": str(exc)},
         ) from exc
     except SegmentAssignmentValidationError as exc:
         raise HTTPException(

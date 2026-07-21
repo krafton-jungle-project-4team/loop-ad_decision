@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -49,12 +50,25 @@ class AudienceSnapshotMember:
 
 
 @dataclass(frozen=True, slots=True)
+class AudienceSnapshotBinding:
+    segment_id: str
+    audience_snapshot_id: str
+    vector_generation_id: str
+    vector_version: str
+    source_cutoff: datetime
+    generation_window_end: datetime
+    generation_source_revision_cutoff: datetime
+    member_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class AudienceSnapshotSet:
     analysis_id: str
     segment_ids: tuple[str, ...]
     vector_version: str
     member_count: int
     snapshot_ids: tuple[str, ...] = ()
+    bindings: tuple[AudienceSnapshotBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -751,12 +765,17 @@ class AudienceSnapshotRepository:
                 plan.status AS plan_status,
                 snapshot.status AS snapshot_status,
                 snapshot.vector_version,
+                snapshot.vector_generation_id,
+                snapshot.source_cutoff,
                 snapshot.final_user_count,
                 snapshot.audience_status,
                 snapshot.snapshot_kind,
                 snapshot.source_snapshot_id,
                 snapshot.allocation_plan_id AS snapshot_allocation_plan_id,
                 target.audience_reservation_state,
+                generation.window_end AS generation_window_end,
+                generation.source_revision_cutoff
+                    AS generation_source_revision_cutoff,
                 (SELECT count(*)
                  FROM segment_audience_members AS member
                  WHERE member.snapshot_id = binding.final_snapshot_id)
@@ -794,6 +813,8 @@ class AudienceSnapshotRepository:
              AND target.segment_id = binding.segment_id
              AND target.allocation_plan_id = binding.allocation_plan_id
              AND target.audience_snapshot_id = binding.final_snapshot_id
+            JOIN user_behavior_vector_search_generations AS generation
+              ON generation.vector_generation_id = snapshot.vector_generation_id
             WHERE binding.promotion_run_id = %s
             ORDER BY binding.segment_id ASC
             """,
@@ -853,6 +874,21 @@ class AudienceSnapshotRepository:
             member_count=sum(int(row["final_user_count"]) for row in rows),
             snapshot_ids=tuple(
                 str(row["final_snapshot_id"]) for row in rows
+            ),
+            bindings=tuple(
+                AudienceSnapshotBinding(
+                    segment_id=str(row["segment_id"]),
+                    audience_snapshot_id=str(row["final_snapshot_id"]),
+                    vector_generation_id=str(row["vector_generation_id"]),
+                    vector_version=str(row["vector_version"]),
+                    source_cutoff=row["source_cutoff"],
+                    generation_window_end=row["generation_window_end"],
+                    generation_source_revision_cutoff=(
+                        row["generation_source_revision_cutoff"]
+                    ),
+                    member_count=int(row["final_user_count"]),
+                )
+                for row in rows
             ),
         )
 

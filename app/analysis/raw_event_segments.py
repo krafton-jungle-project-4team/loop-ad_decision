@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
@@ -19,9 +18,22 @@ from app.analysis.audience_selection import (
     all_matching_audience_selection_policy,
 )
 from app.analysis.behavior_manifest import (
+    canonical_destination_id,
     destination_alias_groups,
     executable_destination_id,
     manifest_intent_benefit_keys,
+)
+from app.analysis.promotion_audience_ast import (
+    DESTINATION_ANY_OF,
+    DESTINATION_CONTAINS_ALL,
+    PROMOTION_AUDIENCE_COMPILER_VERSION,
+    PROMOTION_AUDIENCE_CONTRACT_VERSION,
+    build_promotion_audience_ast,
+    compile_promotion_audience_ast,
+)
+from app.analysis.promotion_audience_beam import (
+    BeamAudienceCandidate,
+    search_promotion_audience_candidates,
 )
 from app.analysis.repositories import (
     PromotionRecord,
@@ -30,7 +42,6 @@ from app.analysis.repositories import (
 )
 from app.analysis.segment_audience_templates import (
     MAX_DESTINATION_IDS,
-    RegisteredSegmentAudienceBinder,
 )
 from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
@@ -300,7 +311,13 @@ class _RawEventCandidate:
     performance_model_metadata: Mapping[str, Any]
     audience_selection: AudienceSelectionDecision
     audience_parameters: RawEventAudienceParameters
+    identity_strategy_key: str | None = None
+    destination_operator: str = DESTINATION_ANY_OF
     rank_distinctiveness: float = 1.0
+    structured_conditions: tuple[Mapping[str, Any], ...] = ()
+    beam_policy_version: str | None = None
+    beam_search_score: float | None = None
+    beam_search_metadata: Mapping[str, Any] | None = None
 
     @property
     def sample_size(self) -> int:
@@ -589,6 +606,7 @@ def generate_raw_event_segment_definitions(
         performance_predictor=performance_predictor,
         audience_selection_policy=audience_selection_policy,
         enforce_prediction_support=True,
+        enable_beam_search=True,
     )
     if not candidates:
         return []
@@ -631,6 +649,7 @@ def generate_raw_event_segment_candidate_pool(
         performance_predictor=performance_predictor,
         audience_selection_policy=None,
         enforce_prediction_support=enforce_prediction_support,
+        enable_beam_search=False,
     )
     total_eligible_user_count = len(profiles)
     return [
@@ -657,6 +676,7 @@ def _generate_raw_event_candidates(
     performance_predictor: SegmentPerformancePredictor | None,
     audience_selection_policy: AudienceSelectionPolicyProtocol | None,
     enforce_prediction_support: bool,
+    enable_beam_search: bool,
 ) -> list[_RawEventCandidate]:
     if len(profiles) < min_sample_size:
         return []
@@ -718,7 +738,24 @@ def _generate_raw_event_candidates(
                 performance_predictor=predictor,
             )
         )
-    candidates = [candidate for candidate in raw_candidates if candidate is not None]
+    factory_candidates = [
+        candidate for candidate in raw_candidates if candidate is not None
+    ]
+    beam_candidates = (
+        _generate_beam_candidates(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=eligible_profiles,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
+            enforce_prediction_support=enforce_prediction_support,
+        )
+        if enable_beam_search
+        else []
+    )
+    candidates = beam_candidates or factory_candidates
     if audience_selection_policy is not None:
         candidates = [
             _apply_audience_selection(
@@ -737,12 +774,160 @@ def _generate_raw_event_candidates(
     )
 
 
+def _generate_beam_candidates(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+    enforce_prediction_support: bool,
+) -> list[_RawEventCandidate]:
+    result = search_promotion_audience_candidates(
+        promotion_id=promotion.promotion_id,
+        destination_ids=intent.destinations,
+        season_months=season_months_from_intent(intent),
+        benefit_keys=intent.benefits,
+        desired_behavior_keys=intent.desired_behaviors,
+        profiles=profiles,
+        min_sample_size=min_sample_size,
+    )
+    profiles_by_user_id = {profile.user_id: profile for profile in profiles}
+    candidates: list[_RawEventCandidate] = []
+    for beam_candidate in result.candidates:
+        if (
+            intent.requested_candidate_types
+            and beam_candidate.candidate_type
+            not in intent.requested_candidate_types
+        ):
+            continue
+        if enforce_prediction_support:
+            support = candidate_type_prediction_support(
+                performance_predictor,
+                goal_metric=promotion.goal_metric,
+                candidate_type=beam_candidate.candidate_type,
+            )
+            if not support.supported:
+                continue
+        candidate = _raw_event_candidate_from_beam(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            beam_candidate=beam_candidate,
+            profiles_by_user_id=profiles_by_user_id,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=performance_predictor,
+            beam_search_metadata={
+                "policy_version": result.policy.policy_version,
+                "beam_width": result.policy.beam_width,
+                "maximum_depth": result.policy.maximum_depth,
+                "maximum_generated_candidates": (
+                    result.policy.maximum_generated_candidates
+                ),
+                "maximum_final_candidates": result.policy.maximum_final_candidates,
+                "generated_candidate_count": result.generated_candidate_count,
+                "pruned_candidate_counts": dict(result.pruned_candidate_counts),
+            },
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _raw_event_candidate_from_beam(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    beam_candidate: BeamAudienceCandidate,
+    profiles_by_user_id: Mapping[str, RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+    beam_search_metadata: Mapping[str, Any],
+) -> _RawEventCandidate | None:
+    matched_profiles = [
+        profiles_by_user_id[user_id]
+        for user_id in beam_candidate.user_ids
+        if user_id in profiles_by_user_id
+    ]
+    matched_condition_keys = tuple(
+        choice.predicate_key for choice in beam_candidate.choices
+    )
+    if intent.destinations:
+        matched_condition_keys = (
+            *matched_condition_keys,
+            "recent_destination_search",
+        )
+    if intent.season:
+        matched_condition_keys = (*matched_condition_keys, "season_match")
+    candidate = _candidate_from_profiles(
+        candidate_type=beam_candidate.candidate_type,
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=matched_profiles,
+        baseline=baseline,
+        min_sample_size=min_sample_size,
+        matched_condition_keys=matched_condition_keys,
+        missing_condition_keys=_missing_condition_keys(
+            compilation,
+            matched_condition_keys,
+        ),
+        performance_predictor=performance_predictor,
+        identity_strategy_key=beam_candidate.strategy_key,
+        audience_parameters=RawEventAudienceParameters(
+            destination_ids=tuple(intent.destinations),
+            season_months=season_months_from_intent(intent),
+            benefit_keys=tuple(intent.benefits),
+        ),
+    )
+    if candidate is None:
+        return None
+    return replace(
+        candidate,
+        structured_conditions=beam_candidate.structured_conditions,
+        beam_policy_version=str(beam_search_metadata["policy_version"]),
+        beam_search_score=beam_candidate.score,
+        beam_search_metadata={
+            **dict(beam_search_metadata),
+            "depth": beam_candidate.depth,
+            "predicate_choices": [
+                {
+                    "predicate_key": choice.predicate_key,
+                    "minimum_count": choice.minimum_count,
+                }
+                for choice in beam_candidate.choices
+            ],
+            "score_components": dict(beam_candidate.score_components),
+        },
+    )
+
+
 def destination_terms_from_intent(intent: PromotionIntent) -> tuple[str, ...]:
     terms: list[str] = []
     for destination in intent.destinations:
         normalized = destination.strip().lower()
         terms.extend(DESTINATION_ALIASES.get(normalized, (normalized,)))
     return tuple(dict.fromkeys(term for term in terms if term))
+
+
+def _profile_destination_ids(profile: RawEventUserSignalRecord) -> set[str]:
+    destination_ids: set[str] = set()
+    for raw_value in profile.destination_values:
+        normalized = " ".join(str(raw_value).strip().casefold().split())
+        if not normalized:
+            continue
+        direct = canonical_destination_id(normalized)
+        if direct in DESTINATION_ALIASES:
+            destination_ids.add(direct)
+        for destination_id, aliases in DESTINATION_ALIASES.items():
+            if any(alias and alias in normalized for alias in aliases):
+                destination_ids.add(destination_id)
+    return destination_ids
 
 
 def season_months_from_intent(intent: PromotionIntent) -> tuple[int, ...]:
@@ -977,21 +1162,33 @@ def _general_destination_explorer_candidate(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
-    if intent.destinations:
+    target_destinations = tuple(sorted(set(intent.destinations)))
+    is_target_comparison = len(target_destinations) >= 2
+    if intent.destinations and not is_target_comparison:
         return None
-    matched_profiles = [
-        profile
-        for profile in profiles
-        if (
-            len(profile.destination_values) >= 2
-            or len(profile.hotel_market_values) >= 2
-            or len(profile.hotel_cluster_values) >= 2
-        )
-        and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
-    ]
+    if is_target_comparison:
+        target_set = set(target_destinations)
+        matched_profiles = [
+            profile
+            for profile in profiles
+            if target_set.issubset(_profile_destination_ids(profile))
+            and profile.hotel_search_count >= len(target_destinations)
+        ]
+    else:
+        matched_profiles = [
+            profile
+            for profile in profiles
+            if (
+                len(profile.destination_values) >= 2
+                or len(profile.hotel_market_values) >= 2
+                or len(profile.hotel_cluster_values) >= 2
+            )
+            and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
+        ]
     matched_condition_keys = (
         "general_destination_exploration",
         "hotel_product_interest",
+        *(("recent_destination_search",) if is_target_comparison else ()),
     )
     return _candidate_from_profiles(
         candidate_type="general_destination_explorer",
@@ -1007,6 +1204,17 @@ def _general_destination_explorer_candidate(
             matched_condition_keys,
         ),
         performance_predictor=performance_predictor,
+        identity_strategy_key=(
+            "destination_comparison" if is_target_comparison else None
+        ),
+        destination_operator=(
+            DESTINATION_CONTAINS_ALL if is_target_comparison else DESTINATION_ANY_OF
+        ),
+        audience_parameters=(
+            RawEventAudienceParameters(destination_ids=target_destinations)
+            if is_target_comparison
+            else None
+        ),
     )
 
 
@@ -1074,6 +1282,9 @@ def _candidate_from_profiles(
     matched_condition_keys: Sequence[str],
     missing_condition_keys: Sequence[str],
     performance_predictor: SegmentPerformancePredictor,
+    identity_strategy_key: str | None = None,
+    destination_operator: str = DESTINATION_ANY_OF,
+    audience_parameters: RawEventAudienceParameters | None = None,
 ) -> _RawEventCandidate | None:
     if len(profiles) < min_sample_size:
         return None
@@ -1159,10 +1370,16 @@ def _candidate_from_profiles(
             **dict(prediction_metadata),
         },
         audience_selection=audience_selection,
-        audience_parameters=_audience_parameters_from_intent(
-            candidate_type=candidate_type,
-            intent=intent,
+        audience_parameters=(
+            audience_parameters
+            if audience_parameters is not None
+            else _audience_parameters_from_intent(
+                candidate_type=candidate_type,
+                intent=intent,
+            )
         ),
+        identity_strategy_key=identity_strategy_key,
+        destination_operator=destination_operator,
     )
 
 
@@ -1336,7 +1553,11 @@ def _select_candidate_portfolio(
         remaining = [
             candidate
             for candidate in remaining
-            if candidate.candidate_type != next_candidate.candidate_type
+            if (candidate.identity_strategy_key or candidate.candidate_type)
+            != (
+                next_candidate.identity_strategy_key
+                or next_candidate.candidate_type
+            )
         ]
     return selected
 
@@ -1381,7 +1602,13 @@ def _with_distinctiveness(
         performance_model_metadata=candidate.performance_model_metadata,
         audience_selection=candidate.audience_selection,
         audience_parameters=candidate.audience_parameters,
+        identity_strategy_key=candidate.identity_strategy_key,
+        destination_operator=candidate.destination_operator,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
+        structured_conditions=candidate.structured_conditions,
+        beam_policy_version=candidate.beam_policy_version,
+        beam_search_score=candidate.beam_search_score,
+        beam_search_metadata=candidate.beam_search_metadata,
     )
 
 
@@ -1476,50 +1703,63 @@ def _segment_definition_from_candidate(
         promotion=promotion,
         candidate=candidate,
     )
+    ast = build_promotion_audience_ast(
+        promotion_id=promotion.promotion_id,
+        candidate_type=candidate.candidate_type,
+        strategy_key=candidate.identity_strategy_key or candidate.candidate_type,
+        matched_condition_keys=candidate.matched_condition_keys,
+        destination_ids=candidate.audience_parameters.destination_ids,
+        season_months=candidate.audience_parameters.season_months,
+        benefit_keys=candidate.audience_parameters.benefit_keys,
+        destination_operator=candidate.destination_operator,
+        unsupported_conditions=compilation.unsupported_conditions,
+        structured_conditions=candidate.structured_conditions,
+        beam_policy_version=candidate.beam_policy_version,
+    )
+    try:
+        audience_compilation = compile_promotion_audience_ast(ast)
+    except ValueError as exc:
+        raise SegmentAudienceContractError(
+            code="segment_audience_template_binding_invalid",
+            segment_id=f"promotion:{promotion.promotion_id}",
+            reason=str(exc),
+        ) from exc
+    display_model = audience_compilation.display_model
+    if promotion.goal_metric == "booking_conversion_rate":
+        performance_estimate["label"] = display_model["metric_label"]
+        performance_estimate["description"] = display_model["metric_description"]
     strategy_summary = _strategy_difference_summary(candidate)
     selection_consideration = _selection_consideration_summary(candidate)
     display_copy = {
-        "title": candidate.title,
-        "strategy_role": candidate.strategy_role,
+        "title": display_model["title"],
+        "strategy_role": display_model["strategy_role"],
         **recommendation_tier,
         "audience_summary": audience_summary,
         "audience": audience,
         "performance_estimate": performance_estimate,
-        "signal_chips": list(candidate.signal_chips),
-        "reason": candidate.reason,
+        "signal_chips": list(display_model["signal_chips"]),
+        "reason": display_model["reason"],
         "strength_summary": strategy_summary,
         "tradeoff_summary": selection_consideration,
         "action_hint": candidate.action_hint,
+        "metric_label": display_model["metric_label"],
+        "metric_description": display_model["metric_description"],
     }
-    segment_id = _raw_event_segment_id(
-        promotion_id=promotion.promotion_id,
-        candidate_type=candidate.candidate_type,
-        candidate_user_ids=candidate.candidate_user_ids,
-    )
-    try:
-        audience_spec = RegisteredSegmentAudienceBinder().bind(
-            candidate_type=candidate.candidate_type,
-            destination_ids=candidate.audience_parameters.destination_ids,
-            season_months=candidate.audience_parameters.season_months,
-            benefit_keys=candidate.audience_parameters.benefit_keys,
-        )
-    except ValueError as exc:
-        raise SegmentAudienceContractError(
-            code="segment_audience_template_binding_invalid",
-            segment_id=segment_id,
-            reason=str(exc),
-        ) from exc
+    segment_id = audience_compilation.segment_id
+    audience_spec = audience_compilation.segment_audience_spec
     profile_json: dict[str, Any] = {
         "primary_segment": segment_id,
         "source": "raw_event_intent",
-        "strategy_role": candidate.strategy_role,
+        "strategy_role": display_model["strategy_role"],
+        "strategy_key": ast.strategy_key,
         "candidate_type": candidate.candidate_type,
         **recommendation_tier,
         "portfolio_position": position + 1,
         "score_components": score_components,
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
-        "signal_chips": list(candidate.signal_chips),
+        "signal_chips": list(display_model["signal_chips"]),
+        "recommendation_reference_signals": list(candidate.signal_chips),
         "audience": audience,
         "performance_estimate": performance_estimate,
         "performance_features": candidate.performance_features.to_json(),
@@ -1530,6 +1770,15 @@ def _segment_definition_from_candidate(
         },
         "promotion_intent": intent.to_json(),
         "compiled_intent": compilation.to_json(),
+        "promotion_audience_ast": ast.to_json(),
+        "promotion_audience_ast_hash": audience_compilation.ast_hash,
+        "segment_audience_spec_hash": (
+            audience_compilation.segment_audience_spec_hash
+        ),
+        "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
+        "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
+        "creative_only": list(ast.creative_only),
+        "unsupported_conditions": list(ast.unsupported_conditions),
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
         "selection_basis": {
@@ -1546,6 +1795,14 @@ def _segment_definition_from_candidate(
             ),
         },
     }
+    if candidate.beam_search_metadata is not None:
+        profile_json["beam_search"] = {
+            **dict(candidate.beam_search_metadata),
+            "candidate_score": round(
+                float(candidate.beam_search_score or 0.0),
+                6,
+            ),
+        }
     primary_signals = [
         key for key in candidate.matched_condition_keys if key.strip()
     ][:3]
@@ -1557,23 +1814,36 @@ def _segment_definition_from_candidate(
         project_id=promotion.project_id,
         campaign_id=promotion.campaign_id,
         promotion_id=promotion.promotion_id,
-        segment_name=candidate.title,
+        segment_name=str(display_model["title"]),
         source="ai_suggested",
         query_preview_id=None,
         natural_language_query=(
-            f"{candidate.strategy_role}: {', '.join(matched_conditions[:3])} 조건을 "
+            f"{display_model['strategy_role']}: {', '.join(matched_conditions[:3])} 조건을 "
             "실제 SDK 행동 이벤트에서 만족한 고객군입니다."
         ),
         generated_sql=None,
         rule_json={
             "source": "raw_event_intent",
             "candidate_type": candidate.candidate_type,
+            "strategy_key": ast.strategy_key,
             "compiled_conditions": list(candidate.matched_condition_keys),
             "candidate_user_ids": list(candidate.candidate_user_ids),
             "fallback_used": False,
             "version": RAW_EVENT_SEGMENT_VERSION,
             "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
             "segment_audience_spec": dict(audience_spec),
+            "segment_audience_spec_hash": (
+                audience_compilation.segment_audience_spec_hash
+            ),
+            "promotion_audience_ast": ast.to_json(),
+            "promotion_audience_ast_hash": audience_compilation.ast_hash,
+            "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
+            "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
+            **(
+                {"beam_search": dict(profile_json["beam_search"])}
+                if "beam_search" in profile_json
+                else {}
+            ),
         },
         profile_json=profile_json,
         sample_size=candidate.sample_size,
@@ -2679,7 +2949,7 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
     final_score = _final_score(candidate)
     weights = _score_weights(candidate)
     recommendation_tier = _recommendation_tier(candidate)
-    return {
+    result = {
         "promotion_condition_match": round(candidate.promotion_condition_match, 6),
         "predicted_goal_rate": round(candidate.predicted_goal_rate, 6),
         "expected_goal_performance": round(candidate.expected_goal_performance, 6),
@@ -2697,6 +2967,17 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
         "destination_context_required": candidate.destination_context_required,
         "primary_component": "expected_goal_performance",
     }
+    if candidate.beam_search_score is not None:
+        result["beam_search_score"] = round(candidate.beam_search_score, 6)
+        if candidate.beam_search_metadata is not None:
+            components = candidate.beam_search_metadata.get("score_components")
+            if isinstance(components, Mapping):
+                result["beam_search_components"] = {
+                    key: round(float(value), 6)
+                    for key, value in components.items()
+                }
+        result["primary_component"] = "bounded_beam_search"
+    return result
 
 
 def _performance_estimate(
@@ -2725,6 +3006,10 @@ def _performance_estimate(
     estimate = {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
+        "interpretation": _performance_estimate_interpretation(
+            promotion.goal_metric
+        ),
+        "is_incremental_effect": False,
         "availability": "available",
         "unit": "rate",
         "value": round(value, 6),
@@ -2768,12 +3053,24 @@ def _observed_goal_rate(
 
 def _performance_estimate_label(goal_metric: str) -> str:
     if goal_metric == "booking_conversion_rate":
-        return "예상 예약 전환율"
+        return "행동 기반 예상 예약 전환율"
     if goal_metric == "inflow_rate":
         return "예상 유입률"
     if goal_metric == "funnel_step_rate":
         return "예상 예약 시작 전환율"
     return "예상 성과"
+
+
+def _performance_estimate_interpretation(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return (
+            "과거 행동을 바탕으로 추정한 향후 예약 가능성이며, "
+            "광고로 인한 증가율은 아닙니다."
+        )
+    return (
+        "과거 행동을 바탕으로 추정한 목표 달성 가능성이며, "
+        "광고로 인한 증가율은 아닙니다."
+    )
 
 
 def _performance_expected_count_label(goal_metric: str) -> str:
@@ -2858,7 +3155,7 @@ def _format_expected_count(value: float) -> str:
 
 def _final_score(candidate: _RawEventCandidate) -> float:
     weights = _score_weights(candidate)
-    return (
+    base_score = (
         weights["promotion_condition_match"] * candidate.promotion_condition_match
         + weights["expected_goal_performance"]
         * candidate.expected_goal_performance
@@ -2867,6 +3164,9 @@ def _final_score(candidate: _RawEventCandidate) -> float:
         + weights["sample_reliability"] * candidate.sample_reliability
         + weights["rank_distinctiveness"] * candidate.rank_distinctiveness
     )
+    if candidate.beam_search_score is None:
+        return base_score
+    return 0.55 * base_score + 0.45 * candidate.beam_search_score
 
 
 def _score_weights(candidate: _RawEventCandidate) -> Mapping[str, float]:
@@ -2968,31 +3268,6 @@ def _sample_ratio(*, sample_size: int, total_eligible_user_count: int) -> Decima
     if total_eligible_user_count <= 0:
         return Decimal("0")
     return Decimal(sample_size / total_eligible_user_count).quantize(Decimal("0.000001"))
-
-
-def _raw_event_segment_id(
-    *,
-    promotion_id: str,
-    candidate_type: str,
-    candidate_user_ids: Sequence[str],
-) -> str:
-    stable_user_ids = sorted(set(candidate_user_ids))
-    digest = hashlib.sha1(  # noqa: S324 - stable non-security identifier.
-        ":".join(
-            [promotion_id, candidate_type, ",".join(stable_user_ids)]
-        ).encode("utf-8")
-    ).hexdigest()[:10]
-    return (
-        f"seg_ai_raw_{_safe_identifier_part(promotion_id)[:32]}_"
-        f"{candidate_type}_{digest}"
-    )
-
-
-def _safe_identifier_part(value: str) -> str:
-    return "".join(
-        character if character.isalnum() or character == "_" else "_"
-        for character in value
-    )
 
 
 def _safe_rate(numerator: float, denominator: float) -> float:
