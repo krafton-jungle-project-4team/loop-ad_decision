@@ -313,7 +313,6 @@ class VectorClusterSegmentSuggester:
                 "segmentInstructionLength": len(segment_instruction or ""),
             },
         )
-        sample_seed = _promotion_sample_seed(promotion)
         raw_event_segments = self._suggest_raw_event_segments(
             promotion=promotion,
             segment_instruction=segment_instruction,
@@ -337,91 +336,22 @@ class VectorClusterSegmentSuggester:
             )
             return response
 
-        if segment_instruction:
-            log.info(
-                "segment_instruction_candidates_empty",
-                {
-                    "segmentInstructionLength": len(segment_instruction),
-                    "fallback": "disabled",
-                },
-            )
-            log.info(
-                "completed",
-                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
-            )
-            return []
-
-        user_vectors = self._load_user_vectors(promotion, sample_seed)
-        if len(user_vectors) < self._min_cluster_size:
-            log.warn("user_vector_sample_insufficient", {"userVectorCount": len(user_vectors), "minClusterSize": self._min_cluster_size})
-            log.info(
-                "completed",
-                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
-            )
-            return raw_event_segments
-
-        cluster_count = min(
-            self._max_suggested_segments,
-            max(1, len(user_vectors) // self._min_cluster_size),
-        )
-        clusters = _cluster_user_vectors(user_vectors, cluster_count)
-        if not clusters:
-            log.warn("vector_clusters_empty", {"userVectorCount": len(user_vectors)})
-            log.info(
-                "completed",
-                {"suggestedSegmentCount": 0, "durationMs": duration_ms(started_at)},
-            )
-            return raw_event_segments
-
-        total_eligible_user_count = len(user_vectors)
-        promotion_intent = _promotion_intent(promotion)
-        scored_clusters = _score_clusters(
-            clusters=clusters,
-            promotion_intent=promotion_intent,
-            total_eligible_user_count=total_eligible_user_count,
-        )
-        response = [
-            _segment_definition_from_cluster(
-                promotion=promotion,
-                scored_cluster=scored_cluster,
-                rank=rank,
-                total_eligible_user_count=total_eligible_user_count,
-                sample_seed=sample_seed,
-                vector_version=self._vector_version,
-                promotion_vector_basis=promotion_intent.basis,
-            )
-            for rank, scored_cluster in enumerate(
-                sorted(
-                    scored_clusters,
-                    key=lambda scored_cluster: (
-                        -scored_cluster.recommendation_score,
-                        -scored_cluster.promotion_similarity,
-                        -scored_cluster.cluster_quality_score,
-                        -len(scored_cluster.cluster.users),
-                        scored_cluster.cluster.index,
-                    ),
-                )
-            )
-            if len(scored_cluster.cluster.users) >= self._min_cluster_size
-        ][: self._max_suggested_segments]
         log.info(
-            "vector_clusters_created",
+            "dynamic_audience_candidates_empty",
             {
-                "clusterCount": len(clusters),
-                "suggestedSegmentCount": len(response),
-                "totalEligibleUserCount": total_eligible_user_count,
-                "promotionVectorBasis": promotion_intent.basis,
+                "segmentInstructionLength": len(segment_instruction or ""),
+                "legacyVectorCardFallback": "disabled",
             },
         )
         log.info(
             "completed",
             {
-                "suggestedSegmentCount": len(response),
-                "segmentIds": [segment.segment_id for segment in response],
+                "suggestedSegmentCount": 0,
+                "segmentIds": [],
                 "durationMs": duration_ms(started_at),
             },
         )
-        return response
+        return []
 
     def _suggest_raw_event_segments(
         self,
@@ -481,6 +411,54 @@ class VectorClusterSegmentSuggester:
                 },
             )
             raise
+
+    def _suggest_legacy_vector_segments_for_diagnostics(
+        self,
+        *,
+        promotion: PromotionRecord,
+    ) -> list[SegmentDefinitionRecord]:
+        """Keep the former cluster output available to offline diagnostics only."""
+
+        sample_seed = _promotion_sample_seed(promotion)
+        user_vectors = self._load_user_vectors(promotion, sample_seed)
+        if len(user_vectors) < self._min_cluster_size:
+            return []
+        cluster_count = min(
+            self._max_suggested_segments,
+            max(1, len(user_vectors) // self._min_cluster_size),
+        )
+        clusters = _cluster_user_vectors(user_vectors, cluster_count)
+        total_eligible_user_count = len(user_vectors)
+        promotion_intent = _promotion_intent(promotion)
+        scored_clusters = _score_clusters(
+            clusters=clusters,
+            promotion_intent=promotion_intent,
+            total_eligible_user_count=total_eligible_user_count,
+        )
+        return [
+            _segment_definition_from_cluster(
+                promotion=promotion,
+                scored_cluster=scored_cluster,
+                rank=rank,
+                total_eligible_user_count=total_eligible_user_count,
+                sample_seed=sample_seed,
+                vector_version=self._vector_version,
+                promotion_vector_basis=promotion_intent.basis,
+            )
+            for rank, scored_cluster in enumerate(
+                sorted(
+                    scored_clusters,
+                    key=lambda scored_cluster: (
+                        -scored_cluster.recommendation_score,
+                        -scored_cluster.promotion_similarity,
+                        -scored_cluster.cluster_quality_score,
+                        -len(scored_cluster.cluster.users),
+                        scored_cluster.cluster.index,
+                    ),
+                )
+            )
+            if len(scored_cluster.cluster.users) >= self._min_cluster_size
+        ][: self._max_suggested_segments]
 
     def _load_user_vectors(
         self,
