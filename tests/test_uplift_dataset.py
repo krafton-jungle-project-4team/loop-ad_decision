@@ -1,5 +1,5 @@
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -10,6 +10,7 @@ from app.uplift.dataset import (
     PostgresUpliftUnitSourceRepository,
     UpliftDatasetBuilder,
     UpliftUnitSourceRecord,
+    build_dataset_manifest,
 )
 
 
@@ -22,12 +23,24 @@ class _UnitReader:
     def __init__(self, records):
         self.records = records
 
-    def list_units(self, *, project_id=None):
-        return [
+    def iter_unit_pages(
+        self,
+        *,
+        project_id,
+        reference_time,
+        after_promotion_run_id=None,
+        after_ad_experiment_id=None,
+        after_user_id=None,
+        page_size=1000,
+    ):
+        del reference_time
+        records = [
             record
             for record in self.records
-            if project_id is None or record.project_id == project_id
+            if record.project_id == project_id
         ]
+        for start in range(0, len(records), page_size):
+            yield tuple(records[start : start + page_size])
 
 
 class _OutcomeReader:
@@ -80,7 +93,7 @@ def test_dataset_uses_frozen_destination_specific_booking_outcome() -> None:
         outcome_reader=outcome_reader,
     )
 
-    result = builder.build(reference_time=WINDOW_END)
+    result = builder.build(reference_time=WINDOW_END, project_id="project")
 
     assert {example.user_id: example.outcome for example in result.examples} == {
         "jeju_user": 1,
@@ -108,7 +121,7 @@ def test_dataset_excludes_unfinished_missing_invalid_and_unsupported_units() -> 
         outcome_reader=_OutcomeReader([]),
     )
 
-    result = builder.build(reference_time=WINDOW_END)
+    result = builder.build(reference_time=WINDOW_END, project_id="project")
 
     assert result.examples == ()
     assert result.excluded_reason_counts == {
@@ -131,7 +144,7 @@ def test_dataset_rejects_mutated_outcome_spec_hash() -> None:
         outcome_reader=_OutcomeReader([]),
     )
 
-    result = builder.build(reference_time=WINDOW_END)
+    result = builder.build(reference_time=WINDOW_END, project_id="project")
 
     assert result.excluded_reason_counts == {"outcome_spec_mismatch": 1}
 
@@ -148,8 +161,60 @@ def test_unit_source_reads_only_finalized_uplift_executions() -> None:
     db = _Db()
     repository = PostgresUpliftUnitSourceRepository(db)
 
-    assert repository.list_units(project_id="project") == []
+    assert list(
+        repository.iter_unit_pages(
+            project_id="project",
+            reference_time=WINDOW_END,
+        )
+    ) == []
     assert "execution.uplift_assignment_status = 'finalized'" in db.query
+    assert "unit.outcome_window_end <=" in db.query
+    assert "randomized_holdout" in db.query
+    assert "uplift_training_eligible" in db.query
+
+
+def test_unit_source_uses_stable_composite_cursor_without_offset() -> None:
+    rows = [
+        asdict(
+            source_record(
+                "u1",
+                promotion_run_id="run_a",
+                ad_experiment_id="exp_a",
+            )
+        ),
+        asdict(
+            source_record(
+                "u2",
+                promotion_run_id="run_a",
+                ad_experiment_id="exp_b",
+            )
+        ),
+    ]
+
+    class _Db:
+        def __init__(self):
+            self.calls = []
+
+        def fetchall(self, query, params=()):
+            self.calls.append((query, params))
+            return rows if len(self.calls) == 1 else []
+
+    db = _Db()
+    pages = list(
+        PostgresUpliftUnitSourceRepository(db).iter_unit_pages(
+            project_id="project",
+            reference_time=WINDOW_END,
+            page_size=2,
+        )
+    )
+
+    assert [[record.user_id for record in page] for page in pages] == [
+        ["u1", "u2"]
+    ]
+    assert len(db.calls) == 2
+    assert "OFFSET" not in db.calls[0][0]
+    assert db.calls[0][1][2:6] == (None, None, None, None)
+    assert db.calls[1][1][2:6] == ("run_a", "run_a", "exp_b", "u2")
 
 
 def test_clickhouse_outcome_query_checks_every_destination_field_with_or() -> None:
@@ -256,6 +321,77 @@ def test_destination_match_contract_accepts_alias_in_any_supported_field() -> No
     assert client.sql.count(" OR\n") == 3
 
 
+def test_dataset_fingerprint_is_independent_of_postgres_page_size_and_order() -> None:
+    records = [source_record(f"user_{index}") for index in range(6)]
+    events = [
+        (
+            "user_1",
+            "booking_complete",
+            "jeju",
+            ASSIGNED_AT + timedelta(days=1),
+        )
+    ]
+    first = UpliftDatasetBuilder(
+        unit_reader=_UnitReader(records),
+        outcome_reader=_OutcomeReader(events),
+        unit_page_size=1,
+    ).build(project_id="project", reference_time=WINDOW_END)
+    second = UpliftDatasetBuilder(
+        unit_reader=_UnitReader(list(reversed(records))),
+        outcome_reader=_OutcomeReader(events),
+        unit_page_size=4,
+    ).build(project_id="project", reference_time=WINDOW_END)
+
+    first_manifest, first_fingerprint = build_dataset_manifest(
+        first,
+        project_id="project",
+        reference_time=WINDOW_END,
+    )
+    second_manifest, second_fingerprint = build_dataset_manifest(
+        second,
+        project_id="project",
+        reference_time=WINDOW_END,
+    )
+
+    assert first_manifest == second_manifest
+    assert first_fingerprint == second_fingerprint
+    assert first_manifest["experiment_unit_set_hash"]
+    assert first_manifest["feature_contract_hash"]
+    assert first_manifest["outcome_contract_hash"]
+
+
+def test_dataset_fingerprint_is_independent_of_clickhouse_batch_size() -> None:
+    class _Result:
+        def __init__(self, user_ids):
+            self.result_rows = [
+                (user_id,) for user_id in user_ids if user_id.endswith("1")
+            ]
+
+    class _Client:
+        def query(self, _sql, *, parameters):
+            return _Result(parameters["user_ids"])
+
+    records = [source_record(f"user_{index}") for index in range(5)]
+    fingerprints = []
+    for batch_size in (1, 5000):
+        result = UpliftDatasetBuilder(
+            unit_reader=_UnitReader(records),
+            outcome_reader=ClickHouseOutcomeEventRepository(
+                _Client(),
+                user_batch_size=batch_size,
+            ),
+            unit_page_size=2,
+        ).build(project_id="project", reference_time=WINDOW_END)
+        _manifest, fingerprint = build_dataset_manifest(
+            result,
+            project_id="project",
+            reference_time=WINDOW_END,
+        )
+        fingerprints.append(fingerprint)
+
+    assert fingerprints[0] == fingerprints[1]
+
+
 def source_record(user_id: str, **overrides) -> UpliftUnitSourceRecord:
     spec, spec_hash = build_frozen_outcome_spec(
         goal_metric="booking_conversion_rate",
@@ -283,6 +419,8 @@ def source_record(user_id: str, **overrides) -> UpliftUnitSourceRecord:
         "generation_window_end": CUTOFF,
         "generation_source_revision_cutoff": CUTOFF,
         "audience_source_cutoff": CUTOFF,
+        "generation_vector_version": "hotel_behavior.v2",
+        "generation_manifest_hash": "a" * 64,
         "execution_manifest": {
             "schema_version": EXECUTION_SCHEMA_VERSION,
             "experiment_design": {

@@ -22,6 +22,10 @@ class UpliftTrainingExample:
     assigned_at: datetime | None = None
     outcome_window_start: datetime | None = None
     outcome_window_end: datetime | None = None
+    vector_version: str | None = None
+    feature_contract_hash: str | None = None
+    outcome_spec_hash: str | None = None
+    outcome_contract_hash: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -40,6 +44,10 @@ class UpliftTrainingExample:
             "assigned_at": _isoformat(self.assigned_at),
             "outcome_window_start": _isoformat(self.outcome_window_start),
             "outcome_window_end": _isoformat(self.outcome_window_end),
+            "vector_version": self.vector_version,
+            "feature_contract_hash": self.feature_contract_hash,
+            "outcome_spec_hash": self.outcome_spec_hash,
+            "outcome_contract_hash": self.outcome_contract_hash,
         }
 
 
