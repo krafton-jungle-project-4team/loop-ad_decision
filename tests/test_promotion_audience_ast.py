@@ -153,9 +153,7 @@ def test_beam_display_uses_only_compiled_execution_conditions() -> None:
 
     compiled = compile_promotion_audience_ast(ast)
 
-    assert compiled.display_model["title"] == (
-        "제주·오키나와 체크인 6·7·8월 숙소 검색·할인·특가 관심 고객"
-    )
+    assert compiled.display_model["title"] == "제주·오키나와 할인·특가 관심 고객"
     assert compiled.display_model["signal_chips"] == [
         "제주·오키나와 체크인 6·7·8월 숙소 검색",
         "할인·특가 관심",
@@ -164,12 +162,15 @@ def test_beam_display_uses_only_compiled_execution_conditions() -> None:
     assert "조기 예약" not in compiled.display_model["signal_chips"]
 
 
-def test_beam_display_collapses_booking_incomplete_execution_conditions() -> None:
+def test_beam_display_keeps_title_compact_with_four_execution_conditions() -> None:
     ast = build_promotion_audience_ast(
         promotion_id="promo_black_friday",
         candidate_type="funnel_recovery",
         strategy_key="beam_booking_start_without_complete_1",
-        matched_condition_keys=("booking_start_without_complete",),
+        matched_condition_keys=(
+            "booking_start_without_complete",
+            "hotel_detail_view",
+        ),
         destination_ids=("jeju", "okinawa"),
         season_months=(6, 7, 8),
         structured_conditions=(
@@ -200,6 +201,15 @@ def test_beam_display_collapses_booking_incomplete_execution_conditions() -> Non
                 "checkin_months": [],
                 "property_filters": [],
             },
+            {
+                "label": "호텔 상세 조회",
+                "event_name": "hotel_detail_view",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [],
+            },
         ),
         beam_policy_version="promotion-audience-beam.v2",
     )
@@ -209,7 +219,6 @@ def test_beam_display_collapses_booking_incomplete_execution_conditions() -> Non
     assert compiled.display_model["signal_chips"] == [
         "제주·오키나와 체크인 6·7·8월 숙소 검색",
         "예약 시작 후 미완료",
+        "호텔 상세 조회",
     ]
-    assert compiled.display_model["title"] == (
-        "제주·오키나와 체크인 6·7·8월 숙소 검색·예약 시작 후 미완료 고객"
-    )
+    assert compiled.display_model["title"] == "제주·오키나와 예약 이탈 고객"

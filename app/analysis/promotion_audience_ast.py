@@ -90,6 +90,21 @@ _BEHAVIOR_CHIPS: Mapping[str, str] = {
     "season_match": "체크인 시즌 일치",
 }
 
+_BEAM_TITLE_LABELS: Mapping[str, str] = {
+    "booking_start_without_complete": "예약 이탈",
+    "booking_start": "예약 시작",
+    "destination_repeat_search": "반복 탐색",
+    "hotel_detail_view": "상세 조회",
+    "discount_interest": "할인·특가 관심",
+    "price_compare": "가격 비교",
+    "free_cancellation_interest": "무료 취소 관심",
+    "breakfast_interest": "조식 관심",
+    "promotion_click": "프로모션 반응",
+    "campaign_landing": "캠페인 방문",
+}
+
+_BEAM_TITLE_PRIORITY = tuple(_BEAM_TITLE_LABELS)
+
 
 @dataclass(frozen=True, slots=True)
 class PromotionAudienceAst:
@@ -356,9 +371,7 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
     strategy_key = ast.strategy_key
     if ast.structured_conditions and ast.beam_policy_version:
         condition_labels = _structured_display_labels(ast)
-        title_conditions = condition_labels[:2]
-        condition_text = "·".join(title_conditions) or "행동 조건"
-        title = f"{condition_text} 고객"
+        title = _structured_title(ast, condition_labels)
         reason = (
             f"{', '.join(condition_labels)} 조건을 모두 만족한 고객입니다."
         )
@@ -470,6 +483,26 @@ def _structured_display_labels(ast: PromotionAudienceAst) -> tuple[str, ...]:
             continue
         labels.append(_execution_condition_label(condition))
     return tuple(dict.fromkeys(label for label in labels if label))
+
+
+def _structured_title(
+    ast: PromotionAudienceAst,
+    condition_labels: Sequence[str],
+) -> str:
+    behavior_label = next(
+        (
+            _BEAM_TITLE_LABELS[key]
+            for key in _BEAM_TITLE_PRIORITY
+            if key in ast.behavior_condition_keys
+        ),
+        None,
+    )
+    if behavior_label is None:
+        behavior_label = next(iter(condition_labels[1:]), "숙소 관심")
+    destination_prefix = (
+        f"{_destination_text(ast.destination_ids)} " if ast.destination_ids else ""
+    )
+    return f"{destination_prefix}{behavior_label} 고객"
 
 
 def _is_promotion_search_anchor(
