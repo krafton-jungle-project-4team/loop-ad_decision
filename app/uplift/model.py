@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Mapping, Sequence
 
 from app.uplift.contracts import UpliftTrainingExample
@@ -35,14 +36,36 @@ class TransformedOutcomeRidgeModel:
         return [self.predict_cate(example.features) for example in examples]
 
 
+class UpliftModelLifecycleStatus(StrEnum):
+    COLLECTING_DATA = "collecting_data"
+    CANDIDATE = "candidate"
+    VALIDATED = "validated"
+    ACTIVE = "active"
+    REJECTED = "rejected"
+    RETIRED = "retired"
+
+
 @dataclass(frozen=True, slots=True)
 class UpliftModelMetadata:
-    model_lifecycle_status: str
+    model_lifecycle_status: UpliftModelLifecycleStatus
     validation_scope: str
     dataset: str
     serving_eligible: bool
     model_version: str
     validation_policy_version: str | None = None
+
+    def __post_init__(self) -> None:
+        status = self.model_lifecycle_status
+        if not isinstance(status, UpliftModelLifecycleStatus):
+            try:
+                status = UpliftModelLifecycleStatus(str(status))
+            except ValueError as exc:
+                raise ValueError("unsupported uplift model lifecycle status") from exc
+            object.__setattr__(self, "model_lifecycle_status", status)
+        if status is UpliftModelLifecycleStatus.ACTIVE or self.serving_eligible:
+            raise ValueError(
+                "active uplift metadata requires the future persistent model registry"
+            )
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -132,13 +155,10 @@ def serving_cate_scores(
     metadata: UpliftModelMetadata,
     examples: Sequence[UpliftTrainingExample],
 ) -> list[float] | None:
-    if (
-        metadata.model_lifecycle_status != "ACTIVE"
-        or not metadata.serving_eligible
-        or metadata.validation_scope != "loopad_randomized_experiments"
-    ):
-        return None
-    return model.predict_many(examples)
+    # No persistent registry or approval provenance exists in this version.
+    # Metadata assembled in process must never activate uplift serving.
+    del model, metadata, examples
+    return None
 
 
 def signed_cate_summary(scores: Sequence[float]) -> Mapping[str, float]:

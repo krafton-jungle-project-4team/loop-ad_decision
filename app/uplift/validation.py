@@ -8,14 +8,17 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from app.uplift.contracts import UpliftTrainingExample
-from app.uplift.model import UpliftModelMetadata
+from app.uplift.model import (
+    UpliftModelLifecycleStatus,
+    UpliftModelMetadata,
+)
 
 
 VALIDATION_POLICY_PATH = Path(__file__).with_name("validation_policy.v1.json")
 
 
 @dataclass(frozen=True, slots=True)
-class CateConfidenceInterval:
+class PredictedCateClusterVariabilityInterval:
     lower: float | None
     upper: float | None
     method: str
@@ -34,13 +37,13 @@ def load_validation_policy() -> Mapping[str, Any]:
     return json.loads(VALIDATION_POLICY_PATH.read_text(encoding="utf-8"))
 
 
-def experiment_cluster_bootstrap_cate_ci(
+def predicted_cate_cluster_variability_interval(
     examples: Sequence[UpliftTrainingExample],
     cate_scores: Sequence[float],
     *,
     iterations: int = 1000,
     seed: int = 20260721,
-) -> CateConfidenceInterval:
+) -> PredictedCateClusterVariabilityInterval:
     if len(examples) != len(cate_scores):
         raise ValueError("examples and CATE scores must have the same length")
     if iterations < 1:
@@ -50,10 +53,10 @@ def experiment_cluster_bootstrap_cate_ci(
         by_experiment[example.ad_experiment_id].append(float(score))
     experiment_ids = sorted(by_experiment)
     if len(experiment_ids) < 2:
-        return CateConfidenceInterval(
+        return PredictedCateClusterVariabilityInterval(
             lower=None,
             upper=None,
-            method="experiment_cluster_bootstrap.v1",
+            method="predicted_cate_cluster_variability_interval.v1",
             reference_only=True,
         )
 
@@ -66,11 +69,11 @@ def experiment_cluster_bootstrap_cate_ci(
             sampled_scores.extend(by_experiment[sampled_experiment])
         estimates.append(sum(sampled_scores) / len(sampled_scores))
     estimates.sort()
-    return CateConfidenceInterval(
+    return PredictedCateClusterVariabilityInterval(
         lower=_percentile(estimates, 0.025),
         upper=_percentile(estimates, 0.975),
-        method="experiment_cluster_bootstrap.v1",
-        reference_only=False,
+        method="predicted_cate_cluster_variability_interval.v1",
+        reference_only=True,
     )
 
 
@@ -81,7 +84,7 @@ def collecting_data_metadata(
 ) -> UpliftModelMetadata:
     policy = load_validation_policy()
     return UpliftModelMetadata(
-        model_lifecycle_status="collecting_data",
+        model_lifecycle_status=UpliftModelLifecycleStatus.COLLECTING_DATA,
         validation_scope="loopad_randomized_experiments",
         dataset=dataset,
         serving_eligible=False,
@@ -96,7 +99,7 @@ def external_validation_metadata(
     dataset: str,
 ) -> UpliftModelMetadata:
     return UpliftModelMetadata(
-        model_lifecycle_status="candidate",
+        model_lifecycle_status=UpliftModelLifecycleStatus.CANDIDATE,
         validation_scope="external_pipeline_validation",
         dataset=dataset,
         serving_eligible=False,

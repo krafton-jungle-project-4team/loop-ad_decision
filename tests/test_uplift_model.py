@@ -1,4 +1,7 @@
+import pytest
+
 from app.uplift.model import (
+    UpliftModelLifecycleStatus,
     UpliftModelMetadata,
     serving_cate_scores,
     signed_cate_summary,
@@ -17,6 +20,9 @@ def test_synthetic_validation_recovers_negative_zero_positive_effect_order() -> 
     assert recovered["negative"] < recovered["zero"] < recovered["positive"]
     assert report["model_metadata"]["model_lifecycle_status"] == "collecting_data"
     assert report["model_metadata"]["serving_eligible"] is False
+    assert report["predicted_cate_cluster_variability_interval"][
+        "reference_only"
+    ] is True
 
 
 def test_signed_cate_summary_keeps_negative_effects() -> None:
@@ -45,6 +51,28 @@ def test_external_or_collecting_model_cannot_score_serving_candidates() -> None:
         metadata=metadata,
         examples=[],
     ) is None
+
+
+def test_in_process_metadata_cannot_activate_uplift_serving() -> None:
+    with pytest.raises(ValueError, match="persistent model registry"):
+        UpliftModelMetadata(
+            model_lifecycle_status=UpliftModelLifecycleStatus.ACTIVE,
+            validation_scope="loopad_randomized_experiments",
+            dataset="loopad_randomized_experiments",
+            serving_eligible=True,
+            model_version="test",
+        )
+
+
+def test_uplift_lifecycle_values_are_lowercase_and_complete() -> None:
+    assert {status.value for status in UpliftModelLifecycleStatus} == {
+        "collecting_data",
+        "candidate",
+        "validated",
+        "active",
+        "rejected",
+        "retired",
+    }
 
 
 def test_validation_policy_is_explicitly_provisional() -> None:

@@ -15,7 +15,7 @@ from app.uplift.model import (
 )
 from app.uplift.validation import (
     collecting_data_metadata,
-    experiment_cluster_bootstrap_cate_ci,
+    predicted_cate_cluster_variability_interval,
 )
 
 
@@ -42,7 +42,7 @@ def run_synthetic_validation(
         for label, values in sorted(by_effect.items())
     }
     metrics = evaluate_uplift_predictions(validation, scores)
-    ci = experiment_cluster_bootstrap_cate_ci(
+    variability_interval = predicted_cate_cluster_variability_interval(
         validation,
         scores,
         iterations=1000,
@@ -61,7 +61,9 @@ def run_synthetic_validation(
         "recovered_signed_cate": recovered,
         "signed_cate_summary": dict(signed_cate_summary(scores)),
         "metrics": metrics,
-        "cate_confidence_interval": ci.to_json(),
+        "predicted_cate_cluster_variability_interval": (
+            variability_interval.to_json()
+        ),
         "model_metadata": metadata.to_json(),
         "serving_activation_evidence": False,
     }
