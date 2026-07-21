@@ -71,6 +71,14 @@ class AudienceV2Preparation:
 
 
 @dataclass(frozen=True, slots=True)
+class AudienceV2MatchPreview:
+    vector_generation_id: str
+    vector_version: str
+    total_eligible_user_count: int
+    matching_user_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _CompiledAudience:
     segment: SegmentDefinitionRecord
     spec: CandidateBehaviorSpec
@@ -204,6 +212,59 @@ class AudienceV2Coordinator:
                 promotion=promotion,
                 item=item,
                 hard_match_count=hard_match_counts[item.segment.segment_id],
+            )
+            for item in compiled
+        }
+
+    def preview_many(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> Mapping[str, AudienceV2MatchPreview]:
+        """Count executable audience matches without writing vectors or snapshots."""
+        if not segments:
+            return {}
+        contexts: dict[str, AudienceSearchContext] = {}
+        compiled: list[_CompiledAudience] = []
+        for segment in segments:
+            audience_spec, spec = self._compile_segment(segment)
+            context = contexts.get(spec.vector_version)
+            if context is None:
+                context = self._active_context(
+                    project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
+                    segment_id=segment.segment_id,
+                    vector_version=spec.vector_version,
+                )
+                contexts[spec.vector_version] = context
+            self._validate_context(
+                segment_id=segment.segment_id,
+                spec=spec,
+                context=context,
+                observation_window_days=audience_spec.observation_window_days,
+            )
+            compiled.append(
+                _CompiledAudience(
+                    segment=segment,
+                    spec=spec,
+                    observation_window_days=audience_spec.observation_window_days,
+                    context=context,
+                    segment_vector_id="",
+                )
+            )
+
+        hard_match_counts = self._count_hard_matches_by_scope(
+            project_id=promotion.project_id,
+            compiled=compiled,
+        )
+        return {
+            item.segment.segment_id: AudienceV2MatchPreview(
+                vector_generation_id=item.context.vector_generation_id,
+                vector_version=item.spec.vector_version,
+                total_eligible_user_count=item.context.corpus_user_count,
+                matching_user_count=hard_match_counts[item.segment.segment_id],
             )
             for item in compiled
         }

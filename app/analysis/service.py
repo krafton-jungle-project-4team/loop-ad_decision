@@ -644,7 +644,21 @@ class PromotionAnalysisService:
             segment_definitions=segment_definitions,
             hotel_profiles=hotel_profiles,
         )
-        log.info("segment_candidates_prepared", {"candidateCount": len(candidates)})
+        empty_audience_candidate_count = 0
+        if refresh_segment_suggestions and next_loop_context is None:
+            candidates, empty_audience_candidate_count = (
+                self._exclude_empty_v2_recommendation_candidates(
+                    promotion=promotion,
+                    candidates=candidates,
+                )
+            )
+        log.info(
+            "segment_candidates_prepared",
+            {
+                "candidateCount": len(candidates),
+                "excludedEmptyAudienceCount": empty_audience_candidate_count,
+            },
+        )
         booking_model = self._train_booking_model()
         if booking_model is None:
             log.warn("booking_model_unavailable")
@@ -661,8 +675,14 @@ class PromotionAnalysisService:
             and request.segment_instruction
         ):
             selection_segment_ids = [
-                segment.segment_id for segment in suggested_segment_definitions
+                segment.segment_id
+                for segment in suggested_segment_definitions
+                if segment.segment_id in candidates
             ]
+            if not selection_segment_ids:
+                raise SegmentSelectionError(
+                    "no executable segment candidates matched segment instruction"
+                )
         elif (
             refresh_segment_suggestions
             and request.segment_instruction
@@ -828,6 +848,35 @@ class PromotionAnalysisService:
             and self._audience_v2_coordinator is not None
             else {}
         )
+        if prepared_v2:
+            log.info(
+                "segment_audience_snapshots_prepared",
+                {
+                    "audienceCount": len(prepared_v2),
+                    "audiences": [
+                        {
+                            "segmentId": segment_id,
+                            "candidateGenerationUserCount": (
+                                candidates[segment_id].estimated_size
+                            ),
+                            "totalEligibleUserCount": (
+                                preparation.total_eligible_user_count
+                            ),
+                            "matchingUserCount": preparation.matching_user_count,
+                            "selectedUserCount": preparation.selected_user_count,
+                            "audienceSnapshotId": (
+                                preparation.audience_snapshot_id
+                            ),
+                            "vectorGenerationId": (
+                                preparation.vector_generation_id
+                            ),
+                        }
+                        for segment_id, preparation in sorted(
+                            prepared_v2.items()
+                        )
+                    ],
+                },
+            )
         allocation_source_analysis_id = confirmation_source_analysis_id or analysis_id
         if (
             v2_custom_confirmation_segments
@@ -1247,6 +1296,91 @@ class PromotionAnalysisService:
                 profile=profile,
             )
         return candidates
+
+    def _exclude_empty_v2_recommendation_candidates(
+        self,
+        *,
+        promotion: PromotionRecord,
+        candidates: Mapping[str, SegmentCandidate],
+    ) -> tuple[dict[str, SegmentCandidate], int]:
+        if self._audience_v2_coordinator is None:
+            return dict(candidates), 0
+
+        v2_candidates: list[SegmentCandidate] = []
+        for candidate in candidates.values():
+            if candidate.definition.source != "ai_suggested":
+                continue
+            resolution = self._audience_adapter.resolve(
+                segment_id=candidate.segment_id,
+                rule_json=candidate.definition.rule_json,
+            )
+            if resolution.is_v2:
+                v2_candidates.append(candidate)
+        if not v2_candidates:
+            return dict(candidates), 0
+
+        previews = self._audience_v2_coordinator.preview_many(
+            promotion=promotion,
+            segments=[candidate.definition for candidate in v2_candidates],
+        )
+        empty_segment_ids = {
+            segment_id
+            for segment_id, preview in previews.items()
+            if preview.matching_user_count <= 0
+        }
+        for candidate in v2_candidates:
+            preview = previews[candidate.segment_id]
+            if candidate.segment_id in empty_segment_ids:
+                log.warn(
+                    "segment_audience_candidate_empty",
+                    {
+                        "segmentId": candidate.segment_id,
+                        "phase": "hard_predicate_preflight",
+                        "candidateGenerationUserCount": candidate.estimated_size,
+                        "totalEligibleUserCount": (
+                            preview.total_eligible_user_count
+                        ),
+                        "matchingUserCount": preview.matching_user_count,
+                        "vectorGenerationId": preview.vector_generation_id,
+                    },
+                )
+        log.info(
+            "segment_audience_preflight_completed",
+            {
+                "candidateCount": len(v2_candidates),
+                "targetableCandidateCount": (
+                    len(v2_candidates) - len(empty_segment_ids)
+                ),
+                "emptyCandidateCount": len(empty_segment_ids),
+                "audiences": [
+                    {
+                        "segmentId": candidate.segment_id,
+                        "candidateGenerationUserCount": candidate.estimated_size,
+                        "totalEligibleUserCount": (
+                            previews[candidate.segment_id].total_eligible_user_count
+                        ),
+                        "matchingUserCount": (
+                            previews[candidate.segment_id].matching_user_count
+                        ),
+                        "vectorGenerationId": (
+                            previews[candidate.segment_id].vector_generation_id
+                        ),
+                    }
+                    for candidate in sorted(
+                        v2_candidates,
+                        key=lambda value: value.segment_id,
+                    )
+                ],
+            },
+        )
+        return (
+            {
+                segment_id: candidate
+                for segment_id, candidate in candidates.items()
+                if segment_id not in empty_segment_ids
+            },
+            len(empty_segment_ids),
+        )
 
     def _summarize_ai_segment_profile(
         self,

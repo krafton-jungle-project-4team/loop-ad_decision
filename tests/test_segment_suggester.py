@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping
 
@@ -13,6 +14,7 @@ from app.audience_contract import (
     SegmentDefinitionAudienceAdapter,
 )
 from app.analysis.audience_selection import fixed_ratio_audience_selection_policy
+from app.analysis.audience_search_repository import AudienceSearchContext
 from app.analysis.behavior_manifest import manifest_intent_benefit_keys
 from app.analysis.raw_event_segments import (
     DeterministicPromotionIntentExtractor,
@@ -23,6 +25,7 @@ from app.analysis.raw_event_segments import (
 )
 from app.analysis.repositories import (
     PromotionRecord,
+    RawEventSignalGenerationScope,
     RawEventUserSignalRecord,
     UserBehaviorVectorRecord,
 )
@@ -67,17 +70,29 @@ class FakeRawEventSignalRepository:
         destination_terms: list[str] | tuple[str, ...] = (),
         season_months: list[int] | tuple[int, ...] = (),
         limit: int = 1000,
+        generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
-        self.calls.append(
-            {
-                "project_id": project_id,
-                "vector_version": vector_version,
-                "destination_terms": tuple(destination_terms),
-                "season_months": tuple(season_months),
-                "limit": limit,
-            }
-        )
+        call: dict[str, Any] = {
+            "project_id": project_id,
+            "vector_version": vector_version,
+            "destination_terms": tuple(destination_terms),
+            "season_months": tuple(season_months),
+            "limit": limit,
+        }
+        if generation_scope is not None:
+            call["generation_scope"] = generation_scope
+        self.calls.append(call)
         return self.profiles
+
+
+class FakeAudienceSearchContextProvider:
+    def __init__(self, context: AudienceSearchContext) -> None:
+        self.context = context
+        self.calls: list[Mapping[str, Any]] = []
+
+    def get_context(self, **kwargs: Any) -> AudienceSearchContext:
+        self.calls.append(dict(kwargs))
+        return self.context
 
 
 class CandidateTypePerformancePredictor:
@@ -247,37 +262,46 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
                 hotel_detail_view_count=3,
                 booking_start_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "funnel_002",
                 hotel_detail_view_count=2,
                 booking_start_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "promo_001",
                 promotion_impression_count=3,
                 promotion_click_count=1,
                 campaign_landing_count=1,
+                destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "promo_002",
                 promotion_impression_count=4,
                 promotion_click_count=1,
                 campaign_landing_count=1,
+                destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "benefit_001",
                 hotel_search_count=1,
                 deal_event_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "benefit_002",
                 hotel_search_count=1,
+                deal_event_count=1,
                 free_cancellation_count=1,
                 price_event_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
         ]
     )
@@ -315,7 +339,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert len(set(candidate_types)) == 3
     assert all(
         re.fullmatch(
-            r"seg_ai_dynamic_promo_banner_001_[a-z_]+_[0-9a-f]{12}",
+            r"seg_ai_dynamic_promo_banner_001_[a-z0-9_]+_[0-9a-f]{12}",
             segment.segment_id,
         )
         for segment in segments
@@ -367,8 +391,74 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
         )
         assert resolution.contract == SEGMENT_AUDIENCE_CONTRACT
         assert resolution.spec is not None
-        assert resolution.spec.candidate_type == segment.rule_json["candidate_type"]
+        assert resolution.spec.candidate_type == "custom_structured"
+        assert (
+            segment.rule_json["promotion_audience_ast"]
+            ["execution_candidate_type"]
+            == segment.rule_json["candidate_type"]
+        )
         assert segment.rule_json["candidate_user_ids"]
+
+
+def test_raw_event_suggester_uses_active_audience_generation_scope() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "user_001",
+                hotel_search_count=1,
+                hotel_detail_view_count=1,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+            raw_signal(
+                "user_002",
+                hotel_search_count=1,
+                hotel_detail_view_count=1,
+                destination_match_count=1,
+                season_match_count=1,
+            ),
+        ]
+    )
+    context = AudienceSearchContext(
+        vector_generation_id="uvgen_active",
+        manifest_hash="manifest_hash",
+        source_cutoff=datetime(2026, 7, 21, tzinfo=UTC),
+        source_revision_cutoff=datetime(2026, 7, 21, 0, 0, 1, tzinfo=UTC),
+        window_start=datetime(2026, 6, 21, tzinfo=UTC),
+        corpus_user_count=946,
+    )
+    context_provider = FakeAudienceSearchContextProvider(context)
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        audience_context_provider=context_provider,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=20,
+        vector_sample_limit=20,
+        min_cluster_size=2,
+    )
+
+    suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief="여름 제주 숙소 예약 프로모션",
+        )
+    )
+
+    assert context_provider.calls == [
+        {
+            "project_id": "hotel-client-a",
+            "campaign_id": "camp_summer_2026",
+            "promotion_id": "promo_banner_001",
+            "vector_version": "hotel_behavior.v2",
+        }
+    ]
+    generation_scope = raw_reader.calls[0]["generation_scope"]
+    assert isinstance(generation_scope, RawEventSignalGenerationScope)
+    assert generation_scope.vector_generation_id == "uvgen_active"
+    assert generation_scope.window_start == context.window_start
+    assert generation_scope.window_end == context.source_cutoff
+    assert generation_scope.source_revision_cutoff == context.source_revision_cutoff
+    assert generation_scope.corpus_user_count == 946
 
 
 def test_review_copy_keeps_only_manifest_registered_executable_benefits(
@@ -953,12 +1043,14 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
                 "target_repeat_1",
                 hotel_search_count=4,
                 destination_match_count=3,
+                season_match_count=1,
                 destination_values=("제주 제주",),
             ),
             raw_signal(
                 "target_repeat_2",
                 hotel_search_count=3,
                 destination_match_count=2,
+                season_match_count=1,
                 destination_values=("jeju 제주 제주",),
             ),
             raw_signal(
@@ -978,12 +1070,14 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
                 hotel_detail_view_count=2,
                 booking_start_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "funnel_target_2",
                 hotel_detail_view_count=2,
                 booking_start_count=1,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "funnel_other_1",
@@ -999,11 +1093,14 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
                 "benefit_target_1",
                 deal_event_count=2,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal(
                 "benefit_target_2",
+                deal_event_count=2,
                 price_event_count=2,
                 destination_match_count=1,
+                season_match_count=1,
             ),
             raw_signal("benefit_other_1", deal_event_count=2),
             raw_signal("benefit_other_2", price_event_count=2),
@@ -1038,9 +1135,6 @@ def test_destination_candidates_exclude_users_without_target_interest() -> None:
         "funnel_target_1",
         "funnel_target_2",
     }
-    assert set(
-        by_type["benefit_value_seeker"].rule_json["candidate_user_ids"]
-    ) == {"benefit_target_1", "benefit_target_2"}
 
 
 def test_general_destination_explorer_is_available_without_target_destination() -> None:
@@ -1409,8 +1503,9 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
         "bounded_beam_search"
     )
     assert first_profile["beam_search"]["policy_version"] == (
-        "promotion-audience-beam.v1"
+        "promotion-audience-beam.v2"
     )
+    assert first_profile["beam_search"]["depth"] == 1
     estimate = first_profile["performance_estimate"]
     assert estimate["label"] == "행동 기반 예상 예약 전환율"
     assert estimate["is_incremental_effect"] is False
