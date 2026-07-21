@@ -649,6 +649,32 @@ def test_coordinator_batches_three_segments_once() -> None:
     assert len(snapshots.writes) == 3
 
 
+def test_coordinator_previews_hard_matches_without_writing_audience_state() -> None:
+    search = _BatchCoordinatorSearchRepository(hard_match_count=7)
+    snapshots = _BatchSnapshotWriter()
+    vectors = _BatchSegmentVectorPreparer()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=vectors,
+        calibration_provider=_TestCalibrationProvider(),
+    )
+
+    previews = coordinator.preview_many(
+        promotion=_analysis_promotion(),
+        segments=tuple(_v2_segment(f"segment_{index}") for index in range(3)),
+    )
+
+    assert set(previews) == {"segment_0", "segment_1", "segment_2"}
+    assert {preview.matching_user_count for preview in previews.values()} == {7}
+    assert {preview.total_eligible_user_count for preview in previews.values()} == {
+        100
+    }
+    assert search.batch_call_count == 1
+    assert snapshots.writes == []
+    assert vectors.requests == []
+
+
 def test_coordinator_uses_final_members_as_behavior_match_lower_bound() -> None:
     search = _BatchCoordinatorSearchRepository(
         hard_match_count=0,
@@ -1887,7 +1913,11 @@ class _SemanticCorpusSearchRepository:
 
 
 class _BatchSegmentVectorPreparer:
+    def __init__(self) -> None:
+        self.requests = []
+
     def prepare_segment_vector(self, request) -> SegmentVectorBuildResult:
+        self.requests.append(request)
         return SegmentVectorBuildResult(
             segment_id=request.segment_id,
             segment_vector_id=f"vector_{request.segment_id}",

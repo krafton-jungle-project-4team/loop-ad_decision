@@ -7,6 +7,7 @@ from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.audience_allocation import (
     ConfirmationAllocationResult,
@@ -35,7 +36,7 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
     SegmentSuggestionAudienceBindingRecord,
 )
-from app.analysis.audience_v2 import AudienceV2Preparation
+from app.analysis.audience_v2 import AudienceV2MatchPreview, AudienceV2Preparation
 from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
 from app.analysis.segment_audience_templates import (
     RegisteredSegmentAudienceBinder,
@@ -245,6 +246,7 @@ class FakePreparingAudienceV2Coordinator:
         self.selected_user_count = selected_user_count
         self.meets_min_sample_size = meets_min_sample_size
         self.counts_by_segment = counts_by_segment or {}
+        self.preview_many_calls: list[dict[str, object]] = []
         self.prepare_many_calls: list[dict[str, object]] = []
 
     def prepare(self, **kwargs: object) -> AudienceV2Preparation:
@@ -301,6 +303,29 @@ class FakePreparingAudienceV2Coordinator:
                 meets_min_sample_size=meets_minimum,
             )
         return preparations
+
+    def preview_many(self, **kwargs: object):
+        self.preview_many_calls.append(dict(kwargs))
+        previews: dict[str, AudienceV2MatchPreview] = {}
+        for segment in kwargs["segments"]:
+            eligible, matching, _selected, _meets_minimum = (
+                self.counts_by_segment.get(
+                    segment.segment_id,
+                    (
+                        self.total_eligible_user_count,
+                        self.matching_user_count,
+                        self.selected_user_count,
+                        self.meets_min_sample_size,
+                    ),
+                )
+            )
+            previews[segment.segment_id] = AudienceV2MatchPreview(
+                vector_generation_id="generation_active",
+                vector_version="hotel_behavior.v2",
+                total_eligible_user_count=eligible,
+                matching_user_count=matching,
+            )
+        return previews
 
 
 class FakeAudienceAllocationService:
@@ -950,12 +975,14 @@ def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
         audience_v2_coordinator=coordinator,
     )
 
-    result = service.recommend_segments(
-        analysis_request(promotion_id=promotion.promotion_id)
-    )
+    with capture_logs() as logs:
+        result = service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
 
     assert len(coordinator.prepare_many_calls) == 1
-    assert len(result.segment_suggestions) == 3
+    assert len(coordinator.preview_many_calls) == 1
+    assert len(result.segment_suggestions) == 2
     for suggestion in result.segment_suggestions:
         eligible, matching, selected, _meets_minimum = expected[
             suggestion.segment_id
@@ -975,12 +1002,36 @@ def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
     assert targets["seg_ai_second"].data_evidence_json["audience_status"] == (
         "insufficient_sample"
     )
-    assert targets["seg_ai_third"].data_evidence_json["audience_status"] == (
-        "no_eligible_audience"
+    assert "seg_ai_third" not in targets
+    preflight = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_preflight_completed"
     )
+    assert preflight["candidateCount"] == 3
+    assert preflight["targetableCandidateCount"] == 2
+    assert preflight["emptyCandidateCount"] == 1
+    excluded = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_candidate_empty"
+    )
+    assert excluded["segmentId"] == "seg_ai_third"
+    assert excluded["candidateGenerationUserCount"] == 40
+    assert excluded["matchingUserCount"] == 0
+    prepared = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_snapshots_prepared"
+    )
+    assert prepared["audienceCount"] == 2
+    assert {audience["segmentId"] for audience in prepared["audiences"]} == {
+        "seg_ai_first",
+        "seg_ai_second",
+    }
 
 
-def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> None:
+def test_v2_recommendation_rejects_when_all_executable_audiences_are_empty() -> None:
     promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
     segment = _v2_ai_segment(
         promotion=promotion,
@@ -992,30 +1043,26 @@ def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> N
             "selected_user_count": 40,
         },
     )
-    coordinator = FakePreparingAudienceV2Coordinator(selected_user_count=0)
-    service, _, _ = build_service(
+    coordinator = FakePreparingAudienceV2Coordinator(
+        matching_user_count=0,
+        selected_user_count=0,
+    )
+    service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=[],
         segment_suggester=FakeSegmentSuggester([segment]),
         audience_v2_coordinator=coordinator,
     )
 
-    result = service.recommend_segments(
-        analysis_request(promotion_id=promotion.promotion_id)
-    )
+    with pytest.raises(SegmentSelectionError, match="no active segment candidates"):
+        service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
 
-    target = result.target_segments[0]
-    assert target.estimated_size == 0
-    assert target.data_evidence_json["sample_size"] == 0
-    assert target.data_evidence_json["sample_ratio"] == 0.0
-    assert target.data_evidence_json["targetable"] is False
-    assert target.data_evidence_json["audience_status"] == "no_eligible_audience"
-    audience = result.segment_suggestions[0].metadata_json["display_copy"][
-        "audience"
-    ]
-    assert audience["selected_user_count"] == 0
-    assert audience["selected_user_ratio"] == 0.0
-    assert audience["selection_ratio_within_matching"] == 0.0
+    assert len(coordinator.preview_many_calls) == 1
+    assert coordinator.prepare_many_calls == []
+    assert analysis_repository.saved.analysis is None
+    assert analysis_repository.saved.segment_suggestions is None
 
 
 def test_legacy_recommendation_preserves_existing_card_audience() -> None:
