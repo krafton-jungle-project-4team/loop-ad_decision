@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
 from psycopg.types.json import Jsonb
 
+from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.repositories import (
     HotelProfileRepository,
     PromotionAnalysisRepository,
     PromotionAnalysisWrite,
     PromotionRepository,
+    RawEventSignalGenerationScope,
     PromotionSegmentSuggestionWrite,
     SegmentDefinitionRecord,
     SegmentDefinitionRepository,
@@ -672,6 +675,53 @@ def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
         "season_months": [],
         "limit": 250,
     }
+
+
+def test_raw_event_signals_use_active_v2_generation_scope() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+    scope = RawEventSignalGenerationScope(
+        vector_generation_id="uvgen_active",
+        vector_version="hotel_behavior.v2",
+        window_start=datetime(2026, 6, 21, tzinfo=UTC),
+        window_end=datetime(2026, 7, 21, tzinfo=UTC),
+        source_revision_cutoff=datetime(2026, 7, 21, 0, 0, 1, tzinfo=UTC),
+        corpus_user_count=946,
+        exclusion_context=PromotionAudienceExclusionContext(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_black_friday",
+            revision=3,
+            excluded_user_count=7,
+            projection_revision=3,
+        ),
+    )
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        vector_version="v1",
+        limit=1000,
+        generation_scope=scope,
+    )
+
+    assert records == []
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_behavior_vector_revisions" in sql
+    assert "received_at <= parsedatetime64besteffort" in sql
+    assert "ingested_at <= parsedatetime64besteffort" in sql
+    assert "left anti join" in sql
+    assert "promotion_audience_exclusion_active" in sql
+    assert "argmax(window_start, updated_at)" not in sql
+    assert call.params["vector_version"] == "hotel_behavior.v2"
+    assert call.params["window_start"] == scope.window_start.isoformat()
+    assert call.params["window_end"] == scope.window_end.isoformat()
+    assert (
+        call.params["source_revision_cutoff"]
+        == scope.source_revision_cutoff.isoformat()
+    )
+    assert call.params["exclusion_promotion_id"] == "promo_black_friday"
+    assert call.params["exclusion_revision"] == 3
 
 
 def test_raw_event_signals_count_matching_destination_events_before_deduplication() -> None:

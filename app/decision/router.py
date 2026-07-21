@@ -329,15 +329,17 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_vector_repository=analysis_segment_vector_repository,
             user_behavior_vector_repository=analysis_user_behavior_vector_repository,
         )
+        analysis_exclusion_repository = PromotionAudienceExclusionRepository(
+            postgres=analysis_executor,
+            clickhouse=clickhouse_client,
+        )
+        audience_search_repository = PgClickHouseAudienceVectorSearchRepository(
+            postgres=analysis_executor,
+            clickhouse=clickhouse_client,
+            exclusion_repository=analysis_exclusion_repository,
+        )
         audience_v2_coordinator = AudienceV2Coordinator(
-            search_repository=PgClickHouseAudienceVectorSearchRepository(
-                postgres=analysis_executor,
-                clickhouse=clickhouse_client,
-                exclusion_repository=PromotionAudienceExclusionRepository(
-                    postgres=analysis_executor,
-                    clickhouse=clickhouse_client,
-                ),
-            ),
+            search_repository=audience_search_repository,
             snapshot_repository=AnalysisAudienceSnapshotRepository(
                 analysis_executor
             ),
@@ -356,6 +358,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=analysis_user_behavior_vector_repository,
                 raw_event_signal_repository=analysis_user_behavior_vector_repository,
+                audience_context_provider=audience_search_repository,
                 promotion_intent_extractor=build_promotion_intent_extractor(settings),
                 vector_version=DEFAULT_VECTOR_VERSION,
             ),
@@ -364,10 +367,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             audience_allocation_service=AudienceAllocationService(
                 PostgresAudienceAllocationRepository(
                     postgres=analysis_executor,
-                    exclusion_reader=PromotionAudienceExclusionRepository(
-                        postgres=analysis_executor,
-                        clickhouse=clickhouse_client,
-                    ),
+                    exclusion_reader=analysis_exclusion_repository,
                 )
             ),
         )

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 import math
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
+
+from app.audience_exclusions import (
+    CLICKHOUSE_EXCLUSION_RELATION,
+    PromotionAudienceExclusionContext,
+)
 
 
 class PostgresExecutor(Protocol):
@@ -250,6 +256,17 @@ class RawEventUserSignalRecord:
     free_cancellation_search_count: int | None = None
     breakfast_search_count: int | None = None
     price_search_count: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RawEventSignalGenerationScope:
+    vector_generation_id: str
+    vector_version: str
+    window_start: datetime
+    window_end: datetime
+    source_revision_cutoff: datetime
+    corpus_user_count: int
+    exclusion_context: PromotionAudienceExclusionContext | None = None
 
 
 @dataclass(frozen=True)
@@ -886,6 +903,7 @@ class UserBehaviorVectorRepository:
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
         limit: int = 1000,
+        generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
         # clickhouse-connect serializes Array(String) parameters from lists.
         # Tuples are rendered as SQL tuples and fail at runtime for this placeholder.
@@ -901,25 +919,105 @@ class UserBehaviorVectorRepository:
                 if 1 <= int(month) <= 12
             }
         )
-        result = self._client.query(
+        effective_vector_version = (
+            generation_scope.vector_version
+            if generation_scope is not None
+            else vector_version
+        )
+        if generation_scope is None:
+            vector_window_cte = """
+                WITH
+                    (
+                        SELECT argMax(window_start, updated_at)
+                        FROM user_behavior_vectors
+                        WHERE project_id = {project_id:String}
+                          AND vector_dim = {vector_dim:UInt16}
+                          AND vector_version = {vector_version:String}
+                          AND source = {vector_source:String}
+                    ) AS vector_window_start,
+                    (
+                        SELECT argMax(window_end, updated_at)
+                        FROM user_behavior_vectors
+                        WHERE project_id = {project_id:String}
+                          AND vector_dim = {vector_dim:UInt16}
+                          AND vector_version = {vector_version:String}
+                          AND source = {vector_source:String}
+                    ) AS vector_window_end
             """
-            WITH
-                (
-                    SELECT argMax(window_start, updated_at)
-                    FROM user_behavior_vectors
-                    WHERE project_id = {project_id:String}
-                      AND vector_dim = {vector_dim:UInt16}
-                      AND vector_version = {vector_version:String}
-                      AND source = {vector_source:String}
-                ) AS vector_window_start,
-                (
-                    SELECT argMax(window_end, updated_at)
-                    FROM user_behavior_vectors
-                    WHERE project_id = {project_id:String}
-                      AND vector_dim = {vector_dim:UInt16}
-                      AND vector_version = {vector_version:String}
-                      AND source = {vector_source:String}
-                ) AS vector_window_end
+            vector_population_query = """
+                SELECT user_id
+                FROM user_behavior_vectors
+                WHERE project_id = {project_id:String}
+                  AND vector_dim = {vector_dim:UInt16}
+                  AND vector_version = {vector_version:String}
+                  AND source = {vector_source:String}
+                  AND window_start = vector_window_start
+                  AND window_end = vector_window_end
+                GROUP BY user_id
+            """
+            received_at_cutoff = ""
+            exclusion_join = ""
+            scope_parameters: dict[str, Any] = {}
+        else:
+            vector_window_cte = """
+                WITH
+                    toDateTime64(
+                        parseDateTimeBestEffort({window_start:String}), 3, 'UTC'
+                    ) AS vector_window_start,
+                    toDateTime64(
+                        parseDateTimeBestEffort({window_end:String}), 3, 'UTC'
+                    ) AS vector_window_end
+            """
+            vector_population_query = """
+                SELECT user_id
+                FROM user_behavior_vector_revisions
+                WHERE project_id = {project_id:String}
+                  AND vector_version = {vector_version:String}
+                  AND window_start = vector_window_start
+                  AND window_end = vector_window_end
+                  AND ingested_at <= parseDateTime64BestEffort(
+                      {source_revision_cutoff:String}, 6, 'UTC'
+                  )
+                GROUP BY user_id
+            """
+            received_at_cutoff = """
+              AND received_at <= parseDateTime64BestEffort(
+                  {source_revision_cutoff:String}, 6, 'UTC'
+              )
+            """
+            exclusion_context = generation_scope.exclusion_context
+            exclusion_join = (
+                f"""
+                LEFT ANTI JOIN (
+                    SELECT user_id
+                    FROM {CLICKHOUSE_EXCLUSION_RELATION}
+                    WHERE project_id = {{project_id:String}}
+                      AND promotion_id = {{exclusion_promotion_id:String}}
+                      AND exclusion_revision <= {{exclusion_revision:UInt64}}
+                    GROUP BY user_id
+                    HAVING argMax(state, exclusion_revision)
+                        IN ('reserved', 'consumed')
+                ) AS promotion_excluded USING (user_id)
+                """
+                if exclusion_context is not None
+                else ""
+            )
+            scope_parameters = {
+                "window_start": generation_scope.window_start.isoformat(),
+                "window_end": generation_scope.window_end.isoformat(),
+                "source_revision_cutoff": (
+                    generation_scope.source_revision_cutoff.isoformat()
+                ),
+            }
+            if exclusion_context is not None:
+                scope_parameters.update(
+                    {
+                        "exclusion_promotion_id": exclusion_context.promotion_id,
+                        "exclusion_revision": exclusion_context.revision,
+                    }
+                )
+        query = """
+            __VECTOR_WINDOW_CTE__
             SELECT
                 project_id,
                 user_id,
@@ -1055,34 +1153,37 @@ class UserBehaviorVectorRepository:
                     ) IS NOT NULL
                 ) AS price_search_count
             FROM raw_events
+            __EXCLUSION_JOIN__
             WHERE project_id = {project_id:String}
               AND validation_status = 'valid'
               AND notEmpty(user_id)
+              __RECEIVED_AT_CUTOFF__
               AND event_time >= vector_window_start
               AND event_time < vector_window_end
               AND user_id IN (
-                  SELECT user_id
-                  FROM user_behavior_vectors
-                  WHERE project_id = {project_id:String}
-                    AND vector_dim = {vector_dim:UInt16}
-                    AND vector_version = {vector_version:String}
-                    AND source = {vector_source:String}
-                    AND window_start = vector_window_start
-                    AND window_end = vector_window_end
-                  GROUP BY user_id
+                  __VECTOR_POPULATION_QUERY__
               )
             GROUP BY project_id, user_id
             ORDER BY max(event_time) DESC, user_id ASC
             LIMIT {limit:UInt32}
-            """,
+        """
+        query = (
+            query.replace("__VECTOR_WINDOW_CTE__", vector_window_cte)
+            .replace("__EXCLUSION_JOIN__", exclusion_join)
+            .replace("__RECEIVED_AT_CUTOFF__", received_at_cutoff)
+            .replace("__VECTOR_POPULATION_QUERY__", vector_population_query)
+        )
+        result = self._client.query(
+            query,
             parameters={
                 "project_id": project_id,
                 "vector_dim": self.VECTOR_DIM,
-                "vector_version": vector_version,
+                "vector_version": effective_vector_version,
                 "vector_source": self.RAW_EVENTS_SOURCE,
                 "destination_terms": cleaned_destination_terms,
                 "season_months": cleaned_season_months,
                 "limit": limit,
+                **scope_parameters,
             },
         )
         season_month_set = set(cleaned_season_months)
