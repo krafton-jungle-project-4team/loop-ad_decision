@@ -24,6 +24,7 @@ from app.generation.worker import GenerationJobProcessor
 from app.internal.router import router as internal_batch_router
 from app.logging import configure_logging, request_logging_middleware
 from app.promotion_offers.router import router as promotion_offer_router
+from app.uplift.router import router as uplift_router
 
 
 MANUAL_NEXT_LOOP_ENABLED_ENVS = frozenset({"dev", "local"})
@@ -93,6 +94,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     app.include_router(promotion_run_router)
     app.include_router(ad_experiment_router)
     app.include_router(internal_batch_router)
+    app.include_router(uplift_router)
     app.include_router(promotion_offer_router)
     return app
 
