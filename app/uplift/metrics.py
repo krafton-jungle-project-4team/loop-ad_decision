@@ -77,4 +77,3 @@ def _fraction_label(fraction: float) -> str:
     if not 0 < fraction <= 1:
         raise ValueError("top fraction must be between zero and one")
     return f"top_{int(round(fraction * 100))}_percent"
-

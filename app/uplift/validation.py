@@ -110,4 +110,3 @@ def _percentile(values: Sequence[float], quantile: float) -> float:
     upper_index = min(lower_index + 1, len(values) - 1)
     fraction = position - lower_index
     return values[lower_index] * (1 - fraction) + values[upper_index] * fraction
-

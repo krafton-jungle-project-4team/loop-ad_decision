@@ -59,4 +59,3 @@ class UpliftDatasetBuildResult:
 
 def _isoformat(value: datetime | None) -> str | None:
     return value.isoformat() if value is not None else None
-

@@ -192,4 +192,3 @@ def _solve_linear_system(
                 )
             ]
     return [augmented[row][-1] for row in range(size)]
-
