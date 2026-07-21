@@ -5,6 +5,7 @@ import json
 from typing import Any, Mapping, Sequence
 
 from app.audience_contract import SegmentDefinitionAudienceAdapter
+from app.analysis.segment_audience_templates import canonical_destination_ids
 
 
 BOOKING_CONVERSION_RATE = "booking_conversion_rate"
@@ -69,6 +70,15 @@ def _target_destination_ids(
         )
         if resolution.spec is not None:
             destination_ids.update(resolution.spec.destination_ids)
+            custom_destinations = [
+                condition.get("destination")
+                for condition in resolution.spec.custom_conditions
+                if isinstance(condition.get("destination"), str)
+                and condition.get("destination")
+            ]
+            destination_ids.update(
+                canonical_destination_ids(custom_destinations)
+            )
     return tuple(sorted(destination_ids))
 
 

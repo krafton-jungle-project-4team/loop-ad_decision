@@ -366,6 +366,7 @@ class UserSegmentAssignmentWrite:
     assignment_source: str
     assigned_at: datetime
     expires_at: datetime | None
+    segment_assignment_execution_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -547,6 +548,12 @@ class PromotionRunWriter(Protocol):
         ...
 
     def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
+        ...
+
+    def get_by_id_for_update(
+        self,
+        promotion_run_id: str,
+    ) -> PromotionRunRecord | None:
         ...
 
     def get_by_scope(
@@ -1286,6 +1293,34 @@ class PromotionRunRepository:
             return None
         return PromotionRunRecord(**row)
 
+    def get_by_id_for_update(
+        self,
+        promotion_run_id: str,
+    ) -> PromotionRunRecord | None:
+        row = self._db.fetchone(
+            """
+            SELECT
+                promotion_run_id,
+                project_id,
+                campaign_id,
+                promotion_id,
+                analysis_id,
+                generation_id,
+                loop_count,
+                status,
+                goal_snapshot_json,
+                segment_scope_json,
+                segment_scope_fingerprint
+            FROM promotion_runs
+            WHERE promotion_run_id = %s
+            FOR UPDATE
+            """,
+            (promotion_run_id,),
+        )
+        if row is None:
+            return None
+        return PromotionRunRecord(**row)
+
     def get_by_scope(
         self,
         *,
@@ -1814,6 +1849,7 @@ class UserSegmentAssignmentRepository:
                         assignment_source,
                         assigned_at,
                         expires_at,
+                        segment_assignment_execution_id,
                         row_ordinal
                     FROM unnest(
                         %s::text[],
@@ -1828,7 +1864,8 @@ class UserSegmentAssignmentRepository:
                         %s::text[],
                         %s::text[],
                         %s::timestamptz[],
-                        %s::timestamptz[]
+                        %s::timestamptz[],
+                        %s::text[]
                     ) WITH ORDINALITY AS assignment_input(
                         project_id,
                         promotion_run_id,
@@ -1843,6 +1880,7 @@ class UserSegmentAssignmentRepository:
                         assignment_source,
                         assigned_at,
                         expires_at,
+                        segment_assignment_execution_id,
                         row_ordinal
                     )
                 )
@@ -1859,7 +1897,8 @@ class UserSegmentAssignmentRepository:
                     fallback_reason,
                     assignment_source,
                     assigned_at,
-                    expires_at
+                    expires_at,
+                    segment_assignment_execution_id
                 )
                 SELECT
                     project_id,
@@ -1874,7 +1913,8 @@ class UserSegmentAssignmentRepository:
                     fallback_reason,
                     assignment_source,
                     assigned_at,
-                    expires_at
+                    expires_at,
+                    segment_assignment_execution_id
                 FROM assignment_rows
                 ORDER BY row_ordinal ASC
                 ON CONFLICT (promotion_run_id, user_id) DO NOTHING
@@ -1899,6 +1939,10 @@ class UserSegmentAssignmentRepository:
                     [assignment.assignment_source for assignment in chunk],
                     [assignment.assigned_at for assignment in chunk],
                     [assignment.expires_at for assignment in chunk],
+                    [
+                        assignment.segment_assignment_execution_id
+                        for assignment in chunk
+                    ],
                 ),
             )
             inserted_records.extend(

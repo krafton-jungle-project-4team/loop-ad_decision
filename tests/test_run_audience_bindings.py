@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from decimal import Decimal
+from datetime import UTC, datetime
 
 import pytest
 
@@ -71,6 +72,12 @@ def _complete_binding_row():
         "plan_status": "locked",
         "snapshot_status": "completed",
         "vector_version": "hotel_behavior.v2",
+        "vector_generation_id": "generation_a",
+        "source_cutoff": datetime(2026, 7, 1, tzinfo=UTC),
+        "generation_window_end": datetime(2026, 7, 1, tzinfo=UTC),
+        "generation_source_revision_cutoff": datetime(
+            2026, 7, 1, tzinfo=UTC
+        ),
         "final_user_count": 2,
         "audience_status": "insufficient_sample",
         "snapshot_kind": "final",

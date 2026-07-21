@@ -13,6 +13,11 @@ from app.decision.assignment_service import (
     SegmentAssignmentValidationError,
 )
 from app.decision.router import get_segment_assignment_service
+from app.decision.experiment_design import (
+    ExperimentDesignConflictError,
+    RandomizedHoldoutAudienceTooSmallError,
+    RandomizedHoldoutConfigurationError,
+)
 from app.decision.schemas import (
     SegmentAssignmentBuildRequest,
     SegmentAssignmentBuildResponse,
@@ -183,6 +188,35 @@ def test_segment_assignment_api_returns_structured_audience_contract_conflict(
         "segment_id": "seg_v2",
         "reason": "snapshot member count is inconsistent",
     }
+
+
+def test_segment_assignment_api_maps_uplift_ready_contract_errors() -> None:
+    cases = [
+        (
+            RandomizedHoldoutAudienceTooSmallError("audience is too small"),
+            422,
+            "randomized_holdout_audience_too_small",
+        ),
+        (
+            RandomizedHoldoutConfigurationError("salt is missing"),
+            503,
+            "randomized_holdout_configuration_unavailable",
+        ),
+        (
+            ExperimentDesignConflictError("design differs"),
+            409,
+            "experiment_design_conflict",
+        ),
+    ]
+
+    for exc, expected_status, expected_code in cases:
+        response = make_client(FakeAssignmentService(exc=exc)).post(
+            "/decision/v1/promotion-runs/run/segment-assignments/build",
+            json={},
+        )
+
+        assert response.status_code == expected_status
+        assert response.json()["detail"]["code"] == expected_code
 
 
 def test_segment_assignment_api_wires_repositories_and_commits(monkeypatch) -> None:
