@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+import math
 from typing import Any, Mapping, Sequence
 
 from app.uplift.contracts import UpliftTrainingExample
@@ -14,6 +15,9 @@ class TransformedOutcomeRidgeModel:
     coefficients: tuple[float, ...]
     intercept: float
     model_version: str = "transformed-outcome-ridge.v1"
+
+    def __post_init__(self) -> None:
+        validate_model_payload(self.to_payload())
 
     def predict_cate(self, features: Sequence[float]) -> float:
         if len(features) != len(self.coefficients):
@@ -35,6 +39,29 @@ class TransformedOutcomeRidgeModel:
     ) -> list[float]:
         return [self.predict_cate(example.features) for example in examples]
 
+    def to_payload(self) -> dict[str, Any]:
+        return {
+            "model_version": self.model_version,
+            "feature_means": list(self.feature_means),
+            "feature_scales": list(self.feature_scales),
+            "coefficients": list(self.coefficients),
+            "intercept": self.intercept,
+        }
+
+    @classmethod
+    def from_payload(
+        cls,
+        payload: Mapping[str, Any],
+    ) -> TransformedOutcomeRidgeModel:
+        normalized = validate_model_payload(payload)
+        return cls(
+            feature_means=tuple(normalized["feature_means"]),
+            feature_scales=tuple(normalized["feature_scales"]),
+            coefficients=tuple(normalized["coefficients"]),
+            intercept=normalized["intercept"],
+            model_version=normalized["model_version"],
+        )
+
 
 class UpliftModelLifecycleStatus(StrEnum):
     COLLECTING_DATA = "collecting_data"
@@ -53,6 +80,9 @@ class UpliftModelMetadata:
     serving_eligible: bool
     model_version: str
     validation_policy_version: str | None = None
+    feature_contract_hash: str | None = None
+    outcome_contract_hash: str | None = None
+    registry_verified: bool = False
 
     def __post_init__(self) -> None:
         status = self.model_lifecycle_status
@@ -62,13 +92,15 @@ class UpliftModelMetadata:
             except ValueError as exc:
                 raise ValueError("unsupported uplift model lifecycle status") from exc
             object.__setattr__(self, "model_lifecycle_status", status)
-        if status is UpliftModelLifecycleStatus.ACTIVE or self.serving_eligible:
+        if (
+            status is UpliftModelLifecycleStatus.ACTIVE or self.serving_eligible
+        ) and not self.registry_verified:
             raise ValueError(
-                "active uplift metadata requires the future persistent model registry"
+                "active uplift metadata requires persistent model registry verification"
             )
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        payload = {
             "model_lifecycle_status": self.model_lifecycle_status,
             "validation_scope": self.validation_scope,
             "dataset": self.dataset,
@@ -76,6 +108,11 @@ class UpliftModelMetadata:
             "model_version": self.model_version,
             "validation_policy_version": self.validation_policy_version,
         }
+        if self.feature_contract_hash is not None:
+            payload["feature_contract_hash"] = self.feature_contract_hash
+        if self.outcome_contract_hash is not None:
+            payload["outcome_contract_hash"] = self.outcome_contract_hash
+        return payload
 
 
 def fit_transformed_outcome_ridge(
@@ -155,10 +192,55 @@ def serving_cate_scores(
     metadata: UpliftModelMetadata,
     examples: Sequence[UpliftTrainingExample],
 ) -> list[float] | None:
-    # No persistent registry or approval provenance exists in this version.
-    # Metadata assembled in process must never activate uplift serving.
-    del model, metadata, examples
-    return None
+    if (
+        metadata.model_lifecycle_status is not UpliftModelLifecycleStatus.ACTIVE
+        or not metadata.serving_eligible
+        or not metadata.registry_verified
+        or metadata.validation_scope != "loopad_randomized_experiments"
+        or metadata.model_version != model.model_version
+    ):
+        return None
+    try:
+        scores = model.predict_many(examples)
+    except (TypeError, ValueError, ArithmeticError):
+        return None
+    if not all(math.isfinite(score) for score in scores):
+        return None
+    return scores
+
+
+def validate_model_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    if payload.get("model_version") != "transformed-outcome-ridge.v1":
+        raise ValueError("unsupported uplift model version")
+    raw_means = payload.get("feature_means")
+    raw_scales = payload.get("feature_scales")
+    raw_coefficients = payload.get("coefficients")
+    if not all(
+        isinstance(value, (list, tuple))
+        for value in (raw_means, raw_scales, raw_coefficients)
+    ):
+        raise ValueError("uplift model arrays are required")
+    try:
+        means = [float(value) for value in raw_means]
+        scales = [float(value) for value in raw_scales]
+        coefficients = [float(value) for value in raw_coefficients]
+        intercept = float(payload.get("intercept"))
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("uplift model values must be numeric") from exc
+    if not means or len(means) != len(scales) or len(means) != len(coefficients):
+        raise ValueError("uplift model array dimensions must match")
+    numeric_values = [*means, *scales, *coefficients, intercept]
+    if not all(math.isfinite(value) for value in numeric_values):
+        raise ValueError("uplift model values must be finite")
+    if any(scale <= 0 for scale in scales):
+        raise ValueError("uplift model feature scales must be positive")
+    return {
+        "model_version": "transformed-outcome-ridge.v1",
+        "feature_means": means,
+        "feature_scales": scales,
+        "coefficients": coefficients,
+        "intercept": intercept,
+    }
 
 
 def signed_cate_summary(scores: Sequence[float]) -> Mapping[str, float]:

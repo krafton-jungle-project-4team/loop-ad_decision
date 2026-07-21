@@ -37,11 +37,16 @@ def evaluate_uplift_predictions(
             cumulative_gain -= 0.5 * example.outcome / (1.0 - probability)
         qini_curve.append(cumulative_gain)
     final_gain = qini_curve[-1]
+    auuc_baseline = sum(
+        final_gain * ((index + 1) / len(qini_curve))
+        for index in range(len(qini_curve))
+    ) / len(qini_curve)
     qini = sum(
         gain - final_gain * ((index + 1) / len(qini_curve))
         for index, gain in enumerate(qini_curve)
     ) / len(qini_curve)
     auuc = sum(qini_curve) / len(qini_curve)
+    predicted_ate = sum(float(score) for score in cate_scores) / len(cate_scores)
     uplift_at_top_k = {
         _fraction_label(fraction): _ipw_observed_uplift(
             [example for example, _score in ordered[: max(1, math.ceil(len(ordered) * fraction))]]
@@ -55,8 +60,15 @@ def evaluate_uplift_predictions(
         "treatment_outcome_rate": treatment_rate,
         "control_outcome_rate": control_rate,
         "ate": treatment_rate - control_rate,
+        "predicted_ate": predicted_ate,
+        "predicted_observed_ate_absolute_error": abs(
+            predicted_ate - (treatment_rate - control_rate)
+        ),
         "auuc": auuc,
+        "auuc_baseline": auuc_baseline,
         "qini": qini,
+        "negative_cate_ratio": sum(float(score) < 0 for score in cate_scores)
+        / len(cate_scores),
         "uplift_at_top_k": uplift_at_top_k,
         "evaluation_method": "individual_propensity_ipw.v1",
     }
