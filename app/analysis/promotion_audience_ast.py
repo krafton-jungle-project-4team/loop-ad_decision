@@ -1,3 +1,10 @@
+"""Canonical audience IR for the existing raw-event candidate factories.
+
+The IR parameterizes the six registered factories with promotion conditions and
+keeps identity, execution, and display semantics aligned. It does not discover
+arbitrary behavior predicates or perform a general rule search.
+"""
+
 from __future__ import annotations
 
 import hashlib
