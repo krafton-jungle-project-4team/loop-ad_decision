@@ -63,6 +63,13 @@ _BENEFIT_LABELS: Mapping[str, str] = {
     "breakfast_included": "조식 포함",
 }
 
+_STRUCTURED_PROPERTY_LABELS: Mapping[str, str] = {
+    "deal": "할인·특가 관심",
+    "price": "가격 비교",
+    "free_cancellation": "무료 취소 관심",
+    "breakfast_included": "조식 포함 관심",
+}
+
 _BEHAVIOR_CHIPS: Mapping[str, str] = {
     "hotel_product_interest": "숙소 관심",
     "recent_destination_search": "목적지 검색",
@@ -348,24 +355,12 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
     )
     strategy_key = ast.strategy_key
     if ast.structured_conditions and ast.beam_policy_version:
-        condition_labels = tuple(
-            dict.fromkeys(
-                str(condition["label"])
-                for condition in ast.structured_conditions
-                if str(condition.get("label", "")).strip()
-            )
-        )
-        behavior_labels = tuple(
-            label
-            for label in condition_labels
-            if not destination_text or destination_text not in label
-        )
-        title_conditions = behavior_labels[:2] or condition_labels[:2]
+        condition_labels = _structured_display_labels(ast)
+        title_conditions = condition_labels[:2]
         condition_text = "·".join(title_conditions) or "행동 조건"
-        title = f"{destination_prefix}{condition_text} 고객"
+        title = f"{condition_text} 고객"
         reason = (
-            f"{destination_text or '프로모션'} 조건과 "
-            f"{', '.join(title_conditions)} 행동을 함께 만족한 고객입니다."
+            f"{', '.join(condition_labels)} 조건을 모두 만족한 고객입니다."
         )
     elif strategy_key == "funnel_recovery":
         title = f"{destination_prefix}예약 직전 이탈 고객"
@@ -403,17 +398,14 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
             "확인된 고객입니다."
         )
 
-    chips = list(_destination_chips(ast))
-    if ast.structured_conditions:
-        chips.extend(
-            str(condition["label"])
-            for condition in ast.structured_conditions
-        )
+    if ast.structured_conditions and ast.beam_policy_version:
+        chips = list(_structured_display_labels(ast))
     else:
+        chips = list(_destination_chips(ast))
         chips.extend(
             _BEHAVIOR_CHIPS.get(key, key) for key in ast.behavior_condition_keys
         )
-    chips.extend(_BENEFIT_LABELS.get(key, key) for key in ast.benefit_keys)
+        chips.extend(_BENEFIT_LABELS.get(key, key) for key in ast.benefit_keys)
     return {
         "title": " ".join(title.split()),
         "strategy_role": _STRATEGY_ROLES.get(
@@ -443,6 +435,62 @@ def _destination_chips(ast: PromotionAudienceAst) -> tuple[str, ...]:
     if len(ast.destination_ids) > 1:
         return (f"{destination_text} 중 한 곳 탐색",)
     return (f"{destination_text} 숙소 탐색",)
+
+
+def _structured_display_labels(ast: PromotionAudienceAst) -> tuple[str, ...]:
+    conditions = tuple(ast.structured_conditions)
+    anchor_index = next(
+        (
+            index
+            for index, condition in enumerate(conditions)
+            if _is_promotion_search_anchor(ast, condition)
+        ),
+        None,
+    )
+    labels: list[str] = []
+    if anchor_index is not None:
+        labels.append(_execution_condition_label(conditions[anchor_index]))
+
+    collapse_booking_incomplete = (
+        "booking_start_without_complete" in ast.behavior_condition_keys
+    )
+    if collapse_booking_incomplete:
+        labels.append("예약 시작 후 미완료")
+
+    for index, condition in enumerate(conditions):
+        if index == anchor_index:
+            continue
+        if collapse_booking_incomplete and (
+            condition.get("event_name") == "booking_start"
+            or (
+                condition.get("event_name") == "booking_complete"
+                and condition.get("maximum_count") == 0
+            )
+        ):
+            continue
+        labels.append(_execution_condition_label(condition))
+    return tuple(dict.fromkeys(label for label in labels if label))
+
+
+def _is_promotion_search_anchor(
+    ast: PromotionAudienceAst,
+    condition: Mapping[str, Any],
+) -> bool:
+    destination = canonical_destination_ids(
+        part
+        for part in str(condition.get("destination") or "").split(",")
+        if part.strip()
+    )
+    months = canonical_season_months(condition.get("checkin_months", ()))
+    return (
+        condition.get("event_name") == "hotel_search"
+        and int(condition.get("minimum_count", 0)) == 1
+        and condition.get("maximum_count") is None
+        and not condition.get("property_filters")
+        and destination == ast.destination_ids
+        and months == ast.season_months
+        and bool(destination or months)
+    )
 
 
 def _destination_text(destination_ids: Sequence[str]) -> str:
@@ -594,26 +642,37 @@ def _execution_condition_label(condition: Mapping[str, Any]) -> str:
     parts: list[str] = []
     destination = str(condition.get("destination") or "").strip()
     if destination:
-        parts.append(destination.replace(",", "·"))
+        parts.append(
+            _destination_text(
+                canonical_destination_ids(
+                    part for part in destination.split(",") if part.strip()
+                )
+            )
+        )
     months = tuple(int(month) for month in condition.get("checkin_months", ()))
     if months:
         parts.append("체크인 " + "·".join(str(month) for month in months) + "월")
-    parts.append(event_label)
+    filters = condition.get("property_filters", ())
+    filter_labels = tuple(
+        _STRUCTURED_PROPERTY_LABELS.get(
+            str(value.get("key", "")),
+            str(value.get("key", "")),
+        )
+        for value in filters
+        if str(value.get("key", "")).strip()
+    )
+    if filter_labels and not destination and not months:
+        parts.append("·".join(filter_labels))
+    else:
+        parts.append(event_label)
     minimum_count = int(condition["minimum_count"])
     maximum_count = condition.get("maximum_count")
     if maximum_count == 0:
         parts.append("없음")
     elif minimum_count > 1:
         parts.append(f"{minimum_count}회 이상")
-    filters = condition.get("property_filters", ())
-    if filters:
-        parts.append(
-            "·".join(
-                str(value.get("key", ""))
-                for value in filters
-                if str(value.get("key", "")).strip()
-            )
-        )
+    if filter_labels and (destination or months):
+        parts.append("·".join(filter_labels))
     return " ".join(parts)[:120]
 
 

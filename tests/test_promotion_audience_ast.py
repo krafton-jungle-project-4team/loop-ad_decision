@@ -115,3 +115,101 @@ def test_identity_changes_with_window_or_destination_operator() -> None:
     assert promotion_audience_segment_id(any_of) != promotion_audience_segment_id(
         seven_days
     )
+
+
+def test_beam_display_uses_only_compiled_execution_conditions() -> None:
+    ast = build_promotion_audience_ast(
+        promotion_id="promo_black_friday",
+        candidate_type="benefit_value_seeker",
+        strategy_key="beam_discount_interest_1",
+        matched_condition_keys=("discount_interest",),
+        destination_ids=("okinawa", "jeju"),
+        season_months=(8, 6, 7),
+        benefit_keys=("discount", "early_booking"),
+        structured_conditions=(
+            {
+                "label": "jeju·okinawa 시즌 일치 숙소 검색",
+                "event_name": "hotel_search",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": "jeju,okinawa",
+                "checkin_months": [6, 7, 8],
+                "property_filters": [],
+            },
+            {
+                "label": "할인·특가 관심",
+                "event_name": "hotel_search",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [
+                    {"key": "deal", "operator": "equals", "value": "true"}
+                ],
+            },
+        ),
+        beam_policy_version="promotion-audience-beam.v2",
+    )
+
+    compiled = compile_promotion_audience_ast(ast)
+
+    assert compiled.display_model["title"] == (
+        "제주·오키나와 체크인 6·7·8월 숙소 검색·할인·특가 관심 고객"
+    )
+    assert compiled.display_model["signal_chips"] == [
+        "제주·오키나와 체크인 6·7·8월 숙소 검색",
+        "할인·특가 관심",
+    ]
+    assert "할인" not in compiled.display_model["signal_chips"]
+    assert "조기 예약" not in compiled.display_model["signal_chips"]
+
+
+def test_beam_display_collapses_booking_incomplete_execution_conditions() -> None:
+    ast = build_promotion_audience_ast(
+        promotion_id="promo_black_friday",
+        candidate_type="funnel_recovery",
+        strategy_key="beam_booking_start_without_complete_1",
+        matched_condition_keys=("booking_start_without_complete",),
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        structured_conditions=(
+            {
+                "label": "시즌 일치 숙소 검색",
+                "event_name": "hotel_search",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": "jeju,okinawa",
+                "checkin_months": [6, 7, 8],
+                "property_filters": [],
+            },
+            {
+                "label": "예약 시작",
+                "event_name": "booking_start",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [],
+            },
+            {
+                "label": "예약 미완료",
+                "event_name": "booking_complete",
+                "minimum_count": 0,
+                "maximum_count": 0,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [],
+            },
+        ),
+        beam_policy_version="promotion-audience-beam.v2",
+    )
+
+    compiled = compile_promotion_audience_ast(ast)
+
+    assert compiled.display_model["signal_chips"] == [
+        "제주·오키나와 체크인 6·7·8월 숙소 검색",
+        "예약 시작 후 미완료",
+    ]
+    assert compiled.display_model["title"] == (
+        "제주·오키나와 체크인 6·7·8월 숙소 검색·예약 시작 후 미완료 고객"
+    )
