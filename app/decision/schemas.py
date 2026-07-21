@@ -67,6 +67,11 @@ class AssignmentSource(StrEnum):
     FIXTURE = "fixture"
 
 
+class ExperimentDesignMode(StrEnum):
+    ALL_TREATMENT = "all_treatment"
+    RANDOMIZED_HOLDOUT = "randomized_holdout"
+
+
 class ContentApprovalMode(StrEnum):
     AUTOMATIC = "automatic"
     MANUAL = "manual"
@@ -123,6 +128,14 @@ class RunCreateResponse(BaseModel):
     ad_experiments: list[AdExperimentCreateResponse]
 
 
+class SegmentAssignmentExperimentDesignRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    mode: ExperimentDesignMode = ExperimentDesignMode.ALL_TREATMENT
+    treatment_ratio: float | None = Field(default=None, gt=0, le=1)
+    outcome_window_days: int = Field(default=30, ge=1)
+
+
 class SegmentAssignmentBuildRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
 
@@ -130,6 +143,32 @@ class SegmentAssignmentBuildRequest(BaseModel):
     eligible_user_limit: int | None = Field(default=None, ge=1)
     vector_version: str = Field(default="v1", min_length=1)
     expires_in_days: int | None = Field(default=None, ge=1)
+    experiment_design: SegmentAssignmentExperimentDesignRequest | None = None
+
+
+class SegmentAssignmentAllocationResultResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    ad_experiment_id: str = Field(min_length=1)
+    segment_id: str = Field(min_length=1)
+    audience_snapshot_id: str = Field(min_length=1)
+    unit_count: int = Field(ge=0)
+    treatment_count: int = Field(ge=0)
+    control_count: int = Field(ge=0)
+    requested_treatment_ratio: float = Field(ge=0, le=1)
+    actual_treatment_ratio: float = Field(ge=0, le=1)
+    quota_policy_version: str = Field(min_length=1)
+
+
+class SegmentAssignmentExperimentDesignResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+
+    mode: ExperimentDesignMode
+    requested_treatment_ratio: float = Field(ge=0, le=1)
+    actual_treatment_ratio: float = Field(ge=0, le=1)
+    outcome_window_days: int = Field(ge=1)
+    randomization_version: str = Field(min_length=1)
+    quota_policy_version: str = Field(min_length=1)
 
 
 class SegmentAssignmentBuildResponse(BaseModel):
@@ -186,6 +225,15 @@ class SegmentAssignmentBuildResponse(BaseModel):
     ]
     input_stability: Literal["not_snapshotted", "snapshotted"] = "not_snapshotted"
     status: Literal["completed"] = "completed"
+    segment_assignment_execution_id: str | None = None
+    request_fingerprint: str | None = None
+    input_fingerprint: str | None = None
+    experiment_design_fingerprint: str | None = None
+    experiment_design: SegmentAssignmentExperimentDesignResponse | None = None
+    outcome_spec: dict[str, Any] | None = None
+    allocation_results: list[SegmentAssignmentAllocationResultResponse] = Field(
+        default_factory=list
+    )
 
 
 class AdExperimentEvaluateRequest(BaseModel):

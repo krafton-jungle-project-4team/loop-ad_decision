@@ -10,9 +10,34 @@ from psycopg import errors as pg_errors
 
 from app.decision.audience_snapshots import (
     AudienceSnapshotContractError,
+    AudienceSnapshotBinding,
     AudienceSnapshotReader,
 )
 from app.audience_contract import SEGMENT_AUDIENCE_CONTRACT
+from app.decision.experiment_assignment_repository import (
+    AdExperimentUnitRecord,
+    AdExperimentUnitWrite,
+    ExperimentAssignmentWriter,
+    SegmentAssignmentExecutionRecord,
+    SegmentAssignmentExecutionWrite,
+)
+from app.decision.experiment_design import (
+    EXECUTION_SCHEMA_VERSION,
+    ExperimentAllocationResult,
+    ExperimentAudienceMember,
+    ExperimentDesign,
+    ExperimentDesignConflictError,
+    ExperimentDesignValidationError,
+    ExperimentUnitAllocation,
+    RandomizedHoldoutAudienceTooSmallError,
+    RandomizedHoldoutConfigurationError,
+    allocate_experiment_units,
+    build_execution_id,
+    build_experiment_design,
+    build_experiment_unit_id,
+    build_input_fingerprint,
+    build_request_fingerprint,
+)
 from app.decision.matcher import (
     ANN_CANDIDATE_LIMIT,
     ANN_QUERY_USER_BATCH_SIZE,
@@ -50,6 +75,7 @@ from app.decision.schemas import (
     SegmentAssignmentBuildRequest,
     SegmentAssignmentBuildResponse,
 )
+from app.decision.outcome_spec import require_frozen_outcome_spec
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
 
@@ -271,6 +297,8 @@ class SegmentAssignmentService:
         promotion_analysis_repository: PromotionAnalysisReader | None = None,
         promotion_evaluation_repository: PromotionEvaluationWriter | None = None,
         evaluation_metric_repository: EvaluationMetricReader | None = None,
+        experiment_assignment_repository: ExperimentAssignmentWriter | None = None,
+        randomization_salt: str | None = None,
     ) -> None:
         self._promotion_run_repository = promotion_run_repository
         self._ad_experiment_repository = ad_experiment_repository
@@ -282,6 +310,8 @@ class SegmentAssignmentService:
         self._promotion_analysis_repository = promotion_analysis_repository
         self._promotion_evaluation_repository = promotion_evaluation_repository
         self._evaluation_metric_repository = evaluation_metric_repository
+        self._experiment_assignment_repository = experiment_assignment_repository
+        self._randomization_salt = randomization_salt
 
     @log_context_scope
     def build_assignments(
@@ -322,6 +352,10 @@ class SegmentAssignmentService:
 
         retry_context = self._resolve_next_loop_retry_context(run)
         if retry_context is not None:
+            if _requested_experiment_mode(request) == "randomized_holdout":
+                raise SegmentAssignmentValidationError(
+                    "randomized_holdout requires a Segment Audience V2 final snapshot"
+                )
             return self._build_next_loop_retry_assignments(
                 run=run,
                 experiments=experiments,
@@ -343,6 +377,11 @@ class SegmentAssignmentService:
                 experiments=experiments,
                 request=request,
                 started_at=started_at,
+            )
+
+        if _requested_experiment_mode(request) == "randomized_holdout":
+            raise SegmentAssignmentValidationError(
+                "randomized_holdout requires a Segment Audience V2 final snapshot"
             )
 
         audience_scope = _build_effective_audience_scope(
@@ -870,6 +909,331 @@ class SegmentAssignmentService:
     def _build_snapshot_assignments(
         self,
         *,
+        run: PromotionRunRecord,
+        experiments: _ExperimentSet,
+        request: SegmentAssignmentBuildRequest,
+        started_at: int,
+    ) -> SegmentAssignmentBuildResponse:
+        repository = self._experiment_assignment_repository
+        has_frozen_outcome = isinstance(
+            run.goal_snapshot_json.get("outcome_spec"), Mapping
+        )
+        if repository is None or not has_frozen_outcome:
+            if _requested_experiment_mode(request) == "randomized_holdout":
+                raise SegmentAssignmentValidationError(
+                    "randomized_holdout requires an uplift-ready promotion run"
+                )
+            return self._build_legacy_snapshot_assignments(
+                run=run,
+                experiments=experiments,
+                request=request,
+                started_at=started_at,
+            )
+
+        lock_run = getattr(
+            self._promotion_run_repository,
+            "get_by_id_for_update",
+            None,
+        )
+        if not callable(lock_run):
+            raise SegmentAssignmentValidationError(
+                "promotion run row locking is not configured"
+            )
+        locked_run = lock_run(run.promotion_run_id)
+        if locked_run is None:
+            raise SegmentAssignmentRunNotFoundError(
+                f"promotion run not found: {run.promotion_run_id}"
+            )
+
+        try:
+            outcome_spec, frozen_outcome_spec_hash = require_frozen_outcome_spec(
+                locked_run.goal_snapshot_json
+            )
+        except ValueError as exc:
+            raise SegmentAssignmentValidationError(str(exc)) from exc
+
+        design_request = request.experiment_design
+        mode = _requested_experiment_mode(request)
+        treatment_ratio = (
+            design_request.treatment_ratio if design_request is not None else None
+        )
+        outcome_window_days = (
+            design_request.outcome_window_days if design_request is not None else 30
+        )
+        design = build_experiment_design(
+            mode=mode,
+            treatment_ratio=treatment_ratio,
+            outcome_window_days=outcome_window_days,
+            outcome_spec_hash=frozen_outcome_spec_hash,
+            randomization_salt=self._randomization_salt,
+        )
+
+        if request.user_ids or request.eligible_user_limit is not None:
+            raise SegmentAssignmentValidationError(
+                "analysis snapshot assignment does not accept user_ids or a limit"
+            )
+        segment_ids = [
+            experiment.segment_id for experiment in experiments.non_fallback
+        ]
+        try:
+            snapshot_set = self._audience_snapshot_repository.require_run_binding_set(
+                promotion_run_id=locked_run.promotion_run_id,
+                segment_ids=segment_ids,
+            )
+        except (pg_errors.UndefinedTable, pg_errors.UndefinedColumn) as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_exclusion_contract_missing",
+                segment_id=",".join(segment_ids),
+                reason="V2 run-target binding Data Contract is missing",
+            ) from exc
+        except AudienceSnapshotContractError as exc:
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_snapshot_binding_invalid",
+                segment_id=",".join(segment_ids),
+                reason=str(exc),
+            ) from exc
+        if len(snapshot_set.bindings) != len(experiments.non_fallback):
+            raise SegmentAssignmentAudienceContractError(
+                code="segment_audience_snapshot_binding_invalid",
+                segment_id=",".join(segment_ids),
+                reason="final snapshot binding metadata is incomplete",
+            )
+
+        experiment_by_segment = {
+            experiment.segment_id: experiment
+            for experiment in experiments.non_fallback
+        }
+        binding_by_segment = {
+            binding.segment_id: binding for binding in snapshot_set.bindings
+        }
+        audience_bindings = [
+            _binding_manifest(
+                binding=binding,
+                ad_experiment_id=experiment_by_segment[
+                    binding.segment_id
+                ].ad_experiment_id,
+            )
+            for binding in sorted(
+                snapshot_set.bindings,
+                key=lambda item: item.segment_id,
+            )
+        ]
+        input_fingerprint = build_input_fingerprint(
+            audience_bindings=audience_bindings
+        )
+        request_fingerprint = build_request_fingerprint(
+            promotion_run_id=locked_run.promotion_run_id,
+            design_fingerprint=design.fingerprint,
+            expires_in_days=request.expires_in_days,
+        )
+
+        existing_executions = repository.list_uplift_ready_executions(
+            locked_run.promotion_run_id
+        )
+        for existing in existing_executions:
+            existing_design_fingerprint = existing.input_manifest_json.get(
+                "experiment_design_fingerprint"
+            )
+            if existing_design_fingerprint != design.fingerprint:
+                raise ExperimentDesignConflictError(
+                    "promotion run already uses a different experiment design"
+                )
+            if existing.input_fingerprint != input_fingerprint:
+                raise ExperimentDesignConflictError(
+                    "promotion run final audience differs from its existing execution"
+                )
+        if existing_executions:
+            existing = existing_executions[0]
+            units = repository.list_units_by_execution(
+                existing.segment_assignment_execution_id
+            )
+            return _build_uplift_ready_response(
+                run=locked_run,
+                vector_version=snapshot_set.vector_version,
+                execution=existing,
+                design=design,
+                outcome_spec=outcome_spec,
+                units=units,
+                allocation_results=_manifest_allocation_results(
+                    existing.input_manifest_json
+                ),
+                score_by_user={},
+                started_at=started_at,
+            )
+
+        raw_members = []
+        after_user_id: str | None = None
+        page_count = 0
+        while True:
+            page = self._audience_snapshot_repository.list_run_members(
+                promotion_run_id=locked_run.promotion_run_id,
+                segment_ids=segment_ids,
+                after_user_id=after_user_id,
+                limit=ASSIGNMENT_PAGE_SIZE,
+            )
+            if not page:
+                break
+            page_count += 1
+            raw_members.extend(page)
+            after_user_id = page[-1].user_id
+            if len(page) < ASSIGNMENT_PAGE_SIZE:
+                break
+
+        actual_counts: dict[str, int] = defaultdict(int)
+        members: list[ExperimentAudienceMember] = []
+        for member in raw_members:
+            binding = binding_by_segment.get(member.segment_id)
+            experiment = experiment_by_segment.get(member.segment_id)
+            if binding is None or experiment is None:
+                raise SegmentAssignmentValidationError(
+                    "snapshot member references an unknown experiment segment"
+                )
+            actual_counts[member.segment_id] += 1
+            members.append(
+                ExperimentAudienceMember(
+                    user_id=member.user_id,
+                    segment_id=member.segment_id,
+                    ad_experiment_id=experiment.ad_experiment_id,
+                    audience_snapshot_id=binding.audience_snapshot_id,
+                    vector_generation_id=binding.vector_generation_id,
+                    behavior_fit_score=member.behavior_fit_score,
+                )
+            )
+        for binding in snapshot_set.bindings:
+            if actual_counts[binding.segment_id] != binding.member_count:
+                raise SegmentAssignmentAudienceContractError(
+                    code="segment_audience_snapshot_binding_invalid",
+                    segment_id=binding.segment_id,
+                    reason="final snapshot member count changed during assignment",
+                )
+
+        experiment_bindings = {
+            experiment.ad_experiment_id: (
+                experiment.segment_id,
+                binding_by_segment[experiment.segment_id].audience_snapshot_id,
+            )
+            for experiment in experiments.non_fallback
+        }
+        allocations, allocation_results = allocate_experiment_units(
+            project_id=locked_run.project_id,
+            promotion_run_id=locked_run.promotion_run_id,
+            design=design,
+            members=members,
+            randomization_salt=self._randomization_salt,
+            experiment_bindings=experiment_bindings,
+        )
+
+        assigned_at = repository.database_clock()
+        for binding in snapshot_set.bindings:
+            _validate_binding_time(binding, assigned_at=assigned_at)
+        outcome_window_end = assigned_at + timedelta(
+            days=design.outcome_window_days
+        )
+        source_cutoff_at = max(
+            cutoff
+            for binding in snapshot_set.bindings
+            for cutoff in (
+                binding.source_cutoff,
+                binding.generation_source_revision_cutoff,
+            )
+        )
+        execution_id = build_execution_id(
+            locked_run.promotion_run_id,
+            request_fingerprint,
+        )
+        score_by_user = {
+            allocation.member.user_id: allocation.member.behavior_fit_score
+            for allocation in allocations
+            if allocation.arm == "treatment"
+        }
+        manifest = {
+            "schema_version": EXECUTION_SCHEMA_VERSION,
+            "experiment_design": design.as_manifest(),
+            "experiment_design_fingerprint": design.fingerprint,
+            "outcome_spec": outcome_spec,
+            "audience_bindings": audience_bindings,
+            "allocation_results": [
+                result.as_manifest() for result in allocation_results
+            ],
+            "assignment_diagnostics": {
+                "page_count": page_count,
+                "similarity_score_buckets": _score_buckets(score_by_user.values()),
+            },
+        }
+        execution = repository.insert_execution(
+            SegmentAssignmentExecutionWrite(
+                segment_assignment_execution_id=execution_id,
+                promotion_run_id=locked_run.promotion_run_id,
+                request_fingerprint=request_fingerprint,
+                input_fingerprint=input_fingerprint,
+                matcher_strategy="analysis_snapshot_complete_randomization",
+                matcher_version="uplift-ready-assignment.v1",
+                vector_version=snapshot_set.vector_version,
+                source_cutoff_at=source_cutoff_at,
+                input_manifest_json=manifest,
+            )
+        )
+        unit_writes = [
+            _unit_write(
+                run=locked_run,
+                allocation=allocation,
+                execution_id=execution_id,
+                assigned_at=assigned_at,
+                outcome_window_end=outcome_window_end,
+            )
+            for allocation in allocations
+        ]
+        repository.insert_units(unit_writes)
+
+        expires_at = (
+            assigned_at + timedelta(days=request.expires_in_days)
+            if request.expires_in_days is not None
+            else None
+        )
+        treatment_writes = [
+            _serving_assignment_write(
+                run=locked_run,
+                experiments=experiment_by_segment,
+                allocation=allocation,
+                execution_id=execution_id,
+                assigned_at=assigned_at,
+                expires_at=expires_at,
+            )
+            for allocation in allocations
+            if allocation.arm == "treatment"
+        ]
+        self._audience_snapshot_repository.consume_run_members(
+            promotion_run_id=locked_run.promotion_run_id,
+            segment_ids=segment_ids,
+        )
+        inserted = self._user_segment_assignment_repository.insert_many(
+            treatment_writes
+        )
+        if len(inserted) != len(treatment_writes):
+            raise ExperimentDesignConflictError(
+                "serving assignments already exist for the promotion run"
+            )
+        repository.finalize_execution(execution_id)
+
+        units = [
+            _unit_record_from_write(unit)
+            for unit in unit_writes
+        ]
+        return _build_uplift_ready_response(
+            run=locked_run,
+            vector_version=snapshot_set.vector_version,
+            execution=execution,
+            design=design,
+            outcome_spec=outcome_spec,
+            units=units,
+            allocation_results=allocation_results,
+            score_by_user=score_by_user,
+            started_at=started_at,
+        )
+
+    def _build_legacy_snapshot_assignments(
+        self,
+        *,
         run: Any,
         experiments: _ExperimentSet,
         request: SegmentAssignmentBuildRequest,
@@ -1197,6 +1561,255 @@ class SegmentAssignmentService:
                     return
             if page_count < page_size:
                 return
+
+def _requested_experiment_mode(
+    request: SegmentAssignmentBuildRequest,
+) -> str:
+    if request.experiment_design is None:
+        return "all_treatment"
+    return request.experiment_design.mode.value
+
+
+def _binding_manifest(
+    *,
+    binding: AudienceSnapshotBinding,
+    ad_experiment_id: str,
+) -> dict[str, Any]:
+    return {
+        "segment_id": binding.segment_id,
+        "ad_experiment_id": ad_experiment_id,
+        "audience_snapshot_id": binding.audience_snapshot_id,
+        "vector_generation_id": binding.vector_generation_id,
+        "vector_version": binding.vector_version,
+        "member_count": binding.member_count,
+        "source_cutoff": binding.source_cutoff.isoformat(),
+        "generation_window_end": binding.generation_window_end.isoformat(),
+        "generation_source_revision_cutoff": (
+            binding.generation_source_revision_cutoff.isoformat()
+        ),
+    }
+
+
+def _validate_binding_time(
+    binding: AudienceSnapshotBinding,
+    *,
+    assigned_at: datetime,
+) -> None:
+    if binding.generation_window_end > assigned_at:
+        raise SegmentAssignmentValidationError(
+            "feature generation window_end must not follow assigned_at"
+        )
+    if binding.generation_source_revision_cutoff > assigned_at:
+        raise SegmentAssignmentValidationError(
+            "feature generation source_revision_cutoff must not follow assigned_at"
+        )
+    if binding.source_cutoff > assigned_at:
+        raise SegmentAssignmentValidationError(
+            "audience snapshot source_cutoff must not follow assigned_at"
+        )
+
+
+def _unit_write(
+    *,
+    run: PromotionRunRecord,
+    allocation: ExperimentUnitAllocation,
+    execution_id: str,
+    assigned_at: datetime,
+    outcome_window_end: datetime,
+) -> AdExperimentUnitWrite:
+    member = allocation.member
+    return AdExperimentUnitWrite(
+        experiment_unit_id=build_experiment_unit_id(
+            promotion_run_id=run.promotion_run_id,
+            user_id=member.user_id,
+        ),
+        project_id=run.project_id,
+        promotion_run_id=run.promotion_run_id,
+        ad_experiment_id=member.ad_experiment_id,
+        segment_id=member.segment_id,
+        audience_snapshot_id=member.audience_snapshot_id,
+        vector_generation_id=member.vector_generation_id,
+        segment_assignment_execution_id=execution_id,
+        user_id=member.user_id,
+        arm=allocation.arm,
+        treatment_probability=allocation.treatment_probability,
+        assigned_at=assigned_at,
+        outcome_window_start=assigned_at,
+        outcome_window_end=outcome_window_end,
+    )
+
+
+def _unit_record_from_write(unit: AdExperimentUnitWrite) -> AdExperimentUnitRecord:
+    return AdExperimentUnitRecord(
+        experiment_unit_id=unit.experiment_unit_id,
+        project_id=unit.project_id,
+        promotion_run_id=unit.promotion_run_id,
+        ad_experiment_id=unit.ad_experiment_id,
+        segment_id=unit.segment_id,
+        audience_snapshot_id=unit.audience_snapshot_id,
+        vector_generation_id=unit.vector_generation_id,
+        segment_assignment_execution_id=unit.segment_assignment_execution_id,
+        user_id=unit.user_id,
+        arm=unit.arm,
+        treatment_probability=unit.treatment_probability,
+        assigned_at=unit.assigned_at,
+        outcome_window_start=unit.outcome_window_start,
+        outcome_window_end=unit.outcome_window_end,
+    )
+
+
+def _serving_assignment_write(
+    *,
+    run: PromotionRunRecord,
+    experiments: Mapping[str, AdExperimentRecord],
+    allocation: ExperimentUnitAllocation,
+    execution_id: str,
+    assigned_at: datetime,
+    expires_at: datetime | None,
+) -> UserSegmentAssignmentWrite:
+    member = allocation.member
+    experiment = experiments[member.segment_id]
+    return UserSegmentAssignmentWrite(
+        project_id=run.project_id,
+        promotion_run_id=run.promotion_run_id,
+        user_id=member.user_id,
+        segment_id=member.segment_id,
+        ad_experiment_id=member.ad_experiment_id,
+        content_id=experiment.content_id,
+        content_option_id=experiment.content_option_id,
+        similarity_score=_score_to_decimal(member.behavior_fit_score),
+        fallback=False,
+        fallback_reason=None,
+        assignment_source=AssignmentSource.ANALYSIS_SNAPSHOT.value,
+        assigned_at=assigned_at,
+        expires_at=expires_at,
+        segment_assignment_execution_id=execution_id,
+    )
+
+
+def _manifest_allocation_results(
+    manifest: Mapping[str, Any],
+) -> list[Mapping[str, Any]]:
+    raw_results = manifest.get("allocation_results")
+    if not isinstance(raw_results, list) or any(
+        not isinstance(result, Mapping) for result in raw_results
+    ):
+        raise ExperimentDesignConflictError(
+            "stored assignment execution allocation results are invalid"
+        )
+    return [dict(result) for result in raw_results]
+
+
+def _score_buckets(scores: Sequence[Decimal | None] | Any) -> dict[str, int]:
+    buckets = {bucket: 0 for bucket in SIMILARITY_BUCKET_KEYS}
+    for score in scores:
+        buckets[_similarity_score_bucket(score)] += 1
+    return buckets
+
+
+def _build_uplift_ready_response(
+    *,
+    run: PromotionRunRecord,
+    vector_version: str,
+    execution: SegmentAssignmentExecutionRecord,
+    design: ExperimentDesign,
+    outcome_spec: Mapping[str, Any],
+    units: Sequence[AdExperimentUnitRecord],
+    allocation_results: Sequence[ExperimentAllocationResult | Mapping[str, Any]],
+    score_by_user: Mapping[str, Decimal | None],
+    started_at: int,
+) -> SegmentAssignmentBuildResponse:
+    result_payloads = [
+        result.as_manifest()
+        if isinstance(result, ExperimentAllocationResult)
+        else dict(result)
+        for result in allocation_results
+    ]
+    treatment_units = [unit for unit in units if unit.arm == "treatment"]
+    segment_counts: dict[str, int] = defaultdict(int)
+    for unit in treatment_units:
+        segment_counts[unit.segment_id] += 1
+    unit_count = len(units)
+    treatment_count = len(treatment_units)
+    actual_treatment_ratio = treatment_count / unit_count if unit_count else 0.0
+    diagnostics = execution.input_manifest_json.get("assignment_diagnostics")
+    stored_buckets = (
+        diagnostics.get("similarity_score_buckets")
+        if isinstance(diagnostics, Mapping)
+        else None
+    )
+    score_buckets = (
+        _score_buckets(list(score_by_user.values()))
+        if score_by_user
+        else {
+            key: int(stored_buckets.get(key, 0))
+            for key in SIMILARITY_BUCKET_KEYS
+        }
+        if isinstance(stored_buckets, Mapping)
+        else {key: 0 for key in SIMILARITY_BUCKET_KEYS}
+    )
+    response = SegmentAssignmentBuildResponse(
+        promotion_run_id=run.promotion_run_id,
+        matching_mode=SNAPSHOT_MATCHING_MODE,
+        vector_version=vector_version,
+        ann_candidate_limit=0,
+        ann_candidate_count=0,
+        exact_reranked_pair_count=0,
+        page_count=(unit_count + ASSIGNMENT_PAGE_SIZE - 1) // ASSIGNMENT_PAGE_SIZE,
+        processed_user_count=unit_count,
+        assignment_count=treatment_count,
+        insert_conflict_count=0,
+        segment_assignment_counts=dict(segment_counts),
+        batch_has_fallback=False,
+        fallback_count=0,
+        fallback_rate=0.0 if treatment_count else None,
+        fallback_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+        below_threshold_fallback_count=0,
+        no_candidate_fallback_count=0,
+        invalid_user_vector_fallback_count=0,
+        unassigned_count=0,
+        unassigned_reason_counts={reason: 0 for reason in FALLBACK_REASON_KEYS},
+        below_threshold_unassigned_count=0,
+        no_candidate_unassigned_count=0,
+        invalid_user_vector_unassigned_count=0,
+        similarity_score_buckets=score_buckets,
+        ann_underfilled_user_count=0,
+        ann_applied=False,
+        ann_not_applied_reason="analysis_snapshot_reuse",
+        skipped_existing_count=0,
+        insufficient_segment_count=0,
+        completion_scope="current_request",
+        assignment_mode=ASSIGNMENT_MODE_ANALYSIS_SNAPSHOT,
+        input_stability="snapshotted",
+        status="completed",
+        segment_assignment_execution_id=(
+            execution.segment_assignment_execution_id
+        ),
+        request_fingerprint=execution.request_fingerprint,
+        input_fingerprint=execution.input_fingerprint,
+        experiment_design_fingerprint=design.fingerprint,
+        experiment_design={
+            "mode": design.mode,
+            "requested_treatment_ratio": float(
+                design.requested_treatment_ratio
+            ),
+            "actual_treatment_ratio": actual_treatment_ratio,
+            "outcome_window_days": design.outcome_window_days,
+            "randomization_version": design.randomization_version,
+            "quota_policy_version": design.quota_policy_version,
+        },
+        outcome_spec=dict(outcome_spec),
+        allocation_results=result_payloads,
+    )
+    log.info(
+        "uplift_ready_snapshot_assignments_completed",
+        {
+            "response": response.model_dump(mode="json"),
+            "durationMs": duration_ms(started_at),
+        },
+    )
+    return response
+
 
 def _split_experiments(experiments: Sequence[AdExperimentRecord]) -> _ExperimentSet:
     if not experiments:

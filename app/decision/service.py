@@ -51,6 +51,7 @@ from app.decision.audience_snapshots import (
     RunAudienceTargetBindingWrite,
 )
 from app.decision.matcher import FALLBACK_SEGMENT_ID
+from app.decision.outcome_spec import build_frozen_outcome_spec
 from app.decision.schemas import (
     AdExperimentCreateResponse,
     AdExperimentStatus,
@@ -277,6 +278,7 @@ class PromotionRunService:
             loop_count=loop_count,
             segment_ids=segment_ids,
             segment_scope_fingerprint=segment_scope_fingerprint,
+            target_segments=target_segments,
         )
         ad_experiments = self._build_ad_experiments(
             promotion=promotion,
@@ -630,6 +632,7 @@ class PromotionRunService:
             loop_count=request.loop_count,
             segment_ids=expected_segment_ids,
             segment_scope_fingerprint=segment_scope_fingerprint,
+            target_segments=target_segments,
         )
         ad_experiments = self._build_ad_experiments(
             promotion=promotion,
@@ -1287,6 +1290,7 @@ class PromotionRunService:
         loop_count: int,
         segment_ids: Sequence[str],
         segment_scope_fingerprint: str,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
     ) -> PromotionRunWrite:
         segment_scope_json = tuple(
             sorted(
@@ -1319,6 +1323,7 @@ class PromotionRunService:
                 analysis=analysis,
                 generation=generation,
                 loop_count=loop_count,
+                target_segments=target_segments,
             ),
             segment_scope_json=segment_scope_json,
             segment_scope_fingerprint=segment_scope_fingerprint,
@@ -1594,7 +1599,12 @@ def _build_goal_snapshot(
     analysis: PromotionAnalysisRecord,
     generation: GenerationRunRecord,
     loop_count: int,
+    target_segments: Sequence[PromotionTargetSegmentRecord],
 ) -> dict[str, Any]:
+    outcome_spec, frozen_outcome_spec_hash = build_frozen_outcome_spec(
+        goal_metric=promotion.goal_metric,
+        target_segment_rules=[target.rule_json for target in target_segments],
+    )
     snapshot: dict[str, Any] = {
         "source": "promotions",
         "promotion_id": promotion.promotion_id,
@@ -1607,6 +1617,8 @@ def _build_goal_snapshot(
         "analysis_id": analysis.analysis_id,
         "generation_id": generation.generation_id,
         "loop_count": loop_count,
+        "outcome_spec": outcome_spec,
+        "outcome_spec_hash": frozen_outcome_spec_hash,
     }
     return snapshot
 

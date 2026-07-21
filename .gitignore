@@ -9,6 +9,7 @@ htmlcov/
 *.egg-info/
 .venv/
 venv/
+build/
 .env
 .env.local
 .env.*.local

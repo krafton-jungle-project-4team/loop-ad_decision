@@ -1220,6 +1220,7 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
     assert "fallback" in sql
     assert "fallback_reason" in sql
     assert "assignment_source" in sql
+    assert "segment_assignment_execution_id" in sql
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
     assert "returning user_id, segment_id, fallback" in sql
@@ -1241,6 +1242,7 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
         [AssignmentSource.FALLBACK.value, AssignmentSource.DECISION_BATCH.value],
         [assigned_at, assigned_at],
         [None, expires_at],
+        [None, None],
     )
 
 
