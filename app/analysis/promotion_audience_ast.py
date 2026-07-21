@@ -304,7 +304,9 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
         )
     elif strategy_key == "destination_comparison":
         title = f"{destination_text}를 비교 탐색한 고객"
-        reason = f"{destination_text} 숙소를 모두 검색해 여행지를 비교한 고객입니다."
+        reason = (
+            f"{destination_text} 숙소를 모두 검색해 여행지를 비교한 고객입니다."
+        )
     elif strategy_key == "general_destination_explorer":
         title = "여러 여행지를 비교 탐색한 고객"
         reason = "두 곳 이상의 여행지 숙소를 비교 탐색한 고객입니다."

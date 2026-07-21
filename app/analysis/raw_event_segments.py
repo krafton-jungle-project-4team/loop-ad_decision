@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
@@ -19,9 +18,18 @@ from app.analysis.audience_selection import (
     all_matching_audience_selection_policy,
 )
 from app.analysis.behavior_manifest import (
+    canonical_destination_id,
     destination_alias_groups,
     executable_destination_id,
     manifest_intent_benefit_keys,
+)
+from app.analysis.promotion_audience_ast import (
+    DESTINATION_ANY_OF,
+    DESTINATION_CONTAINS_ALL,
+    PROMOTION_AUDIENCE_COMPILER_VERSION,
+    PROMOTION_AUDIENCE_CONTRACT_VERSION,
+    build_promotion_audience_ast,
+    compile_promotion_audience_ast,
 )
 from app.analysis.repositories import (
     PromotionRecord,
@@ -30,7 +38,6 @@ from app.analysis.repositories import (
 )
 from app.analysis.segment_audience_templates import (
     MAX_DESTINATION_IDS,
-    RegisteredSegmentAudienceBinder,
 )
 from app.analysis.segment_performance import (
     ContextualBookingHeuristicPredictor,
@@ -300,6 +307,8 @@ class _RawEventCandidate:
     performance_model_metadata: Mapping[str, Any]
     audience_selection: AudienceSelectionDecision
     audience_parameters: RawEventAudienceParameters
+    identity_strategy_key: str | None = None
+    destination_operator: str = DESTINATION_ANY_OF
     rank_distinctiveness: float = 1.0
 
     @property
@@ -745,6 +754,21 @@ def destination_terms_from_intent(intent: PromotionIntent) -> tuple[str, ...]:
     return tuple(dict.fromkeys(term for term in terms if term))
 
 
+def _profile_destination_ids(profile: RawEventUserSignalRecord) -> set[str]:
+    destination_ids: set[str] = set()
+    for raw_value in profile.destination_values:
+        normalized = " ".join(str(raw_value).strip().casefold().split())
+        if not normalized:
+            continue
+        direct = canonical_destination_id(normalized)
+        if direct in DESTINATION_ALIASES:
+            destination_ids.add(direct)
+        for destination_id, aliases in DESTINATION_ALIASES.items():
+            if any(alias and alias in normalized for alias in aliases):
+                destination_ids.add(destination_id)
+    return destination_ids
+
+
 def season_months_from_intent(intent: PromotionIntent) -> tuple[int, ...]:
     months: list[int] = []
     for season in intent.season:
@@ -977,21 +1001,33 @@ def _general_destination_explorer_candidate(
     min_sample_size: int,
     performance_predictor: SegmentPerformancePredictor,
 ) -> _RawEventCandidate | None:
-    if intent.destinations:
+    target_destinations = tuple(sorted(set(intent.destinations)))
+    is_target_comparison = len(target_destinations) >= 2
+    if intent.destinations and not is_target_comparison:
         return None
-    matched_profiles = [
-        profile
-        for profile in profiles
-        if (
-            len(profile.destination_values) >= 2
-            or len(profile.hotel_market_values) >= 2
-            or len(profile.hotel_cluster_values) >= 2
-        )
-        and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
-    ]
+    if is_target_comparison:
+        target_set = set(target_destinations)
+        matched_profiles = [
+            profile
+            for profile in profiles
+            if target_set.issubset(_profile_destination_ids(profile))
+            and profile.hotel_search_count >= len(target_destinations)
+        ]
+    else:
+        matched_profiles = [
+            profile
+            for profile in profiles
+            if (
+                len(profile.destination_values) >= 2
+                or len(profile.hotel_market_values) >= 2
+                or len(profile.hotel_cluster_values) >= 2
+            )
+            and (profile.hotel_search_count + profile.hotel_detail_view_count) > 0
+        ]
     matched_condition_keys = (
         "general_destination_exploration",
         "hotel_product_interest",
+        *(("recent_destination_search",) if is_target_comparison else ()),
     )
     return _candidate_from_profiles(
         candidate_type="general_destination_explorer",
@@ -1007,6 +1043,17 @@ def _general_destination_explorer_candidate(
             matched_condition_keys,
         ),
         performance_predictor=performance_predictor,
+        identity_strategy_key=(
+            "destination_comparison" if is_target_comparison else None
+        ),
+        destination_operator=(
+            DESTINATION_CONTAINS_ALL if is_target_comparison else DESTINATION_ANY_OF
+        ),
+        audience_parameters=(
+            RawEventAudienceParameters(destination_ids=target_destinations)
+            if is_target_comparison
+            else None
+        ),
     )
 
 
@@ -1074,6 +1121,9 @@ def _candidate_from_profiles(
     matched_condition_keys: Sequence[str],
     missing_condition_keys: Sequence[str],
     performance_predictor: SegmentPerformancePredictor,
+    identity_strategy_key: str | None = None,
+    destination_operator: str = DESTINATION_ANY_OF,
+    audience_parameters: RawEventAudienceParameters | None = None,
 ) -> _RawEventCandidate | None:
     if len(profiles) < min_sample_size:
         return None
@@ -1159,10 +1209,16 @@ def _candidate_from_profiles(
             **dict(prediction_metadata),
         },
         audience_selection=audience_selection,
-        audience_parameters=_audience_parameters_from_intent(
-            candidate_type=candidate_type,
-            intent=intent,
+        audience_parameters=(
+            audience_parameters
+            if audience_parameters is not None
+            else _audience_parameters_from_intent(
+                candidate_type=candidate_type,
+                intent=intent,
+            )
         ),
+        identity_strategy_key=identity_strategy_key,
+        destination_operator=destination_operator,
     )
 
 
@@ -1381,6 +1437,8 @@ def _with_distinctiveness(
         performance_model_metadata=candidate.performance_model_metadata,
         audience_selection=candidate.audience_selection,
         audience_parameters=candidate.audience_parameters,
+        identity_strategy_key=candidate.identity_strategy_key,
+        destination_operator=candidate.destination_operator,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
     )
 
@@ -1476,50 +1534,61 @@ def _segment_definition_from_candidate(
         promotion=promotion,
         candidate=candidate,
     )
+    ast = build_promotion_audience_ast(
+        promotion_id=promotion.promotion_id,
+        candidate_type=candidate.candidate_type,
+        strategy_key=candidate.identity_strategy_key or candidate.candidate_type,
+        matched_condition_keys=candidate.matched_condition_keys,
+        destination_ids=candidate.audience_parameters.destination_ids,
+        season_months=candidate.audience_parameters.season_months,
+        benefit_keys=candidate.audience_parameters.benefit_keys,
+        destination_operator=candidate.destination_operator,
+        unsupported_conditions=compilation.unsupported_conditions,
+    )
+    try:
+        audience_compilation = compile_promotion_audience_ast(ast)
+    except ValueError as exc:
+        raise SegmentAudienceContractError(
+            code="segment_audience_template_binding_invalid",
+            segment_id=f"promotion:{promotion.promotion_id}",
+            reason=str(exc),
+        ) from exc
+    display_model = audience_compilation.display_model
+    if promotion.goal_metric == "booking_conversion_rate":
+        performance_estimate["label"] = display_model["metric_label"]
+        performance_estimate["description"] = display_model["metric_description"]
     strategy_summary = _strategy_difference_summary(candidate)
     selection_consideration = _selection_consideration_summary(candidate)
     display_copy = {
-        "title": candidate.title,
-        "strategy_role": candidate.strategy_role,
+        "title": display_model["title"],
+        "strategy_role": display_model["strategy_role"],
         **recommendation_tier,
         "audience_summary": audience_summary,
         "audience": audience,
         "performance_estimate": performance_estimate,
-        "signal_chips": list(candidate.signal_chips),
-        "reason": candidate.reason,
+        "signal_chips": list(display_model["signal_chips"]),
+        "reason": display_model["reason"],
         "strength_summary": strategy_summary,
         "tradeoff_summary": selection_consideration,
         "action_hint": candidate.action_hint,
+        "metric_label": display_model["metric_label"],
+        "metric_description": display_model["metric_description"],
     }
-    segment_id = _raw_event_segment_id(
-        promotion_id=promotion.promotion_id,
-        candidate_type=candidate.candidate_type,
-        candidate_user_ids=candidate.candidate_user_ids,
-    )
-    try:
-        audience_spec = RegisteredSegmentAudienceBinder().bind(
-            candidate_type=candidate.candidate_type,
-            destination_ids=candidate.audience_parameters.destination_ids,
-            season_months=candidate.audience_parameters.season_months,
-            benefit_keys=candidate.audience_parameters.benefit_keys,
-        )
-    except ValueError as exc:
-        raise SegmentAudienceContractError(
-            code="segment_audience_template_binding_invalid",
-            segment_id=segment_id,
-            reason=str(exc),
-        ) from exc
+    segment_id = audience_compilation.segment_id
+    audience_spec = audience_compilation.segment_audience_spec
     profile_json: dict[str, Any] = {
         "primary_segment": segment_id,
         "source": "raw_event_intent",
-        "strategy_role": candidate.strategy_role,
+        "strategy_role": display_model["strategy_role"],
+        "strategy_key": ast.strategy_key,
         "candidate_type": candidate.candidate_type,
         **recommendation_tier,
         "portfolio_position": position + 1,
         "score_components": score_components,
         "matched_conditions": matched_conditions,
         "missing_conditions": missing_conditions,
-        "signal_chips": list(candidate.signal_chips),
+        "signal_chips": list(display_model["signal_chips"]),
+        "recommendation_reference_signals": list(candidate.signal_chips),
         "audience": audience,
         "performance_estimate": performance_estimate,
         "performance_features": candidate.performance_features.to_json(),
@@ -1530,6 +1599,15 @@ def _segment_definition_from_candidate(
         },
         "promotion_intent": intent.to_json(),
         "compiled_intent": compilation.to_json(),
+        "promotion_audience_ast": ast.to_json(),
+        "promotion_audience_ast_hash": audience_compilation.ast_hash,
+        "segment_audience_spec_hash": (
+            audience_compilation.segment_audience_spec_hash
+        ),
+        "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
+        "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
+        "creative_only": list(ast.creative_only),
+        "unsupported_conditions": list(ast.unsupported_conditions),
         "display_copy": display_copy,
         "recommendation_score": score_components["final_score"],
         "selection_basis": {
@@ -1557,23 +1635,31 @@ def _segment_definition_from_candidate(
         project_id=promotion.project_id,
         campaign_id=promotion.campaign_id,
         promotion_id=promotion.promotion_id,
-        segment_name=candidate.title,
+        segment_name=str(display_model["title"]),
         source="ai_suggested",
         query_preview_id=None,
         natural_language_query=(
-            f"{candidate.strategy_role}: {', '.join(matched_conditions[:3])} 조건을 "
+            f"{display_model['strategy_role']}: {', '.join(matched_conditions[:3])} 조건을 "
             "실제 SDK 행동 이벤트에서 만족한 고객군입니다."
         ),
         generated_sql=None,
         rule_json={
             "source": "raw_event_intent",
             "candidate_type": candidate.candidate_type,
+            "strategy_key": ast.strategy_key,
             "compiled_conditions": list(candidate.matched_condition_keys),
             "candidate_user_ids": list(candidate.candidate_user_ids),
             "fallback_used": False,
             "version": RAW_EVENT_SEGMENT_VERSION,
             "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
             "segment_audience_spec": dict(audience_spec),
+            "segment_audience_spec_hash": (
+                audience_compilation.segment_audience_spec_hash
+            ),
+            "promotion_audience_ast": ast.to_json(),
+            "promotion_audience_ast_hash": audience_compilation.ast_hash,
+            "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
+            "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
         },
         profile_json=profile_json,
         sample_size=candidate.sample_size,
@@ -2968,31 +3054,6 @@ def _sample_ratio(*, sample_size: int, total_eligible_user_count: int) -> Decima
     if total_eligible_user_count <= 0:
         return Decimal("0")
     return Decimal(sample_size / total_eligible_user_count).quantize(Decimal("0.000001"))
-
-
-def _raw_event_segment_id(
-    *,
-    promotion_id: str,
-    candidate_type: str,
-    candidate_user_ids: Sequence[str],
-) -> str:
-    stable_user_ids = sorted(set(candidate_user_ids))
-    digest = hashlib.sha1(  # noqa: S324 - stable non-security identifier.
-        ":".join(
-            [promotion_id, candidate_type, ",".join(stable_user_ids)]
-        ).encode("utf-8")
-    ).hexdigest()[:10]
-    return (
-        f"seg_ai_raw_{_safe_identifier_part(promotion_id)[:32]}_"
-        f"{candidate_type}_{digest}"
-    )
-
-
-def _safe_identifier_part(value: str) -> str:
-    return "".join(
-        character if character.isalnum() or character == "_" else "_"
-        for character in value
-    )
 
 
 def _safe_rate(numerator: float, denominator: float) -> float:
