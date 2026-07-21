@@ -1,8 +1,8 @@
-"""Canonical audience IR for the existing raw-event candidate factories.
+"""Canonical promotion audience IR and deterministic Audience V2 compiler.
 
-The IR parameterizes the six registered factories with promotion conditions and
-keeps identity, execution, and display semantics aligned. It does not discover
-arbitrary behavior predicates or perform a general rule search.
+The IR is shared by the registered seed factories and the bounded predicate
+search. It only accepts conditions that can be lowered to an existing Audience
+V2 template; it never accepts SQL or an unregistered public template version.
 """
 
 from __future__ import annotations
@@ -98,6 +98,8 @@ class PromotionAudienceAst:
     creative_only: tuple[str, ...] = ()
     unsupported_conditions: tuple[str, ...] = ()
     reference_signal_keys: tuple[str, ...] = ()
+    structured_conditions: tuple[Mapping[str, Any], ...] = ()
+    beam_policy_version: str | None = None
 
     def semantic_payload(self) -> dict[str, Any]:
         destination: dict[str, Any] | None = None
@@ -106,7 +108,7 @@ class PromotionAudienceAst:
                 "operator": self.destination_operator or DESTINATION_ANY_OF,
                 "values": list(self.destination_ids),
             }
-        return {
+        payload = {
             "schema_version": PROMOTION_AUDIENCE_AST_VERSION,
             "strategy_key": self.strategy_key,
             "execution_candidate_type": self.execution_candidate_type,
@@ -116,6 +118,12 @@ class PromotionAudienceAst:
             "season_months": list(self.season_months),
             "benefit_keys": list(self.benefit_keys),
         }
+        if self.structured_conditions:
+            payload["structured_conditions"] = [
+                _semantic_structured_condition(condition)
+                for condition in self.structured_conditions
+            ]
+        return payload
 
     def evaluation_window(self) -> dict[str, Any]:
         return {
@@ -131,6 +139,10 @@ class PromotionAudienceAst:
             "creative_only": list(self.creative_only),
             "unsupported_conditions": list(self.unsupported_conditions),
             "reference_signal_keys": list(self.reference_signal_keys),
+            "structured_conditions": [
+                dict(condition) for condition in self.structured_conditions
+            ],
+            "beam_policy_version": self.beam_policy_version,
         }
 
 
@@ -156,6 +168,8 @@ def build_promotion_audience_ast(
     strategy_key: str | None = None,
     lookback_days: int = PROMOTION_AUDIENCE_LOOKBACK_DAYS,
     unsupported_conditions: Sequence[str] = (),
+    structured_conditions: Sequence[Mapping[str, Any]] = (),
+    beam_policy_version: str | None = None,
 ) -> PromotionAudienceAst:
     destinations = canonical_destination_ids(destination_ids)
     operator = destination_operator if destinations else None
@@ -167,11 +181,18 @@ def build_promotion_audience_ast(
         unsupported_conditions
     )
     seasons = canonical_season_months(season_months)
-    executable_conditions = _executable_condition_keys(
-        candidate_type=candidate_type,
-        destination_operator=operator,
-        destination_ids=destinations,
-        season_months=seasons,
+    canonical_structured_conditions = _canonical_structured_conditions(
+        structured_conditions
+    )
+    executable_conditions = (
+        _canonical_condition_keys(matched_condition_keys)
+        if canonical_structured_conditions
+        else _executable_condition_keys(
+            candidate_type=candidate_type,
+            destination_operator=operator,
+            destination_ids=destinations,
+            season_months=seasons,
+        )
     )
     return PromotionAudienceAst(
         promotion_id=promotion_id,
@@ -186,6 +207,10 @@ def build_promotion_audience_ast(
         creative_only=creative_only,
         unsupported_conditions=unsupported,
         reference_signal_keys=_canonical_condition_keys(matched_condition_keys),
+        structured_conditions=canonical_structured_conditions,
+        beam_policy_version=(
+            str(beam_policy_version).strip() if beam_policy_version else None
+        ),
     )
 
 
@@ -196,7 +221,9 @@ def compile_promotion_audience_ast(
         raise ValueError(
             "the current Segment Audience V2 contract supports a 30-day lookback"
         )
-    if ast.destination_operator == DESTINATION_CONTAINS_ALL:
+    if ast.structured_conditions:
+        audience_spec = _custom_structured_spec(ast)
+    elif ast.destination_operator == DESTINATION_CONTAINS_ALL:
         audience_spec = _custom_contains_all_spec(ast)
     else:
         audience_spec = RegisteredSegmentAudienceBinder().bind(
@@ -243,6 +270,8 @@ def promotion_audience_segment_id(
         "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
         "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
     }
+    if ast.beam_policy_version:
+        fingerprint_payload["beam_policy_version"] = ast.beam_policy_version
     fingerprint = _sha256_json(fingerprint_payload)
     strategy = _safe_identifier_part(ast.strategy_key)[:36] or "dynamic"
     promotion = _safe_identifier_part(ast.promotion_id)[:32] or "promotion"
@@ -284,6 +313,33 @@ def _custom_contains_all_spec(ast: PromotionAudienceAst) -> Mapping[str, Any]:
     }
 
 
+def _custom_structured_spec(ast: PromotionAudienceAst) -> Mapping[str, Any]:
+    execution_conditions = tuple(
+        _execution_structured_condition(condition)
+        for condition in ast.structured_conditions
+    )
+    return {
+        "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+        "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+        "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+        "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+        "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+        "condition_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+        "query_signal_keys": list(
+            _custom_structured_query_signal_keys(execution_conditions)
+        ),
+        "hard_predicate_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+        "parameters": {
+            "lookback_days": ast.lookback_days,
+            "conditions": [dict(value) for value in execution_conditions],
+        },
+        "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+        "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+        "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+        "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+    }
+
+
 def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
     destination_text = _destination_text(ast.destination_ids)
     destination_prefix = f"{destination_text} " if destination_text else ""
@@ -291,7 +347,27 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
         _BENEFIT_LABELS.get(key, key) for key in ast.benefit_keys
     )
     strategy_key = ast.strategy_key
-    if strategy_key == "funnel_recovery":
+    if ast.structured_conditions and ast.beam_policy_version:
+        condition_labels = tuple(
+            dict.fromkeys(
+                str(condition["label"])
+                for condition in ast.structured_conditions
+                if str(condition.get("label", "")).strip()
+            )
+        )
+        behavior_labels = tuple(
+            label
+            for label in condition_labels
+            if not destination_text or destination_text not in label
+        )
+        title_conditions = behavior_labels[:2] or condition_labels[:2]
+        condition_text = "·".join(title_conditions) or "행동 조건"
+        title = f"{destination_prefix}{condition_text} 고객"
+        reason = (
+            f"{destination_text or '프로모션'} 조건과 "
+            f"{', '.join(title_conditions)} 행동을 함께 만족한 고객입니다."
+        )
+    elif strategy_key == "funnel_recovery":
         title = f"{destination_prefix}예약 직전 이탈 고객"
         reason = (
             f"{destination_text or '프로모션 목적지'} 숙소를 탐색하고 예약을 "
@@ -328,13 +404,26 @@ def _display_model(ast: PromotionAudienceAst) -> Mapping[str, Any]:
         )
 
     chips = list(_destination_chips(ast))
-    chips.extend(
-        _BEHAVIOR_CHIPS.get(key, key) for key in ast.behavior_condition_keys
-    )
+    if ast.structured_conditions:
+        chips.extend(
+            str(condition["label"])
+            for condition in ast.structured_conditions
+        )
+    else:
+        chips.extend(
+            _BEHAVIOR_CHIPS.get(key, key) for key in ast.behavior_condition_keys
+        )
     chips.extend(_BENEFIT_LABELS.get(key, key) for key in ast.benefit_keys)
     return {
         "title": " ".join(title.split()),
-        "strategy_role": _STRATEGY_ROLES.get(strategy_key, "동적 조건형"),
+        "strategy_role": _STRATEGY_ROLES.get(
+            (
+                ast.execution_candidate_type
+                if ast.structured_conditions and ast.beam_policy_version
+                else strategy_key
+            ),
+            "동적 조건형",
+        ),
         "signal_chips": list(dict.fromkeys(chips))[:5],
         "reason": reason,
         "metric_label": "행동 기반 예상 예약 전환율",
@@ -386,6 +475,182 @@ def _partition_non_executable_conditions(
 
 def _canonical_condition_keys(values: Sequence[str]) -> tuple[str, ...]:
     return tuple(sorted({str(value).strip() for value in values if str(value).strip()}))
+
+
+def _canonical_structured_conditions(
+    values: Sequence[Mapping[str, Any]],
+) -> tuple[Mapping[str, Any], ...]:
+    conditions: list[dict[str, Any]] = []
+    for value in values:
+        if not isinstance(value, Mapping):
+            raise ValueError("structured audience condition must be an object")
+        event_name = str(value.get("event_name", "")).strip()
+        label = " ".join(str(value.get("label", "")).strip().split())
+        if not event_name or not label:
+            raise ValueError("structured audience condition requires event_name and label")
+        destination = value.get("destination")
+        destination_text = (
+            ",".join(
+                canonical_destination_ids(
+                    part
+                    for part in str(destination).replace("·", ",").split(",")
+                    if part.strip()
+                )
+            )
+            if destination
+            else None
+        )
+        property_filters = sorted(
+            (
+                {
+                    "key": str(item.get("key", "")).strip(),
+                    "operator": str(item.get("operator", "")).strip(),
+                    "value": str(item.get("value", "")).strip(),
+                }
+                for item in value.get("property_filters", ())
+                if isinstance(item, Mapping)
+            ),
+            key=lambda item: (item["key"], item["operator"], item["value"]),
+        )
+        conditions.append(
+            {
+                "label": label,
+                "event_name": event_name,
+                "minimum_count": int(value.get("minimum_count", 0)),
+                "maximum_count": (
+                    int(value["maximum_count"])
+                    if value.get("maximum_count") is not None
+                    else None
+                ),
+                "destination": destination_text,
+                "checkin_months": sorted(
+                    {int(month) for month in value.get("checkin_months", ())}
+                ),
+                "property_filters": property_filters,
+            }
+        )
+    conditions.sort(
+        key=lambda condition: json.dumps(
+            _semantic_structured_condition(condition),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    semantic_keys = [
+        json.dumps(
+            _semantic_structured_condition(condition),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        for condition in conditions
+    ]
+    if len(semantic_keys) != len(set(semantic_keys)):
+        raise ValueError("structured audience conditions must not contain duplicates")
+    return tuple(conditions)
+
+
+def _semantic_structured_condition(
+    condition: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    return {
+        key: value
+        for key, value in condition.items()
+        if key != "label"
+    }
+
+
+def _execution_structured_condition(
+    condition: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    semantic = dict(_semantic_structured_condition(condition))
+    semantic["label"] = _execution_condition_label(condition)
+    return {
+        "label": semantic["label"],
+        "event_name": semantic["event_name"],
+        "minimum_count": semantic["minimum_count"],
+        "maximum_count": semantic["maximum_count"],
+        "destination": semantic["destination"],
+        "checkin_months": semantic["checkin_months"],
+        "property_filters": semantic["property_filters"],
+    }
+
+
+def _execution_condition_label(condition: Mapping[str, Any]) -> str:
+    event_label = {
+        "page_view": "페이지 조회",
+        "hotel_search": "숙소 검색",
+        "hotel_click": "숙소 클릭",
+        "hotel_detail_view": "호텔 상세 조회",
+        "promotion_impression": "프로모션 노출",
+        "promotion_click": "프로모션 클릭",
+        "campaign_redirect_click": "캠페인 이동",
+        "campaign_landing": "캠페인 랜딩",
+        "booking_start": "예약 시작",
+        "booking_complete": "예약 완료",
+        "booking_cancel": "예약 취소",
+    }.get(str(condition["event_name"]), str(condition["event_name"]))
+    parts: list[str] = []
+    destination = str(condition.get("destination") or "").strip()
+    if destination:
+        parts.append(destination.replace(",", "·"))
+    months = tuple(int(month) for month in condition.get("checkin_months", ()))
+    if months:
+        parts.append("체크인 " + "·".join(str(month) for month in months) + "월")
+    parts.append(event_label)
+    minimum_count = int(condition["minimum_count"])
+    maximum_count = condition.get("maximum_count")
+    if maximum_count == 0:
+        parts.append("없음")
+    elif minimum_count > 1:
+        parts.append(f"{minimum_count}회 이상")
+    filters = condition.get("property_filters", ())
+    if filters:
+        parts.append(
+            "·".join(
+                str(value.get("key", ""))
+                for value in filters
+                if str(value.get("key", "")).strip()
+            )
+        )
+    return " ".join(parts)[:120]
+
+
+def _custom_structured_query_signal_keys(
+    conditions: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    event_signals = {
+        "hotel_search": "hotel_search_intensity",
+        "hotel_click": "hotel_click_intensity",
+        "hotel_detail_view": "hotel_detail_view_intensity",
+        "promotion_impression": "promotion_impression_intensity",
+        "promotion_click": "promotion_click_intensity",
+        "campaign_redirect_click": "campaign_redirect_intensity",
+        "campaign_landing": "campaign_landing_intensity",
+        "booking_start": "booking_start_intensity",
+    }
+    signals = {
+        event_signals[str(condition["event_name"])]
+        for condition in conditions
+        if int(condition["minimum_count"]) > 0
+        and str(condition["event_name"]) in event_signals
+    }
+    has_booking_start = any(
+        condition["event_name"] == "booking_start"
+        and int(condition["minimum_count"]) > 0
+        for condition in conditions
+    )
+    has_no_booking_complete = any(
+        condition["event_name"] == "booking_complete"
+        and condition.get("maximum_count") == 0
+        for condition in conditions
+    )
+    if has_booking_start and has_no_booking_complete:
+        signals.add("booking_start_without_complete")
+    if not signals:
+        signals.add("hotel_consideration_intensity")
+    return tuple(sorted(signals))
 
 
 def _executable_condition_keys(

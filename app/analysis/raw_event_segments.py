@@ -31,6 +31,10 @@ from app.analysis.promotion_audience_ast import (
     build_promotion_audience_ast,
     compile_promotion_audience_ast,
 )
+from app.analysis.promotion_audience_beam import (
+    BeamAudienceCandidate,
+    search_promotion_audience_candidates,
+)
 from app.analysis.repositories import (
     PromotionRecord,
     RawEventUserSignalRecord,
@@ -310,6 +314,10 @@ class _RawEventCandidate:
     identity_strategy_key: str | None = None
     destination_operator: str = DESTINATION_ANY_OF
     rank_distinctiveness: float = 1.0
+    structured_conditions: tuple[Mapping[str, Any], ...] = ()
+    beam_policy_version: str | None = None
+    beam_search_score: float | None = None
+    beam_search_metadata: Mapping[str, Any] | None = None
 
     @property
     def sample_size(self) -> int:
@@ -598,6 +606,7 @@ def generate_raw_event_segment_definitions(
         performance_predictor=performance_predictor,
         audience_selection_policy=audience_selection_policy,
         enforce_prediction_support=True,
+        enable_beam_search=True,
     )
     if not candidates:
         return []
@@ -640,6 +649,7 @@ def generate_raw_event_segment_candidate_pool(
         performance_predictor=performance_predictor,
         audience_selection_policy=None,
         enforce_prediction_support=enforce_prediction_support,
+        enable_beam_search=False,
     )
     total_eligible_user_count = len(profiles)
     return [
@@ -666,6 +676,7 @@ def _generate_raw_event_candidates(
     performance_predictor: SegmentPerformancePredictor | None,
     audience_selection_policy: AudienceSelectionPolicyProtocol | None,
     enforce_prediction_support: bool,
+    enable_beam_search: bool,
 ) -> list[_RawEventCandidate]:
     if len(profiles) < min_sample_size:
         return []
@@ -727,7 +738,24 @@ def _generate_raw_event_candidates(
                 performance_predictor=predictor,
             )
         )
-    candidates = [candidate for candidate in raw_candidates if candidate is not None]
+    factory_candidates = [
+        candidate for candidate in raw_candidates if candidate is not None
+    ]
+    beam_candidates = (
+        _generate_beam_candidates(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            profiles=eligible_profiles,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=predictor,
+            enforce_prediction_support=enforce_prediction_support,
+        )
+        if enable_beam_search
+        else []
+    )
+    candidates = beam_candidates or factory_candidates
     if audience_selection_policy is not None:
         candidates = [
             _apply_audience_selection(
@@ -743,6 +771,139 @@ def _generate_raw_event_candidates(
         ]
     return _normalize_expected_performance(
         candidates
+    )
+
+
+def _generate_beam_candidates(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    profiles: Sequence[RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+    enforce_prediction_support: bool,
+) -> list[_RawEventCandidate]:
+    result = search_promotion_audience_candidates(
+        promotion_id=promotion.promotion_id,
+        destination_ids=intent.destinations,
+        season_months=season_months_from_intent(intent),
+        benefit_keys=intent.benefits,
+        desired_behavior_keys=intent.desired_behaviors,
+        profiles=profiles,
+        min_sample_size=min_sample_size,
+    )
+    profiles_by_user_id = {profile.user_id: profile for profile in profiles}
+    candidates: list[_RawEventCandidate] = []
+    for beam_candidate in result.candidates:
+        if (
+            intent.requested_candidate_types
+            and beam_candidate.candidate_type
+            not in intent.requested_candidate_types
+        ):
+            continue
+        if enforce_prediction_support:
+            support = candidate_type_prediction_support(
+                performance_predictor,
+                goal_metric=promotion.goal_metric,
+                candidate_type=beam_candidate.candidate_type,
+            )
+            if not support.supported:
+                continue
+        candidate = _raw_event_candidate_from_beam(
+            promotion=promotion,
+            intent=intent,
+            compilation=compilation,
+            beam_candidate=beam_candidate,
+            profiles_by_user_id=profiles_by_user_id,
+            baseline=baseline,
+            min_sample_size=min_sample_size,
+            performance_predictor=performance_predictor,
+            beam_search_metadata={
+                "policy_version": result.policy.policy_version,
+                "beam_width": result.policy.beam_width,
+                "maximum_depth": result.policy.maximum_depth,
+                "maximum_generated_candidates": (
+                    result.policy.maximum_generated_candidates
+                ),
+                "maximum_final_candidates": result.policy.maximum_final_candidates,
+                "generated_candidate_count": result.generated_candidate_count,
+                "pruned_candidate_counts": dict(result.pruned_candidate_counts),
+            },
+        )
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
+def _raw_event_candidate_from_beam(
+    *,
+    promotion: PromotionRecord,
+    intent: PromotionIntent,
+    compilation: RawEventIntentCompilation,
+    beam_candidate: BeamAudienceCandidate,
+    profiles_by_user_id: Mapping[str, RawEventUserSignalRecord],
+    baseline: Mapping[str, float],
+    min_sample_size: int,
+    performance_predictor: SegmentPerformancePredictor,
+    beam_search_metadata: Mapping[str, Any],
+) -> _RawEventCandidate | None:
+    matched_profiles = [
+        profiles_by_user_id[user_id]
+        for user_id in beam_candidate.user_ids
+        if user_id in profiles_by_user_id
+    ]
+    matched_condition_keys = tuple(
+        choice.predicate_key for choice in beam_candidate.choices
+    )
+    if intent.destinations:
+        matched_condition_keys = (
+            *matched_condition_keys,
+            "recent_destination_search",
+        )
+    if intent.season:
+        matched_condition_keys = (*matched_condition_keys, "season_match")
+    candidate = _candidate_from_profiles(
+        candidate_type=beam_candidate.candidate_type,
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=matched_profiles,
+        baseline=baseline,
+        min_sample_size=min_sample_size,
+        matched_condition_keys=matched_condition_keys,
+        missing_condition_keys=_missing_condition_keys(
+            compilation,
+            matched_condition_keys,
+        ),
+        performance_predictor=performance_predictor,
+        identity_strategy_key=beam_candidate.strategy_key,
+        audience_parameters=RawEventAudienceParameters(
+            destination_ids=tuple(intent.destinations),
+            season_months=season_months_from_intent(intent),
+            benefit_keys=tuple(intent.benefits),
+        ),
+    )
+    if candidate is None:
+        return None
+    return replace(
+        candidate,
+        structured_conditions=beam_candidate.structured_conditions,
+        beam_policy_version=str(beam_search_metadata["policy_version"]),
+        beam_search_score=beam_candidate.score,
+        beam_search_metadata={
+            **dict(beam_search_metadata),
+            "depth": beam_candidate.depth,
+            "predicate_choices": [
+                {
+                    "predicate_key": choice.predicate_key,
+                    "minimum_count": choice.minimum_count,
+                }
+                for choice in beam_candidate.choices
+            ],
+            "score_components": dict(beam_candidate.score_components),
+        },
     )
 
 
@@ -1392,7 +1553,11 @@ def _select_candidate_portfolio(
         remaining = [
             candidate
             for candidate in remaining
-            if candidate.candidate_type != next_candidate.candidate_type
+            if (candidate.identity_strategy_key or candidate.candidate_type)
+            != (
+                next_candidate.identity_strategy_key
+                or next_candidate.candidate_type
+            )
         ]
     return selected
 
@@ -1440,6 +1605,10 @@ def _with_distinctiveness(
         identity_strategy_key=candidate.identity_strategy_key,
         destination_operator=candidate.destination_operator,
         rank_distinctiveness=max(0.0, min(1.0, distinctiveness)),
+        structured_conditions=candidate.structured_conditions,
+        beam_policy_version=candidate.beam_policy_version,
+        beam_search_score=candidate.beam_search_score,
+        beam_search_metadata=candidate.beam_search_metadata,
     )
 
 
@@ -1544,6 +1713,8 @@ def _segment_definition_from_candidate(
         benefit_keys=candidate.audience_parameters.benefit_keys,
         destination_operator=candidate.destination_operator,
         unsupported_conditions=compilation.unsupported_conditions,
+        structured_conditions=candidate.structured_conditions,
+        beam_policy_version=candidate.beam_policy_version,
     )
     try:
         audience_compilation = compile_promotion_audience_ast(ast)
@@ -1624,6 +1795,14 @@ def _segment_definition_from_candidate(
             ),
         },
     }
+    if candidate.beam_search_metadata is not None:
+        profile_json["beam_search"] = {
+            **dict(candidate.beam_search_metadata),
+            "candidate_score": round(
+                float(candidate.beam_search_score or 0.0),
+                6,
+            ),
+        }
     primary_signals = [
         key for key in candidate.matched_condition_keys if key.strip()
     ][:3]
@@ -1660,6 +1839,11 @@ def _segment_definition_from_candidate(
             "promotion_audience_ast_hash": audience_compilation.ast_hash,
             "condition_compiler_version": PROMOTION_AUDIENCE_COMPILER_VERSION,
             "audience_contract_version": PROMOTION_AUDIENCE_CONTRACT_VERSION,
+            **(
+                {"beam_search": dict(profile_json["beam_search"])}
+                if "beam_search" in profile_json
+                else {}
+            ),
         },
         profile_json=profile_json,
         sample_size=candidate.sample_size,
@@ -2765,7 +2949,7 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
     final_score = _final_score(candidate)
     weights = _score_weights(candidate)
     recommendation_tier = _recommendation_tier(candidate)
-    return {
+    result = {
         "promotion_condition_match": round(candidate.promotion_condition_match, 6),
         "predicted_goal_rate": round(candidate.predicted_goal_rate, 6),
         "expected_goal_performance": round(candidate.expected_goal_performance, 6),
@@ -2783,6 +2967,17 @@ def _score_components(candidate: _RawEventCandidate) -> dict[str, Any]:
         "destination_context_required": candidate.destination_context_required,
         "primary_component": "expected_goal_performance",
     }
+    if candidate.beam_search_score is not None:
+        result["beam_search_score"] = round(candidate.beam_search_score, 6)
+        if candidate.beam_search_metadata is not None:
+            components = candidate.beam_search_metadata.get("score_components")
+            if isinstance(components, Mapping):
+                result["beam_search_components"] = {
+                    key: round(float(value), 6)
+                    for key, value in components.items()
+                }
+        result["primary_component"] = "bounded_beam_search"
+    return result
 
 
 def _performance_estimate(
@@ -2960,7 +3155,7 @@ def _format_expected_count(value: float) -> str:
 
 def _final_score(candidate: _RawEventCandidate) -> float:
     weights = _score_weights(candidate)
-    return (
+    base_score = (
         weights["promotion_condition_match"] * candidate.promotion_condition_match
         + weights["expected_goal_performance"]
         * candidate.expected_goal_performance
@@ -2969,6 +3164,9 @@ def _final_score(candidate: _RawEventCandidate) -> float:
         + weights["sample_reliability"] * candidate.sample_reliability
         + weights["rank_distinctiveness"] * candidate.rank_distinctiveness
     )
+    if candidate.beam_search_score is None:
+        return base_score
+    return 0.55 * base_score + 0.45 * candidate.beam_search_score
 
 
 def _score_weights(candidate: _RawEventCandidate) -> Mapping[str, float]:
