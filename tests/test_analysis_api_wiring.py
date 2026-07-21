@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -416,6 +417,17 @@ class RecordingCursor:
         sql = compact_sql(self._last_query)
         if "from promotions" in sql:
             return self._connection.promotion_row
+        if "from promotion_audience_exclusion_state as state" in sql:
+            return {"revision": 0, "excluded_user_count": 0}
+        if "from user_behavior_vector_search_generations as generation" in sql:
+            return {
+                "vector_generation_id": "uvgen_wiring_test",
+                "manifest_hash": "manifest-wiring-test",
+                "source_cutoff": datetime(2026, 7, 1, tzinfo=UTC),
+                "source_revision_cutoff": datetime(2026, 7, 1, tzinfo=UTC),
+                "window_start": datetime(2026, 6, 1, tzinfo=UTC),
+                "corpus_user_count": len(self._connection.user_vector_rows),
+            }
         if "from segment_vectors" in sql:
             return None
         if "insert into generation_runs" in sql:
@@ -463,6 +475,7 @@ class RecordingConnection:
         )
         self.executed: list[tuple[str, Any]] = []
         self.target_segment_rows: list[dict[str, object]] = []
+        self.user_vector_rows = user_behavior_vector_rows()
         self.commit_count = 0
         self.rollback_count = 0
         self.close_count = 0

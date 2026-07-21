@@ -92,12 +92,13 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             segment_vector_repository=segment_vector_repository,
             user_behavior_vector_repository=user_behavior_vector_repository,
         )
+        audience_search_repository = PgClickHouseAudienceVectorSearchRepository(
+            postgres=postgres_executor,
+            clickhouse=clickhouse_client,
+            exclusion_repository=exclusion_repository,
+        )
         audience_v2_coordinator = AudienceV2Coordinator(
-            search_repository=PgClickHouseAudienceVectorSearchRepository(
-                postgres=postgres_executor,
-                clickhouse=clickhouse_client,
-                exclusion_repository=exclusion_repository,
-            ),
+            search_repository=audience_search_repository,
             snapshot_repository=AudienceSnapshotRepository(postgres_executor),
             segment_vector_service=segment_vector_service,
         )
@@ -115,6 +116,7 @@ def get_analysis_service(request: Request) -> Iterator[PromotionAnalysisService]
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=user_behavior_vector_repository,
                 raw_event_signal_repository=user_behavior_vector_repository,
+                audience_context_provider=audience_search_repository,
                 promotion_intent_extractor=build_promotion_intent_extractor(settings),
                 performance_predictor=build_segment_performance_predictor(
                     settings.segment_performance_model_path

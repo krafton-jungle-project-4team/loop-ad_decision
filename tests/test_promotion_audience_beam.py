@@ -25,6 +25,9 @@ def _profile(
     deal: int = 0,
     destination_match: int = 1,
     season_match: int = 1,
+    promotion_condition_search: int | None = None,
+    target_destination_search: int | None = None,
+    deal_search: int | None = None,
 ) -> RawEventUserSignalRecord:
     return RawEventUserSignalRecord(
         project_id="demo_project",
@@ -57,6 +60,9 @@ def _profile(
         preferred_category_values=(),
         destination_match_count=destination_match,
         season_match_count=season_match,
+        promotion_condition_search_count=promotion_condition_search,
+        target_destination_search_count=target_destination_search,
+        deal_search_count=deal_search,
     )
 
 
@@ -108,11 +114,13 @@ def test_predicate_registry_is_executable_and_explicit() -> None:
         assert predicate.display_label
 
 
-def test_beam_generates_compound_candidate_and_keeps_mandatory_conditions() -> None:
+def test_default_beam_adds_one_behavior_to_mandatory_conditions() -> None:
     result = _search(_profiles())
 
     assert result.candidates
-    assert any(candidate.depth >= 2 for candidate in result.candidates)
+    assert result.policy.policy_version == "promotion-audience-beam.v2"
+    assert result.policy.maximum_depth == 1
+    assert all(candidate.depth == 1 for candidate in result.candidates)
     assert all(candidate.strategy_key.startswith("beam_") for candidate in result.candidates)
     for candidate in result.candidates:
         ast = build_promotion_audience_ast(
@@ -174,6 +182,96 @@ def test_beam_is_independent_of_profile_input_order() -> None:
         (candidate.strategy_key, candidate.user_ids)
         for candidate in reverse.candidates
     ]
+
+
+def test_beam_keeps_benefit_as_optional_executable_candidate_condition() -> None:
+    profiles = [
+        _profile(
+            "no-benefit",
+            detail=2,
+            deal=1,
+            promotion_condition_search=1,
+            deal_search=0,
+        ),
+        _profile(
+            "benefit-match",
+            detail=2,
+            deal=1,
+            promotion_condition_search=1,
+            deal_search=1,
+        ),
+        _profile(
+            "baseline",
+            promotion_condition_search=1,
+            deal_search=0,
+        ),
+    ]
+
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-jeju-okinawa",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=("discount",),
+        desired_behavior_keys=("hotel_detail_view",),
+        profiles=profiles,
+        min_sample_size=1,
+    )
+
+    assert result.candidates
+    discount_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "discount_interest"
+            for choice in candidate.choices
+        )
+    )
+    detail_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "hotel_detail_view"
+            for choice in candidate.choices
+        )
+    )
+    assert discount_candidate.user_ids == ("benefit-match",)
+    assert detail_candidate.user_ids == ("benefit-match", "no-benefit")
+
+
+def test_beam_uses_destination_search_count_for_repeat_predicate() -> None:
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-jeju-okinawa",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("destination_repeat_search",),
+        profiles=[
+            _profile(
+                "coarse-repeat-only",
+                destination_match=3,
+                promotion_condition_search=1,
+                target_destination_search=1,
+            ),
+            _profile(
+                "executable-repeat",
+                destination_match=3,
+                promotion_condition_search=1,
+                target_destination_search=2,
+            ),
+        ],
+        min_sample_size=1,
+        policy=PromotionAudienceBeamPolicy(maximum_final_candidates=10),
+    )
+
+    repeat_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "destination_repeat_search"
+            for choice in candidate.choices
+        )
+    )
+    assert repeat_candidate.user_ids == ("executable-repeat",)
 
 
 def test_beam_policy_version_changes_identity_without_public_v3() -> None:

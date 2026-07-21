@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
 from psycopg.types.json import Jsonb
 
+from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.repositories import (
     HotelProfileRepository,
     PromotionAnalysisRepository,
     PromotionAnalysisWrite,
     PromotionRepository,
+    RawEventSignalGenerationScope,
     PromotionSegmentSuggestionWrite,
     SegmentDefinitionRecord,
     SegmentDefinitionRepository,
@@ -669,8 +672,56 @@ def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
         "vector_version": "v2",
         "vector_source": "raw_events",
         "destination_terms": [],
+        "season_months": [],
         "limit": 250,
     }
+
+
+def test_raw_event_signals_use_active_v2_generation_scope() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+    scope = RawEventSignalGenerationScope(
+        vector_generation_id="uvgen_active",
+        vector_version="hotel_behavior.v2",
+        window_start=datetime(2026, 6, 21, tzinfo=UTC),
+        window_end=datetime(2026, 7, 21, tzinfo=UTC),
+        source_revision_cutoff=datetime(2026, 7, 21, 0, 0, 1, tzinfo=UTC),
+        corpus_user_count=946,
+        exclusion_context=PromotionAudienceExclusionContext(
+            project_id="hotel-client-a",
+            campaign_id="camp_summer_2026",
+            promotion_id="promo_black_friday",
+            revision=3,
+            excluded_user_count=7,
+            projection_revision=3,
+        ),
+    )
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        vector_version="v1",
+        limit=1000,
+        generation_scope=scope,
+    )
+
+    assert records == []
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_behavior_vector_revisions" in sql
+    assert "received_at <= parsedatetime64besteffort" in sql
+    assert "ingested_at <= parsedatetime64besteffort" in sql
+    assert "left anti join" in sql
+    assert "promotion_audience_exclusion_active" in sql
+    assert "argmax(window_start, updated_at)" not in sql
+    assert call.params["vector_version"] == "hotel_behavior.v2"
+    assert call.params["window_start"] == scope.window_start.isoformat()
+    assert call.params["window_end"] == scope.window_end.isoformat()
+    assert (
+        call.params["source_revision_cutoff"]
+        == scope.source_revision_cutoff.isoformat()
+    )
+    assert call.params["exclusion_promotion_id"] == "promo_black_friday"
+    assert call.params["exclusion_revision"] == 3
 
 
 def test_raw_event_signals_count_matching_destination_events_before_deduplication() -> None:
@@ -703,6 +754,12 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
                 "gender_values": [],
                 "preferred_category_values": [],
                 "destination_match_count": 2,
+                "promotion_condition_search_count": 1,
+                "target_destination_search_count": 2,
+                "deal_search_count": 1,
+                "free_cancellation_search_count": 0,
+                "breakfast_search_count": 0,
+                "price_search_count": 2,
             }
         ]
     )
@@ -711,16 +768,25 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
     records = repo.list_raw_event_user_signals(
         project_id="hotel-client-a",
         destination_terms=(" JeJu ", "제주"),
+        season_months=(8, 6, 8),
     )
 
     assert records[0].destination_values == ("제주 제주",)
     assert records[0].destination_match_count == 2
+    assert records[0].promotion_condition_search_count == 1
+    assert records[0].target_destination_search_count == 2
+    assert records[0].deal_search_count == 1
+    assert records[0].price_search_count == 2
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "countif( arrayexists(" in sql
     assert "positioncaseinsensitiveutf8(" in sql
     assert "{destination_terms:array(string)}" in sql
+    assert "as promotion_condition_search_count" in sql
+    assert "as target_destination_search_count" in sql
+    assert "as deal_search_count" in sql
     assert call.params["destination_terms"] == ["jeju", "제주"]
+    assert call.params["season_months"] == [6, 8]
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:
