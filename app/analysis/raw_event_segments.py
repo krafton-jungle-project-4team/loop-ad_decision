@@ -2811,6 +2811,10 @@ def _performance_estimate(
     estimate = {
         "metric": promotion.goal_metric,
         "label": _performance_estimate_label(promotion.goal_metric),
+        "interpretation": _performance_estimate_interpretation(
+            promotion.goal_metric
+        ),
+        "is_incremental_effect": False,
         "availability": "available",
         "unit": "rate",
         "value": round(value, 6),
@@ -2854,12 +2858,24 @@ def _observed_goal_rate(
 
 def _performance_estimate_label(goal_metric: str) -> str:
     if goal_metric == "booking_conversion_rate":
-        return "예상 예약 전환율"
+        return "행동 기반 예상 예약 전환율"
     if goal_metric == "inflow_rate":
         return "예상 유입률"
     if goal_metric == "funnel_step_rate":
         return "예상 예약 시작 전환율"
     return "예상 성과"
+
+
+def _performance_estimate_interpretation(goal_metric: str) -> str:
+    if goal_metric == "booking_conversion_rate":
+        return (
+            "과거 행동을 바탕으로 추정한 향후 예약 가능성이며, "
+            "광고로 인한 증가율은 아닙니다."
+        )
+    return (
+        "과거 행동을 바탕으로 추정한 목표 달성 가능성이며, "
+        "광고로 인한 증가율은 아닙니다."
+    )
 
 
 def _performance_expected_count_label(goal_metric: str) -> str:

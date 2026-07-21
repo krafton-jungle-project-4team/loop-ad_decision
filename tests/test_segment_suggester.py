@@ -1410,6 +1410,11 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
     )
     estimate = first_profile["performance_estimate"]
     assert estimate["label"] == "행동 기반 예상 예약 전환율"
+    assert estimate["is_incremental_effect"] is False
+    assert estimate["interpretation"] == (
+        "과거 행동을 바탕으로 추정한 향후 예약 가능성이며, "
+        "광고로 인한 증가율은 아닙니다."
+    )
     assert estimate["value"] == 0.42
     assert estimate["window_days"] == 30
     assert estimate["window_label"] == "향후 30일 내 프로모션 조건 일치 예약"
