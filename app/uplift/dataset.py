@@ -7,7 +7,10 @@ from decimal import Decimal
 import math
 from typing import Any, Mapping, Protocol, Sequence
 
-from app.analysis.behavior_manifest import destination_alias_groups
+from app.analysis.behavior_manifest import (
+    canonical_destination_id,
+    clickhouse_canonical_destination_sql,
+)
 from app.decision.experiment_design import EXECUTION_SCHEMA_VERSION
 from app.decision.matcher import parse_vector_values
 from app.decision.outcome_spec import (
@@ -16,6 +19,15 @@ from app.decision.outcome_spec import (
 )
 from app.decision.repositories import ClickHouseClient, PostgresExecutor
 from app.uplift.contracts import UpliftDatasetBuildResult, UpliftTrainingExample
+
+
+DEFAULT_OUTCOME_USER_BATCH_SIZE = 5000
+_OUTCOME_DESTINATION_PROPERTY_KEYS = (
+    "destination_id",
+    "destination_name",
+    "hotel_city",
+    "hotel_country",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +125,7 @@ class PostgresUpliftUnitSourceRepository:
               ON vector.vector_generation_id = unit.vector_generation_id
              AND vector.user_id = unit.user_id
             WHERE (%s::text IS NULL OR unit.project_id = %s)
+              AND execution.uplift_assignment_status = 'finalized'
             ORDER BY
                 unit.promotion_run_id ASC,
                 unit.ad_experiment_id ASC,
@@ -124,8 +137,16 @@ class PostgresUpliftUnitSourceRepository:
 
 
 class ClickHouseOutcomeEventRepository:
-    def __init__(self, client: ClickHouseClient) -> None:
+    def __init__(
+        self,
+        client: ClickHouseClient,
+        *,
+        user_batch_size: int = DEFAULT_OUTCOME_USER_BATCH_SIZE,
+    ) -> None:
+        if user_batch_size < 1:
+            raise ValueError("outcome user batch size must be positive")
         self._client = client
+        self._user_batch_size = user_batch_size
 
     def list_success_user_ids(
         self,
@@ -139,39 +160,53 @@ class ClickHouseOutcomeEventRepository:
     ) -> set[str]:
         if not user_ids:
             return set()
-        aliases = _destination_aliases(destination_ids)
-        destination_clause = ""
-        if aliases:
-            destination_clause = """
-              AND lowerUTF8(coalesce(
-                    nullIf(JSONExtractString(properties_json, 'destination_id'), ''),
-                    nullIf(JSONExtractString(properties_json, 'destination_name'), ''),
-                    nullIf(JSONExtractString(properties_json, 'hotel_city'), ''),
-                    ''
-              )) IN {destination_aliases:Array(String)}
-            """
-        result = self._client.query(
-            f"""
-            SELECT DISTINCT user_id
-            FROM raw_events
-            WHERE project_id = {{project_id:String}}
-              AND event_name = {{event_name:String}}
-              AND validation_status = 'valid'
-              AND user_id IN {{user_ids:Array(String)}}
-              AND event_time >= {{window_start:DateTime64(3, 'UTC')}}
-              AND event_time < {{window_end:DateTime64(3, 'UTC')}}
-              {destination_clause}
-            """,
-            parameters={
-                "project_id": project_id,
-                "event_name": event_name,
-                "user_ids": list(user_ids),
-                "window_start": window_start,
-                "window_end": window_end,
-                "destination_aliases": list(aliases),
-            },
+        canonical_destination_ids = tuple(
+            dict.fromkeys(
+                canonical
+                for value in destination_ids
+                if (canonical := canonical_destination_id(value))
+            )
         )
-        return {str(row[0]) for row in result.result_rows}
+        destination_clause = ""
+        if canonical_destination_ids:
+            destination_predicates = [
+                "(" + clickhouse_canonical_destination_sql(
+                    "JSONExtractString(properties_json, "
+                    f"'{property_key}')"
+                ) + ") IN {destination_ids:Array(String)}"
+                for property_key in _OUTCOME_DESTINATION_PROPERTY_KEYS
+            ]
+            destination_clause = " AND (\n" + " OR\n".join(
+                destination_predicates
+            ) + "\n)"
+
+        unique_user_ids = tuple(dict.fromkeys(str(value) for value in user_ids))
+        success_user_ids: set[str] = set()
+        for start in range(0, len(unique_user_ids), self._user_batch_size):
+            batch = unique_user_ids[start : start + self._user_batch_size]
+            result = self._client.query(
+                f"""
+                SELECT DISTINCT user_id
+                FROM raw_events
+                WHERE project_id = {{project_id:String}}
+                  AND event_name = {{event_name:String}}
+                  AND validation_status = 'valid'
+                  AND user_id IN {{user_ids:Array(String)}}
+                  AND event_time >= {{window_start:DateTime64(3, 'UTC')}}
+                  AND event_time < {{window_end:DateTime64(3, 'UTC')}}
+                  {destination_clause}
+                """,
+                parameters={
+                    "project_id": project_id,
+                    "event_name": event_name,
+                    "user_ids": list(batch),
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "destination_ids": list(canonical_destination_ids),
+                },
+            )
+            success_user_ids.update(str(row[0]) for row in result.result_rows)
+        return success_user_ids
 
 
 class UpliftDatasetBuilder:
@@ -321,10 +356,3 @@ def _prepare_unit(
         return "feature_snapshot_invalid"
     return features, dict(outcome_spec)
 
-
-def _destination_aliases(destination_ids: Sequence[str]) -> tuple[str, ...]:
-    groups = destination_alias_groups()
-    aliases: list[str] = []
-    for destination_id in destination_ids:
-        aliases.extend(groups.get(destination_id, (destination_id,)))
-    return tuple(dict.fromkeys(alias.lower() for alias in aliases))

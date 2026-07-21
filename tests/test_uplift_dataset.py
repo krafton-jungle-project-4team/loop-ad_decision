@@ -7,6 +7,7 @@ from app.decision.experiment_design import EXECUTION_SCHEMA_VERSION
 from app.decision.outcome_spec import build_frozen_outcome_spec
 from app.uplift.dataset import (
     ClickHouseOutcomeEventRepository,
+    PostgresUpliftUnitSourceRepository,
     UpliftDatasetBuilder,
     UpliftUnitSourceRecord,
 )
@@ -135,7 +136,23 @@ def test_dataset_rejects_mutated_outcome_spec_hash() -> None:
     assert result.excluded_reason_counts == {"outcome_spec_mismatch": 1}
 
 
-def test_clickhouse_outcome_query_uses_destination_aliases_and_half_open_window() -> None:
+def test_unit_source_reads_only_finalized_uplift_executions() -> None:
+    class _Db:
+        def __init__(self):
+            self.query = ""
+
+        def fetchall(self, query, params=()):
+            self.query = query
+            return []
+
+    db = _Db()
+    repository = PostgresUpliftUnitSourceRepository(db)
+
+    assert repository.list_units(project_id="project") == []
+    assert "execution.uplift_assignment_status = 'finalized'" in db.query
+
+
+def test_clickhouse_outcome_query_checks_every_destination_field_with_or() -> None:
     class _Result:
         result_rows = [("jeju_user",)]
 
@@ -165,12 +182,78 @@ def test_clickhouse_outcome_query_uses_destination_aliases_and_half_open_window(
     assert "event_time >=" in client.sql
     assert "event_time <" in client.sql
     assert "promotion_id" not in client.sql
-    assert set(client.parameters["destination_aliases"]) >= {
-        "jeju",
-        "제주",
-        "okinawa",
-        "오키나와",
-    }
+    assert client.parameters["destination_ids"] == ["okinawa", "jeju"]
+    for property_key in (
+        "destination_id",
+        "destination_name",
+        "hotel_city",
+        "hotel_country",
+    ):
+        assert f"'{property_key}'" in client.sql
+    assert client.sql.count(" OR\n") == 3
+
+
+def test_clickhouse_outcome_query_batches_users_and_combines_matches() -> None:
+    class _Result:
+        def __init__(self, user_ids):
+            self.result_rows = [(user_id,) for user_id in user_ids]
+
+    class _Client:
+        def __init__(self):
+            self.calls = []
+
+        def query(self, sql, *, parameters):
+            self.calls.append((sql, parameters))
+            return _Result(parameters["user_ids"][:1])
+
+    client = _Client()
+    repository = ClickHouseOutcomeEventRepository(client, user_batch_size=2)
+
+    success_user_ids = repository.list_success_user_ids(
+        project_id="project",
+        user_ids=["u1", "u2", "u3", "u4", "u5"],
+        event_name="booking_complete",
+        window_start=ASSIGNED_AT,
+        window_end=WINDOW_END,
+        destination_ids=["jeju"],
+    )
+
+    assert [call[1]["user_ids"] for call in client.calls] == [
+        ["u1", "u2"],
+        ["u3", "u4"],
+        ["u5"],
+    ]
+    assert success_user_ids == {"u1", "u3", "u5"}
+
+
+def test_destination_match_contract_accepts_alias_in_any_supported_field() -> None:
+    class _Result:
+        result_rows = []
+
+    class _Client:
+        def __init__(self):
+            self.sql = ""
+
+        def query(self, sql, *, parameters):
+            self.sql = sql
+            return _Result()
+
+    client = _Client()
+    repository = ClickHouseOutcomeEventRepository(client)
+    repository.list_success_user_ids(
+        project_id="project",
+        user_ids=["numeric_id_with_jeju_name", "seoul_id_with_jeju_name"],
+        event_name="booking_complete",
+        window_start=ASSIGNED_AT,
+        window_end=WINDOW_END,
+        destination_ids=["jeju"],
+    )
+
+    # Outcome v1 intentionally uses OR: a canonical match in destination_name
+    # remains valid even when destination_id is numeric or names another place.
+    assert "JSONExtractString(properties_json, 'destination_id')" in client.sql
+    assert "JSONExtractString(properties_json, 'destination_name')" in client.sql
+    assert client.sql.count(" OR\n") == 3
 
 
 def source_record(user_id: str, **overrides) -> UpliftUnitSourceRecord:
