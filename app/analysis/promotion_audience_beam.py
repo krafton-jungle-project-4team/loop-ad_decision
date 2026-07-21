@@ -210,12 +210,10 @@ def search_promotion_audience_candidates(
     mandatory_keys = _mandatory_predicate_keys(
         destination_ids=destinations,
         season_months=seasons,
-        benefit_keys=benefits,
     )
     mandatory_conditions = _mandatory_conditions(
         destination_ids=destinations,
         season_months=seasons,
-        benefit_keys=benefits,
     )
     mandatory_profiles = tuple(
         profile
@@ -224,7 +222,6 @@ def search_promotion_audience_candidates(
             profile,
             destination_ids=destinations,
             season_months=seasons,
-            benefit_keys=benefits,
         )
     )
     pruned: dict[str, int] = {}
@@ -476,14 +473,12 @@ def _mandatory_predicate_keys(
     *,
     destination_ids: Sequence[str],
     season_months: Sequence[int],
-    benefit_keys: Sequence[str],
 ) -> set[str]:
     result: set[str] = set()
     if destination_ids:
         result.add("promotion_destination_search")
     if season_months:
         result.add("promotion_season_search")
-    result.update(_benefit_predicate_keys(benefit_keys))
     return result
 
 
@@ -491,7 +486,6 @@ def _mandatory_conditions(
     *,
     destination_ids: tuple[str, ...],
     season_months: tuple[int, ...],
-    benefit_keys: tuple[str, ...],
 ) -> tuple[Mapping[str, Any], ...]:
     conditions: list[Mapping[str, Any]] = []
     if destination_ids or season_months:
@@ -506,15 +500,6 @@ def _mandatory_conditions(
                 checkin_months=season_months,
             )
         )
-    for predicate_key in _benefit_predicate_keys(benefit_keys):
-        predicate = _predicate(predicate_key)
-        conditions.extend(
-            _predicate_conditions(
-                predicate,
-                minimum_count=1,
-                destination_ids=destination_ids,
-            )
-        )
     return _canonical_conditions(conditions)
 
 
@@ -523,7 +508,6 @@ def _matches_mandatory(
     *,
     destination_ids: Sequence[str],
     season_months: Sequence[int],
-    benefit_keys: Sequence[str],
 ) -> bool:
     if destination_ids or season_months:
         if profile.promotion_condition_search_count is not None:
@@ -534,10 +518,7 @@ def _matches_mandatory(
             or (season_months and profile.season_match_count <= 0)
         ):
             return False
-    return all(
-        _matches_predicate(profile, _predicate(key), 1)
-        for key in _benefit_predicate_keys(benefit_keys)
-    )
+    return True
 
 
 def _benefit_predicate_keys(values: Sequence[str]) -> tuple[str, ...]:

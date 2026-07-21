@@ -182,21 +182,26 @@ def test_beam_is_independent_of_profile_input_order() -> None:
     ]
 
 
-def test_beam_uses_same_event_promotion_and_benefit_conditions_as_compiler() -> None:
+def test_beam_keeps_benefit_as_optional_executable_candidate_condition() -> None:
     profiles = [
         _profile(
-            "coarse-only",
+            "no-benefit",
             detail=2,
             deal=1,
-            promotion_condition_search=0,
+            promotion_condition_search=1,
             deal_search=0,
         ),
         _profile(
-            "executable-match",
+            "benefit-match",
             detail=2,
             deal=1,
             promotion_condition_search=1,
             deal_search=1,
+        ),
+        _profile(
+            "baseline",
+            promotion_condition_search=1,
+            deal_search=0,
         ),
     ]
 
@@ -211,10 +216,24 @@ def test_beam_uses_same_event_promotion_and_benefit_conditions_as_compiler() -> 
     )
 
     assert result.candidates
-    assert all(
-        candidate.user_ids == ("executable-match",)
+    discount_candidate = next(
+        candidate
         for candidate in result.candidates
+        if any(
+            choice.predicate_key == "discount_interest"
+            for choice in candidate.choices
+        )
     )
+    detail_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "hotel_detail_view"
+            for choice in candidate.choices
+        )
+    )
+    assert discount_candidate.user_ids == ("benefit-match",)
+    assert detail_candidate.user_ids == ("benefit-match", "no-benefit")
 
 
 def test_beam_uses_destination_search_count_for_repeat_predicate() -> None:
