@@ -1406,7 +1406,10 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
         "expected_goal_performance"
     ] == 0.70
     assert first_profile["score_components"]["primary_component"] == (
-        "expected_goal_performance"
+        "bounded_beam_search"
+    )
+    assert first_profile["beam_search"]["policy_version"] == (
+        "promotion-audience-beam.v1"
     )
     estimate = first_profile["performance_estimate"]
     assert estimate["label"] == "행동 기반 예상 예약 전환율"
