@@ -355,4 +355,3 @@ def _prepare_unit(
     if len(features) != 64 or not all(math.isfinite(value) for value in features):
         return "feature_snapshot_invalid"
     return features, dict(outcome_spec)
-
