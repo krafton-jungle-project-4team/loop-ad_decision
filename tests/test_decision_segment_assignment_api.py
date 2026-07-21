@@ -107,6 +107,13 @@ def test_segment_assignment_api_returns_conservative_response_shape() -> None:
         "assignment_mode": "explicit_user_ids",
         "input_stability": "not_snapshotted",
         "status": "completed",
+        "segment_assignment_execution_id": None,
+        "request_fingerprint": None,
+        "input_fingerprint": None,
+        "experiment_design_fingerprint": None,
+        "experiment_design": None,
+        "outcome_spec": None,
+        "allocation_results": [],
     }
     assert service.calls[0][0] == "prun_banner_001_loop_1"
     assert service.calls[0][1].user_ids == ["user_001"]

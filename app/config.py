@@ -71,6 +71,7 @@ class Settings:
     )
     generation_shutdown_grace_seconds: int = GENERATION_SHUTDOWN_GRACE_SECONDS
     segment_performance_model_path: str | None = None
+    segment_holdout_randomization_salt: str | None = None
 
 
 REQUIRED_ENV_NAMES = (
@@ -132,6 +133,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         segment_performance_model_path=_read_optional(
             source,
             "LOOPAD_SEGMENT_PERFORMANCE_MODEL_PATH",
+        ),
+        segment_holdout_randomization_salt=_read_optional(
+            source,
+            "SEGMENT_HOLDOUT_RANDOMIZATION_SALT",
         ),
     )
     _validate_generation_settings(settings)

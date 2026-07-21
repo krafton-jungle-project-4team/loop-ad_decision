@@ -80,6 +80,15 @@ def test_load_settings_collects_validated_values() -> None:
     assert settings.brand_context_base_prefix == BRAND_CONTEXT_BASE_PREFIX
     assert settings.gemini_api_key == "value-for-loopad_gemini_api_key"
     assert settings.segment_performance_model_path == "/models/segment.json"
+    assert settings.segment_holdout_randomization_salt is None
+
+
+def test_load_settings_reads_optional_holdout_randomization_salt() -> None:
+    settings = load_settings(
+        valid_env() | {"SEGMENT_HOLDOUT_RANDOMIZATION_SALT": "holdout-secret"}
+    )
+
+    assert settings.segment_holdout_randomization_salt == "holdout-secret"
 
 
 def test_load_settings_rejects_public_prefix_matching_source_manifest() -> None:
