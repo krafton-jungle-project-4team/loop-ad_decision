@@ -669,6 +669,7 @@ def test_raw_event_signals_use_latest_raw_event_vector_window() -> None:
         "vector_version": "v2",
         "vector_source": "raw_events",
         "destination_terms": [],
+        "season_months": [],
         "limit": 250,
     }
 
@@ -703,6 +704,12 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
                 "gender_values": [],
                 "preferred_category_values": [],
                 "destination_match_count": 2,
+                "promotion_condition_search_count": 1,
+                "target_destination_search_count": 2,
+                "deal_search_count": 1,
+                "free_cancellation_search_count": 0,
+                "breakfast_search_count": 0,
+                "price_search_count": 2,
             }
         ]
     )
@@ -711,16 +718,25 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
     records = repo.list_raw_event_user_signals(
         project_id="hotel-client-a",
         destination_terms=(" JeJu ", "제주"),
+        season_months=(8, 6, 8),
     )
 
     assert records[0].destination_values == ("제주 제주",)
     assert records[0].destination_match_count == 2
+    assert records[0].promotion_condition_search_count == 1
+    assert records[0].target_destination_search_count == 2
+    assert records[0].deal_search_count == 1
+    assert records[0].price_search_count == 2
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "countif( arrayexists(" in sql
     assert "positioncaseinsensitiveutf8(" in sql
     assert "{destination_terms:array(string)}" in sql
+    assert "as promotion_condition_search_count" in sql
+    assert "as target_destination_search_count" in sql
+    assert "as deal_search_count" in sql
     assert call.params["destination_terms"] == ["jeju", "제주"]
+    assert call.params["season_months"] == [6, 8]
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:

@@ -25,6 +25,9 @@ def _profile(
     deal: int = 0,
     destination_match: int = 1,
     season_match: int = 1,
+    promotion_condition_search: int | None = None,
+    target_destination_search: int | None = None,
+    deal_search: int | None = None,
 ) -> RawEventUserSignalRecord:
     return RawEventUserSignalRecord(
         project_id="demo_project",
@@ -57,6 +60,9 @@ def _profile(
         preferred_category_values=(),
         destination_match_count=destination_match,
         season_match_count=season_match,
+        promotion_condition_search_count=promotion_condition_search,
+        target_destination_search_count=target_destination_search,
+        deal_search_count=deal_search,
     )
 
 
@@ -174,6 +180,77 @@ def test_beam_is_independent_of_profile_input_order() -> None:
         (candidate.strategy_key, candidate.user_ids)
         for candidate in reverse.candidates
     ]
+
+
+def test_beam_uses_same_event_promotion_and_benefit_conditions_as_compiler() -> None:
+    profiles = [
+        _profile(
+            "coarse-only",
+            detail=2,
+            deal=1,
+            promotion_condition_search=0,
+            deal_search=0,
+        ),
+        _profile(
+            "executable-match",
+            detail=2,
+            deal=1,
+            promotion_condition_search=1,
+            deal_search=1,
+        ),
+    ]
+
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-jeju-okinawa",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=("discount",),
+        desired_behavior_keys=("hotel_detail_view",),
+        profiles=profiles,
+        min_sample_size=1,
+    )
+
+    assert result.candidates
+    assert all(
+        candidate.user_ids == ("executable-match",)
+        for candidate in result.candidates
+    )
+
+
+def test_beam_uses_destination_search_count_for_repeat_predicate() -> None:
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-jeju-okinawa",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("destination_repeat_search",),
+        profiles=[
+            _profile(
+                "coarse-repeat-only",
+                destination_match=3,
+                promotion_condition_search=1,
+                target_destination_search=1,
+            ),
+            _profile(
+                "executable-repeat",
+                destination_match=3,
+                promotion_condition_search=1,
+                target_destination_search=2,
+            ),
+        ],
+        min_sample_size=1,
+        policy=PromotionAudienceBeamPolicy(maximum_final_candidates=10),
+    )
+
+    repeat_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "destination_repeat_search"
+            for choice in candidate.choices
+        )
+    )
+    assert repeat_candidate.user_ids == ("executable-repeat",)
 
 
 def test_beam_policy_version_changes_identity_without_public_v3() -> None:

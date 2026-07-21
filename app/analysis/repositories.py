@@ -244,6 +244,12 @@ class RawEventUserSignalRecord:
     weekend_checkin_count: int = 0
     budget_price_count: int = 0
     premium_price_count: int = 0
+    promotion_condition_search_count: int | None = None
+    target_destination_search_count: int | None = None
+    deal_search_count: int | None = None
+    free_cancellation_search_count: int | None = None
+    breakfast_search_count: int | None = None
+    price_search_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -888,6 +894,13 @@ class UserBehaviorVectorRepository:
             for term in destination_terms
             if str(term).strip()
         ]
+        cleaned_season_months = sorted(
+            {
+                int(month)
+                for month in season_months
+                if 1 <= int(month) <= 12
+            }
+        )
         result = self._client.query(
             """
             WITH
@@ -962,7 +975,85 @@ class UserBehaviorVectorRepository:
                         ) > 0,
                         {destination_terms:Array(String)}
                     )
-                ) AS destination_match_count
+                ) AS destination_match_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND (
+                        empty({destination_terms:Array(String)})
+                        OR arrayExists(
+                            term -> positionCaseInsensitiveUTF8(
+                                concat(
+                                    ifNull(JSONExtractString(properties_json, 'destination_id'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'destination_name'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'hotel_city'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'hotel_country'), '')
+                                ),
+                                term
+                            ) > 0,
+                            {destination_terms:Array(String)}
+                        )
+                    )
+                    AND (
+                        empty({season_months:Array(UInt8)})
+                        OR toMonth(
+                            parseDateTimeBestEffortOrNull(
+                                nullIf(
+                                    JSONExtractString(properties_json, 'checkin_date'),
+                                    ''
+                                )
+                            )
+                        ) IN {season_months:Array(UInt8)}
+                    )
+                ) AS promotion_condition_search_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND (
+                        empty({destination_terms:Array(String)})
+                        OR arrayExists(
+                            term -> positionCaseInsensitiveUTF8(
+                                concat(
+                                    ifNull(JSONExtractString(properties_json, 'destination_id'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'destination_name'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'hotel_city'), ''),
+                                    ' ',
+                                    ifNull(JSONExtractString(properties_json, 'hotel_country'), '')
+                                ),
+                                term
+                            ) > 0,
+                            {destination_terms:Array(String)}
+                        )
+                    )
+                ) AS target_destination_search_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND lowerUTF8(
+                        ifNull(JSONExtractString(properties_json, 'deal'), '')
+                    ) = 'true'
+                ) AS deal_search_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND toUInt8OrZero(
+                        JSONExtractString(properties_json, 'free_cancellation')
+                    ) = 1
+                ) AS free_cancellation_search_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND toUInt8OrZero(
+                        JSONExtractString(properties_json, 'breakfast_included')
+                    ) = 1
+                ) AS breakfast_search_count,
+                countIf(
+                    event_name = 'hotel_search'
+                    AND nullIf(
+                        JSONExtractString(properties_json, 'price'),
+                        ''
+                    ) IS NOT NULL
+                ) AS price_search_count
             FROM raw_events
             WHERE project_id = {project_id:String}
               AND validation_status = 'valid'
@@ -990,14 +1081,11 @@ class UserBehaviorVectorRepository:
                 "vector_version": vector_version,
                 "vector_source": self.RAW_EVENTS_SOURCE,
                 "destination_terms": cleaned_destination_terms,
+                "season_months": cleaned_season_months,
                 "limit": limit,
             },
         )
-        cleaned_season_months = {
-            int(month)
-            for month in season_months
-            if 1 <= int(month) <= 12
-        }
+        season_month_set = set(cleaned_season_months)
         records: list[RawEventUserSignalRecord] = []
         for row in _clickhouse_rows(result):
             destination_values = _clean_string_tuple(
@@ -1076,7 +1164,37 @@ class UserBehaviorVectorRepository:
                     ),
                     season_match_count=_season_match_count(
                         values=checkin_dates,
-                        season_months=cleaned_season_months,
+                        season_months=season_month_set,
+                    ),
+                    promotion_condition_search_count=_optional_clickhouse_int(
+                        row,
+                        "promotion_condition_search_count",
+                        26,
+                    ),
+                    target_destination_search_count=_optional_clickhouse_int(
+                        row,
+                        "target_destination_search_count",
+                        27,
+                    ),
+                    deal_search_count=_optional_clickhouse_int(
+                        row,
+                        "deal_search_count",
+                        28,
+                    ),
+                    free_cancellation_search_count=_optional_clickhouse_int(
+                        row,
+                        "free_cancellation_search_count",
+                        29,
+                    ),
+                    breakfast_search_count=_optional_clickhouse_int(
+                        row,
+                        "breakfast_search_count",
+                        30,
+                    ),
+                    price_search_count=_optional_clickhouse_int(
+                        row,
+                        "price_search_count",
+                        31,
                     ),
                 )
             )
@@ -1261,6 +1379,17 @@ def _clickhouse_value(row: Any, key: str, index: int) -> Any:
     if isinstance(row, Mapping):
         return row[key]
     return row[index]
+
+
+def _optional_clickhouse_int(row: Any, key: str, index: int) -> int | None:
+    if isinstance(row, Mapping):
+        value = row.get(key)
+    else:
+        try:
+            value = row[index]
+        except IndexError:
+            return None
+    return int(value) if value is not None else None
 
 
 def _clean_string_tuple(value: Any) -> tuple[str, ...]:

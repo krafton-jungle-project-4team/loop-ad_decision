@@ -525,10 +525,15 @@ def _matches_mandatory(
     season_months: Sequence[int],
     benefit_keys: Sequence[str],
 ) -> bool:
-    if destination_ids and profile.destination_match_count <= 0:
-        return False
-    if season_months and profile.season_match_count <= 0:
-        return False
+    if destination_ids or season_months:
+        if profile.promotion_condition_search_count is not None:
+            if profile.promotion_condition_search_count <= 0:
+                return False
+        elif (
+            (destination_ids and profile.destination_match_count <= 0)
+            or (season_months and profile.season_match_count <= 0)
+        ):
+            return False
     return all(
         _matches_predicate(profile, _predicate(key), 1)
         for key in _benefit_predicate_keys(benefit_keys)
@@ -581,7 +586,10 @@ def _matches_predicate(
 ) -> bool:
     key = predicate.predicate_key
     if key == "destination_repeat_search":
-        return profile.destination_match_count >= minimum_count
+        return _executable_count(
+            profile.target_destination_search_count,
+            profile.destination_match_count,
+        ) >= minimum_count
     if key == "hotel_detail_view":
         return profile.hotel_detail_view_count >= minimum_count
     if key == "booking_start":
@@ -592,18 +600,34 @@ def _matches_predicate(
             and profile.booking_complete_count == 0
         )
     if key == "price_compare":
-        return profile.price_event_count >= minimum_count
+        return _executable_count(
+            profile.price_search_count,
+            profile.price_event_count,
+        ) >= minimum_count
     if key == "discount_interest":
-        return profile.deal_event_count >= minimum_count
+        return _executable_count(
+            profile.deal_search_count,
+            profile.deal_event_count,
+        ) >= minimum_count
     if key == "free_cancellation_interest":
-        return profile.free_cancellation_count >= minimum_count
+        return _executable_count(
+            profile.free_cancellation_search_count,
+            profile.free_cancellation_count,
+        ) >= minimum_count
     if key == "breakfast_interest":
-        return profile.breakfast_included_count >= minimum_count
+        return _executable_count(
+            profile.breakfast_search_count,
+            profile.breakfast_included_count,
+        ) >= minimum_count
     if key == "promotion_click":
         return profile.promotion_click_count >= minimum_count
     if key == "campaign_landing":
         return profile.campaign_landing_count >= minimum_count
     return False
+
+
+def _executable_count(exact_count: int | None, legacy_count: int) -> int:
+    return legacy_count if exact_count is None else exact_count
 
 
 def _predicate_conditions(
