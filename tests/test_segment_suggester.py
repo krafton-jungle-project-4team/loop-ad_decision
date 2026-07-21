@@ -315,7 +315,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     assert len(set(candidate_types)) == 3
     assert all(
         re.fullmatch(
-            r"seg_ai_raw_promo_banner_001_[a-z_]+_[0-9a-f]{10}",
+            r"seg_ai_dynamic_promo_banner_001_[a-z_]+_[0-9a-f]{12}",
             segment.segment_id,
         )
         for segment in segments
@@ -333,7 +333,7 @@ def test_raw_event_suggester_creates_distinct_candidate_types() -> None:
     )
     assert all(
         segment.profile_json["display_copy"]["performance_estimate"]["label"]
-        == "예상 예약 전환율"
+        == "행동 기반 예상 예약 전환율"
         for segment in segments
     )
     assert all(
@@ -409,6 +409,46 @@ def test_review_copy_keeps_only_manifest_registered_executable_benefits(
     assert benefit_segment.rule_json["segment_audience_spec"]["parameters"][
         "benefit_keys"
     ] == ["discount", "early_booking"]
+
+
+def test_multi_destination_comparison_uses_custom_v1_and_conditions() -> None:
+    promotion = promotion_record(
+        message_brief="제주와 오키나와 숙소를 비교하는 여름 휴가 프로모션",
+    )
+    intent = DeterministicPromotionIntentExtractor().extract(promotion)
+    compilation = compile_raw_event_intent(intent)
+    profiles = [
+        raw_signal(
+            f"comparison_user_{index}",
+            hotel_search_count=2,
+            destination_match_count=2,
+            destination_values=("제주", "오키나와"),
+        )
+        for index in range(2)
+    ]
+
+    segments = generate_raw_event_segment_candidate_pool(
+        promotion=promotion,
+        intent=intent,
+        compilation=compilation,
+        profiles=profiles,
+        min_sample_size=2,
+        enforce_prediction_support=False,
+    )
+
+    comparison = next(
+        segment
+        for segment in segments
+        if segment.rule_json["strategy_key"] == "destination_comparison"
+    )
+    spec = comparison.rule_json["segment_audience_spec"]
+    assert spec["template_id"] == "custom_structured_condition"
+    assert spec["template_version"] == 1
+    assert [
+        condition["destination"]
+        for condition in spec["parameters"]["conditions"]
+    ] == ["jeju", "okinawa"]
+    assert comparison.segment_name == "제주·오키나와를 비교 탐색한 고객"
 
 
 def test_raw_event_suggester_does_not_fallback_for_descriptive_review_copy(
@@ -868,7 +908,7 @@ def test_segment_instruction_does_not_fall_back_to_generic_vector_clusters() -> 
     assert vector_reader.calls == []
 
 
-def test_empty_raw_event_candidates_keep_vector_fallback_for_generic_request() -> None:
+def test_empty_raw_event_candidates_do_not_expose_vector_cluster_cards() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("vector_001", vector_values(0)),
@@ -887,9 +927,8 @@ def test_empty_raw_event_candidates_keep_vector_fallback_for_generic_request() -
 
     segments = suggester.suggest_segments(promotion=promotion_record())
 
-    assert len(segments) == 1
-    assert segments[0].rule_json["source"] == "user_vector_clustering"
-    assert vector_reader.calls
+    assert segments == []
+    assert vector_reader.calls == []
 
 
 def test_destination_candidates_exclude_users_without_target_interest() -> None:
@@ -1370,7 +1409,7 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
         "expected_goal_performance"
     )
     estimate = first_profile["performance_estimate"]
-    assert estimate["label"] == "예상 예약 전환율"
+    assert estimate["label"] == "행동 기반 예상 예약 전환율"
     assert estimate["value"] == 0.42
     assert estimate["window_days"] == 30
     assert estimate["window_label"] == "향후 30일 내 프로모션 조건 일치 예약"
@@ -1526,7 +1565,7 @@ def test_raw_event_suggester_uses_destination_context_for_expected_conversion_ra
     )
 
     performance_estimate = segments[0].profile_json["performance_estimate"]
-    assert performance_estimate["label"] == "예상 예약 전환율"
+    assert performance_estimate["label"] == "행동 기반 예상 예약 전환율"
     assert performance_estimate["value"] < 1.0
     assert performance_estimate["formatted"] != "100.0%"
     assert performance_estimate["observed_value"] == 1.0
@@ -1812,7 +1851,7 @@ def test_raw_event_suggester_requests_vector_window_signals() -> None:
     ]
 
 
-def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> None:
+def test_vector_cluster_diagnostics_groups_similar_users() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("user_001", vector_values(0)),
@@ -1829,7 +1868,9 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
         min_cluster_size=2,
     )
 
-    segments = suggester.suggest_segments(promotion=promotion_record())
+    segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
+        promotion=promotion_record()
+    )
 
     assert reader.calls == [
         {
@@ -1873,7 +1914,7 @@ def test_vector_cluster_suggester_groups_similar_users_into_ai_segments() -> Non
     assert all("top_common_features" in segment.profile_json for segment in segments)
 
 
-def test_vector_cluster_suggester_uses_promotion_seed_for_sampling() -> None:
+def test_vector_cluster_diagnostics_uses_promotion_seed_for_sampling() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector(f"user_{index:03}", vector_values(index % 4))
@@ -1888,13 +1929,13 @@ def test_vector_cluster_suggester_uses_promotion_seed_for_sampling() -> None:
         min_cluster_size=1,
     )
 
-    first_segments = suggester.suggest_segments(
+    first_segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
         promotion=promotion_record(
             promotion_id="promo_family_trip",
             message_brief="Promote family hotel stays.",
         )
     )
-    second_segments = suggester.suggest_segments(
+    second_segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
         promotion=promotion_record(
             promotion_id="promo_last_minute",
             message_brief="Promote last minute hotel deals.",
@@ -1909,7 +1950,7 @@ def test_vector_cluster_suggester_uses_promotion_seed_for_sampling() -> None:
     )
 
 
-def test_vector_cluster_suggester_names_segments_from_dominant_features() -> None:
+def test_vector_cluster_diagnostics_names_dominant_features() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("booking_user_001", vector_values(8)),
@@ -1926,14 +1967,16 @@ def test_vector_cluster_suggester_names_segments_from_dominant_features() -> Non
         min_cluster_size=2,
     )
 
-    segments = suggester.suggest_segments(promotion=promotion_record())
+    segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
+        promotion=promotion_record()
+    )
     segment_names = {segment.segment_name for segment in segments}
 
     assert "Booking starters" in segment_names
     assert "Promotion click responders" in segment_names
 
 
-def test_vector_cluster_suggester_ranks_clusters_by_promotion_intent() -> None:
+def test_vector_cluster_diagnostics_ranks_by_promotion_intent() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("booking_user_001", vector_values(62)),
@@ -1950,7 +1993,7 @@ def test_vector_cluster_suggester_ranks_clusters_by_promotion_intent() -> None:
         min_cluster_size=2,
     )
 
-    segments = suggester.suggest_segments(
+    segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
         promotion=promotion_record(
             message_brief=(
                 "여름 호텔 예약 전환을 높이기 위한 이메일 예약 혜택 캠페인"
@@ -1970,7 +2013,7 @@ def test_vector_cluster_suggester_ranks_clusters_by_promotion_intent() -> None:
     ].profile_json["recommendation_score"]
 
 
-def test_vector_cluster_suggester_stores_promotion_vector_basis() -> None:
+def test_vector_cluster_diagnostics_stores_promotion_vector_basis() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("jeju_user_001", vector_values(32)),
@@ -1987,7 +2030,7 @@ def test_vector_cluster_suggester_stores_promotion_vector_basis() -> None:
         min_cluster_size=2,
     )
 
-    segments = suggester.suggest_segments(
+    segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
         promotion=promotion_record(
             message_brief="제주 호텔 특가 예약 혜택을 안내한다.",
         )
@@ -2006,7 +2049,7 @@ def test_vector_cluster_suggester_stores_promotion_vector_basis() -> None:
     assert profile_json["promotion_vector_basis"]["weighted_features"]
 
 
-def test_vector_cluster_suggester_returns_empty_when_vectors_are_insufficient() -> None:
+def test_vector_cluster_diagnostics_returns_empty_when_vectors_are_insufficient() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [user_vector("user_001", vector_values(0))]
     )
@@ -2015,10 +2058,12 @@ def test_vector_cluster_suggester_returns_empty_when_vectors_are_insufficient() 
         min_cluster_size=2,
     )
 
-    assert suggester.suggest_segments(promotion=promotion_record()) == []
+    assert suggester._suggest_legacy_vector_segments_for_diagnostics(
+        promotion=promotion_record()
+    ) == []
 
 
-def test_vector_cluster_suggester_keeps_cluster_when_mean_vector_is_zero() -> None:
+def test_vector_cluster_diagnostics_keeps_zero_mean_cluster() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [
             user_vector("user_001", vector_values(0)),
@@ -2031,13 +2076,15 @@ def test_vector_cluster_suggester_keeps_cluster_when_mean_vector_is_zero() -> No
         min_cluster_size=2,
     )
 
-    segments = suggester.suggest_segments(promotion=promotion_record())
+    segments = suggester._suggest_legacy_vector_segments_for_diagnostics(
+        promotion=promotion_record()
+    )
 
     assert len(segments) == 1
     assert segments[0].rule_json["candidate_user_ids"] == ["user_001", "user_002"]
 
 
-def test_vector_cluster_suggester_rejects_non_64_dimensional_vectors() -> None:
+def test_vector_cluster_diagnostics_rejects_non_64_dimensional_vectors() -> None:
     reader = FakeUserBehaviorVectorRepository(
         [user_vector("user_001", [1.0] * 63, vector_dim=64)]
     )
@@ -2046,4 +2093,6 @@ def test_vector_cluster_suggester_rejects_non_64_dimensional_vectors() -> None:
     )
 
     with pytest.raises(ValueError, match="64 values"):
-        suggester.suggest_segments(promotion=promotion_record())
+        suggester._suggest_legacy_vector_segments_for_diagnostics(
+            promotion=promotion_record()
+        )
