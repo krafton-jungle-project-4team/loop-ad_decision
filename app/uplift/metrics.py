@@ -21,25 +21,21 @@ def evaluate_uplift_predictions(
     if not treatment or not control:
         raise ValueError("uplift evaluation requires non-empty treatment and control")
 
-    treatment_rate = sum(example.outcome for example in treatment) / len(treatment)
-    control_rate = sum(example.outcome for example in control) / len(control)
+    _validate_randomized_examples(examples)
+    treatment_rate, control_rate = _ipw_arm_outcome_rates(examples)
     ordered = sorted(
         zip(examples, cate_scores, strict=True),
         key=lambda item: (-item[1], item[0].experiment_unit_id),
     )
-    treatment_control_ratio = len(treatment) / len(control)
-    cumulative_treatment_outcomes = 0
-    cumulative_control_outcomes = 0
+    cumulative_gain = 0.0
     qini_curve: list[float] = []
     for example, _score in ordered:
+        probability = float(example.treatment_probability)
         if example.treatment:
-            cumulative_treatment_outcomes += example.outcome
+            cumulative_gain += 0.5 * example.outcome / probability
         else:
-            cumulative_control_outcomes += example.outcome
-        qini_curve.append(
-            cumulative_treatment_outcomes
-            - cumulative_control_outcomes * treatment_control_ratio
-        )
+            cumulative_gain -= 0.5 * example.outcome / (1.0 - probability)
+        qini_curve.append(cumulative_gain)
     final_gain = qini_curve[-1]
     qini = sum(
         gain - final_gain * ((index + 1) / len(qini_curve))
@@ -47,7 +43,7 @@ def evaluate_uplift_predictions(
     ) / len(qini_curve)
     auuc = sum(qini_curve) / len(qini_curve)
     uplift_at_top_k = {
-        _fraction_label(fraction): _observed_uplift(
+        _fraction_label(fraction): _ipw_observed_uplift(
             [example for example, _score in ordered[: max(1, math.ceil(len(ordered) * fraction))]]
         )
         for fraction in top_fractions
@@ -62,15 +58,57 @@ def evaluate_uplift_predictions(
         "auuc": auuc,
         "qini": qini,
         "uplift_at_top_k": uplift_at_top_k,
+        "evaluation_method": "individual_propensity_ipw.v1",
     }
 
 
-def _observed_uplift(examples: Sequence[UpliftTrainingExample]) -> float | None:
-    treatment = [example.outcome for example in examples if example.treatment == 1]
-    control = [example.outcome for example in examples if example.treatment == 0]
-    if not treatment or not control:
+def _ipw_observed_uplift(
+    examples: Sequence[UpliftTrainingExample],
+) -> float | None:
+    if not any(example.treatment == 1 for example in examples) or not any(
+        example.treatment == 0 for example in examples
+    ):
         return None
-    return sum(treatment) / len(treatment) - sum(control) / len(control)
+    treatment_rate, control_rate = _ipw_arm_outcome_rates(examples)
+    return treatment_rate - control_rate
+
+
+def _ipw_arm_outcome_rates(
+    examples: Sequence[UpliftTrainingExample],
+) -> tuple[float, float]:
+    treatment_outcome = 0.0
+    treatment_weight = 0.0
+    control_outcome = 0.0
+    control_weight = 0.0
+    for example in examples:
+        probability = float(example.treatment_probability)
+        if example.treatment:
+            weight = 1.0 / probability
+            treatment_outcome += weight * example.outcome
+            treatment_weight += weight
+        else:
+            weight = 1.0 / (1.0 - probability)
+            control_outcome += weight * example.outcome
+            control_weight += weight
+    if treatment_weight == 0.0 or control_weight == 0.0:
+        raise ValueError("uplift evaluation requires both randomized arms")
+    return (
+        treatment_outcome / treatment_weight,
+        control_outcome / control_weight,
+    )
+
+
+def _validate_randomized_examples(
+    examples: Sequence[UpliftTrainingExample],
+) -> None:
+    for example in examples:
+        probability = float(example.treatment_probability)
+        if example.treatment not in (0, 1):
+            raise ValueError("uplift treatment must be zero or one")
+        if not 0.0 < probability < 1.0:
+            raise ValueError(
+                "uplift evaluation requires individual randomized propensities"
+            )
 
 
 def _fraction_label(fraction: float) -> str:
