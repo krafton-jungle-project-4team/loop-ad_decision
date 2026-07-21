@@ -13,14 +13,15 @@ from app.uplift.contracts import UpliftTrainingExample
 from app.uplift.metrics import evaluate_uplift_predictions
 from app.uplift.model import fit_transformed_outcome_ridge, signed_cate_summary
 from app.uplift.validation import (
-    experiment_cluster_bootstrap_cate_ci,
     external_validation_metadata,
+    predicted_cate_cluster_variability_interval,
 )
 
 
 _NON_FEATURE_COLUMNS = frozenset(
     {"treatment", "conversion", "visit", "exposure"}
 )
+CRITEO_SPLIT_POLICY_VERSION = "stable-row-hash-stratified-70-30.v1"
 
 
 def load_criteo_examples(
@@ -104,11 +105,24 @@ def validate_criteo_pipeline(
         max_rows=max_rows,
         sample_seed=sample_seed,
     )
-    model = fit_transformed_outcome_ridge(examples, ridge_strength=1.0)
-    cate_scores = model.predict_many(examples)
-    metrics = evaluate_uplift_predictions(examples, cate_scores)
-    ci = experiment_cluster_bootstrap_cate_ci(
+    train_examples, test_examples = _stable_train_test_split(
         examples,
+        sample_seed=sample_seed,
+    )
+    adapter_metadata.update(
+        {
+            "split_policy_version": CRITEO_SPLIT_POLICY_VERSION,
+            "train_count": len(train_examples),
+            "test_count": len(test_examples),
+            "train_sample_fingerprint": _sample_fingerprint(train_examples),
+            "test_sample_fingerprint": _sample_fingerprint(test_examples),
+        }
+    )
+    model = fit_transformed_outcome_ridge(train_examples, ridge_strength=1.0)
+    cate_scores = model.predict_many(test_examples)
+    metrics = evaluate_uplift_predictions(test_examples, cate_scores)
+    variability_interval = predicted_cate_cluster_variability_interval(
+        test_examples,
         cate_scores,
         iterations=1000,
         seed=sample_seed,
@@ -129,7 +143,9 @@ def validate_criteo_pipeline(
         },
         "metrics": metrics,
         "signed_cate_summary": dict(signed_cate_summary(cate_scores)),
-        "cate_confidence_interval": ci.to_json(),
+        "predicted_cate_cluster_variability_interval": (
+            variability_interval.to_json()
+        ),
         "model_metadata": metadata.to_json(),
         "domain_claim": "external_pipeline_only_not_hotel_performance_evidence",
         "serving_activation_evidence": False,
@@ -192,6 +208,56 @@ def _feature_value(value: str) -> float:
         digest = hashlib.sha256(normalized.encode("utf-8")).digest()
         bucket = int.from_bytes(digest[:8], "big") / (2**64 - 1)
         return bucket * 2.0 - 1.0
+
+
+def _stable_train_test_split(
+    examples: Sequence[UpliftTrainingExample],
+    *,
+    sample_seed: int,
+) -> tuple[list[UpliftTrainingExample], list[UpliftTrainingExample]]:
+    by_arm = {
+        arm: [example for example in examples if example.treatment == arm]
+        for arm in (0, 1)
+    }
+    if any(len(arm_examples) < 2 for arm_examples in by_arm.values()):
+        raise ValueError(
+            "Criteo train/test split requires at least two treatment and control rows"
+        )
+
+    train_ids: set[str] = set()
+    for arm in (0, 1):
+        ordered = sorted(
+            by_arm[arm],
+            key=lambda example: (
+                _split_hash(example.experiment_unit_id, sample_seed),
+                example.experiment_unit_id,
+            ),
+        )
+        raw_train_count = int(len(ordered) * 0.7 + 0.5)
+        train_count = min(max(raw_train_count, 1), len(ordered) - 1)
+        train_ids.update(
+            example.experiment_unit_id for example in ordered[:train_count]
+        )
+
+    train = [
+        example
+        for example in examples
+        if example.experiment_unit_id in train_ids
+    ]
+    test = [
+        example
+        for example in examples
+        if example.experiment_unit_id not in train_ids
+    ]
+    return train, test
+
+
+def _split_hash(experiment_unit_id: str, sample_seed: int) -> str:
+    payload = (
+        f"{CRITEO_SPLIT_POLICY_VERSION}\x00{sample_seed}\x00"
+        f"{experiment_unit_id}"
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _sample_fingerprint(examples: Iterable[UpliftTrainingExample]) -> str:
