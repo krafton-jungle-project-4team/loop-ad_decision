@@ -71,15 +71,31 @@ def _target_destination_ids(
         if resolution.spec is not None:
             destination_ids.update(resolution.spec.destination_ids)
             custom_destinations = [
-                condition.get("destination")
+                destination
                 for condition in resolution.spec.custom_conditions
                 if isinstance(condition.get("destination"), str)
                 and condition.get("destination")
+                for destination in _split_custom_destination_values(
+                    str(condition["destination"])
+                )
             ]
             destination_ids.update(
                 canonical_destination_ids(custom_destinations)
             )
     return tuple(sorted(destination_ids))
+
+
+def _split_custom_destination_values(value: str) -> tuple[str, ...]:
+    normalized = (
+        value.replace("\uff0c", ",")
+        .replace("/", ",")
+        .replace("\u00b7", ",")
+    )
+    return tuple(
+        item.strip()
+        for item in normalized.split(",")
+        if item.strip()
+    )
 
 
 def _canonical_json(value: Mapping[str, Any]) -> str:
