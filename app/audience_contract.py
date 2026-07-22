@@ -112,7 +112,7 @@ CUSTOM_STRUCTURED_PROPERTY_KEYS = frozenset(
     }
 )
 CUSTOM_STRUCTURED_PROPERTY_OPERATORS = frozenset(
-    {"equals", "contains", "exists", "gte", "lte"}
+    {"equals", "in", "contains", "exists", "gte", "lte"}
 )
 SCORE_THRESHOLD_QUANTUM = Decimal("0.000001")
 _QUERY_COMPILER_SEMANTICS = {
@@ -783,23 +783,44 @@ def _canonical_custom_property_filters(
                 condition_index,
                 "has an invalid property value",
             )
+        canonical_value = raw_value.strip()
         if operator in {"gte", "lte"}:
             try:
-                float(raw_value)
+                float(canonical_value)
             except ValueError as exc:
                 raise _custom_condition_error(
                     segment_id,
                     condition_index,
                     "requires a numeric property value",
                 ) from exc
+        if operator == "in":
+            alternatives = _canonical_property_filter_values(canonical_value)
+            if len(alternatives) < 2:
+                raise _custom_condition_error(
+                    segment_id,
+                    condition_index,
+                    "requires at least two property alternatives",
+                )
+            canonical_value = ",".join(alternatives)
         filters.append(
             {
                 "key": str(key),
                 "operator": str(operator),
-                "value": raw_value.strip(),
+                "value": canonical_value,
             }
         )
     return tuple(filters)
+
+
+def _canonical_property_filter_values(value: str) -> tuple[str, ...]:
+    normalized = value.replace("，", ",").replace("/", ",").replace("·", ",")
+    normalized = normalized.replace("또는", ",").replace("혹은", ",")
+    values = {
+        item.strip().casefold()
+        for item in normalized.split(",")
+        if item.strip()
+    }
+    return tuple(sorted(values))
 
 
 def _custom_query_signal_keys(
