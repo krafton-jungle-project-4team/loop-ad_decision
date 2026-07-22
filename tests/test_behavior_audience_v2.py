@@ -65,6 +65,7 @@ from app.analysis.audience_search_repository import (
     PgClickHouseAudienceVectorSearchRepository,
     _hard_predicate_batch_query,
     _hard_predicate_query,
+    _structured_query_parameters,
 )
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import (
@@ -291,6 +292,49 @@ def test_custom_structured_segment_compiles_exact_conditions_without_semantic_fi
     assert "custom_0_destination_terms" in sql
     assert "custom_1_destination_terms" in sql
     assert "custom_2_maximum_count" in sql
+
+
+def test_custom_structured_segment_compiles_multiple_age_groups_as_one_filter() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "page_view",
+                "label": "20~30대",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [
+                    {
+                        "key": "age_group",
+                        "operator": "in",
+                        "value": "30대, 20대",
+                    }
+                ],
+            }
+        ],
+        query_signal_keys=("hotel_consideration_intensity",),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="twenties_and_thirties",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.custom_conditions[0]["property_filters"] == [
+        {"key": "age_group", "operator": "in", "value": "20대,30대"}
+    ]
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    parameters = _structured_query_parameters(compiled.predicate_parameters)
+    assert "has({custom_0_property_0:Array(String)}, lowerUTF8(" in sql
+    assert parameters["custom_0_property_0"] == ["20대", "30대"]
 
 
 def test_source_refinement_intersects_structured_conditions_with_source_users() -> None:
