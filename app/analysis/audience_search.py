@@ -93,6 +93,7 @@ class AudienceVectorSearchRepository(Protocol):
         source_cutoff: str,
         query_vector: Sequence[float],
         score_threshold: float,
+        apply_score_threshold: bool,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> list[SearchCandidate]:
@@ -458,6 +459,7 @@ class CandidateAudienceSearchService:
         hard_match_user_count: int,
         method: AudienceSearchMethod,
     ) -> AudienceSearchResult:
+        apply_score_threshold = spec.template_id != CUSTOM_STRUCTURED_TEMPLATE_ID
         materialize_exact = getattr(
             self._repository,
             "materialize_exact_members",
@@ -471,6 +473,7 @@ class CandidateAudienceSearchService:
                 source_cutoff=source_cutoff,
                 query_vector=spec.query_vector,
                 score_threshold=spec.score_threshold,
+                apply_score_threshold=apply_score_threshold,
                 hard_predicate_keys=spec.hard_predicate_keys,
                 predicate_parameters=spec.predicate_parameters,
             )
@@ -492,6 +495,7 @@ class CandidateAudienceSearchService:
             source_cutoff=source_cutoff,
             query_vector=spec.query_vector,
             score_threshold=spec.score_threshold,
+            apply_score_threshold=apply_score_threshold,
             hard_predicate_keys=spec.hard_predicate_keys,
             predicate_parameters=spec.predicate_parameters,
         )

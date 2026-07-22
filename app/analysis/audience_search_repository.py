@@ -374,6 +374,7 @@ class PgClickHouseAudienceVectorSearchRepository:
         source_cutoff: str | datetime,
         query_vector: Sequence[float],
         score_threshold: float,
+        apply_score_threshold: bool = True,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> int:
@@ -384,6 +385,12 @@ class PgClickHouseAudienceVectorSearchRepository:
             project_expression="search.project_id",
         )
         self._drop_temp_relation(candidate_relation)
+        score_filter_sql = (
+            "WHERE scored.behavior_fit_score >= %s"
+            if apply_score_threshold
+            else ""
+        )
+        score_filter_params = (score_threshold,) if apply_score_threshold else ()
         self._postgres.execute(
             f"""
             CREATE TEMP TABLE {candidate_relation}
@@ -398,8 +405,10 @@ class PgClickHouseAudienceVectorSearchRepository:
             FROM (
                 SELECT
                     search.user_id,
-                    1 - (search.embedding <=> %s::vector)
-                        AS behavior_fit_score
+                    COALESCE(
+                        1 - (search.embedding <=> %s::vector),
+                        -1.0
+                    ) AS behavior_fit_score
                 FROM user_behavior_vector_search AS search
                 WHERE search.project_id = %s
                   AND search.vector_version = %s
@@ -408,7 +417,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                   AND search.vector_generation_id = %s
                   {exclusion_sql}
             ) AS scored
-            WHERE scored.behavior_fit_score >= %s
+            {score_filter_sql}
             """,
             (
                 _vector_literal(query_vector),
@@ -417,7 +426,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 source_cutoff,
                 vector_generation_id,
                 *exclusion_params,
-                score_threshold,
+                *score_filter_params,
             ),
         )
         self._index_temp_candidates(candidate_relation)
@@ -617,6 +626,7 @@ class PgClickHouseAudienceVectorSearchRepository:
         source_cutoff: str | datetime,
         query_vector: Sequence[float],
         score_threshold: float,
+        apply_score_threshold: bool = True,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> list[SearchCandidate]:
@@ -625,18 +635,31 @@ class PgClickHouseAudienceVectorSearchRepository:
             user_expression="search.user_id",
             project_expression="search.project_id",
         )
+        score_filter_sql = (
+            "AND COALESCE(1 - (search.embedding <=> %s::vector), -1.0) >= %s"
+            if apply_score_threshold
+            else ""
+        )
+        score_filter_params = (
+            (_vector_literal(query_vector), score_threshold)
+            if apply_score_threshold
+            else ()
+        )
         rows = self._postgres.fetchall(
             f"""
             SELECT
                 search.user_id,
-                1 - (search.embedding <=> %s::vector) AS behavior_fit_score
+                COALESCE(
+                    1 - (search.embedding <=> %s::vector),
+                    -1.0
+                ) AS behavior_fit_score
             FROM user_behavior_vector_search AS search
             WHERE search.project_id = %s
               AND search.vector_version = %s
               AND search.vector_dim = 64
               AND search.window_end = %s
               AND search.vector_generation_id = %s
-              AND 1 - (search.embedding <=> %s::vector) >= %s
+              {score_filter_sql}
               {exclusion_sql}
             ORDER BY behavior_fit_score DESC, search.user_id ASC
             """,
@@ -646,8 +669,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                 vector_version,
                 source_cutoff,
                 vector_generation_id,
-                _vector_literal(query_vector),
-                score_threshold,
+                *score_filter_params,
                 *exclusion_params,
             ),
         )
