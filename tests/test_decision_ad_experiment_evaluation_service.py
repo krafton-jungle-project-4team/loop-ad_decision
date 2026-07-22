@@ -13,6 +13,7 @@ from app.decision.evaluation_service import (
 )
 from app.decision.repositories import (
     AdExperimentRecord,
+    BookingIntentCohortRecord,
     EvaluationFunnelRecord,
     MetricCountRecord,
     PromotionEvaluationWrite,
@@ -117,7 +118,7 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
         "denominator": "promotion_click",
     }
     diagnosis = inserted.result_json["diagnosis"]
-    assert diagnosis["version"] == "dec.evaluation-diagnosis.v2"
+    assert diagnosis["version"] == "dec.evaluation-diagnosis.v3"
     assert diagnosis["status"] == "goal_not_met"
     assert diagnosis["summary"] == response.feedback
     assert diagnosis["observed_bottleneck"] == (
@@ -146,9 +147,109 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
         "label": "수집 이벤트",
     }
     assert "상세 실패 이벤트" in diagnosis["limitations"][-1]
+    assert diagnosis["audience_intent_analysis"] is None
     assert repos.experiments.status_updates == []
     assert repos.experiments.experiment is not None
     assert repos.experiments.experiment.status == AdExperimentStatus.RUNNING.value
+
+
+def test_goal_not_met_includes_booking_intent_cohort_analysis() -> None:
+    repos = FakeEvaluationRepos(
+        run=promotion_run_record(
+            goal_snapshot_json={
+                "goal_target_value": "0.100000",
+                "min_sample_size": 10,
+                "outcome_spec": {
+                    "outcome_filter": {
+                        "destination_ids": ["okinawa", "jeju"],
+                    }
+                },
+                "audience_context": {"age_groups": ["20대", "30대"]},
+            }
+        ),
+        counts=MetricCountRecord(
+            numerator_count=24,
+            denominator_count=480,
+            funnel=EvaluationFunnelRecord(
+                response_count=480,
+                hotel_search_count=216,
+                hotel_detail_view_count=144,
+                booking_start_count=64,
+                booking_complete_count=24,
+            ),
+        ),
+        cohorts=BookingIntentCohortRecord(
+            ad_click_count=216,
+            repeat_view_user_count=130,
+            repeat_view_booking_count=16,
+            comparison_user_count=350,
+            comparison_booking_count=9,
+            booking_abandon_user_count=40,
+            booking_complete_user_count=24,
+            booking_abandon_median_revenue=Decimal("720000"),
+            booking_complete_median_revenue=Decimal("510000"),
+        ),
+    )
+
+    make_service(repos).evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    diagnosis = repos.evaluations.inserted[0].result_json["diagnosis"]
+    analysis = diagnosis["audience_intent_analysis"]
+    assert analysis["title"] == (
+        "초기 고객군 안에서 현재 예약 의도의 차이가 확인됐습니다"
+    )
+    assert analysis["cohort_comparison"] == {
+        "lookback_days": 30,
+        "repeat_detail_minimum_count": 2,
+        "repeat_view_user_count": 130,
+        "repeat_view_booking_count": 16,
+        "repeat_view_conversion_rate": "0.123077",
+        "comparison_user_count": 350,
+        "comparison_booking_count": 9,
+        "comparison_conversion_rate": "0.025714",
+    }
+    assert analysis["booking_value_comparison"] == {
+        "currency": "KRW",
+        "abandoned_user_count": 40,
+        "completed_user_count": 24,
+        "abandoned_median_revenue": "720000",
+        "completed_median_revenue": "510000",
+    }
+    assert analysis["next_segment_hypothesis"]["condition_labels"] == [
+        "20~30대",
+        "최근 30일 제주·오키나와 숙소 상세 2회 이상",
+        "예약 시작 후 미완료",
+    ]
+    assert any("가능성이 있습니다" in item for item in analysis["paragraphs"])
+    assert repos.metrics.cohort_destination_ids == [("jeju", "okinawa")]
+
+
+def test_booking_intent_cohort_failure_does_not_block_evaluation() -> None:
+    repos = FakeEvaluationRepos(
+        counts=MetricCountRecord(
+            numerator_count=2,
+            denominator_count=10,
+            funnel=EvaluationFunnelRecord(10, 9, 8, 5, 2),
+        ),
+        cohort_error=RuntimeError("supplemental query failed"),
+    )
+
+    response = make_service(repos).evaluate(
+        ad_experiment_id="adexp_family_trip_001",
+        request=AdExperimentEvaluateRequest(),
+    )
+
+    assert response.status == PromotionEvaluationStatus.GOAL_NOT_MET
+    assert len(repos.evaluations.inserted) == 1
+    assert (
+        repos.evaluations.inserted[0].result_json["diagnosis"][
+            "audience_intent_analysis"
+        ]
+        is None
+    )
 
 
 def test_email_booking_conversion_uses_campaign_landing_denominator() -> None:
@@ -438,6 +539,8 @@ class FakeEvaluationRepos:
         experiment: AdExperimentRecord | None | object = DEFAULT_EXPERIMENT,
         run: PromotionRunRecord | None = None,
         counts: MetricCountRecord | None = None,
+        cohorts: BookingIntentCohortRecord | None = None,
+        cohort_error: Exception | None = None,
     ) -> None:
         self.experiments = FakeAdExperimentRepository(
             ad_experiment_record()
@@ -447,7 +550,9 @@ class FakeEvaluationRepos:
         self.runs = FakePromotionRunRepository(run or promotion_run_record())
         self.evaluations = FakePromotionEvaluationRepository()
         self.metrics = FakeEvaluationMetricRepository(
-            counts or MetricCountRecord(numerator_count=2, denominator_count=10)
+            counts or MetricCountRecord(numerator_count=2, denominator_count=10),
+            cohorts=cohorts,
+            cohort_error=cohort_error,
         )
 
 
@@ -488,9 +593,20 @@ class FakePromotionEvaluationRepository:
 
 
 class FakeEvaluationMetricRepository:
-    def __init__(self, counts: MetricCountRecord) -> None:
+    def __init__(
+        self,
+        counts: MetricCountRecord,
+        *,
+        cohorts: BookingIntentCohortRecord | None,
+        cohort_error: Exception | None,
+    ) -> None:
         self.counts = counts
+        self.cohorts = cohorts or BookingIntentCohortRecord(
+            0, 0, 0, 0, 0, 0, 0, None, None
+        )
+        self.cohort_error = cohort_error
         self.cutoffs: list[datetime] = []
+        self.cohort_destination_ids: list[tuple[str, ...]] = []
 
     def count_inflow_rate(
         self,
@@ -509,6 +625,20 @@ class FakeEvaluationMetricRepository:
     ) -> MetricCountRecord:
         self.cutoffs.append(evaluation_cutoff_at)
         return self.counts
+
+    def analyze_booking_intent_cohorts(
+        self,
+        _experiment: AdExperimentRecord,
+        *,
+        destination_ids: tuple[str, ...],
+        evaluation_cutoff_at: datetime,
+        lookback_days: int,
+    ) -> BookingIntentCohortRecord:
+        del evaluation_cutoff_at, lookback_days
+        if self.cohort_error is not None:
+            raise self.cohort_error
+        self.cohort_destination_ids.append(tuple(destination_ids))
+        return self.cohorts
 
 
 def ad_experiment_record(

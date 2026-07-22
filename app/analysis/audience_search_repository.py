@@ -1376,6 +1376,11 @@ def _structured_query_parameters(
                 continue
             raw_value = str(property_filter["value"])
             parameter_name = f"{prefix}_property_{filter_index}"
+            if operator == "in":
+                parameters[parameter_name] = list(
+                    _structured_property_values(raw_value)
+                )
+                continue
             if (
                 operator == "equals"
                 and property_filter["key"]
@@ -1430,6 +1435,11 @@ def _structured_property_predicate(
             f"positionCaseInsensitiveUTF8({extracted}, "
             f"{{{parameter_name}:String}}) > 0"
         )
+    if operator == "in":
+        return (
+            f"has({{{parameter_name}:Array(String)}}, "
+            f"lowerUTF8({extracted}))"
+        )
     if operator in {"gte", "lte"}:
         comparison = ">=" if operator == "gte" else "<="
         return (
@@ -1444,6 +1454,20 @@ def _structured_property_predicate(
             f"toUInt8OrZero({{{parameter_name}:String}})"
         )
     return f"lowerUTF8({extracted}) = lowerUTF8({{{parameter_name}:String}})"
+
+
+def _structured_property_values(value: str) -> tuple[str, ...]:
+    normalized = value.replace("，", ",").replace("/", ",").replace("·", ",")
+    normalized = normalized.replace("또는", ",").replace("혹은", ",")
+    return tuple(
+        sorted(
+            {
+                item.strip().casefold()
+                for item in normalized.split(",")
+                if item.strip()
+            }
+        )
+    )
 
 
 def _destination_search_terms(destination: str) -> tuple[str, ...]:

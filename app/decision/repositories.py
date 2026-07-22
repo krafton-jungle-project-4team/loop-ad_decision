@@ -21,6 +21,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+from app.analysis.behavior_manifest import clickhouse_canonical_destination_sql
 from app.decision.matcher import (
     HNSW_EF_SEARCH as DEFAULT_HNSW_EF_SEARCH,
     HNSW_MAX_SCAN_TUPLES as DEFAULT_HNSW_MAX_SCAN_TUPLES,
@@ -349,6 +350,18 @@ class MetricCountRecord(NamedTuple):
     numerator_count: int
     denominator_count: int
     funnel: EvaluationFunnelRecord | None = None
+
+
+class BookingIntentCohortRecord(NamedTuple):
+    ad_click_count: int
+    repeat_view_user_count: int
+    repeat_view_booking_count: int
+    comparison_user_count: int
+    comparison_booking_count: int
+    booking_abandon_user_count: int
+    booking_complete_user_count: int
+    booking_abandon_median_revenue: Decimal | None
+    booking_complete_median_revenue: Decimal | None
 
 
 @dataclass(frozen=True)
@@ -766,6 +779,16 @@ class EvaluationMetricReader(Protocol):
         *,
         evaluation_cutoff_at: datetime,
     ) -> MetricCountRecord:
+        ...
+
+    def analyze_booking_intent_cohorts(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        destination_ids: Sequence[str],
+        evaluation_cutoff_at: datetime,
+        lookback_days: int,
+    ) -> BookingIntentCohortRecord:
         ...
 
 
@@ -2686,6 +2709,162 @@ class EvaluationMetricRepository:
         )
         return _booking_metric_count_from_result(result)
 
+    def analyze_booking_intent_cohorts(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        destination_ids: Sequence[str],
+        evaluation_cutoff_at: datetime,
+        lookback_days: int,
+    ) -> BookingIntentCohortRecord:
+        canonical_destination = clickhouse_canonical_destination_sql(
+            "coalesce("
+            "nullIf(JSONExtractString(events.properties_json, 'destination_id'), ''), "
+            "nullIf(JSONExtractString(events.properties_json, 'destination_name'), ''), "
+            "nullIf(JSONExtractString(events.properties_json, 'hotel_city'), '')"
+            ")"
+        )
+        destination_predicate = (
+            f"AND {canonical_destination} IN {{destination_ids:Array(String)}}"
+            if destination_ids
+            else ""
+        )
+        result = self._client.query(
+            f"""
+            WITH
+                toDateTime64(0, 3, 'UTC') AS no_event,
+                response_users AS (
+                    SELECT user_id, min(event_time) AS response_at
+                    FROM promotion_touch_events
+                    WHERE project_id = {{project_id:String}}
+                      AND promotion_run_id = {{promotion_run_id:String}}
+                      AND ad_experiment_id = {{ad_experiment_id:String}}
+                      AND event_name = {{denominator_event_name:String}}
+                      AND event_time <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
+                      AND notEmpty(user_id)
+                    GROUP BY user_id
+                ),
+                click_users AS (
+                    SELECT DISTINCT user_id
+                    FROM promotion_touch_events
+                    WHERE project_id = {{project_id:String}}
+                      AND promotion_run_id = {{promotion_run_id:String}}
+                      AND ad_experiment_id = {{ad_experiment_id:String}}
+                      AND event_name = {{click_event_name:String}}
+                      AND event_time <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
+                      AND notEmpty(user_id)
+                ),
+                pre_experiment_behavior AS (
+                    SELECT
+                        responses.user_id AS user_id,
+                        countIf(
+                            events.event_name = 'hotel_detail_view'
+                            AND events.event_time < responses.response_at
+                            AND events.event_time >= responses.response_at
+                                - toIntervalDay({{lookback_days:UInt16}})
+                            {destination_predicate}
+                        ) AS detail_view_count
+                    FROM response_users AS responses
+                    LEFT JOIN raw_events AS events
+                      ON events.project_id = {{project_id:String}}
+                     AND events.user_id = responses.user_id
+                     AND events.validation_status = 'valid'
+                     AND events.event_name = 'hotel_detail_view'
+                     AND events.event_time < responses.response_at
+                     AND events.event_time >= responses.response_at
+                         - toIntervalDay({{lookback_days:UInt16}})
+                    GROUP BY responses.user_id
+                ),
+                booking_journeys AS (
+                    SELECT
+                        responses.user_id AS user_id,
+                        maxIf(
+                            bookings.event_time,
+                            bookings.event_name = 'booking_start'
+                        ) AS booking_start_at,
+                        maxIf(
+                            bookings.event_time,
+                            bookings.event_name = 'booking_complete'
+                        ) AS booking_complete_at,
+                        argMaxIf(
+                            bookings.revenue,
+                            bookings.event_time,
+                            bookings.event_name = 'booking_start'
+                                AND isNotNull(bookings.revenue)
+                        ) AS booking_start_revenue
+                    FROM response_users AS responses
+                    LEFT JOIN booking_outcome_events AS bookings
+                      ON bookings.project_id = {{project_id:String}}
+                     AND bookings.promotion_run_id = {{promotion_run_id:String}}
+                     AND bookings.ad_experiment_id = {{ad_experiment_id:String}}
+                     AND bookings.user_id = responses.user_id
+                     AND bookings.event_name IN ('booking_start', 'booking_complete')
+                     AND bookings.event_time >= responses.response_at
+                     AND bookings.event_time <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
+                    GROUP BY responses.user_id
+                ),
+                audience AS (
+                    SELECT
+                        responses.user_id AS user_id,
+                        behavior.detail_view_count AS detail_view_count,
+                        ifNull(bookings.booking_start_at, no_event) AS booking_start_at,
+                        ifNull(bookings.booking_complete_at, no_event) AS booking_complete_at,
+                        bookings.booking_start_revenue AS booking_start_revenue
+                    FROM response_users AS responses
+                    LEFT JOIN pre_experiment_behavior AS behavior USING (user_id)
+                    LEFT JOIN booking_journeys AS bookings USING (user_id)
+                )
+            SELECT
+                (SELECT count() FROM click_users) AS ad_click_count,
+                countIf(detail_view_count >= 2) AS repeat_view_user_count,
+                countIf(
+                    detail_view_count >= 2
+                    AND booking_complete_at >= booking_start_at
+                    AND booking_complete_at != no_event
+                ) AS repeat_view_booking_count,
+                countIf(detail_view_count < 2) AS comparison_user_count,
+                countIf(
+                    detail_view_count < 2
+                    AND booking_complete_at >= booking_start_at
+                    AND booking_complete_at != no_event
+                ) AS comparison_booking_count,
+                countIf(
+                    booking_start_at != no_event
+                    AND booking_complete_at = no_event
+                ) AS booking_abandon_user_count,
+                countIf(booking_complete_at != no_event) AS booking_complete_user_count,
+                quantileExactIf(0.5)(
+                    ifNull(booking_start_revenue, 0),
+                    booking_start_at != no_event
+                    AND booking_complete_at = no_event
+                    AND isNotNull(booking_start_revenue)
+                ) AS booking_abandon_median_revenue,
+                quantileExactIf(0.5)(
+                    ifNull(booking_start_revenue, 0),
+                    booking_complete_at != no_event
+                    AND isNotNull(booking_start_revenue)
+                ) AS booking_complete_median_revenue
+            FROM audience
+            """,
+            parameters={
+                "project_id": experiment.project_id,
+                "promotion_run_id": experiment.promotion_run_id,
+                "ad_experiment_id": experiment.ad_experiment_id,
+                "denominator_event_name": _booking_conversion_denominator_event(
+                    experiment
+                ),
+                "click_event_name": (
+                    "campaign_redirect_click"
+                    if experiment.channel == EMAIL_CHANNEL
+                    else "promotion_click"
+                ),
+                "destination_ids": list(destination_ids),
+                "evaluation_cutoff_at": evaluation_cutoff_at,
+                "lookback_days": lookback_days,
+            },
+        )
+        return _booking_intent_cohort_from_result(result)
+
 
 def _next_loop_preparation_record_or_none(
     row: Mapping[str, Any] | None,
@@ -2817,6 +2996,46 @@ def _booking_metric_count_from_result(result: Any) -> MetricCountRecord:
         denominator_count=int(_clickhouse_value(row, "denominator_count", 1)),
         funnel=funnel,
     )
+
+
+def _booking_intent_cohort_from_result(result: Any) -> BookingIntentCohortRecord:
+    rows = _clickhouse_rows(result)
+    if not rows:
+        return BookingIntentCohortRecord(0, 0, 0, 0, 0, 0, 0, None, None)
+    row = rows[0]
+    return BookingIntentCohortRecord(
+        ad_click_count=int(_clickhouse_value(row, "ad_click_count", 0)),
+        repeat_view_user_count=int(
+            _clickhouse_value(row, "repeat_view_user_count", 1)
+        ),
+        repeat_view_booking_count=int(
+            _clickhouse_value(row, "repeat_view_booking_count", 2)
+        ),
+        comparison_user_count=int(
+            _clickhouse_value(row, "comparison_user_count", 3)
+        ),
+        comparison_booking_count=int(
+            _clickhouse_value(row, "comparison_booking_count", 4)
+        ),
+        booking_abandon_user_count=int(
+            _clickhouse_value(row, "booking_abandon_user_count", 5)
+        ),
+        booking_complete_user_count=int(
+            _clickhouse_value(row, "booking_complete_user_count", 6)
+        ),
+        booking_abandon_median_revenue=_optional_decimal(
+            _clickhouse_value(row, "booking_abandon_median_revenue", 7)
+        ),
+        booking_complete_median_revenue=_optional_decimal(
+            _clickhouse_value(row, "booking_complete_median_revenue", 8)
+        ),
+    )
+
+
+def _optional_decimal(value: Any) -> Decimal | None:
+    if value is None:
+        return None
+    return Decimal(str(value))
 
 
 def _vector_literal(values: Sequence[float], vector_dim: int) -> str:

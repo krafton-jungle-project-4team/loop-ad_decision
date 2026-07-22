@@ -9,6 +9,7 @@ from app.decision.matcher import FALLBACK_SEGMENT_ID
 from app.decision.repositories import (
     AdExperimentRecord,
     AdExperimentWriter,
+    BookingIntentCohortRecord,
     EvaluationFunnelRecord,
     EvaluationMetricReader,
     MetricCountRecord,
@@ -198,6 +199,12 @@ class AdExperimentEvaluationService:
             sample_size=sample_size,
             min_sample_size=min_sample_size,
         )
+        booking_intent_cohorts = self._load_booking_intent_cohorts(
+            experiment=experiment,
+            run=run,
+            status=status,
+            context=context,
+        )
         diagnosis = _build_evaluation_diagnosis(
             metric=metric,
             channel=experiment.channel,
@@ -206,6 +213,9 @@ class AdExperimentEvaluationService:
             actual_value=actual_value,
             counts=counts,
             min_sample_size=min_sample_size,
+            booking_intent_cohorts=booking_intent_cohorts,
+            destination_ids=_outcome_destination_ids(run.goal_snapshot_json),
+            age_groups=_audience_age_groups(run.goal_snapshot_json),
         )
         next_loop_required = status == PromotionEvaluationStatus.GOAL_NOT_MET.value
         evaluation_id = build_bounded_decision_id(
@@ -252,6 +262,46 @@ class AdExperimentEvaluationService:
         self._promotion_evaluation_repository.insert(evaluation)
         log.info("promotion_evaluation_created", {"evaluation": evaluation, "status": status})
         return evaluation
+
+    def _load_booking_intent_cohorts(
+        self,
+        *,
+        experiment: AdExperimentRecord,
+        run: PromotionRunRecord,
+        status: str,
+        context: EvaluationContext,
+    ) -> BookingIntentCohortRecord | None:
+        if (
+            experiment.goal_metric != GoalMetric.BOOKING_CONVERSION_RATE.value
+            or status != PromotionEvaluationStatus.GOAL_NOT_MET.value
+        ):
+            return None
+        destination_ids = _outcome_destination_ids(run.goal_snapshot_json)
+        try:
+            cohorts = self._evaluation_metric_repository.analyze_booking_intent_cohorts(
+                experiment,
+                destination_ids=destination_ids,
+                evaluation_cutoff_at=context.evaluation_cutoff_at,
+                lookback_days=30,
+            )
+            _validate_booking_intent_cohorts(cohorts)
+        except Exception as exc:
+            log.warn(
+                "booking_intent_cohort_analysis_unavailable",
+                {
+                    "destinationCount": len(destination_ids),
+                    "err": exc,
+                },
+            )
+            return None
+        log.info(
+            "booking_intent_cohort_analysis_completed",
+            {
+                "comparisonUsers": cohorts.comparison_user_count,
+                "repeatViewUsers": cohorts.repeat_view_user_count,
+            },
+        )
+        return cohorts
 
     def _load_counts(
         self,
@@ -893,6 +943,9 @@ def _build_evaluation_diagnosis(
     actual_value: Decimal,
     counts: MetricCountRecord,
     min_sample_size: int,
+    booking_intent_cohorts: BookingIntentCohortRecord | None = None,
+    destination_ids: tuple[str, ...] = (),
+    age_groups: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     gap_percentage_points = max(
         (target_value - actual_value) * Decimal("100"),
@@ -1014,8 +1067,18 @@ def _build_evaluation_diagnosis(
             "CTA 문구와 연결되는 랜딩 내용의 일치도 강화",
         ]
 
+    audience_intent_analysis = _build_audience_intent_analysis(
+        status=status,
+        target_value=target_value,
+        actual_value=actual_value,
+        counts=counts,
+        cohorts=booking_intent_cohorts,
+        destination_ids=destination_ids,
+        age_groups=age_groups,
+    )
+
     return {
-        "version": "dec.evaluation-diagnosis.v2",
+        "version": "dec.evaluation-diagnosis.v3",
         "status": status,
         "summary": summary,
         "observed_bottleneck": bottleneck,
@@ -1026,8 +1089,234 @@ def _build_evaluation_diagnosis(
         "evidence_strength": evidence_strength,
         "limitations": limitations,
         "data_origin": _evaluation_data_origin(counts.funnel),
+        "audience_intent_analysis": audience_intent_analysis,
         "funnel": funnel,
     }
+
+
+def _build_audience_intent_analysis(
+    *,
+    status: str,
+    target_value: Decimal,
+    actual_value: Decimal,
+    counts: MetricCountRecord,
+    cohorts: BookingIntentCohortRecord | None,
+    destination_ids: tuple[str, ...],
+    age_groups: tuple[str, ...],
+) -> dict[str, Any] | None:
+    funnel = counts.funnel
+    if (
+        status != PromotionEvaluationStatus.GOAL_NOT_MET.value
+        or funnel is None
+        or cohorts is None
+        or cohorts.repeat_view_user_count == 0
+        or cohorts.comparison_user_count == 0
+    ):
+        return None
+
+    repeat_rate = _ratio_decimal(
+        cohorts.repeat_view_booking_count,
+        cohorts.repeat_view_user_count,
+    )
+    comparison_rate = _ratio_decimal(
+        cohorts.comparison_booking_count,
+        cohorts.comparison_user_count,
+    )
+    has_intent_difference = repeat_rate > comparison_rate
+    destination_label = _destination_display_label(destination_ids)
+    destination_phrase = (
+        f"{destination_label} 숙소"
+        if destination_label
+        else "프로모션 대상 숙소"
+    )
+
+    paragraphs = [
+        (
+            f"목표 예약 전환율은 {_format_percent(target_value)}였지만 실제 전환율은 "
+            f"{_format_percent(actual_value)}였습니다. 광고 반응 고객 "
+            f"{counts.denominator_count}명 중 {cohorts.ad_click_count}명이 광고 링크를 "
+            f"눌렀고 {funnel.hotel_detail_view_count}명이 숙소 상세까지 확인해 "
+            "여행지와 프로모션에 대한 관심은 확인됐습니다."
+        ),
+        (
+            f"하지만 예약을 시작한 {funnel.booking_start_count}명 중 "
+            f"{funnel.booking_complete_count}명만 예약을 완료했습니다. 가장 큰 이탈은 "
+            "예약 시작과 완료 사이에서 발생했습니다."
+        ),
+        (
+            "초기 고객군은 프로모션 관심 고객을 확보한다는 점에서는 합리적이었습니다. "
+            f"다만 실험 전 {destination_phrase}를 반복 조회한 고객의 전환율은 "
+            f"{_format_rate_one_decimal(repeat_rate)}, 일회성 또는 과거 조회 고객은 "
+            f"{_format_rate_one_decimal(comparison_rate)}로 현재 예약 의도에 "
+            f"{'차이가 있었습니다.' if has_intent_difference else '뚜렷한 차이가 확인되지 않았습니다.'}"
+        ),
+    ]
+    value_comparison = _booking_value_comparison(cohorts)
+    if value_comparison is not None:
+        paragraphs.append(value_comparison["narrative"])
+    paragraphs.append(
+        f"다음 실험에서는 {destination_phrase}를 반복해서 확인하고 예약 단계까지 "
+        "진입한 고객을 별도로 검증해 보세요."
+    )
+
+    condition_labels: list[str] = []
+    if age_groups:
+        condition_labels.append(_age_group_display_label(age_groups))
+    condition_labels.extend(
+        [
+            f"최근 30일 {destination_phrase} 상세 2회 이상",
+            "예약 시작 후 미완료",
+        ]
+    )
+    return {
+        "version": "dec.audience-intent-analysis.v1",
+        "title": "초기 고객군 안에서 현재 예약 의도의 차이가 확인됐습니다",
+        "paragraphs": paragraphs,
+        "cohort_comparison": {
+            "lookback_days": 30,
+            "repeat_detail_minimum_count": 2,
+            "repeat_view_user_count": cohorts.repeat_view_user_count,
+            "repeat_view_booking_count": cohorts.repeat_view_booking_count,
+            "repeat_view_conversion_rate": str(repeat_rate),
+            "comparison_user_count": cohorts.comparison_user_count,
+            "comparison_booking_count": cohorts.comparison_booking_count,
+            "comparison_conversion_rate": str(comparison_rate),
+        },
+        "booking_value_comparison": (
+            None if value_comparison is None else value_comparison["facts"]
+        ),
+        "next_segment_hypothesis": {
+            "lookback_days": 30,
+            "condition_labels": condition_labels,
+            "validation_note": (
+                "관측된 행동 차이를 바탕으로 만든 다음 실험 가설이며 성공을 보장하지 않습니다."
+            ),
+        },
+    }
+
+
+def _booking_value_comparison(
+    cohorts: BookingIntentCohortRecord,
+) -> dict[str, Any] | None:
+    abandoned = cohorts.booking_abandon_median_revenue
+    completed = cohorts.booking_complete_median_revenue
+    if abandoned is None or completed is None or abandoned <= completed:
+        return None
+    return {
+        "narrative": (
+            "또한 예약 이탈 고객이 선택한 숙소 총액의 중앙값은 "
+            f"{_format_won(abandoned)}으로 예약 완료 고객의 {_format_won(completed)}보다 "
+            "높았습니다. 성수기 숙박 총액이나 취소 조건이 최종 결정에 부담이 "
+            "되었을 가능성이 있습니다."
+        ),
+        "facts": {
+            "currency": "KRW",
+            "abandoned_user_count": cohorts.booking_abandon_user_count,
+            "completed_user_count": cohorts.booking_complete_user_count,
+            "abandoned_median_revenue": str(abandoned),
+            "completed_median_revenue": str(completed),
+        },
+    }
+
+
+def _validate_booking_intent_cohorts(cohorts: BookingIntentCohortRecord) -> None:
+    count_fields = (
+        cohorts.ad_click_count,
+        cohorts.repeat_view_user_count,
+        cohorts.repeat_view_booking_count,
+        cohorts.comparison_user_count,
+        cohorts.comparison_booking_count,
+        cohorts.booking_abandon_user_count,
+        cohorts.booking_complete_user_count,
+    )
+    if any(value < 0 for value in count_fields):
+        raise ValueError("booking intent cohort counts must not be negative")
+    if cohorts.repeat_view_booking_count > cohorts.repeat_view_user_count:
+        raise ValueError("repeat-view bookings exceed cohort users")
+    if cohorts.comparison_booking_count > cohorts.comparison_user_count:
+        raise ValueError("comparison bookings exceed cohort users")
+    for value in (
+        cohorts.booking_abandon_median_revenue,
+        cohorts.booking_complete_median_revenue,
+    ):
+        if value is not None and value < 0:
+            raise ValueError("booking intent cohort revenue must not be negative")
+
+
+def _outcome_destination_ids(snapshot: Mapping[str, Any]) -> tuple[str, ...]:
+    outcome_spec = snapshot.get("outcome_spec")
+    if not isinstance(outcome_spec, Mapping):
+        return ()
+    outcome_filter = outcome_spec.get("outcome_filter")
+    if not isinstance(outcome_filter, Mapping):
+        return ()
+    values = outcome_filter.get("destination_ids")
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        sorted(
+            {
+                str(value).strip().casefold()
+                for value in values
+                if isinstance(value, str) and value.strip()
+            }
+        )
+    )
+
+
+def _audience_age_groups(snapshot: Mapping[str, Any]) -> tuple[str, ...]:
+    context = snapshot.get("audience_context")
+    if not isinstance(context, Mapping):
+        return ()
+    values = context.get("age_groups")
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        dict.fromkeys(
+            str(value).strip()
+            for value in values
+            if isinstance(value, str) and value.strip()
+        )
+    )
+
+
+def _destination_display_label(destination_ids: tuple[str, ...]) -> str:
+    labels = {
+        "jeju": "제주",
+        "okinawa": "오키나와",
+        "busan": "부산",
+        "gangneung": "강릉",
+        "seoul": "서울",
+    }
+    return "·".join(labels.get(value, value) for value in destination_ids)
+
+
+def _age_group_display_label(values: tuple[str, ...]) -> str:
+    normalized = [
+        value.strip()[:-1] if value.strip().endswith("대") else value.strip()
+        for value in values
+        if value.strip()
+    ]
+    if len(normalized) == 2:
+        return f"{normalized[0]}~{normalized[1]}대"
+    return f"{'·'.join(normalized)}대"
+
+
+def _ratio_decimal(numerator: int, denominator: int) -> Decimal:
+    if denominator <= 0:
+        return Decimal("0")
+    return (Decimal(numerator) / Decimal(denominator)).quantize(
+        DECIMAL_SCALE,
+        rounding=ROUND_HALF_UP,
+    )
+
+
+def _format_rate_one_decimal(value: Decimal) -> str:
+    return f"{(value * Decimal('100')).quantize(Decimal('0.1'), rounding=ROUND_HALF_UP)}%"
+
+
+def _format_won(value: Decimal) -> str:
+    return f"{int(value.quantize(Decimal('1'), rounding=ROUND_HALF_UP)):,}원"
 
 
 def _build_evaluation_funnel(

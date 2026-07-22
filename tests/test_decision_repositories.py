@@ -13,6 +13,7 @@ from psycopg.types.json import Jsonb
 from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
+    BookingIntentCohortRecord,
     ContentCandidateRepository,
     EvaluationFunnelRecord,
     EvaluationMetricRepository,
@@ -2272,6 +2273,53 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
     assert counts.funnel.fixture_response_count == 2
     call = client.calls[0]
     assert call.params["denominator_event_name"] == "campaign_landing"
+
+
+def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -> None:
+    cutoff = datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
+    client = FakeClickHouseClient(
+        rows=[(216, 130, 16, 350, 9, 40, 24, Decimal("720000"), Decimal("510000"))]
+    )
+    repo = EvaluationMetricRepository(client)
+
+    cohorts = repo.analyze_booking_intent_cohorts(
+        ad_experiment_record(
+            goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            channel=Channel.EMAIL.value,
+        ),
+        destination_ids=("jeju", "okinawa"),
+        evaluation_cutoff_at=cutoff,
+        lookback_days=30,
+    )
+
+    assert cohorts == BookingIntentCohortRecord(
+        ad_click_count=216,
+        repeat_view_user_count=130,
+        repeat_view_booking_count=16,
+        comparison_user_count=350,
+        comparison_booking_count=9,
+        booking_abandon_user_count=40,
+        booking_complete_user_count=24,
+        booking_abandon_median_revenue=Decimal("720000"),
+        booking_complete_median_revenue=Decimal("510000"),
+    )
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "pre_experiment_behavior" in sql
+    assert "events.event_time < responses.response_at" in sql
+    assert "tointervalday({lookback_days:uint16})" in sql
+    assert "in {destination_ids:array(string)}" in sql
+    assert "quantileexactif(0.5)" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+        "denominator_event_name": "campaign_landing",
+        "click_event_name": "campaign_redirect_click",
+        "destination_ids": ["jeju", "okinawa"],
+        "evaluation_cutoff_at": cutoff,
+        "lookback_days": 30,
+    }
 
 
 def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:
