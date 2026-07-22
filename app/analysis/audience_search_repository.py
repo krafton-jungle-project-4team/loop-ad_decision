@@ -1073,10 +1073,16 @@ class PgClickHouseAudienceVectorSearchRepository:
             AND NOT EXISTS (
                 SELECT 1
                 FROM {POSTGRES_EXCLUSION_RELATION} AS excluded
+                JOIN promotion_target_segments AS target
+                  ON target.analysis_id = excluded.target_analysis_id
+                 AND target.segment_id = excluded.segment_id
+                 AND target.allocation_plan_id = excluded.allocation_plan_id
+                 AND target.audience_snapshot_id = excluded.final_snapshot_id
                 WHERE excluded.project_id = {project_expression}
                   AND excluded.promotion_id = %s
                   AND excluded.user_id = {user_expression}
                   AND excluded.state IN ('reserved', 'consumed')
+                  AND target.status <> 'stopped'
             )
             """,
             (context.promotion_id,),
