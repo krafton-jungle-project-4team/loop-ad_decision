@@ -1365,6 +1365,19 @@ class PostgresAudienceAllocationRepository:
                         consumed_at = NULL,
                         released_at = NULL
                     WHERE {POSTGRES_EXCLUSION_RELATION}.state = 'released'
+                       OR EXISTS (
+                            SELECT 1
+                            FROM promotion_target_segments AS stale_target
+                            WHERE stale_target.analysis_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.target_analysis_id
+                              AND stale_target.segment_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.segment_id
+                              AND stale_target.allocation_plan_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.allocation_plan_id
+                              AND stale_target.audience_snapshot_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.final_snapshot_id
+                              AND stale_target.status = 'stopped'
+                       )
                     RETURNING user_id
                 )
                 SELECT count(*) AS reserved_count

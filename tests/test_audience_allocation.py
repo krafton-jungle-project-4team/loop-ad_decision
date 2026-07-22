@@ -160,6 +160,9 @@ def test_confirmation_reservation_uses_the_advanced_revision() -> None:
     assert "winner.segment_id" in reservation_query
     assert "ON CONFLICT (project_id, promotion_id, user_id)" in reservation_query
     assert "state = 'released'" in reservation_query
+    assert "stale_target.status = 'stopped'" in reservation_query
+    assert "stale_target.allocation_plan_id" in reservation_query
+    assert "stale_target.audience_snapshot_id" in reservation_query
     assert "released_at = NULL" in reservation_query
     assert context.revision == 6
     assert context.excluded_user_count == 25
