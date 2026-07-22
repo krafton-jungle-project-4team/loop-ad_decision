@@ -69,18 +69,20 @@ def _target_destination_ids(
             rule_json=rule_json,
         )
         if resolution.spec is not None:
-            destination_ids.update(resolution.spec.destination_ids)
-            custom_destinations = [
-                destination
+            raw_destinations = list(resolution.spec.destination_ids)
+            raw_destinations.extend(
+                str(condition["destination"])
                 for condition in resolution.spec.custom_conditions
                 if isinstance(condition.get("destination"), str)
                 and condition.get("destination")
-                for destination in _split_custom_destination_values(
-                    str(condition["destination"])
-                )
+            )
+            expanded_destinations = [
+                destination
+                for raw_destination in raw_destinations
+                for destination in _split_custom_destination_values(raw_destination)
             ]
             destination_ids.update(
-                canonical_destination_ids(custom_destinations)
+                canonical_destination_ids(expanded_destinations)
             )
     return tuple(sorted(destination_ids))
 
