@@ -142,9 +142,15 @@ class PromotionAudienceExclusionRepository:
                     (
                         SELECT count(*)
                         FROM {POSTGRES_EXCLUSION_RELATION} AS member
+                        JOIN promotion_target_segments AS target
+                          ON target.analysis_id = member.target_analysis_id
+                         AND target.segment_id = member.segment_id
+                         AND target.allocation_plan_id = member.allocation_plan_id
+                         AND target.audience_snapshot_id = member.final_snapshot_id
                         WHERE member.project_id = %s
                           AND member.promotion_id = state.promotion_id
                           AND member.state IN ('reserved', 'consumed')
+                          AND target.status <> 'stopped'
                     ) AS excluded_user_count
                 FROM {EXCLUSION_REVISION_RELATION} AS state
                 WHERE state.promotion_id = %s
@@ -197,16 +203,31 @@ class PromotionAudienceExclusionRepository:
         members = self._postgres.fetchall(
             f"""
             SELECT
-                user_id,
-                state,
-                revision,
-                coalesce(released_at, consumed_at, reserved_at) AS updated_at
-            FROM {POSTGRES_EXCLUSION_RELATION}
-            WHERE project_id = %s
-              AND promotion_id = %s
-            ORDER BY user_id ASC
+                member.user_id,
+                CASE
+                    WHEN target.status = 'stopped' THEN 'released'
+                    ELSE member.state
+                END AS state,
+                CASE
+                    WHEN target.status = 'stopped' THEN %s
+                    ELSE member.revision
+                END AS revision,
+                coalesce(
+                    member.released_at,
+                    member.consumed_at,
+                    member.reserved_at
+                ) AS updated_at
+            FROM {POSTGRES_EXCLUSION_RELATION} AS member
+            JOIN promotion_target_segments AS target
+              ON target.analysis_id = member.target_analysis_id
+             AND target.segment_id = member.segment_id
+             AND target.allocation_plan_id = member.allocation_plan_id
+             AND target.audience_snapshot_id = member.final_snapshot_id
+            WHERE member.project_id = %s
+              AND member.promotion_id = %s
+            ORDER BY member.user_id ASC
             """,
-            (project_id, promotion_id),
+            (revision, project_id, promotion_id),
         )
         active_member_count = sum(
             1

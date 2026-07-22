@@ -117,6 +117,7 @@ def test_allocation_winner_sql_uses_template_priority_then_normalized_fit() -> N
     assert "source.segment_id ASC" in winner_query
     assert "promotion_audience_exclusion_members" in winner_query
     assert "NOT EXISTS" in winner_query
+    assert "target.status <> 'stopped'" in winner_query
 
 
 def test_confirmation_reservation_uses_the_advanced_revision() -> None:

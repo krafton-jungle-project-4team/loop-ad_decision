@@ -223,6 +223,7 @@ def test_vector_population_count_anti_joins_same_promotion_exclusions() -> None:
     assert "promotion_audience_exclusion_members" in query
     assert "NOT EXISTS" in query
     assert "reserved" in query and "consumed" in query
+    assert "target.status <> 'stopped'" in query
     assert params == ("project", "hotel_behavior.v2", "promotion")
     assert result.corpus_user_count == 63
     assert result.exclusion_context == context
@@ -242,6 +243,39 @@ def test_empty_exclusion_context_uses_zero_revisions() -> None:
 
     assert context.revision == 0
     assert context.projection_revision == 0
+
+
+def test_projection_treats_stopped_targets_as_released() -> None:
+    now = datetime(2026, 7, 22, tzinfo=UTC)
+    postgres = _Postgres(
+        {"revision": 3, "excluded_user_count": 0},
+        rows=[
+            {
+                "user_id": "reusable_user",
+                "state": "released",
+                "revision": 3,
+                "updated_at": now,
+            }
+        ],
+    )
+    clickhouse = _ClickHouse([{"applied_revision": 2}])
+    repository = PromotionAudienceExclusionRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
+    )
+
+    repository.load_active_exclusion_context(
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+    )
+
+    projection_query, projection_params = postgres.calls[1]
+    assert "WHEN target.status = 'stopped' THEN 'released'" in projection_query
+    assert projection_params == (3, "project", "promotion")
+    assert clickhouse.inserts[0][1] == [
+        ("project", "campaign", "promotion", "reusable_user", "released", 3, now)
+    ]
 
 
 def test_clickhouse_hard_predicate_uses_revisioned_anti_join() -> None:
