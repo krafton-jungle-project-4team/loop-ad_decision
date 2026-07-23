@@ -4,7 +4,7 @@ import json
 import re
 from datetime import UTC, datetime
 from decimal import Decimal
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pytest
 
@@ -33,6 +33,7 @@ from app.analysis.segment_performance import (
     SegmentPerformanceFeatures,
     build_segment_performance_predictor,
 )
+from app.analysis.segment_property_conditions import SegmentPropertyCondition
 from app.analysis.segment_suggester import VectorClusterSegmentSuggester
 
 
@@ -69,6 +70,7 @@ class FakeRawEventSignalRepository:
         vector_version: str = "v1",
         destination_terms: list[str] | tuple[str, ...] = (),
         season_months: list[int] | tuple[int, ...] = (),
+        segment_property_conditions: Sequence[SegmentPropertyCondition] = (),
         limit: int = 1000,
         generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
@@ -77,6 +79,7 @@ class FakeRawEventSignalRepository:
             "vector_version": vector_version,
             "destination_terms": tuple(destination_terms),
             "season_months": tuple(season_months),
+            "segment_property_conditions": tuple(segment_property_conditions),
             "limit": limit,
         }
         if generation_scope is not None:
@@ -178,6 +181,7 @@ def raw_signal(
     hotel_market_values: tuple[str, ...] = (),
     age_group_values: tuple[str, ...] = (),
     gender_values: tuple[str, ...] = (),
+    segment_property_match_count: int | None = None,
 ) -> RawEventUserSignalRecord:
     event_count = max(
         1,
@@ -221,6 +225,7 @@ def raw_signal(
         preferred_category_values=(),
         destination_match_count=destination_match_count,
         season_match_count=season_match_count,
+        segment_property_match_count=segment_property_match_count,
     )
 
 
@@ -465,7 +470,7 @@ def test_review_copy_keeps_only_manifest_registered_executable_benefits(
 ) -> None:
     promotion = promotion_record(
         message_brief=(
-            "여름 휴가를 준비하는 20~30대 사용자를 대상으로 제주/오키나와 "
+            "여름 휴가를 준비하는 사용자를 대상으로 제주/오키나와 "
             "숙소 예약을 유도합니다. 인기 여행지, 조기 예약 할인, "
             "후기 기반 추천을 강조합니다."
         ),
@@ -478,6 +483,8 @@ def test_review_copy_keeps_only_manifest_registered_executable_benefits(
             f"review_user_{index}",
             deal_event_count=1,
             destination_match_count=1,
+            age_group_values=("20대",),
+            segment_property_match_count=1,
         )
         for index in range(2)
     ]
@@ -829,16 +836,19 @@ def test_raw_event_suggester_applies_demographic_instruction_to_profiles() -> No
                 hotel_search_count=2,
                 age_group_values=("20대",),
                 gender_values=("여성",),
+                segment_property_match_count=2,
             ),
             raw_signal(
                 "wrong_age_001",
                 hotel_search_count=2,
                 age_group_values=("40대",),
                 gender_values=("여성",),
+                segment_property_match_count=1,
             ),
             raw_signal(
                 "missing_profile_001",
                 hotel_search_count=2,
+                segment_property_match_count=0,
             ),
         ]
     )
@@ -915,6 +925,86 @@ def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
     )
     assert intent.requested_candidate_types == ("funnel_recovery",)
     assert intent.excluded_behaviors == ("booking_complete",)
+
+
+def test_openai_intent_extractor_keeps_allowlisted_property_conditions() -> None:
+    captured: dict[str, Any] = {}
+
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, timeout_seconds
+        captured["payload"] = payload
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "서울 4성급 숙소 관심 고객",
+                    "product": "hotel",
+                    "season": [],
+                    "destinations": ["seoul"],
+                    "benefits": [],
+                    "audience_hints": [],
+                    "channel": "onsite_banner",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": ["hotel_detail_view"],
+                    "excluded_behaviors": [],
+                    "explicit_conditions": ["서울", "4성급 이상"],
+                    "requested_candidate_types": ["intent_matched"],
+                    "segment_property_conditions": [
+                        {
+                            "event_name": "hotel_search",
+                            "property_key": "region",
+                            "operator": "equals",
+                            "value": "Seoul",
+                            "minimum_count": 1,
+                        },
+                        {
+                            "event_name": "hotel_detail_view",
+                            "property_key": "hotel_star_rating",
+                            "operator": "gte",
+                            "value": "4.0",
+                            "minimum_count": 1,
+                        },
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    extractor = OpenAIPromotionIntentExtractor(
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    intent = extractor.extract(
+        promotion_record(message_brief="서울 4성급 이상 숙소 예약 프로모션"),
+    )
+
+    property_schema = captured["payload"]["text"]["format"]["schema"][
+        "properties"
+    ]["segment_property_conditions"]["items"]["properties"]
+    assert "email" not in property_schema["property_key"]["enum"]
+    assert [condition.to_json() for condition in intent.segment_property_conditions] == [
+        {
+            "event_name": "hotel_detail_view",
+            "property_key": "hotel_star_rating",
+            "operator": "gte",
+            "value": "4",
+            "minimum_count": 1,
+        },
+        {
+            "event_name": "hotel_search",
+            "property_key": "region",
+            "operator": "equals",
+            "value": "seoul",
+            "minimum_count": 1,
+        },
+    ]
 
 
 def test_openai_intent_extractor_guards_positive_actions_from_false_exclusion() -> None:
@@ -1949,6 +2039,7 @@ def test_raw_event_suggester_requests_vector_window_signals() -> None:
                 "제주도",
             ),
             "season_months": (6, 7, 8),
+            "segment_property_conditions": (),
             "limit": 20,
         }
     ]

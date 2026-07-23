@@ -13,6 +13,7 @@ from app.analysis.promotion_audience_beam import (
     search_promotion_audience_candidates,
 )
 from app.analysis.repositories import RawEventUserSignalRecord
+from app.analysis.segment_property_conditions import SegmentPropertyCondition
 
 
 def _profile(
@@ -28,6 +29,7 @@ def _profile(
     promotion_condition_search: int | None = None,
     target_destination_search: int | None = None,
     deal_search: int | None = None,
+    segment_property_match: int | None = None,
 ) -> RawEventUserSignalRecord:
     return RawEventUserSignalRecord(
         project_id="demo_project",
@@ -63,6 +65,7 @@ def _profile(
         promotion_condition_search_count=promotion_condition_search,
         target_destination_search_count=target_destination_search,
         deal_search_count=deal_search,
+        segment_property_match_count=segment_property_match,
     )
 
 
@@ -272,6 +275,67 @@ def test_beam_uses_destination_search_count_for_repeat_predicate() -> None:
         )
     )
     assert repeat_candidate.user_ids == ("executable-repeat",)
+
+
+def test_beam_keeps_all_allowlisted_property_conditions_in_members_and_spec() -> None:
+    property_conditions = (
+        SegmentPropertyCondition(
+            event_name="hotel_search",
+            property_key="age_group",
+            operator="in",
+            value="20s,30s",
+        ),
+        SegmentPropertyCondition(
+            event_name="hotel_search",
+            property_key="region",
+            operator="equals",
+            value="seoul",
+        ),
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-property-target",
+        destination_ids=(),
+        season_months=(),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=property_conditions,
+        profiles=[
+            _profile("full-match", detail=2, segment_property_match=2),
+            _profile("age-only", detail=2, segment_property_match=1),
+            _profile("no-match", detail=2, segment_property_match=0),
+        ],
+        min_sample_size=1,
+        policy=PromotionAudienceBeamPolicy(maximum_final_candidates=10),
+    )
+
+    assert result.candidates
+    assert all(candidate.user_ids == ("full-match",) for candidate in result.candidates)
+
+    candidate = result.candidates[0]
+    ast = build_promotion_audience_ast(
+        promotion_id="promo-property-target",
+        candidate_type=candidate.candidate_type,
+        strategy_key=candidate.strategy_key,
+        matched_condition_keys=(
+            *(choice.predicate_key for choice in candidate.choices),
+            "profile_hint",
+        ),
+        structured_conditions=candidate.structured_conditions,
+        beam_policy_version=result.policy.policy_version,
+    )
+    compiled = compile_promotion_audience_ast(ast)
+
+    assert compiled.segment_audience_spec["template_id"] == "custom_structured_condition"
+    assert compiled.segment_audience_spec["template_version"] == 1
+    property_keys = {
+        property_filter["key"]
+        for condition in compiled.segment_audience_spec["parameters"]["conditions"]
+        for property_filter in condition["property_filters"]
+    }
+    assert property_keys == {"age_group", "region"}
+    assert {"20·30대", "지역 seoul"} <= set(
+        compiled.display_model["signal_chips"]
+    )
 
 
 def test_beam_policy_version_changes_identity_without_public_v3() -> None:

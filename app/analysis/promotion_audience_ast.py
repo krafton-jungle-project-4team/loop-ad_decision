@@ -35,6 +35,7 @@ from app.analysis.segment_audience_templates import (
     canonical_season_months,
     require_registered_template,
 )
+from app.analysis.segment_property_conditions import segment_property_filter_label
 
 
 PROMOTION_AUDIENCE_AST_VERSION = "promotion_audience_ast.v1"
@@ -61,13 +62,6 @@ _BENEFIT_LABELS: Mapping[str, str] = {
     "early_booking": "조기 예약",
     "free_cancellation": "무료 취소",
     "breakfast_included": "조식 포함",
-}
-
-_STRUCTURED_PROPERTY_LABELS: Mapping[str, str] = {
-    "deal": "할인·특가 관심",
-    "price": "가격 비교",
-    "free_cancellation": "무료 취소 관심",
-    "breakfast_included": "조식 포함 관심",
 }
 
 _BEHAVIOR_CHIPS: Mapping[str, str] = {
@@ -498,7 +492,12 @@ def _structured_title(
         None,
     )
     if behavior_label is None:
-        behavior_label = next(iter(condition_labels[1:]), "숙소 관심")
+        fallback_labels = (
+            condition_labels[1:]
+            if ast.destination_ids or ast.season_months
+            else condition_labels
+        )
+        behavior_label = next(iter(fallback_labels), "숙소 관심")
     destination_prefix = (
         f"{_destination_text(ast.destination_ids)} " if ast.destination_ids else ""
     )
@@ -687,10 +686,7 @@ def _execution_condition_label(condition: Mapping[str, Any]) -> str:
         parts.append("체크인 " + "·".join(str(month) for month in months) + "월")
     filters = condition.get("property_filters", ())
     filter_labels = tuple(
-        _STRUCTURED_PROPERTY_LABELS.get(
-            str(value.get("key", "")),
-            str(value.get("key", "")),
-        )
+        segment_property_filter_label(value)
         for value in filters
         if str(value.get("key", "")).strip()
     )
