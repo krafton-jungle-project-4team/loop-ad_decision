@@ -16,6 +16,7 @@ build/
 *.md
 !/README.md
 !/docs/dashboard-promotion-offer-url-handoff.md
+!/docs/privacy_data_boundary.md
 !/.codex/skills/loopad-log-tracer/SKILL.md
 artifacts/
 evaluation_manifests/**/*.execution-started.json
