@@ -9,6 +9,9 @@ from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from app.audience_contract import (
+    CUSTOM_STRUCTURED_EVENT_NAMES,
+    CUSTOM_STRUCTURED_PROPERTY_KEYS,
+    CUSTOM_STRUCTURED_PROPERTY_OPERATORS,
     SEGMENT_AUDIENCE_CONTRACT,
     SegmentAudienceContractError,
 )
@@ -49,6 +52,13 @@ from app.analysis.segment_performance import (
     SegmentPerformancePredictor,
     candidate_type_prediction_support,
     predict_segment_performance,
+)
+from app.analysis.segment_property_conditions import (
+    MAX_SEGMENT_PROPERTY_CONDITIONS,
+    SegmentPropertyCondition,
+    canonical_segment_property_conditions,
+    merge_segment_property_conditions,
+    segment_property_conditions_from_hints,
 )
 from app.config import Settings
 from app.generation.adapters import (
@@ -223,6 +233,7 @@ class PromotionIntent:
     unsupported_conditions: tuple[str, ...] = ()
     excluded_behaviors: tuple[str, ...] = ()
     requested_candidate_types: tuple[str, ...] = ()
+    segment_property_conditions: tuple[SegmentPropertyCondition, ...] = ()
     source: str = "deterministic"
 
     def to_json(self) -> dict[str, Any]:
@@ -243,6 +254,10 @@ class PromotionIntent:
             "excluded_behaviors": list(self.excluded_behaviors),
             "explicit_conditions": list(self.explicit_conditions),
             "requested_candidate_types": list(self.requested_candidate_types),
+            "segment_property_conditions": [
+                condition.to_json()
+                for condition in self.segment_property_conditions
+            ],
         }
 
 
@@ -568,14 +583,28 @@ def compile_raw_event_intent(intent: PromotionIntent) -> RawEventIntentCompilati
             )
         )
 
-    if any(hint in intent.audience_hints for hint in ("20s_30s", "male", "female")):
+    if intent.segment_property_conditions:
         conditions.append(
             CompiledRawEventCondition(
                 key="profile_hint",
                 label=CONDITION_LABELS["profile_hint"][0],
                 support="direct",
-                event_names=(),
-                property_keys=("age_group", "gender", "user_segment", "preferred_category"),
+                event_names=tuple(
+                    sorted(
+                        {
+                            condition.event_name
+                            for condition in intent.segment_property_conditions
+                        }
+                    )
+                ),
+                property_keys=tuple(
+                    sorted(
+                        {
+                            condition.property_key
+                            for condition in intent.segment_property_conditions
+                        }
+                    )
+                ),
                 weight=0.08,
             )
         )
@@ -752,10 +781,14 @@ def _generate_raw_event_candidates(
             performance_predictor=predictor,
             enforce_prediction_support=enforce_prediction_support,
         )
-        if enable_beam_search
+        if enable_beam_search or intent.segment_property_conditions
         else []
     )
-    candidates = beam_candidates or factory_candidates
+    candidates = (
+        beam_candidates
+        if intent.segment_property_conditions
+        else (beam_candidates or factory_candidates)
+    )
     if audience_selection_policy is not None:
         candidates = [
             _apply_audience_selection(
@@ -791,6 +824,7 @@ def _generate_beam_candidates(
         season_months=season_months_from_intent(intent),
         benefit_keys=intent.benefits,
         desired_behavior_keys=intent.desired_behaviors,
+        property_conditions=intent.segment_property_conditions,
         profiles=profiles,
         min_sample_size=min_sample_size,
     )
@@ -864,6 +898,8 @@ def _raw_event_candidate_from_beam(
         )
     if intent.season:
         matched_condition_keys = (*matched_condition_keys, "season_match")
+    if intent.segment_property_conditions:
+        matched_condition_keys = (*matched_condition_keys, "profile_hint")
     candidate = _candidate_from_profiles(
         candidate_type=beam_candidate.candidate_type,
         promotion=promotion,
@@ -1887,6 +1923,8 @@ def _intent_system_instruction() -> str:
         "requested_candidate_types에는 운영자가 특정한 전략만 넣고, 특정 전략을 요구하지 않았다면 "
         "빈 배열을 반환하세요. "
         "excluded_behaviors에는 사용자가 명시적으로 제외해 달라고 한 행동만 넣으세요. "
+        "segment_property_conditions에는 입력에 값과 비교 의미가 명시된 SDK 속성 조건만 넣으세요. "
+        "허용되지 않은 이벤트, 속성, 연산자를 만들거나 값이 없는 속성 조건을 추정하지 마세요. "
         "최종 고객 선정이나 순위 결정은 하지 말고 조건 추출만 수행하세요."
     )
 
@@ -1909,6 +1947,22 @@ def _intent_user_instruction(
             (
                 "excluded_behaviors 허용값: booking_complete, booking_cancel, "
                 "booking_start, promotion_response, hotel_search, hotel_detail_view"
+            ),
+            (
+                "segment_property_conditions event_name 허용값: "
+                + ", ".join(sorted(CUSTOM_STRUCTURED_EVENT_NAMES))
+            ),
+            (
+                "segment_property_conditions property_key 허용값: "
+                + ", ".join(sorted(CUSTOM_STRUCTURED_PROPERTY_KEYS))
+            ),
+            (
+                "segment_property_conditions operator 허용값: "
+                + ", ".join(sorted(CUSTOM_STRUCTURED_PROPERTY_OPERATORS))
+            ),
+            (
+                "속성 조건은 프로모션 입력에 대상 값과 비교 기준이 명시된 경우에만 "
+                "추출하고, 실행 가능한 조건이 없으면 빈 배열을 반환하세요."
             ),
             f"- channel: {promotion.channel}",
             f"- goal_metric: {promotion.goal_metric}",
@@ -1944,6 +1998,7 @@ def _intent_schema() -> dict[str, Any]:
             "excluded_behaviors",
             "explicit_conditions",
             "requested_candidate_types",
+            "segment_property_conditions",
         ],
         "properties": {
             "summary": {"type": "string"},
@@ -1977,6 +2032,41 @@ def _intent_schema() -> dict[str, Any]:
                 "type": "array",
                 "items": {"type": "string", "enum": list(CANDIDATE_TYPE_ORDER)},
                 "maxItems": len(CANDIDATE_TYPE_ORDER),
+            },
+            "segment_property_conditions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": [
+                        "event_name",
+                        "property_key",
+                        "operator",
+                        "value",
+                        "minimum_count",
+                    ],
+                    "properties": {
+                        "event_name": {
+                            "type": "string",
+                            "enum": sorted(CUSTOM_STRUCTURED_EVENT_NAMES),
+                        },
+                        "property_key": {
+                            "type": "string",
+                            "enum": sorted(CUSTOM_STRUCTURED_PROPERTY_KEYS),
+                        },
+                        "operator": {
+                            "type": "string",
+                            "enum": sorted(CUSTOM_STRUCTURED_PROPERTY_OPERATORS),
+                        },
+                        "value": {"type": "string"},
+                        "minimum_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100,
+                        },
+                    },
+                },
+                "maxItems": MAX_SEGMENT_PROPERTY_CONDITIONS,
             },
         },
     }
@@ -2015,6 +2105,16 @@ def _intent_from_payload(
         )
         if candidate_type in CANDIDATE_TYPE_ORDER
     )
+    (
+        payload_property_conditions,
+        unsupported_property_conditions,
+    ) = canonical_segment_property_conditions(
+        payload.get("segment_property_conditions")
+    )
+    segment_property_conditions = merge_segment_property_conditions(
+        payload_property_conditions,
+        fallback.segment_property_conditions,
+    )
 
     # Exclusions are destructive filters. For an operator instruction, only
     # behaviors tied to an explicit negative clause by the deterministic guard
@@ -2039,6 +2139,7 @@ def _intent_from_payload(
                 *fallback.unsupported_conditions,
                 *(f"destination:{value}" for value in unsupported_destinations),
                 *(f"benefit:{value}" for value in unsupported_benefits),
+                *unsupported_property_conditions,
             )
         )
     )
@@ -2064,6 +2165,7 @@ def _intent_from_payload(
         explicit_conditions=tuple(_safe_text_list(payload.get("explicit_conditions")))
         or fallback.explicit_conditions,
         requested_candidate_types=requested_candidate_types,
+        segment_property_conditions=segment_property_conditions,
         source=source,
     )
 
@@ -2161,13 +2263,14 @@ def _fallback_intent(
         segment_instruction
     )
     excluded_behaviors = _extract_excluded_behaviors(segment_instruction)
+    audience_hints = tuple(_extract_audience_hints(searchable))
     return PromotionIntent(
         summary=_fallback_summary(season=season, destinations=destinations, benefits=benefits),
         product="hotel",
         season=tuple(season),
         destinations=tuple(destinations),
         benefits=tuple(benefits),
-        audience_hints=tuple(_extract_audience_hints(searchable)),
+        audience_hints=audience_hints,
         channel=promotion.channel,
         goal_metric=promotion.goal_metric,
         funnel_goal=_funnel_goal(promotion.goal_metric),
@@ -2178,6 +2281,9 @@ def _fallback_intent(
         excluded_behaviors=tuple(excluded_behaviors),
         explicit_conditions=tuple(dict.fromkeys(explicit_conditions)),
         requested_candidate_types=tuple(requested_candidate_types),
+        segment_property_conditions=segment_property_conditions_from_hints(
+            audience_hints
+        ),
         source=source,
     )
 

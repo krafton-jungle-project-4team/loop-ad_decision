@@ -18,6 +18,11 @@ from app.analysis.segment_audience_templates import (
     canonical_destination_ids,
     canonical_season_months,
 )
+from app.analysis.segment_property_conditions import (
+    SegmentPropertyCondition,
+    profile_matches_segment_properties,
+    structured_conditions_from_segment_properties,
+)
 
 
 PROMOTION_AUDIENCE_BEAM_POLICY_VERSION = "promotion-audience-beam.v2"
@@ -199,6 +204,7 @@ def search_promotion_audience_candidates(
     season_months: Sequence[int],
     benefit_keys: Sequence[str],
     desired_behavior_keys: Sequence[str],
+    property_conditions: Sequence[SegmentPropertyCondition] = (),
     profiles: Sequence[RawEventUserSignalRecord],
     min_sample_size: int,
     policy: PromotionAudienceBeamPolicy = DEFAULT_PROMOTION_AUDIENCE_BEAM_POLICY,
@@ -214,6 +220,7 @@ def search_promotion_audience_candidates(
     mandatory_conditions = _mandatory_conditions(
         destination_ids=destinations,
         season_months=seasons,
+        property_conditions=property_conditions,
     )
     mandatory_profiles = tuple(
         profile
@@ -222,6 +229,7 @@ def search_promotion_audience_candidates(
             profile,
             destination_ids=destinations,
             season_months=seasons,
+            property_conditions=property_conditions,
         )
     )
     pruned: dict[str, int] = {}
@@ -242,6 +250,29 @@ def search_promotion_audience_candidates(
     generated = 0
     seen_choices: set[tuple[tuple[str, int], ...]] = set()
     seen_member_sets: dict[tuple[str, ...], BeamAudienceCandidate] = {}
+
+    if property_conditions:
+        property_candidate = _evaluate_candidate(
+            promotion_id=promotion_id,
+            choices=(),
+            mandatory_conditions=mandatory_conditions,
+            mandatory_profiles=mandatory_profiles,
+            total_profile_count=len(ordered_profiles),
+            destination_ids=destinations,
+            season_months=seasons,
+            benefit_keys=benefits,
+            desired_behavior_keys=desired_behavior_keys,
+            has_property_conditions=True,
+            min_sample_size=min_sample_size,
+            policy=policy,
+        )
+        if (
+            property_candidate is not None
+            and len(property_candidate.user_ids) >= min_sample_size
+            and len(property_candidate.user_ids) != len(ordered_profiles)
+        ):
+            evaluated.append(property_candidate)
+            seen_member_sets[property_candidate.user_ids] = property_candidate
 
     for _depth in range(1, policy.maximum_depth + 1):
         depth_candidates: list[BeamAudienceCandidate] = []
@@ -289,6 +320,7 @@ def search_promotion_audience_candidates(
                         season_months=seasons,
                         benefit_keys=benefits,
                         desired_behavior_keys=desired_behavior_keys,
+                        has_property_conditions=bool(property_conditions),
                         min_sample_size=min_sample_size,
                         policy=policy,
                     )
@@ -359,6 +391,7 @@ def _evaluate_candidate(
     season_months: tuple[int, ...],
     benefit_keys: tuple[str, ...],
     desired_behavior_keys: Sequence[str],
+    has_property_conditions: bool,
     min_sample_size: int,
     policy: PromotionAudienceBeamPolicy,
 ) -> BeamAudienceCandidate | None:
@@ -388,16 +421,22 @@ def _evaluate_candidate(
     if not conditions or len(conditions) > 8:
         return None
     candidate_type = _candidate_type(predicates)
-    strategy_key = "beam_" + "__".join(
-        f"{choice.predicate_key}_{choice.minimum_count}" for choice in choices
+    strategy_key = (
+        "beam_"
+        + "__".join(
+            f"{choice.predicate_key}_{choice.minimum_count}" for choice in choices
+        )
+        if choices
+        else "beam_property_anchor"
     )
     try:
         ast = build_promotion_audience_ast(
             promotion_id=promotion_id,
             candidate_type=candidate_type,
             strategy_key=strategy_key,
-            matched_condition_keys=tuple(
-                choice.predicate_key for choice in choices
+            matched_condition_keys=(
+                *(choice.predicate_key for choice in choices),
+                *(("profile_hint",) if has_property_conditions else ()),
             ),
             destination_ids=destination_ids,
             season_months=season_months,
@@ -420,9 +459,15 @@ def _evaluate_candidate(
         or _predicate(choice.predicate_key).dimension in {"funnel", "value", "benefit"}
     )
     promotion_alignment = min(1.0, 0.7 + aligned / max(10.0, len(choices) * 3.0))
-    behavior_intent = sum(
-        _dimension_intent_score(predicate.dimension) for predicate in predicates
-    ) / max(len(predicates), 1)
+    behavior_intent = (
+        sum(
+            _dimension_intent_score(predicate.dimension)
+            for predicate in predicates
+        )
+        / len(predicates)
+        if predicates
+        else 0.45
+    )
     if any(
         predicate.predicate_key == "booking_start_without_complete"
         for predicate in predicates
@@ -486,6 +531,7 @@ def _mandatory_conditions(
     *,
     destination_ids: tuple[str, ...],
     season_months: tuple[int, ...],
+    property_conditions: Sequence[SegmentPropertyCondition],
 ) -> tuple[Mapping[str, Any], ...]:
     conditions: list[Mapping[str, Any]] = []
     if destination_ids or season_months:
@@ -500,6 +546,9 @@ def _mandatory_conditions(
                 checkin_months=season_months,
             )
         )
+    conditions.extend(
+        structured_conditions_from_segment_properties(property_conditions)
+    )
     return _canonical_conditions(conditions)
 
 
@@ -508,6 +557,7 @@ def _matches_mandatory(
     *,
     destination_ids: Sequence[str],
     season_months: Sequence[int],
+    property_conditions: Sequence[SegmentPropertyCondition],
 ) -> bool:
     if destination_ids or season_months:
         if profile.promotion_condition_search_count is not None:
@@ -518,7 +568,7 @@ def _matches_mandatory(
             or (season_months and profile.season_match_count <= 0)
         ):
             return False
-    return True
+    return profile_matches_segment_properties(profile, property_conditions)
 
 
 def _benefit_predicate_keys(values: Sequence[str]) -> tuple[str, ...]:
