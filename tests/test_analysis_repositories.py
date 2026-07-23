@@ -22,6 +22,7 @@ from app.analysis.repositories import (
     SegmentVectorRepository,
     UserBehaviorVectorRepository,
 )
+from app.analysis.segment_property_conditions import SegmentPropertyCondition
 
 
 @dataclass(frozen=True)
@@ -787,6 +788,76 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
     assert "as deal_search_count" in sql
     assert call.params["destination_terms"] == ["jeju", "제주"]
     assert call.params["season_months"] == [6, 8]
+
+
+def test_raw_event_signals_count_allowlisted_property_condition_matches() -> None:
+    client = FakeClickHouseClient(
+        rows=[
+            {
+                "project_id": "hotel-client-a",
+                "user_id": "premium-seoul-user",
+                "event_count": 3,
+                "hotel_search_count": 1,
+                "hotel_click_count": 0,
+                "hotel_detail_view_count": 2,
+                "promotion_impression_count": 0,
+                "promotion_click_count": 0,
+                "campaign_redirect_click_count": 0,
+                "campaign_landing_count": 0,
+                "booking_start_count": 0,
+                "booking_complete_count": 0,
+                "booking_cancel_count": 0,
+                "deal_event_count": 0,
+                "free_cancellation_count": 0,
+                "breakfast_included_count": 0,
+                "price_event_count": 0,
+                "avg_price": 0.0,
+                "destination_values": [],
+                "checkin_dates": [],
+                "hotel_market_values": [],
+                "hotel_cluster_values": [],
+                "age_group_values": [],
+                "gender_values": [],
+                "preferred_category_values": [],
+                "destination_match_count": 0,
+                "segment_property_match_count": 2,
+            }
+        ]
+    )
+    repo = UserBehaviorVectorRepository(client)
+    conditions = (
+        SegmentPropertyCondition(
+            event_name="hotel_search",
+            property_key="region",
+            operator="equals",
+            value="seoul",
+        ),
+        SegmentPropertyCondition(
+            event_name="hotel_detail_view",
+            property_key="hotel_star_rating",
+            operator="gte",
+            value="4",
+            minimum_count=2,
+        ),
+    )
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        segment_property_conditions=conditions,
+    )
+
+    assert records[0].segment_property_match_count == 2
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "jsonextractstring(properties_json, 'region')" in sql
+    assert "jsonextractstring(properties_json, 'hotel_star_rating')" in sql
+    assert "as segment_property_match_count" in sql
+    assert "seoul" not in sql
+    assert call.params["segment_property_0_event_name"] == "hotel_search"
+    assert call.params["segment_property_0_value"] == "seoul"
+    assert call.params["segment_property_1_event_name"] == "hotel_detail_view"
+    assert call.params["segment_property_1_value"] == 4.0
+    assert call.params["segment_property_1_minimum_count"] == 2
 
 
 def test_hotel_profile_repository_queries_marketing_profiles() -> None:
