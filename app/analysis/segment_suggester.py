@@ -26,6 +26,7 @@ from app.analysis.raw_event_segments import (
     season_months_from_intent,
 )
 from app.analysis.segment_performance import SegmentPerformancePredictor
+from app.analysis.segment_property_conditions import SegmentPropertyCondition
 from app.analysis.vector_service import DEFAULT_VECTOR_VERSION, VECTOR_DIM
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -220,6 +221,7 @@ class RawEventUserSignalSampler(Protocol):
         vector_version: str = DEFAULT_VECTOR_VERSION,
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
+        segment_property_conditions: Sequence[SegmentPropertyCondition] = (),
         limit: int = DEFAULT_VECTOR_POOL_LIMIT,
         generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
@@ -396,6 +398,7 @@ class VectorClusterSegmentSuggester:
                 "vector_version": self._vector_version,
                 "destination_terms": destination_terms_from_intent(intent),
                 "season_months": season_months_from_intent(intent),
+                "segment_property_conditions": intent.segment_property_conditions,
                 "limit": self._vector_pool_limit,
             }
             if generation_scope is None:
@@ -441,6 +444,9 @@ class VectorClusterSegmentSuggester:
                     "destinationCount": len(intent.destinations),
                     "seasonCount": len(intent.season),
                     "desiredBehaviorCount": len(intent.desired_behaviors),
+                    "segmentPropertyConditionCount": len(
+                        intent.segment_property_conditions
+                    ),
                     "requestedCandidateTypes": list(intent.requested_candidate_types),
                     "compiledConditionCount": len(compilation.compiled_conditions),
                     "unsupportedConditionCount": len(

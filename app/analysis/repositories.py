@@ -13,6 +13,10 @@ from app.audience_exclusions import (
     CLICKHOUSE_EXCLUSION_RELATION,
     PromotionAudienceExclusionContext,
 )
+from app.analysis.segment_property_conditions import (
+    SegmentPropertyCondition,
+    clickhouse_segment_property_match_expression,
+)
 
 
 class PostgresExecutor(Protocol):
@@ -256,6 +260,7 @@ class RawEventUserSignalRecord:
     free_cancellation_search_count: int | None = None
     breakfast_search_count: int | None = None
     price_search_count: int | None = None
+    segment_property_match_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -902,6 +907,7 @@ class UserBehaviorVectorRepository:
         vector_version: str = "v1",
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
+        segment_property_conditions: Sequence[SegmentPropertyCondition] = (),
         limit: int = 1000,
         generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
@@ -923,6 +929,12 @@ class UserBehaviorVectorRepository:
             generation_scope.vector_version
             if generation_scope is not None
             else vector_version
+        )
+        (
+            segment_property_match_expression,
+            segment_property_parameters,
+        ) = clickhouse_segment_property_match_expression(
+            segment_property_conditions
         )
         if generation_scope is None:
             vector_window_cte = """
@@ -1151,7 +1163,9 @@ class UserBehaviorVectorRepository:
                         JSONExtractString(properties_json, 'price'),
                         ''
                     ) IS NOT NULL
-                ) AS price_search_count
+                ) AS price_search_count,
+                __SEGMENT_PROPERTY_MATCH_EXPRESSION__
+                    AS segment_property_match_count
             FROM raw_events
             __EXCLUSION_JOIN__
             WHERE project_id = {project_id:String}
@@ -1172,6 +1186,10 @@ class UserBehaviorVectorRepository:
             .replace("__EXCLUSION_JOIN__", exclusion_join)
             .replace("__RECEIVED_AT_CUTOFF__", received_at_cutoff)
             .replace("__VECTOR_POPULATION_QUERY__", vector_population_query)
+            .replace(
+                "__SEGMENT_PROPERTY_MATCH_EXPRESSION__",
+                segment_property_match_expression,
+            )
         )
         result = self._client.query(
             query,
@@ -1183,6 +1201,7 @@ class UserBehaviorVectorRepository:
                 "destination_terms": cleaned_destination_terms,
                 "season_months": cleaned_season_months,
                 "limit": limit,
+                **segment_property_parameters,
                 **scope_parameters,
             },
         )
@@ -1296,6 +1315,11 @@ class UserBehaviorVectorRepository:
                         row,
                         "price_search_count",
                         31,
+                    ),
+                    segment_property_match_count=_optional_clickhouse_int(
+                        row,
+                        "segment_property_match_count",
+                        32,
                     ),
                 )
             )
