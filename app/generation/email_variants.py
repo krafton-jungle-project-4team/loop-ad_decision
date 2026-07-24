@@ -17,7 +17,7 @@ EMAIL_VARIANT_SEQUENCE = (
     COMPARISON_VARIANT,
 )
 EDITORIAL_TEMPLATE_VERSION = "email.editorial.v4"
-OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v4"
+OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v5"
 COMPARISON_TEMPLATE_VERSION = "email.comparison.v2"
 PRICE_DISPLAY_PROMOTION_AND_FINAL = "promotion_and_final"
 PRICE_DISPLAY_ALL_TIERS = "all_price_tiers"

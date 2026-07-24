@@ -80,7 +80,7 @@ def test_offer_card_variant_builds_eight_redirect_targets_and_email_html() -> No
     )
 
     assert extensions["variant_type"] == OFFER_CARDS_VARIANT
-    assert extensions["template_version"] == "email.offer-cards.v4"
+    assert extensions["template_version"] == "email.offer-cards.v5"
     assert len(extensions["offers"]) == 8
     assert len(extensions["link_targets"]) == 9
     assert extensions["link_targets"][0] == {
@@ -249,7 +249,10 @@ def test_offer_card_uses_catalog_price_tiers_without_recalculation() -> None:
     revised_rendered = render_email_html(_content_values(revised))
     assert "정상가 342,000원" in revised_rendered
     assert "프로모션가 278,000원" in revised_rendered
-    assert "추가 할인가 250,200원" in revised_rendered
+    assert "10% 추가 할인가 250,200원 / 박" in revised_rendered
+    assert 'data-loopad-price-contract="offer-price.v1"' in revised_rendered
+    assert 'data-loopad-price-offer-id="jeju-ocean-breeze-006"' in revised_rendered
+    assert "white-space:nowrap" in revised_rendered
     assert "225,180원" not in revised_rendered
 
 
