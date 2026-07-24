@@ -15,6 +15,7 @@ from app.promotion_offers.schemas import (
     PromotionOfferCatalogResponse,
 )
 from app.promotion_offers.service import (
+    PromotionOfferCatalogInvalidOfferSetId,
     PromotionOfferCatalogInvalidProjectId,
     PromotionOfferCatalogNotFound,
     PromotionOfferCatalogService,
@@ -48,6 +49,7 @@ def get_promotion_offer_catalog_service(
 def list_promotion_offers(
     project_id: str,
     request: Request,
+    offer_set_id: str | None = None,
     x_loop_ad_internal_key: str | None = Header(
         default=None,
         alias="X-Loop-Ad-Internal-Key",
@@ -68,13 +70,25 @@ def list_promotion_offers(
             message="internal API key is missing or invalid",
         )
     try:
-        return service.list_offers(project_id=project_id)
+        if offer_set_id is None:
+            return service.list_offers(project_id=project_id)
+        return service.list_offers(
+            project_id=project_id,
+            offer_set_id=offer_set_id,
+        )
     except PromotionOfferCatalogInvalidProjectId:
         return _error_response(
             request,
             status_code=status.HTTP_400_BAD_REQUEST,
             code="project_id_invalid",
             message="project_id is invalid",
+        )
+    except PromotionOfferCatalogInvalidOfferSetId:
+        return _error_response(
+            request,
+            status_code=status.HTTP_400_BAD_REQUEST,
+            code="offer_set_id_invalid",
+            message="offer_set_id is invalid",
         )
     except PromotionOfferCatalogNotFound:
         return _error_response(

@@ -17,7 +17,7 @@ from app.generation.evidence import EvidenceResolver, verified_hotel_benefits
 from app.generation.schemas import ContentChannel, GenerationRequest
 
 
-PROMPT_BUILDER_VERSION = "dec-c2.v4"
+PROMPT_BUILDER_VERSION = "dec-c2.v5"
 CANDIDATE_STRATEGY_BLOCK_HEADER = (
     "Candidate strategy (apply only to this content option):"
 )
@@ -28,7 +28,7 @@ SAFE_VISUAL_DIRECTIONS = (
 )
 SAFE_EMAIL_VISUAL_DIRECTIONS = (
     "editorial destination story with a hero and two travel sections",
-    "eight accommodation offer cards using verified catalog images",
+    "accommodation offer cards using verified catalog images",
     "concise four-accommodation comparison using verified catalog images",
 )
 

@@ -23,6 +23,8 @@ class PromotionOfferCatalogResponse(BaseModel):
     project_id: str = Field(min_length=1)
     catalog_id: str = Field(min_length=1)
     catalog_version: str = Field(min_length=1)
+    offer_set_id: str | None = Field(default=None, min_length=1)
+    landing_url: HttpUrl | None = None
     offers: list[PromotionOfferResponse]
 
 
@@ -47,4 +49,3 @@ class PromotionOfferApiErrorEnvelope(BaseModel):
 
     request_id: str = Field(alias="requestId", min_length=1)
     error: PromotionOfferApiError
-

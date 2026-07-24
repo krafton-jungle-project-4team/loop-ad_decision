@@ -17,7 +17,7 @@ EMAIL_VARIANT_SEQUENCE = (
     COMPARISON_VARIANT,
 )
 EDITORIAL_TEMPLATE_VERSION = "email.editorial.v3"
-OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v2"
+OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v3"
 COMPARISON_TEMPLATE_VERSION = "email.comparison.v1"
 PRIMARY_REDIRECT_PLACEHOLDER = "{{redirect_url}}"
 OPEN_PIXEL_PLACEHOLDER = "{{open_pixel_url}}"
@@ -90,6 +90,10 @@ def build_email_creative_extensions(
                 "discount_rate_percent",
             ),
             "image_url": image_url,
+            "destination_url": _offer_destination_url(
+                catalog_hotel,
+                fallback=offer_link.destination_url,
+            ),
         }
         if variant_type == OFFER_CARDS_VARIANT:
             placeholder = f"{{{{offer_redirect_url_{index}}}}}"
@@ -98,7 +102,7 @@ def build_email_creative_extensions(
                     "placeholder": placeholder,
                     "target_type": "offer",
                     "offer_id": offer_link.offer_id,
-                    "destination_url": offer_link.destination_url,
+                    "destination_url": offer["destination_url"],
                 }
             )
             offer["redirect_placeholder"] = placeholder
@@ -240,6 +244,25 @@ def _select_destination_offers(
         if len(selected) == maximum:
             break
     return selected
+
+
+def _offer_destination_url(
+    catalog_hotel: Mapping[str, Any],
+    *,
+    fallback: str,
+) -> str:
+    destination_url = str(catalog_hotel.get("destination_url") or "").strip()
+    if not destination_url:
+        return fallback
+    parsed = urlsplit(destination_url)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+    ):
+        raise ValueError("offer catalog destination_url is invalid")
+    return destination_url
 
 
 def email_required_placeholders(

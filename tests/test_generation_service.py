@@ -222,7 +222,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
         "schema_version": "generation.request.v1",
         "content_candidate_count": 2,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v4",
+        "prompt_builder": "dec-c2.v5",
         "content_generator": "dec-c3.deterministic.v4",
         "report_builder": "dec-c4.v3",
     }
@@ -244,7 +244,7 @@ def test_generation_service_persists_run_and_content_candidates() -> None:
     assert first_candidate.metadata_json["content_id"] == first_candidate.content_id
     assert first_candidate.metadata_json["channel"] == "onsite_banner"
     assert first_candidate.metadata_json["report_version"] == "dec-c4.v3"
-    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v4"
+    assert first_candidate.metadata_json["prompt_builder_version"] == "dec-c2.v5"
     assert (
         first_candidate.metadata_json["content_generator_version"]
         == "dec-c3.deterministic.v4"
@@ -410,7 +410,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     card_creative = result.content_candidates[1].metadata_json["creative"]
     assert len(card_creative["link_targets"]) == 3
     assert card_creative["renderer"]["template_version"] == (
-        "email.offer-cards.v2"
+        "email.offer-cards.v3"
     )
     assert card_creative["source"]["required_placeholders"] == [
         "{{redirect_url}}",
@@ -1627,7 +1627,7 @@ def test_generation_service_records_failed_run_when_generator_fails() -> None:
         "schema_version": "generation.request.v1",
         "content_candidate_count": 0,
         "target_segment_count": 1,
-        "prompt_builder": "dec-c2.v4",
+        "prompt_builder": "dec-c2.v5",
         "content_generator": "dec-c3.deterministic.v4",
         "report_builder": "dec-c4.v3",
         "error_code": "content_generation_failed",
