@@ -1773,9 +1773,17 @@ def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist(
             "recommendation_score": 0.8,
         },
     )
+    stored_custom_segment = _v2_custom_segment(
+        promotion=promotion,
+        segment_id="seg_custom_stored_zero",
+    )
     service, _, segment_definition_repository = build_service(
         promotion=promotion,
-        segments=[stale_ai_segment, *default_segments()],
+        segments=[
+            stale_ai_segment,
+            stored_custom_segment,
+            *default_segments(),
+        ],
         segment_suggester=FakeSegmentSuggester([fresh_ai_segment]),
     )
 
@@ -1787,12 +1795,18 @@ def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist(
     assert fresh_ai_segment.segment_id in selected_segment_ids
     assert stale_ai_segment.segment_id not in selected_segment_ids
     assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
-    assert all(
-        segment["segment_id"] != stale_ai_segment.segment_id
+    available_segment_ids = {
+        segment["segment_id"]
         for segment in result.analysis.input_snapshot_json[
             "available_segment_definitions"
         ]
-    )
+    }
+    assert fresh_ai_segment.segment_id in available_segment_ids
+    assert stale_ai_segment.segment_id not in available_segment_ids
+    assert stored_custom_segment.segment_id not in available_segment_ids
+    assert {
+        segment.segment_id for segment in default_segments()
+    }.issubset(available_segment_ids)
 
 
 def test_service_scopes_conversational_recommendation_to_fresh_segments() -> None:
