@@ -38,6 +38,7 @@ from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorBuildResult,
 )
+from app.logging import log
 
 
 BUNDLED_AUDIENCE_CALIBRATION_PATH = BUNDLED_SEMANTIC_SELECTION_PATH
@@ -475,6 +476,20 @@ class AudienceV2Coordinator:
             hard_match_user_count=hard_match_count,
             estimated_score_pass_rate=estimated_score_pass_rate,
         )
+        log.info(
+            "segment_audience_materialized",
+            {
+                "projectId": promotion.project_id,
+                "promotionId": promotion.promotion_id,
+                "segmentId": segment.segment_id,
+                "templateId": spec.template_id,
+                "vectorGenerationId": context.vector_generation_id,
+                "vectorPopulationCount": context.corpus_user_count,
+                "preliminaryHardMatchCount": hard_match_count,
+                "materializedMemberCount": search_result.final_user_count,
+                "selectionMethod": search_result.method.value,
+            },
+        )
         # Final members have passed both the hard predicates and score threshold.
         # Treat them as an authoritative lower bound when the aggregate pre-count
         # lags behind the materialized search population.
@@ -512,7 +527,7 @@ class AudienceV2Coordinator:
             segment_vector_id=item.segment_vector_id,
             vector_generation_id=context.vector_generation_id,
             vector_version=spec.vector_version,
-            total_eligible_user_count=context.corpus_user_count,
+            total_eligible_user_count=search_result.corpus_user_count,
             matching_user_count=behavior_match_count,
             selected_user_count=final_user_count,
             selection_method=search_result.method.value,

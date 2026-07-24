@@ -791,6 +791,63 @@ def test_coordinator_uses_final_members_as_behavior_match_lower_bound() -> None:
     assert snapshots.writes[0].search_result.hard_match_user_count == 2
 
 
+def test_custom_segment_snapshot_uses_raw_exact_members_without_vector_overlap() -> None:
+    search = _RawExactBatchCoordinatorSearchRepository(member_count=103)
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+    )
+    segment = replace(
+        _v2_segment("seg_custom_chatkit"),
+        source="custom_chatkit",
+        rule_json=_custom_structured_rule(
+            conditions=[
+                {
+                    "event_name": "booking_start",
+                    "label": "20만원 초과 숙소 예약 시작",
+                    "minimum_count": 1,
+                    "maximum_count": None,
+                    "destination": "jeju,okinawa",
+                    "checkin_months": [],
+                    "property_filters": [
+                        {"key": "price", "operator": "gte", "value": "200001"},
+                    ],
+                },
+                {
+                    "event_name": "booking_complete",
+                    "label": "예약 완료 없음",
+                    "minimum_count": 0,
+                    "maximum_count": 0,
+                    "destination": None,
+                    "checkin_months": [],
+                    "property_filters": [],
+                },
+            ],
+            query_signal_keys=(
+                "booking_start_intensity",
+                "booking_start_without_complete",
+            ),
+            lookback_days=7,
+        ),
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis",
+        promotion=_analysis_promotion(),
+        segments=(segment,),
+    )[segment.segment_id]
+
+    assert search.raw_exact_call_count == 1
+    assert prepared.total_eligible_user_count == 103
+    assert prepared.matching_user_count == 103
+    assert prepared.selected_user_count == 103
+    assert snapshots.writes[0].search_result.members_relation == (
+        "audience_exact_members"
+    )
+
+
 def test_six_registered_templates_build_expected_exact_snapshot_members() -> None:
     schema = HotelBookingBehaviorSchemaV2()
     artifact = load_bundled_semantic_selection(segment_id="demo_validation")
@@ -1142,6 +1199,73 @@ def test_materialized_exact_members_use_postgres_array_parameters(
         if "FROM unnest(" in query
     )
     assert params == (["user_1", "user_2"], [0.9, 0.8], [1, 2])
+
+
+def test_raw_exact_members_materialize_clickhouse_users_without_vector_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_ids = [f"user_{index:03d}" for index in range(103)]
+    clickhouse = _RawExactClickHouse(user_ids)
+    postgres = _SearchSqlPostgres()
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
+    )
+    monkeypatch.setattr(
+        repository,
+        "_generation_window",
+        lambda **_kwargs: (
+            datetime(2026, 6, 24, tzinfo=UTC),
+            datetime(2026, 7, 24, tzinfo=UTC),
+        ),
+    )
+    predicate_parameters = {
+        "observation_window_days": (7,),
+        "structured_conditions_json": (
+            json.dumps(
+                [
+                    {
+                        "event_name": "booking_start",
+                        "label": "20만원 초과 숙소 예약 시작",
+                        "minimum_count": 1,
+                        "maximum_count": None,
+                        "destination": "jeju,okinawa",
+                        "checkin_months": [],
+                        "property_filters": [
+                            {
+                                "key": "price",
+                                "operator": "gte",
+                                "value": "200001",
+                            }
+                        ],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        ),
+    }
+
+    count = repository.materialize_raw_exact_members(
+        project_id="project",
+        vector_generation_id="uvgen_without_overlap",
+        vector_version="hotel_behavior.v2",
+        source_cutoff=datetime(2026, 7, 24, tzinfo=UTC),
+        hard_predicate_keys=(CUSTOM_STRUCTURED_CONDITION_KEY,),
+        predicate_parameters=predicate_parameters,
+    )
+
+    assert count == 103
+    assert "user_behavior_vector_revisions" not in clickhouse.query_text
+    assert "user_ids" not in clickhouse.parameters
+    assert clickhouse.parameters["custom_0_property_0"] == 200001.0
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(" in query
+    )
+    assert params[0] == user_ids
+    assert params[1] == [1.0] * 103
+    assert params[2] == list(range(1, 104))
 
 
 def test_temp_user_ids_use_postgres_array_parameters() -> None:
@@ -1918,6 +2042,22 @@ class _BatchCoordinatorSearchRepository:
         return self.materialized_member_count
 
 
+class _RawExactBatchCoordinatorSearchRepository(
+    _BatchCoordinatorSearchRepository
+):
+    def __init__(self, *, member_count: int) -> None:
+        super().__init__(hard_match_count=0, materialized_member_count=0)
+        self.member_count = member_count
+        self.raw_exact_call_count = 0
+
+    def materialize_raw_exact_members(self, **_kwargs: object) -> int:
+        self.raw_exact_call_count += 1
+        return self.member_count
+
+    def materialize_exact_members(self, **_kwargs: object) -> int:
+        raise AssertionError("custom conditions must not use vector candidates")
+
+
 class _SemanticCorpusSearchRepository:
     def __init__(
         self,
@@ -2112,6 +2252,26 @@ class _SearchSqlPostgres:
         if "SELECT count(*) AS row_count" in query:
             return {"row_count": 100_000}
         return None
+
+
+class _RawExactQueryResult:
+    def __init__(self, user_ids: Sequence[str]) -> None:
+        self._user_ids = user_ids
+
+    def named_results(self):
+        return ({"user_id": user_id} for user_id in self._user_ids)
+
+
+class _RawExactClickHouse:
+    def __init__(self, user_ids: Sequence[str]) -> None:
+        self.user_ids = user_ids
+        self.query_text = ""
+        self.parameters: Mapping[str, object] = {}
+
+    def query(self, query: str, *, parameters: Mapping[str, object]):
+        self.query_text = query
+        self.parameters = parameters
+        return _RawExactQueryResult(self.user_ids)
 
 
 class _SnapshotWriteDb:
