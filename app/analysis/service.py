@@ -423,6 +423,7 @@ class NextLoopAnalysisContext:
 class SegmentCandidate:
     definition: SegmentDefinitionRecord
     profile: HotelMarketingProfileRecord | None
+    current_matching_user_count: int | None = None
 
     @property
     def segment_id(self) -> str:
@@ -430,6 +431,8 @@ class SegmentCandidate:
 
     @property
     def estimated_size(self) -> int:
+        if self.current_matching_user_count is not None:
+            return self.current_matching_user_count
         return self.definition.sample_size
 
 
@@ -1418,7 +1421,16 @@ class PromotionAnalysisService:
         )
         return (
             {
-                segment_id: candidate
+                segment_id: (
+                    replace(
+                        candidate,
+                        current_matching_user_count=(
+                            previews[segment_id].matching_user_count
+                        ),
+                    )
+                    if segment_id in previews
+                    else candidate
+                )
                 for segment_id, candidate in candidates.items()
                 if segment_id not in empty_segment_ids
             },

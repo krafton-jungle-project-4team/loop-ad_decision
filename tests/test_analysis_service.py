@@ -1073,6 +1073,54 @@ def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
     }
 
 
+def test_v2_recommendation_uses_current_audience_when_stored_sample_is_zero() -> None:
+    promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
+    segment = _v2_ai_segment(
+        promotion=promotion,
+        segment_id="seg_ai_stale_zero",
+        sample_size=0,
+        raw_audience={
+            "total_eligible_user_count": 0,
+            "matching_user_count": 0,
+            "selected_user_count": 0,
+        },
+    )
+    coordinator = FakePreparingAudienceV2Coordinator(
+        total_eligible_user_count=100,
+        matching_user_count=20,
+        selected_user_count=10,
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[segment],
+        segment_suggester=FakeSegmentSuggester([]),
+        audience_v2_coordinator=coordinator,
+    )
+
+    with capture_logs() as logs:
+        result = service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
+
+    assert segment_ids(result.target_segments) == [segment.segment_id]
+    assert result.target_segments[0].estimated_size == 10
+    preflight = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_preflight_completed"
+    )
+    assert preflight["targetableCandidateCount"] == 1
+    assert preflight["audiences"] == [
+        {
+            "segmentId": segment.segment_id,
+            "candidateGenerationUserCount": 0,
+            "totalEligibleUserCount": 100,
+            "matchingUserCount": 20,
+            "vectorGenerationId": "generation_active",
+        }
+    ]
+
+
 def test_v2_recommendation_rejects_when_all_executable_audiences_are_empty() -> None:
     promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
     segment = _v2_ai_segment(
