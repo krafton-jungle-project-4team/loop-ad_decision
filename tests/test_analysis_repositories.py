@@ -790,6 +790,40 @@ def test_raw_event_signals_count_matching_destination_events_before_deduplicatio
     assert call.params["season_months"] == [6, 8]
 
 
+def test_raw_event_signals_prioritize_intent_matches_before_recent_users() -> None:
+    client = FakeClickHouseClient(rows=[])
+    repo = UserBehaviorVectorRepository(client)
+
+    records = repo.list_raw_event_user_signals(
+        project_id="hotel-client-a",
+        destination_terms=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        segment_property_conditions=(
+            SegmentPropertyCondition(
+                event_name="page_view",
+                property_key="age_group",
+                operator="in",
+                value="20s,30s",
+            ),
+        ),
+        limit=1000,
+    )
+
+    assert records == []
+    sql = compact_sql(client.calls[0].query)
+    intent_order = (
+        "order by "
+        "if( notempty({destination_terms:array(string)}) "
+        "or notempty({season_months:array(uint8)}), "
+        "promotion_condition_search_count > 0, touint8(0) ) desc, "
+        "if( notempty({destination_terms:array(string)}), "
+        "target_destination_search_count > 0, touint8(0) ) desc, "
+        "segment_property_match_count desc, "
+        "max(event_time) desc, user_id asc"
+    )
+    assert intent_order in sql
+
+
 def test_raw_event_signals_count_allowlisted_property_condition_matches() -> None:
     client = FakeClickHouseClient(
         rows=[
