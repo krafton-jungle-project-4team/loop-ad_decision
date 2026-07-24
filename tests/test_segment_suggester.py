@@ -941,6 +941,65 @@ def test_raw_event_suggester_relaxes_demographic_then_season_anchor() -> None:
         )
 
 
+def test_raw_event_suggester_keeps_relaxed_destination_only_anchor() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "destination_only_001",
+                hotel_search_count=1,
+                destination_match_count=1,
+                season_match_count=0,
+                destination_values=("제주 호텔",),
+                segment_property_match_count=0,
+            ),
+            raw_signal(
+                "destination_only_002",
+                hotel_search_count=1,
+                destination_match_count=1,
+                season_match_count=0,
+                destination_values=("오키나와 호텔",),
+                segment_property_match_count=0,
+            ),
+            raw_signal("unrelated_baseline"),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "여름 휴가를 준비하는 20~30대 사용자를 대상으로 "
+                "제주/오키나와 숙소 예약을 유도합니다."
+            ),
+        )
+    )
+
+    assert len(segments) == 1
+    segment = segments[0]
+    assert segment.rule_json["candidate_type"] == "intent_matched"
+    assert segment.rule_json["candidate_user_ids"] == [
+        "destination_only_001",
+        "destination_only_002",
+    ]
+    assert segment.rule_json["compiled_conditions"] == [
+        "recent_destination_search"
+    ]
+    assert segment.profile_json["beam_search"]["depth"] == 0
+    assert segment.profile_json["beam_search"]["predicate_choices"] == []
+    assert segment.profile_json["beam_search"]["relaxed_condition_keys"] == [
+        "age_group",
+        "season_months",
+    ]
+
+
 def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
     captured: dict[str, Any] = {}
 

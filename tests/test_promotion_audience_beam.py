@@ -444,6 +444,60 @@ def test_beam_relaxes_season_after_demographic_hint() -> None:
     )
 
 
+def test_beam_keeps_relaxed_destination_anchor_without_optional_behavior() -> None:
+    age_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="age_group",
+        operator="in",
+        value="20s,30s",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-relaxed-destination-anchor",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=(age_condition,),
+        profiles=[
+            _profile(
+                "destination-only-001",
+                promotion_condition_search=0,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+            _profile(
+                "destination-only-002",
+                promotion_condition_search=0,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+            _profile(
+                "unrelated-baseline",
+                destination_match=0,
+                season_match=0,
+                promotion_condition_search=0,
+                target_destination_search=0,
+                segment_property_match=0,
+            ),
+        ],
+        min_sample_size=2,
+    )
+
+    assert result.relaxed_condition_keys == ("age_group", "season_months")
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.depth == 0
+    assert candidate.strategy_key == "beam_mandatory_anchor"
+    assert candidate.candidate_type == "intent_matched"
+    assert candidate.user_ids == (
+        "destination-only-001",
+        "destination-only-002",
+    )
+    assert len(candidate.structured_conditions) == 1
+    assert candidate.structured_conditions[0]["destination"] == "jeju,okinawa"
+    assert candidate.structured_conditions[0]["checkin_months"] == []
+
+
 def test_beam_never_relaxes_destination_or_explicit_property_conditions() -> None:
     region_condition = SegmentPropertyCondition(
         event_name="page_view",
