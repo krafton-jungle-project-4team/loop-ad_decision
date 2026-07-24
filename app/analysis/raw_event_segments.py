@@ -2113,11 +2113,6 @@ def _intent_from_payload(
     payload_benefits, unsupported_benefits = _partition_executable_benefits(
         _safe_text_list(payload.get("benefits"))
     )
-    payload_excluded_behaviors = tuple(
-        behavior
-        for behavior in _safe_text_list(payload.get("excluded_behaviors"))
-        if behavior in EXCLUDED_BEHAVIOR_VALUES
-    )
     payload_candidate_types = tuple(
         candidate_type
         for candidate_type in _safe_text_list(
@@ -2136,15 +2131,9 @@ def _intent_from_payload(
         fallback.segment_property_conditions,
     )
 
-    # Exclusions are destructive filters. For an operator instruction, only
-    # behaviors tied to an explicit negative clause by the deterministic guard
-    # are allowed. This keeps "searched but did not book" from excluding the
-    # positive search behavior along with booking completion.
-    excluded_behaviors = (
-        fallback.excluded_behaviors
-        if _clean_segment_instruction(segment_instruction)
-        else payload_excluded_behaviors or fallback.excluded_behaviors
-    )
+    # Exclusions are destructive filters, so only an explicit operator-provided
+    # segment instruction may remove users from the candidate pool.
+    excluded_behaviors = fallback.excluded_behaviors
     requested_candidate_types = tuple(
         dict.fromkeys(
             (
