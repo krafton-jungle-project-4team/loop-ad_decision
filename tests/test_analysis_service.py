@@ -426,6 +426,42 @@ class FakeSegmentVectorService:
         )
 
 
+@dataclass(frozen=True)
+class FakeSourceAssignment:
+    user_id: str
+    segment_id: str
+    ad_experiment_id: str
+
+
+class FakeNextLoopSourceAssignmentReader:
+    def __init__(self, assignments: Sequence[FakeSourceAssignment]) -> None:
+        self.assignments = sorted(assignments, key=lambda item: item.user_id)
+        self.calls: list[dict[str, Any]] = []
+
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: Sequence[str],
+        after_user_id: str | None,
+        limit: int,
+    ) -> list[FakeSourceAssignment]:
+        self.calls.append(
+            {
+                "promotion_run_id": promotion_run_id,
+                "ad_experiment_ids": list(ad_experiment_ids),
+                "after_user_id": after_user_id,
+                "limit": limit,
+            }
+        )
+        return [
+            assignment
+            for assignment in self.assignments
+            if assignment.ad_experiment_id in ad_experiment_ids
+            and (after_user_id is None or assignment.user_id > after_user_id)
+        ][:limit]
+
+
 class FakeSegmentSuggester:
     def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
         self.segments = segments
@@ -566,6 +602,9 @@ def build_service(
     audience_v2_coordinator: FakeAudienceV2Coordinator | None = None,
     audience_bindings: Sequence[SegmentSuggestionAudienceBindingRecord] = (),
     audience_allocation_service: FakeAudienceAllocationService | None = None,
+    next_loop_source_assignment_reader: (
+        FakeNextLoopSourceAssignmentReader | None
+    ) = None,
     configured_candidate_limit: int = 3,
 ) -> tuple[
     PromotionAnalysisService,
@@ -590,6 +629,9 @@ def build_service(
         audience_allocation_service=(
             audience_allocation_service
             or FakeAudienceAllocationService(audience_bindings)
+        ),
+        next_loop_source_assignment_reader=(
+            next_loop_source_assignment_reader
         ),
         max_default_target_segments=configured_candidate_limit,
     )
@@ -1335,13 +1377,49 @@ def test_v2_next_loop_uses_failed_source_assignments_without_reallocation() -> N
         sample_size=25,
         raw_audience={},
     )
+    segment = replace(
+        segment,
+        rule_json={
+            key: value
+            for key, value in segment.rule_json.items()
+            if key != "candidate_user_ids"
+        },
+    )
     coordinator = FakePreparingAudienceV2Coordinator()
     allocation_service = FakeAudienceAllocationService()
+    vector_service = FakeSegmentVectorService()
+    source_assignments = [
+        FakeSourceAssignment(
+            user_id=f"user_{index:04d}",
+            segment_id=segment_id,
+            ad_experiment_id="adexp_failed",
+        )
+        for index in range(1001)
+    ]
+    source_assignments.extend(
+        [
+            FakeSourceAssignment(
+                user_id="user_other_segment",
+                segment_id="seg_other",
+                ad_experiment_id="adexp_failed",
+            ),
+            FakeSourceAssignment(
+                user_id="user_other_experiment",
+                segment_id=segment_id,
+                ad_experiment_id="adexp_success",
+            ),
+        ]
+    )
+    source_assignment_reader = FakeNextLoopSourceAssignmentReader(
+        source_assignments
+    )
     service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=[segment],
+        segment_vector_service=vector_service,
         audience_v2_coordinator=coordinator,
         audience_allocation_service=allocation_service,
+        next_loop_source_assignment_reader=source_assignment_reader,
     )
 
     result = service.analyze_focus(
@@ -1366,6 +1444,18 @@ def test_v2_next_loop_uses_failed_source_assignments_without_reallocation() -> N
     )
     assert allocation_service.confirm_calls == []
     assert coordinator.prepare_many_calls == []
+    assert len(source_assignment_reader.calls) == 2
+    assert source_assignment_reader.calls[0] == {
+        "promotion_run_id": "run_previous",
+        "ad_experiment_ids": ["adexp_failed"],
+        "after_user_id": None,
+        "limit": 1000,
+    }
+    assert source_assignment_reader.calls[1]["after_user_id"] == "user_0999"
+    assert len(vector_service.calls) == 1
+    assert vector_service.calls[0].candidate_user_ids == tuple(
+        f"user_{index:04d}" for index in range(1001)
+    )
     assert analysis_repository.saved.target_segments == result.target_segments
 
 

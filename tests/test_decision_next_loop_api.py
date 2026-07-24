@@ -429,7 +429,10 @@ def test_manual_next_loop_api_persists_preparation_and_returns_pending_candidate
     assert any("pg_advisory_xact_lock" in query for query in executed_sql)
     assert not any("insert into promotion_runs" in query for query in executed_sql)
     assert not any("insert into ad_experiments" in query for query in executed_sql)
-    assert not any("user_segment_assignments" in query for query in executed_sql)
+    assert not any(
+        "insert into user_segment_assignments" in query
+        for query in executed_sql
+    )
     evaluation_sql = next(
         query for query in executed_sql if "from promotion_evaluations" in query
     )
@@ -1482,6 +1485,24 @@ class RecordingCursor:
         sql = compact_sql(self._last_query)
         if "pg_advisory_xact_lock" in sql:
             return list(self._connection.generation_attempt_rows)
+        if "from user_segment_assignments" in sql:
+            (
+                _promotion_run_id,
+                ad_experiment_ids,
+                after_user_id,
+                _repeated_after_user_id,
+                limit,
+            ) = self._last_params
+            rows = [
+                row
+                for row in self._connection.source_assignment_rows
+                if row["ad_experiment_id"] in ad_experiment_ids
+                and (
+                    after_user_id is None
+                    or str(row["user_id"]) > after_user_id
+                )
+            ]
+            return sorted(rows, key=lambda row: str(row["user_id"]))[:limit]
         if "from ad_experiments" in sql:
             return [ad_experiment_row(self._connection.segment_id)]
         if "from promotion_evaluations" in sql:
@@ -1527,6 +1548,7 @@ class RecordingConnection:
         next_attempt_no: int = 1,
         generation_attempt_rows: list[dict[str, object]] | None = None,
         promotion_evaluation_rows: list[dict[str, object]] | None = None,
+        source_assignment_rows: list[dict[str, object]] | None = None,
     ) -> None:
         self.segment_id = segment_id
         self.promotion_run_row = (
@@ -1550,6 +1572,11 @@ class RecordingConnection:
             promotion_evaluation_rows
             if promotion_evaluation_rows is not None
             else [promotion_evaluation_row(segment_id)]
+        )
+        self.source_assignment_rows = (
+            list(source_assignment_rows)
+            if source_assignment_rows is not None
+            else [source_assignment_row(segment_id)]
         )
         self.content_candidate_rows: list[dict[str, object]] = []
         self.rejected_preparation_rows: list[dict[str, object]] = []
@@ -1668,6 +1695,20 @@ def ad_experiment_row(segment_id: str = "seg_luxury") -> dict[str, object]:
     }
 
 
+def source_assignment_row(
+    segment_id: str = "seg_luxury",
+    *,
+    user_id: str = "user_luxury_001",
+    ad_experiment_id: str = "adexp_luxury_001",
+) -> dict[str, object]:
+    return {
+        "user_id": user_id,
+        "segment_id": segment_id,
+        "ad_experiment_id": ad_experiment_id,
+        "similarity_score": Decimal("0.900000"),
+    }
+
+
 def promotion_evaluation_row(
     segment_id: str = "seg_luxury",
     *,
@@ -1709,10 +1750,7 @@ def segment_definition_row(segment_id: str = "seg_luxury") -> dict[str, object]:
         "query_preview_id": None,
         "natural_language_query": "luxury hotel users",
         "generated_sql": None,
-        "rule_json": {
-            "segment_id": segment_id,
-            "candidate_user_ids": ["user_luxury_001", "user_luxury_002"],
-        },
+        "rule_json": {"segment_id": segment_id},
         "profile_json": {"primary_segment": segment_id},
         "sample_size": 1200,
         "total_eligible_user_count": 50000,
