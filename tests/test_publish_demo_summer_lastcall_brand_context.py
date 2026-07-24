@@ -28,6 +28,16 @@ from scripts.publish_demo_summer_lastcall_brand_context import (
 
 
 BUCKET = "test-bucket"
+BASE_HOTEL_IDS = (
+    "jeju-ocean-breeze-006",
+    "jeju-aewol-sunset-007",
+    "jeju-halla-garden-008",
+    "jeju-seogwipo-cliff-009",
+    "okinawa-naha-terrace-017",
+    "okinawa-chatan-sunset-018",
+    "okinawa-ishigaki-blue-019",
+    "okinawa-yomitan-coast-020",
+)
 
 
 class FakeS3Client:
@@ -79,9 +89,16 @@ def test_publication_builds_both_offer_sets_and_four_discounted_hotels() -> None
         BASE_CATALOG_ID,
         TARGET_CATALOG_ID,
     ]
+    assert len(json.loads(bundle.base_catalog_bytes)["hotels"]) == 8
     hotels = bundle.target_catalog["hotels"]
     assert [hotel["hotel_id"] for hotel in hotels] == list(TARGET_HOTEL_IDS)
     assert [hotel["original_price_per_night"] for hotel in hotels] == [
+        342000,
+        264000,
+        286000,
+        362000,
+    ]
+    assert [hotel["promotion_price_per_night"] for hotel in hotels] == [
         278000,
         214000,
         232000,
@@ -93,7 +110,16 @@ def test_publication_builds_both_offer_sets_and_four_discounted_hotels() -> None
         208800,
         286200,
     ]
-    assert all(hotel["discount_rate_percent"] == 10 for hotel in hotels)
+    assert [hotel["discount_rate_percent"] for hotel in hotels] == [
+        19,
+        19,
+        19,
+        12,
+    ]
+    assert all(
+        hotel["additional_discount_rate_percent"] == 10
+        for hotel in hotels
+    )
     assert bundle.target_pointer["manifest_sha256"] == hashlib.sha256(
         bundle.target_manifest_bytes
     ).hexdigest()
@@ -112,7 +138,7 @@ def test_publication_writes_pointer_last_and_loader_resolves_target() -> None:
     ]
     assert s3_client.put_calls[-1]["IfMatch"] == bundle.source_pointer_etag
     assert verify_published_bundle(s3_client, bucket_name=BUCKET) == {
-        "context_version": "v3",
+        "context_version": "v4",
         "manifest_sha256": hashlib.sha256(
             bundle.target_manifest_bytes
         ).hexdigest(),
@@ -179,7 +205,11 @@ def test_publication_rejects_missing_target_hotel() -> None:
     manifest = json.loads(objects[manifest_key][0])
     base_key = manifest["catalogs"][0]["s3_key"]
     base_catalog = json.loads(objects[base_key][0])
-    base_catalog["hotels"] = base_catalog["hotels"][:-1]
+    base_catalog["hotels"] = [
+        hotel
+        for hotel in base_catalog["hotels"]
+        if hotel["hotel_id"] != TARGET_HOTEL_IDS[-1]
+    ]
     base_bytes = _json_bytes(base_catalog)
     objects[base_key] = (base_bytes, JSON_CONTENT_TYPE)
     manifest["catalogs"][0]["sha256"] = hashlib.sha256(base_bytes).hexdigest()
@@ -213,14 +243,69 @@ def source_objects() -> dict[str, tuple[bytes, str]]:
             "taxes_and_fees_included": True,
             "currency": "KRW",
             "hotels": [
-                _hotel("jeju-ocean-breeze-006", "Jeju Ocean Breeze Resort", "jeju", 278000),
-                _hotel("jeju-aewol-sunset-007", "Aewol Sunset Villa", "jeju", 214000),
-                _hotel("okinawa-naha-terrace-017", "Naha Island Terrace", "okinawa", 232000),
+                _hotel(
+                    "jeju-ocean-breeze-006",
+                    "Jeju Ocean Breeze Resort",
+                    "jeju",
+                    342000,
+                    278000,
+                    19,
+                ),
+                _hotel(
+                    "jeju-aewol-sunset-007",
+                    "Aewol Sunset Villa",
+                    "jeju",
+                    264000,
+                    214000,
+                    19,
+                ),
+                _hotel(
+                    "jeju-halla-garden-008",
+                    "Halla Garden Hotel",
+                    "jeju",
+                    198000,
+                    154000,
+                    22,
+                ),
+                _hotel(
+                    "jeju-seogwipo-cliff-009",
+                    "Seogwipo Cliff Stay",
+                    "jeju",
+                    248000,
+                    196000,
+                    21,
+                ),
+                _hotel(
+                    "okinawa-naha-terrace-017",
+                    "Naha Island Terrace",
+                    "okinawa",
+                    286000,
+                    232000,
+                    19,
+                ),
                 _hotel(
                     "okinawa-chatan-sunset-018",
                     "Chatan Sunset Bay Resort",
                     "okinawa",
+                    362000,
                     318000,
+                    12,
+                ),
+                _hotel(
+                    "okinawa-ishigaki-blue-019",
+                    "Ishigaki Blue Sky Resort",
+                    "okinawa",
+                    246000,
+                    196000,
+                    20,
+                ),
+                _hotel(
+                    "okinawa-yomitan-coast-020",
+                    "Yomitan Coast Hotel",
+                    "okinawa",
+                    218000,
+                    174000,
+                    20,
                 ),
             ],
         }
@@ -242,7 +327,7 @@ def source_objects() -> dict[str, tuple[bytes, str]]:
             "guidelines": [],
             "assets": [
                 _hotel_asset(hotel_id)
-                for hotel_id in TARGET_HOTEL_IDS
+                for hotel_id in BASE_HOTEL_IDS
             ],
             "catalogs": [
                 {
@@ -280,14 +365,19 @@ def _hotel(
     hotel_id: str,
     hotel_name: str,
     destination_id: str,
-    sale_price: int,
+    regular_price: int,
+    promotion_price: int,
+    discount_rate: int,
 ) -> dict[str, Any]:
     return {
         "hotel_id": hotel_id,
         "hotel_name": hotel_name,
         "destination_id": destination_id,
         "currency": "KRW",
-        "sale_price_per_night": sale_price,
+        "sale_price_per_night": promotion_price,
+        "original_price_per_night": regular_price,
+        "discount_amount": regular_price - promotion_price,
+        "discount_rate_percent": discount_rate,
     }
 
 

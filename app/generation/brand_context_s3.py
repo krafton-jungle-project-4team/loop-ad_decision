@@ -1014,13 +1014,24 @@ def _normalise_offer_catalog(
                 hotel.get("original_price_per_night"),
                 "catalog.original_price_per_night",
             ),
+            "promotion_price_per_night": _catalog_optional_nonnegative_int(
+                hotel.get("promotion_price_per_night"),
+                "catalog.promotion_price_per_night",
+            ),
             "discount_rate_percent": _catalog_optional_nonnegative_int(
                 hotel.get("discount_rate_percent"),
                 "catalog.discount_rate_percent",
             ),
+            "additional_discount_rate_percent": (
+                _catalog_optional_nonnegative_int(
+                    hotel.get("additional_discount_rate_percent"),
+                    "catalog.additional_discount_rate_percent",
+                )
+            ),
             "image_path": _validated_frontend_path(asset.get("frontend_path")),
             "asset_id": _required_text(asset.get("asset_id"), "asset.asset_id"),
         }
+        _validate_catalog_price_order(normalized_hotel)
         destination_url = _optional_https_url(
             hotel.get("destination_url"),
             field_name="catalog.destination_url",
@@ -1055,6 +1066,26 @@ def _normalise_offer_catalog(
     if deal_code is not None:
         normalized_catalog["deal_code"] = deal_code
     return normalized_catalog
+
+
+def _validate_catalog_price_order(hotel: Mapping[str, Any]) -> None:
+    sale_price = int(hotel["sale_price_per_night"])
+    promotion_price = hotel.get("promotion_price_per_night")
+    original_price = hotel.get("original_price_per_night")
+    if promotion_price is not None and int(promotion_price) < sale_price:
+        _raise_invalid_catalog_price_order()
+    comparison_price = (
+        int(promotion_price) if promotion_price is not None else sale_price
+    )
+    if original_price is not None and int(original_price) < comparison_price:
+        _raise_invalid_catalog_price_order()
+
+
+def _raise_invalid_catalog_price_order() -> None:
+    raise PermanentGenerationError(
+        code="brand_context_catalog_invalid",
+        safe_message="The promotion price catalog was invalid.",
+    )
 
 
 def _normalised_catalog_offer_set_id(
