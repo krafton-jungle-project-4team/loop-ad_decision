@@ -262,7 +262,7 @@ def search_promotion_audience_candidates(
     seen_choices: set[tuple[tuple[str, int], ...]] = set()
     seen_member_sets: dict[tuple[str, ...], BeamAudienceCandidate] = {}
 
-    if property_conditions:
+    if property_conditions or anchor.relaxed_condition_keys:
         property_candidate = _evaluate_candidate(
             promotion_id=promotion_id,
             choices=(),
@@ -273,7 +273,7 @@ def search_promotion_audience_candidates(
             season_months=seasons,
             benefit_keys=benefits,
             desired_behavior_keys=desired_behavior_keys,
-            has_property_conditions=True,
+            has_property_conditions=bool(property_conditions),
             min_sample_size=min_sample_size,
             policy=policy,
         )
@@ -504,7 +504,11 @@ def _evaluate_candidate(
             f"{choice.predicate_key}_{choice.minimum_count}" for choice in choices
         )
         if choices
-        else "beam_property_anchor"
+        else (
+            "beam_property_anchor"
+            if has_property_conditions
+            else "beam_mandatory_anchor"
+        )
     )
     try:
         ast = build_promotion_audience_ast(
