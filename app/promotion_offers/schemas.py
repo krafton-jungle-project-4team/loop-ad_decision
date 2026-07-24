@@ -12,7 +12,9 @@ class PromotionOfferResponse(BaseModel):
     currency: str = Field(min_length=1)
     sale_price_per_night: int = Field(ge=0)
     original_price_per_night: int | None = Field(default=None, ge=0)
+    promotion_price_per_night: int | None = Field(default=None, ge=0)
     discount_rate_percent: int | None = Field(default=None, ge=0)
+    additional_discount_rate_percent: int | None = Field(default=None, ge=0)
     image_url: HttpUrl
     destination_url: HttpUrl
 

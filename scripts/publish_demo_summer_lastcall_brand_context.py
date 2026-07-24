@@ -20,9 +20,9 @@ POINTER_KEY = f"{BASE_PREFIX}{PROJECT_ID}/current.json"
 BASE_CATALOG_ID = "black-friday-hotels"
 BASE_CATALOG_VERSION = "v2"
 BASE_OFFER_SET_ID = "summer-base"
-TARGET_CONTEXT_VERSION = "v3"
+TARGET_CONTEXT_VERSION = "v4"
 TARGET_CATALOG_ID = "black-friday-hotels-lastcall"
-TARGET_CATALOG_VERSION = "v3"
+TARGET_CATALOG_VERSION = "v4"
 TARGET_OFFER_SET_ID = "summer-lastcall"
 TARGET_DEAL_CODE = "summer-lastcall"
 TARGET_CREATED_AT = "2026-07-24T00:00:00Z"
@@ -90,11 +90,19 @@ def build_lastcall_catalog(base_catalog: Mapping[str, Any]) -> dict[str, Any]:
         source = hotels_by_id.get(hotel_id)
         if source is None:
             raise ValueError(f"base catalog is missing target hotel: {hotel_id}")
-        original_price = _required_positive_int(
+        regular_price = _required_positive_int(
+            source.get("original_price_per_night"),
+            f"{hotel_id}.original_price_per_night",
+        )
+        promotion_price = _required_positive_int(
             source.get("sale_price_per_night"),
             f"{hotel_id}.sale_price_per_night",
         )
-        sale_price = (original_price * 9 + 5) // 10
+        base_discount_rate = _required_percentage(
+            source.get("discount_rate_percent"),
+            f"{hotel_id}.discount_rate_percent",
+        )
+        final_price = (promotion_price * 9 + 5) // 10
         target_hotels.append(
             {
                 "hotel_id": hotel_id,
@@ -110,10 +118,12 @@ def build_lastcall_catalog(base_catalog: Mapping[str, Any]) -> dict[str, Any]:
                     source.get("currency"),
                     f"{hotel_id}.currency",
                 ),
-                "sale_price_per_night": sale_price,
-                "original_price_per_night": original_price,
-                "discount_amount": original_price - sale_price,
-                "discount_rate_percent": 10,
+                "sale_price_per_night": final_price,
+                "original_price_per_night": regular_price,
+                "promotion_price_per_night": promotion_price,
+                "discount_amount": regular_price - promotion_price,
+                "discount_rate_percent": base_discount_rate,
+                "additional_discount_rate_percent": 10,
                 "destination_url": (
                     f"{SHOP_ORIGIN}/hotel/{hotel_id}?deal={TARGET_DEAL_CODE}"
                 ),
@@ -158,8 +168,9 @@ def build_lastcall_catalog(base_catalog: Mapping[str, Any]) -> dict[str, Any]:
                 "and fees included."
             ),
             (
-                "The sale price is the 10% summer-lastcall price applied to "
-                "the snapshotted base promotion price."
+                "The original price is the regular price, the promotion "
+                "price is the snapshotted base offer, and the sale price is "
+                "the final summer-lastcall price."
             ),
         ],
         "hotels": target_hotels,
@@ -630,6 +641,14 @@ def _required_positive_int(value: object, label: str) -> int:
     return value
 
 
+def _required_percentage(value: object, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if value < 0 or value > 100:
+        raise ValueError(f"{label} must be between 0 and 100")
+    return value
+
+
 def _require_equal(value: Mapping[str, Any], key: str, expected: object) -> None:
     if value.get(key) != expected:
         raise ValueError(f"{key} must be {expected!r}")
@@ -654,6 +673,9 @@ def _summary(bundle: PublicationBundle) -> dict[str, Any]:
             {
                 "hotel_id": hotel["hotel_id"],
                 "original_price_per_night": hotel["original_price_per_night"],
+                "promotion_price_per_night": hotel[
+                    "promotion_price_per_night"
+                ],
                 "sale_price_per_night": hotel["sale_price_per_night"],
             }
             for hotel in bundle.target_catalog["hotels"]

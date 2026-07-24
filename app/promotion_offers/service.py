@@ -325,8 +325,14 @@ def _normalised_offer(
     original_price = _optional_nonnegative_int(
         value.get("original_price_per_night")
     )
+    promotion_price = _optional_nonnegative_int(
+        value.get("promotion_price_per_night")
+    )
     discount_rate = _optional_nonnegative_int(
         value.get("discount_rate_percent")
+    )
+    additional_discount_rate = _optional_nonnegative_int(
+        value.get("additional_discount_rate_percent")
     )
     image_path = _required_text(value.get("image_path"))
     if (
@@ -339,7 +345,14 @@ def _normalised_offer(
         or sale_price is None
         or image_path is None
         or original_price is _INVALID
+        or promotion_price is _INVALID
         or discount_rate is _INVALID
+        or additional_discount_rate is _INVALID
+        or not _has_valid_price_order(
+            sale_price=sale_price,
+            promotion_price=promotion_price,
+            original_price=original_price,
+        )
     ):
         return None
     try:
@@ -365,13 +378,29 @@ def _normalised_offer(
         currency=currency,
         sale_price_per_night=sale_price,
         original_price_per_night=original_price,
+        promotion_price_per_night=promotion_price,
         discount_rate_percent=discount_rate,
+        additional_discount_rate_percent=additional_discount_rate,
         image_url=image_url,
         destination_url=destination_url,
     )
 
 
 _INVALID = object()
+
+
+def _has_valid_price_order(
+    *,
+    sale_price: int,
+    promotion_price: int | None,
+    original_price: int | None,
+) -> bool:
+    if promotion_price is not None and promotion_price < sale_price:
+        return False
+    comparison_price = (
+        promotion_price if promotion_price is not None else sale_price
+    )
+    return original_price is None or original_price >= comparison_price
 
 
 def _required_text(value: object) -> str | None:
