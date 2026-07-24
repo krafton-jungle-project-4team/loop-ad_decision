@@ -1189,6 +1189,157 @@ def test_openai_intent_extractor_guards_positive_actions_from_false_exclusion() 
     )
 
 
+def test_openai_intent_extractor_ignores_model_exclusions_without_segment_instruction(
+) -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, payload, timeout_seconds
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "여름 제주 숙소 예약 고객",
+                    "product": "hotel",
+                    "season": ["여름"],
+                    "destinations": ["제주"],
+                    "benefits": [],
+                    "audience_hints": [],
+                    "channel": "email",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": [
+                        "hotel_search",
+                        "hotel_detail_view",
+                        "booking_start_without_complete",
+                    ],
+                    "excluded_behaviors": [
+                        "booking_complete",
+                        "hotel_search",
+                        "hotel_detail_view",
+                    ],
+                    "explicit_conditions": ["여름", "제주"],
+                    "requested_candidate_types": [],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    extractor = OpenAIPromotionIntentExtractor(
+        api_key="test-key",
+        model="gpt-test",
+        transport=transport,
+    )
+
+    intent = extractor.extract(
+        promotion_record(message_brief="여름 제주 숙소 예약 프로모션"),
+    )
+
+    assert intent.excluded_behaviors == ()
+
+
+def test_default_recommendation_survives_model_generated_destructive_exclusions(
+) -> None:
+    def transport(
+        endpoint: str,
+        headers: Mapping[str, str],
+        payload: Mapping[str, Any],
+        timeout_seconds: float,
+    ) -> Mapping[str, Any]:
+        del endpoint, headers, payload, timeout_seconds
+        return {
+            "output_text": json.dumps(
+                {
+                    "summary": "여름 제주·오키나와 예약 이탈 고객",
+                    "product": "hotel",
+                    "season": ["여름"],
+                    "destinations": ["제주", "오키나와"],
+                    "benefits": [],
+                    "audience_hints": ["20s_30s"],
+                    "channel": "onsite_banner",
+                    "goal_metric": "booking_conversion_rate",
+                    "funnel_goal": "booking_complete",
+                    "desired_behaviors": [
+                        "hotel_search",
+                        "hotel_detail_view",
+                        "booking_start_without_complete",
+                    ],
+                    "excluded_behaviors": [
+                        "booking_complete",
+                        "hotel_search",
+                        "hotel_detail_view",
+                    ],
+                    "explicit_conditions": ["여름", "제주", "오키나와", "20~30대"],
+                    "requested_candidate_types": [],
+                    "segment_property_conditions": [
+                        {
+                            "event_name": "page_view",
+                            "property_key": "age_group",
+                            "operator": "in",
+                            "value": "20s,30s",
+                            "minimum_count": 1,
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            )
+        }
+
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                f"matched-{index}",
+                hotel_search_count=1,
+                hotel_detail_view_count=1,
+                booking_start_count=1,
+                destination_match_count=1,
+                season_match_count=1,
+                age_group_values=("20대",),
+                segment_property_match_count=1,
+            )
+            for index in range(2)
+        ]
+        + [raw_signal("unrelated")]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=OpenAIPromotionIntentExtractor(
+            api_key="test-key",
+            model="gpt-test",
+            transport=transport,
+        ),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "여름 휴가를 준비하는 20~30대 사용자를 대상으로 "
+                "제주·오키나와 숙소 예약을 유도합니다."
+            ),
+        )
+    )
+
+    assert segments
+    assert all(
+        segment.rule_json["candidate_user_ids"] == [
+            "matched-0",
+            "matched-1",
+        ]
+        for segment in segments
+    )
+    assert all(
+        segment.profile_json["promotion_intent"]["excluded_behaviors"] == []
+        for segment in segments
+    )
+
+
 def test_segment_instruction_does_not_fall_back_to_generic_vector_clusters() -> None:
     vector_reader = FakeUserBehaviorVectorRepository(
         [

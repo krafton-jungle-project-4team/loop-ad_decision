@@ -280,7 +280,10 @@ def search_promotion_audience_candidates(
         if (
             property_candidate is not None
             and len(property_candidate.user_ids) >= min_sample_size
-            and len(property_candidate.user_ids) != len(ordered_profiles)
+            and (
+                bool(property_conditions)
+                or len(property_candidate.user_ids) != len(ordered_profiles)
+            )
         ):
             evaluated.append(property_candidate)
             seen_member_sets[property_candidate.user_ids] = property_candidate

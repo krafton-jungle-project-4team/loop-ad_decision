@@ -444,6 +444,7 @@ class VectorClusterSegmentSuggester:
                     "destinationCount": len(intent.destinations),
                     "seasonCount": len(intent.season),
                     "desiredBehaviorCount": len(intent.desired_behaviors),
+                    "excludedBehaviors": list(intent.excluded_behaviors),
                     "segmentPropertyConditionCount": len(
                         intent.segment_property_conditions
                     ),
