@@ -1178,7 +1178,21 @@ class UserBehaviorVectorRepository:
                   __VECTOR_POPULATION_QUERY__
               )
             GROUP BY project_id, user_id
-            ORDER BY max(event_time) DESC, user_id ASC
+            ORDER BY
+                if(
+                    notEmpty({destination_terms:Array(String)})
+                    OR notEmpty({season_months:Array(UInt8)}),
+                    promotion_condition_search_count > 0,
+                    toUInt8(0)
+                ) DESC,
+                if(
+                    notEmpty({destination_terms:Array(String)}),
+                    target_destination_search_count > 0,
+                    toUInt8(0)
+                ) DESC,
+                segment_property_match_count DESC,
+                max(event_time) DESC,
+                user_id ASC
             LIMIT {limit:UInt32}
         """
         query = (
