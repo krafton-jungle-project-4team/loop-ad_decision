@@ -134,6 +134,10 @@ def test_demographic_hints_compile_to_existing_structured_contract() -> None:
         "age_group",
         "gender",
     ]
+    assert [condition.event_name for condition in conditions] == [
+        "page_view",
+        "page_view",
+    ]
     assert [
         item["property_filters"][0]["key"]
         for item in structured_conditions_from_segment_properties(conditions)
@@ -144,6 +148,15 @@ def test_demographic_hints_compile_to_existing_structured_contract() -> None:
     assert segment_property_filter_label(
         conditions[1].to_structured_condition()["property_filters"][0]
     ) == "여성"
+
+
+def test_price_filter_label_preserves_strict_threshold_semantics() -> None:
+    assert segment_property_filter_label(
+        {"key": "price", "operator": "gte", "value": "200001"}
+    ) == "가격 20만원 초과"
+    assert segment_property_filter_label(
+        {"key": "revenue", "operator": "gte", "value": "200000"}
+    ) == "숙박 총액 20만원 이상"
 
 
 def test_clickhouse_match_expression_parameterizes_values() -> None:

@@ -621,6 +621,7 @@ class PromotionAnalysisService:
             self._segment_definition_repository.save_ai_suggested(
                 suggested_segment_definitions
             )
+            stored_segment_count = len(segment_definitions)
             segment_definitions = _merge_segment_definitions(
                 segment_definitions,
                 suggested_segment_definitions,
@@ -629,6 +630,7 @@ class PromotionAnalysisService:
                 "segment_definitions_created",
                 {
                     "segmentDefinitionCount": len(suggested_segment_definitions),
+                    "discardedStoredSegmentCount": stored_segment_count,
                     "segmentIds": [
                         segment.segment_id
                         for segment in suggested_segment_definitions
@@ -1308,8 +1310,6 @@ class PromotionAnalysisService:
 
         v2_candidates: list[SegmentCandidate] = []
         for candidate in candidates.values():
-            if candidate.definition.source != "ai_suggested":
-                continue
             resolution = self._audience_adapter.resolve(
                 segment_id=candidate.segment_id,
                 rule_json=candidate.definition.rule_json,
@@ -1896,7 +1896,7 @@ def _merge_segment_definitions(
     merged = {
         segment.segment_id: segment
         for segment in stored_segments
-        if segment.source != "ai_suggested"
+        if segment.source == "system_default"
     }
     for segment in suggested_segments:
         merged[segment.segment_id] = segment
