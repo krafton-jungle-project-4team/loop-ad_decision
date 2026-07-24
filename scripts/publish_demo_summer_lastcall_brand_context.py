@@ -262,6 +262,18 @@ def build_publication_bundle(s3_client: Any, *, bucket_name: str) -> Publication
         target_catalog_bytes=target_catalog_bytes,
     )
     target_manifest_bytes = canonical_json_bytes(target_manifest)
+    existing_target = _load_compatible_existing_target(
+        s3_client,
+        bucket_name=bucket_name,
+        expected_catalog=target_catalog,
+    )
+    if existing_target is not None:
+        (
+            target_catalog,
+            target_catalog_bytes,
+            target_manifest,
+            target_manifest_bytes,
+        ) = existing_target
     target_pointer = {
         "schema_version": "loopad.brand-context-pointer.v1",
         "project_id": PROJECT_ID,
@@ -424,6 +436,143 @@ def _put_immutable(
     _require_json_content_type(content_type, key)
     if existing != body:
         raise ValueError(f"immutable S3 object already exists with different bytes: {key}")
+
+
+def _load_compatible_existing_target(
+    s3_client: Any,
+    *,
+    bucket_name: str,
+    expected_catalog: Mapping[str, Any],
+) -> tuple[
+    Mapping[str, Any],
+    bytes,
+    Mapping[str, Any],
+    bytes,
+] | None:
+    catalog_object = _read_optional_object(
+        s3_client,
+        bucket_name=bucket_name,
+        key=TARGET_CATALOG_KEY,
+    )
+    manifest_object = _read_optional_object(
+        s3_client,
+        bucket_name=bucket_name,
+        key=TARGET_MANIFEST_KEY,
+    )
+    if catalog_object is None and manifest_object is None:
+        return None
+    if catalog_object is None or manifest_object is None:
+        raise ValueError(
+            "summer-lastcall target publication is incomplete; "
+            "catalog and manifest must either both exist or both be absent"
+        )
+
+    catalog_bytes, catalog_content_type, _ = catalog_object
+    manifest_bytes, manifest_content_type, _ = manifest_object
+    _require_json_content_type(catalog_content_type, TARGET_CATALOG_KEY)
+    _require_json_content_type(manifest_content_type, TARGET_MANIFEST_KEY)
+    catalog = _json_object(catalog_bytes, TARGET_CATALOG_KEY)
+    manifest = _json_object(manifest_bytes, TARGET_MANIFEST_KEY)
+
+    if _target_catalog_execution_view(catalog) != _target_catalog_execution_view(
+        expected_catalog
+    ):
+        raise ValueError(
+            "existing summer-lastcall catalog does not match the expected offer set"
+        )
+    _validate_existing_target_manifest(
+        manifest,
+        catalog_bytes=catalog_bytes,
+    )
+    return catalog, catalog_bytes, manifest, manifest_bytes
+
+
+def _validate_existing_target_manifest(
+    manifest: Mapping[str, Any],
+    *,
+    catalog_bytes: bytes,
+) -> None:
+    _require_equal(manifest, "project_id", PROJECT_ID)
+    _require_equal(manifest, "context_version", TARGET_CONTEXT_VERSION)
+    references = [
+        reference
+        for reference in _mapping_list(manifest.get("catalogs"))
+        if reference.get("catalog_id") == TARGET_CATALOG_ID
+        and reference.get("version") == TARGET_CATALOG_VERSION
+    ]
+    if len(references) != 1:
+        raise ValueError("target manifest must contain exactly one lastcall catalog")
+    reference = references[0]
+    _require_equal(reference, "s3_key", TARGET_CATALOG_KEY)
+    _require_equal(reference, "sha256", sha256_hex(catalog_bytes))
+    _require_equal(reference, "byte_size", len(catalog_bytes))
+    _require_json_content_type(
+        _required_text(reference.get("content_type"), "target catalog content_type"),
+        TARGET_CATALOG_KEY,
+    )
+
+    offer_sets = [
+        offer_set
+        for offer_set in _mapping_list(manifest.get("offer_sets"))
+        if offer_set.get("offer_set_id") == TARGET_OFFER_SET_ID
+    ]
+    if len(offer_sets) != 1:
+        raise ValueError("target manifest must contain exactly one lastcall offer set")
+    offer_set = offer_sets[0]
+    _require_equal(offer_set, "catalog_id", TARGET_CATALOG_ID)
+    _require_equal(offer_set, "catalog_version", TARGET_CATALOG_VERSION)
+    _require_equal(offer_set, "landing_url", TARGET_LANDING_URL)
+
+
+def _target_catalog_execution_view(catalog: Mapping[str, Any]) -> dict[str, Any]:
+    hotels = _mapping_list(catalog.get("hotels"))
+    return {
+        "schema_version": catalog.get("schema_version"),
+        "project_id": catalog.get("project_id"),
+        "catalog_id": catalog.get("catalog_id"),
+        "catalog_version": catalog.get("catalog_version"),
+        "offer_set_id": catalog.get("offer_set_id"),
+        "currency": catalog.get("currency"),
+        "deal_code": catalog.get("deal_code"),
+        "landing_url": catalog.get("landing_url"),
+        "hotels": [
+            {
+                key: hotel.get(key)
+                for key in (
+                    "hotel_id",
+                    "hotel_name",
+                    "destination_id",
+                    "currency",
+                    "original_price_per_night",
+                    "sale_price_per_night",
+                    "discount_amount",
+                    "discount_rate_percent",
+                    "destination_url",
+                )
+            }
+            for hotel in hotels
+        ],
+    }
+
+
+def _read_optional_object(
+    s3_client: Any,
+    *,
+    bucket_name: str,
+    key: str,
+) -> tuple[bytes, str, str] | None:
+    try:
+        return _read_object(
+            s3_client,
+            bucket_name=bucket_name,
+            key=key,
+        )
+    except ClientError as exc:
+        status = int(exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0))
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if status == 404 or code in {"NoSuchKey", "NotFound", "404"}:
+            return None
+        raise
 
 
 def _read_object(

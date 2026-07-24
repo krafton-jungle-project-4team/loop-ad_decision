@@ -139,6 +139,39 @@ def test_publication_is_idempotent_for_existing_immutable_objects() -> None:
     assert len(s3_client.put_calls) == first_put_count
 
 
+def test_publication_recovers_when_valid_target_exists_before_pointer_switch() -> None:
+    objects = source_objects()
+    initial_client = FakeS3Client(objects)
+    generated = build_publication_bundle(initial_client, bucket_name=BUCKET)
+
+    existing_catalog = json.loads(generated.target_catalog_bytes)
+    existing_catalog["publication_note"] = "uploaded before pointer activation"
+    existing_catalog_bytes = _json_bytes(existing_catalog)
+    existing_manifest = json.loads(generated.target_manifest_bytes)
+    existing_manifest["publication_note"] = "uploaded before pointer activation"
+    target_reference = next(
+        reference
+        for reference in existing_manifest["catalogs"]
+        if reference["catalog_id"] == TARGET_CATALOG_ID
+    )
+    target_reference["sha256"] = hashlib.sha256(existing_catalog_bytes).hexdigest()
+    target_reference["byte_size"] = len(existing_catalog_bytes)
+    existing_manifest_bytes = _json_bytes(existing_manifest)
+    objects[TARGET_CATALOG_KEY] = (existing_catalog_bytes, JSON_CONTENT_TYPE)
+    objects[TARGET_MANIFEST_KEY] = (existing_manifest_bytes, JSON_CONTENT_TYPE)
+    s3_client = FakeS3Client(objects)
+
+    recovered = build_publication_bundle(s3_client, bucket_name=BUCKET)
+
+    assert recovered.target_catalog_bytes == existing_catalog_bytes
+    assert recovered.target_manifest_bytes == existing_manifest_bytes
+    assert publish_bundle(s3_client, bucket_name=BUCKET, bundle=recovered)
+    assert [call["Key"] for call in s3_client.put_calls] == [POINTER_KEY]
+    assert verify_published_bundle(s3_client, bucket_name=BUCKET)[
+        "manifest_sha256"
+    ] == hashlib.sha256(existing_manifest_bytes).hexdigest()
+
+
 def test_publication_rejects_missing_target_hotel() -> None:
     objects = source_objects()
     pointer = json.loads(objects[POINTER_KEY][0])
