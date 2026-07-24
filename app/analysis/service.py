@@ -57,6 +57,7 @@ from app.logging import log, log_context_scope, now_ms, duration_ms
 
 MAX_DEFAULT_TARGET_SEGMENTS = DEFAULT_MAX_SUGGESTED_SEGMENTS
 MAX_SEGMENT_REPORT_WORKERS = 4
+NEXT_LOOP_SOURCE_ASSIGNMENT_PAGE_SIZE = 1000
 
 TargetSegmentStatus = Literal["planned", "approved"]
 
@@ -362,6 +363,24 @@ class SegmentVectorPreparer(Protocol):
         ...
 
 
+class NextLoopSourceAssignmentRecord(Protocol):
+    user_id: str
+    segment_id: str
+    ad_experiment_id: str
+
+
+class NextLoopSourceAssignmentReader(Protocol):
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: Sequence[str],
+        after_user_id: str | None,
+        limit: int,
+    ) -> Sequence[NextLoopSourceAssignmentRecord]:
+        ...
+
+
 class SegmentDefinitionSuggester(Protocol):
     def suggest_segments(
         self,
@@ -437,6 +456,9 @@ class PromotionAnalysisService:
         audience_v2_coordinator: AudienceV2Coordinator | None = None,
         audience_adapter: SegmentDefinitionAudienceAdapter | None = None,
         audience_allocation_service: AudienceAllocationService | None = None,
+        next_loop_source_assignment_reader: (
+            NextLoopSourceAssignmentReader | None
+        ) = None,
     ) -> None:
         self._promotion_repository = promotion_repository
         self._segment_definition_repository = segment_definition_repository
@@ -452,6 +474,9 @@ class PromotionAnalysisService:
         self._audience_v2_coordinator = audience_v2_coordinator
         self._audience_adapter = audience_adapter or SegmentDefinitionAudienceAdapter()
         self._audience_allocation_service = audience_allocation_service
+        self._next_loop_source_assignment_reader = (
+            next_loop_source_assignment_reader
+        )
 
     @log_context_scope
     def recommend_segments(
@@ -701,6 +726,16 @@ class PromotionAnalysisService:
         if not selected_candidates:
             log.warn("segment_candidates_empty", {"candidateCount": len(candidates)})
             raise SegmentSelectionError("no active segment candidates matched analysis request")
+        next_loop_source_user_ids = (
+            self._load_next_loop_source_user_ids(
+                context=next_loop_context,
+                segment_ids=[
+                    candidate.segment_id for candidate in selected_candidates
+                ],
+            )
+            if next_loop_context is not None
+            else None
+        )
         audience_resolutions = {
             candidate.segment_id: self._audience_adapter.resolve(
                 segment_id=candidate.segment_id,
@@ -938,6 +973,14 @@ class PromotionAnalysisService:
                     analysis_id=analysis_id,
                     promotion=promotion,
                     candidate=candidate,
+                    candidate_user_ids=(
+                        next_loop_source_user_ids.get(
+                            candidate.segment_id,
+                            (),
+                        )
+                        if next_loop_source_user_ids is not None
+                        else None
+                    ),
                 )
             )
             target_segment = self._build_target_segment(
@@ -1815,6 +1858,7 @@ class PromotionAnalysisService:
         analysis_id: str,
         promotion: PromotionRecord,
         candidate: SegmentCandidate,
+        candidate_user_ids: Sequence[str] | None = None,
     ) -> str:
         result = self._segment_vector_service.prepare_segment_vector(
             SegmentVectorBuildRequest(
@@ -1822,10 +1866,117 @@ class PromotionAnalysisService:
                 promotion_id=promotion.promotion_id,
                 analysis_id=analysis_id,
                 segment_id=candidate.segment_id,
-                candidate_user_ids=_candidate_user_ids(candidate.definition.rule_json),
+                candidate_user_ids=(
+                    candidate_user_ids
+                    if candidate_user_ids is not None
+                    else _candidate_user_ids(candidate.definition.rule_json)
+                ),
             )
         )
         return result.segment_vector_id
+
+    def _load_next_loop_source_user_ids(
+        self,
+        *,
+        context: NextLoopAnalysisContext,
+        segment_ids: Sequence[str],
+    ) -> dict[str, tuple[str, ...]] | None:
+        reader = self._next_loop_source_assignment_reader
+        if reader is None:
+            log.warn(
+                "next_loop_source_assignment_reader_unavailable",
+                {
+                    "sourcePromotionRunId": context.source_promotion_run_id,
+                    "failedAdExperimentCount": len(
+                        context.source_failed_ad_experiment_ids
+                    ),
+                },
+            )
+            return None
+
+        selected_segment_ids = set(segment_ids)
+        failed_ad_experiment_ids = sorted(
+            set(context.source_failed_ad_experiment_ids)
+        )
+        user_ids_by_segment: dict[str, list[str]] = {
+            segment_id: [] for segment_id in selected_segment_ids
+        }
+        seen_user_ids_by_segment: dict[str, set[str]] = {
+            segment_id: set() for segment_id in selected_segment_ids
+        }
+        after_user_id: str | None = None
+        page_count = 0
+        source_assignment_count = 0
+
+        while failed_ad_experiment_ids:
+            page = list(
+                reader.list_source_page(
+                    promotion_run_id=context.source_promotion_run_id,
+                    ad_experiment_ids=failed_ad_experiment_ids,
+                    after_user_id=after_user_id,
+                    limit=NEXT_LOOP_SOURCE_ASSIGNMENT_PAGE_SIZE,
+                )
+            )
+            if not page:
+                break
+
+            next_after_user_id = str(page[-1].user_id)
+            if (
+                after_user_id is not None
+                and next_after_user_id <= after_user_id
+            ):
+                raise SegmentSelectionError(
+                    "next-loop source assignment pagination did not advance"
+                )
+
+            page_count += 1
+            source_assignment_count += len(page)
+            for assignment in page:
+                if (
+                    assignment.ad_experiment_id
+                    not in failed_ad_experiment_ids
+                    or assignment.segment_id not in selected_segment_ids
+                ):
+                    continue
+                seen_user_ids = seen_user_ids_by_segment[
+                    assignment.segment_id
+                ]
+                if assignment.user_id in seen_user_ids:
+                    continue
+                seen_user_ids.add(assignment.user_id)
+                user_ids_by_segment[assignment.segment_id].append(
+                    assignment.user_id
+                )
+
+            if len(page) < NEXT_LOOP_SOURCE_ASSIGNMENT_PAGE_SIZE:
+                break
+            after_user_id = next_after_user_id
+
+        resolved_user_ids = {
+            segment_id: tuple(user_ids)
+            for segment_id, user_ids in user_ids_by_segment.items()
+        }
+        log.info(
+            "next_loop_source_assignments_resolved",
+            {
+                "sourcePromotionRunId": context.source_promotion_run_id,
+                "failedAdExperimentCount": len(failed_ad_experiment_ids),
+                "sourceAssignmentCount": source_assignment_count,
+                "matchedAssignmentCount": sum(
+                    len(user_ids)
+                    for user_ids in resolved_user_ids.values()
+                ),
+                "pageCount": page_count,
+                "segments": [
+                    {
+                        "segmentId": segment_id,
+                        "userCount": len(resolved_user_ids[segment_id]),
+                    }
+                    for segment_id in sorted(resolved_user_ids)
+                ],
+            },
+        )
+        return resolved_user_ids
 
 
 def _predict_booking_propensity(
