@@ -25,7 +25,9 @@ from app.analysis.segment_property_conditions import (
 )
 
 
-PROMOTION_AUDIENCE_BEAM_POLICY_VERSION = "promotion-audience-beam.v2"
+PROMOTION_AUDIENCE_BEAM_POLICY_VERSION = "promotion-audience-beam.v3"
+
+_RELAXABLE_DEMOGRAPHIC_PROPERTY_KEYS = frozenset({"age_group", "gender"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,6 +197,15 @@ class BeamSearchResult:
     generated_candidate_count: int
     pruned_candidate_counts: Mapping[str, int]
     policy: PromotionAudienceBeamPolicy
+    relaxed_condition_keys: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _MandatoryAudienceAnchor:
+    season_months: tuple[int, ...]
+    property_conditions: tuple[SegmentPropertyCondition, ...]
+    profiles: tuple[RawEventUserSignalRecord, ...]
+    relaxed_condition_keys: tuple[str, ...]
 
 
 def search_promotion_audience_candidates(
@@ -213,6 +224,17 @@ def search_promotion_audience_candidates(
     destinations = canonical_destination_ids(destination_ids)
     seasons = canonical_season_months(season_months)
     benefits = canonical_benefit_keys(benefit_keys)
+    anchor = _select_mandatory_anchor(
+        profiles=ordered_profiles,
+        destination_ids=destinations,
+        season_months=seasons,
+        property_conditions=property_conditions,
+        min_sample_size=min_sample_size,
+    )
+    if anchor is None:
+        return BeamSearchResult((), 0, {"minimum_sample": 1}, policy)
+    seasons = anchor.season_months
+    property_conditions = anchor.property_conditions
     mandatory_keys = _mandatory_predicate_keys(
         destination_ids=destinations,
         season_months=seasons,
@@ -222,19 +244,8 @@ def search_promotion_audience_candidates(
         season_months=seasons,
         property_conditions=property_conditions,
     )
-    mandatory_profiles = tuple(
-        profile
-        for profile in ordered_profiles
-        if _matches_mandatory(
-            profile,
-            destination_ids=destinations,
-            season_months=seasons,
-            property_conditions=property_conditions,
-        )
-    )
+    mandatory_profiles = anchor.profiles
     pruned: dict[str, int] = {}
-    if len(mandatory_profiles) < min_sample_size:
-        return BeamSearchResult((), 0, {"minimum_sample": 1}, policy)
 
     registry = tuple(
         predicate
@@ -377,7 +388,73 @@ def search_promotion_audience_candidates(
         selected.append(adjusted)
         if len(selected) >= policy.maximum_final_candidates:
             break
-    return BeamSearchResult(tuple(selected), generated, dict(sorted(pruned.items())), policy)
+    return BeamSearchResult(
+        tuple(selected),
+        generated,
+        dict(sorted(pruned.items())),
+        policy,
+        anchor.relaxed_condition_keys,
+    )
+
+
+def _select_mandatory_anchor(
+    *,
+    profiles: Sequence[RawEventUserSignalRecord],
+    destination_ids: tuple[str, ...],
+    season_months: tuple[int, ...],
+    property_conditions: Sequence[SegmentPropertyCondition],
+    min_sample_size: int,
+) -> _MandatoryAudienceAnchor | None:
+    conditions = tuple(property_conditions)
+    variants: list[
+        tuple[
+            tuple[int, ...],
+            tuple[SegmentPropertyCondition, ...],
+            tuple[str, ...],
+        ]
+    ] = [(season_months, conditions, ())]
+
+    demographic_keys = tuple(
+        sorted({condition.property_key for condition in conditions})
+    )
+    can_relax_demographics = bool(conditions) and all(
+        key in _RELAXABLE_DEMOGRAPHIC_PROPERTY_KEYS
+        for key in demographic_keys
+    )
+    relaxed_conditions = conditions
+    relaxed_keys: tuple[str, ...] = ()
+    if can_relax_demographics:
+        relaxed_conditions = ()
+        relaxed_keys = demographic_keys
+        variants.append((season_months, relaxed_conditions, relaxed_keys))
+        if destination_ids and season_months:
+            variants.append(
+                (
+                    (),
+                    relaxed_conditions,
+                    (*relaxed_keys, "season_months"),
+                )
+            )
+
+    for variant_seasons, variant_conditions, variant_relaxed_keys in variants:
+        matched_profiles = tuple(
+            profile
+            for profile in profiles
+            if _matches_mandatory(
+                profile,
+                destination_ids=destination_ids,
+                season_months=variant_seasons,
+                property_conditions=variant_conditions,
+            )
+        )
+        if len(matched_profiles) >= min_sample_size:
+            return _MandatoryAudienceAnchor(
+                season_months=variant_seasons,
+                property_conditions=variant_conditions,
+                profiles=matched_profiles,
+                relaxed_condition_keys=variant_relaxed_keys,
+            )
+    return None
 
 
 def _evaluate_candidate(
@@ -559,14 +636,26 @@ def _matches_mandatory(
     season_months: Sequence[int],
     property_conditions: Sequence[SegmentPropertyCondition],
 ) -> bool:
-    if destination_ids or season_months:
+    if destination_ids and season_months:
         if profile.promotion_condition_search_count is not None:
             if profile.promotion_condition_search_count <= 0:
                 return False
         elif (
-            (destination_ids and profile.destination_match_count <= 0)
-            or (season_months and profile.season_match_count <= 0)
+            profile.destination_match_count <= 0
+            or profile.season_match_count <= 0
         ):
+            return False
+    elif destination_ids:
+        if profile.target_destination_search_count is not None:
+            if profile.target_destination_search_count <= 0:
+                return False
+        elif profile.destination_match_count <= 0:
+            return False
+    elif season_months:
+        if profile.promotion_condition_search_count is not None:
+            if profile.promotion_condition_search_count <= 0:
+                return False
+        elif profile.season_match_count <= 0:
             return False
     return profile_matches_segment_properties(profile, property_conditions)
 
