@@ -3,6 +3,8 @@ from app.generation.email_variants import (
     COMPARISON_VARIANT,
     EDITORIAL_VARIANT,
     OFFER_CARDS_VARIANT,
+    PRICE_DISPLAY_ALL_TIERS,
+    PRICE_DISPLAY_PROMOTION_AND_FINAL,
     build_email_creative_extensions,
     reusable_catalog_image_url,
 )
@@ -32,7 +34,7 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     )
 
     assert extensions["variant_type"] == EDITORIAL_VARIANT
-    assert extensions["template_version"] == "email.editorial.v3"
+    assert extensions["template_version"] == "email.editorial.v4"
     assert len(extensions["featured_offers"]) == 2
     assert [
         offer["destination_id"] for offer in extensions["featured_offers"]
@@ -78,7 +80,7 @@ def test_offer_card_variant_builds_eight_redirect_targets_and_email_html() -> No
     )
 
     assert extensions["variant_type"] == OFFER_CARDS_VARIANT
-    assert extensions["template_version"] == "email.offer-cards.v3"
+    assert extensions["template_version"] == "email.offer-cards.v4"
     assert len(extensions["offers"]) == 8
     assert len(extensions["link_targets"]) == 9
     assert extensions["link_targets"][0] == {
@@ -133,7 +135,7 @@ def test_comparison_variant_builds_four_rows_and_primary_redirect_only() -> None
     )
 
     assert extensions["variant_type"] == COMPARISON_VARIANT
-    assert extensions["template_version"] == "email.comparison.v1"
+    assert extensions["template_version"] == "email.comparison.v2"
     assert len(extensions["comparison_offers"]) == 4
     assert [
         offer["destination_id"] for offer in extensions["comparison_offers"]
@@ -219,6 +221,38 @@ def test_offer_card_variant_preserves_catalog_deal_query_for_offer_redirects() -
     assert rendered.count("전체 프로모션 보기") == 5
 
 
+def test_offer_card_uses_catalog_price_tiers_without_recalculation() -> None:
+    catalog = _lastcall_offer_catalog()
+    initial = build_email_creative_extensions(
+        option_index=2,
+        landing_url=LANDING_URL,
+        offer_links=_offer_links()[:1],
+        offer_catalog=catalog,
+    )
+
+    assert initial["price_display_mode"] == PRICE_DISPLAY_PROMOTION_AND_FINAL
+    initial_rendered = render_email_html(_content_values(initial))
+    assert "프로모션가 278,000원" in initial_rendered
+    assert "추가 할인가 250,200원" in initial_rendered
+    assert "정상가 342,000원" not in initial_rendered
+    assert "225,180원" not in initial_rendered
+
+    revised = build_email_creative_extensions(
+        option_index=2,
+        landing_url=LANDING_URL,
+        offer_links=_offer_links()[:1],
+        offer_catalog=catalog,
+        operator_instruction="추가 할인을 강조하기 위해 정상가를 추가해줘",
+    )
+
+    assert revised["price_display_mode"] == PRICE_DISPLAY_ALL_TIERS
+    revised_rendered = render_email_html(_content_values(revised))
+    assert "정상가 342,000원" in revised_rendered
+    assert "프로모션가 278,000원" in revised_rendered
+    assert "추가 할인가 250,200원" in revised_rendered
+    assert "225,180원" not in revised_rendered
+
+
 def _content_values(extensions: dict[str, object]) -> dict[str, object]:
     return {
         "subject": "제주·오키나와 여름 숙소 추천",
@@ -281,3 +315,30 @@ def _offer_catalog(*, deal_code: str | None = None) -> dict[str, object]:
             f"search?deal={deal_code}"
         )
     return catalog
+
+
+def _lastcall_offer_catalog() -> dict[str, object]:
+    return {
+        "schema_version": "stayloop.promotion-price-catalog.v1",
+        "catalog_id": "black-friday-hotels-lastcall",
+        "catalog_version": "v4",
+        "offer_set_id": "summer-lastcall",
+        "promotion_label": "제주·오키나와 여름 막바지 추가 할인",
+        "currency": "KRW",
+        "price_basis": "one_room_one_night",
+        "hotels": [
+            {
+                "offer_id": HOTEL_IDS[0],
+                "hotel_name": "Jeju Ocean Breeze Resort",
+                "destination_id": "jeju",
+                "currency": "KRW",
+                "sale_price_per_night": 250200,
+                "original_price_per_night": 342000,
+                "promotion_price_per_night": 278000,
+                "discount_rate_percent": 19,
+                "additional_discount_rate_percent": 10,
+                "image_path": "/stayloop/promotions/hotel-1.png",
+                "asset_id": "hotel-1-hero",
+            }
+        ],
+    }

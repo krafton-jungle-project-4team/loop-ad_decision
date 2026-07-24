@@ -992,6 +992,7 @@ class GenerationService:
                 landing_url=prompt_input.promotion.landing_url,
                 offer_links=prompt_input.promotion.offer_links,
                 offer_catalog=prompt_input.offer_catalog,
+                operator_instruction=prompt_input.request.operator_instruction,
             )
             catalog_image_url = reusable_catalog_image_url(creative_extensions)
             if catalog_image_url is not None:
@@ -1692,6 +1693,7 @@ def _content_values_with_candidate_renderer(
             "featured_offers",
             "comparison_offers",
             "catalog",
+            "price_display_mode",
         ):
             field_value = creative.get(field_name)
             if field_value is not None:
