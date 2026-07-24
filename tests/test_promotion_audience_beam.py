@@ -121,7 +121,7 @@ def test_default_beam_adds_one_behavior_to_mandatory_conditions() -> None:
     result = _search(_profiles())
 
     assert result.candidates
-    assert result.policy.policy_version == "promotion-audience-beam.v2"
+    assert result.policy.policy_version == "promotion-audience-beam.v3"
     assert result.policy.maximum_depth == 1
     assert all(candidate.depth == 1 for candidate in result.candidates)
     assert all(candidate.strategy_key.startswith("beam_") for candidate in result.candidates)
@@ -336,6 +336,207 @@ def test_beam_keeps_all_allowlisted_property_conditions_in_members_and_spec() ->
     assert {"20·30대", "지역 seoul"} <= set(
         compiled.display_model["signal_chips"]
     )
+
+
+def test_beam_relaxes_demographic_hint_when_exact_anchor_is_empty() -> None:
+    age_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="age_group",
+        operator="in",
+        value="20s,30s",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-demographic-relaxation",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=(age_condition,),
+        profiles=[
+            _profile(
+                "destination-season-match",
+                detail=2,
+                promotion_condition_search=1,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+            _profile(
+                "destination-season-baseline",
+                promotion_condition_search=1,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+        ],
+        min_sample_size=1,
+    )
+
+    assert result.candidates
+    assert result.relaxed_condition_keys == ("age_group",)
+    detail_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "hotel_detail_view"
+            for choice in candidate.choices
+        )
+    )
+    assert detail_candidate.user_ids == ("destination-season-match",)
+    assert not any(
+        property_filter["key"] == "age_group"
+        for candidate in result.candidates
+        for condition in candidate.structured_conditions
+        for property_filter in condition["property_filters"]
+    )
+    assert any(
+        condition["checkin_months"] == [6, 7, 8]
+        for candidate in result.candidates
+        for condition in candidate.structured_conditions
+    )
+
+
+def test_beam_relaxes_season_after_demographic_hint() -> None:
+    age_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="age_group",
+        operator="in",
+        value="20s,30s",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-season-relaxation",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=(age_condition,),
+        profiles=[
+            _profile(
+                "destination-match",
+                detail=2,
+                promotion_condition_search=0,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+            _profile(
+                "destination-baseline",
+                promotion_condition_search=0,
+                target_destination_search=1,
+                segment_property_match=0,
+            ),
+        ],
+        min_sample_size=1,
+    )
+
+    assert result.candidates
+    assert result.relaxed_condition_keys == ("age_group", "season_months")
+    detail_candidate = next(
+        candidate
+        for candidate in result.candidates
+        if any(
+            choice.predicate_key == "hotel_detail_view"
+            for choice in candidate.choices
+        )
+    )
+    assert detail_candidate.user_ids == ("destination-match",)
+    assert all(
+        condition["checkin_months"] == []
+        for candidate in result.candidates
+        for condition in candidate.structured_conditions
+    )
+
+
+def test_beam_never_relaxes_destination_or_explicit_property_conditions() -> None:
+    region_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="region",
+        operator="equals",
+        value="seoul",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-hard-conditions",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=(region_condition,),
+        profiles=[
+            _profile(
+                "wrong-destination-and-region",
+                detail=2,
+                destination_match=0,
+                season_match=1,
+                promotion_condition_search=0,
+                target_destination_search=0,
+                segment_property_match=0,
+            )
+        ],
+        min_sample_size=1,
+    )
+
+    assert result.candidates == ()
+    assert result.relaxed_condition_keys == ()
+
+
+def test_beam_does_not_partially_relax_mixed_property_conditions() -> None:
+    age_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="age_group",
+        operator="in",
+        value="20s,30s",
+    )
+    hotel_star_condition = SegmentPropertyCondition(
+        event_name="hotel_detail_view",
+        property_key="hotel_star_rating",
+        operator="gte",
+        value="4",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-mixed-hard-conditions",
+        destination_ids=("jeju", "okinawa"),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        property_conditions=(age_condition, hotel_star_condition),
+        profiles=[
+            _profile(
+                "only-one-property-match",
+                detail=2,
+                promotion_condition_search=1,
+                target_destination_search=1,
+                segment_property_match=1,
+            )
+        ],
+        min_sample_size=1,
+    )
+
+    assert result.candidates == ()
+    assert result.relaxed_condition_keys == ()
+
+
+def test_beam_prefers_exact_season_search_count_over_coarse_match() -> None:
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-season-only-exact-count",
+        destination_ids=(),
+        season_months=(6, 7, 8),
+        benefit_keys=(),
+        desired_behavior_keys=("hotel_detail_view",),
+        profiles=[
+            _profile(
+                "coarse-season-only",
+                detail=2,
+                season_match=1,
+                promotion_condition_search=0,
+            ),
+            _profile(
+                "unrelated-baseline",
+                season_match=0,
+                promotion_condition_search=0,
+            ),
+        ],
+        min_sample_size=1,
+    )
+
+    assert result.candidates == ()
+    assert result.relaxed_condition_keys == ()
 
 
 def test_beam_policy_version_changes_identity_without_public_v3() -> None:
