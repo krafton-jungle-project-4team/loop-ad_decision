@@ -460,6 +460,35 @@ class CandidateAudienceSearchService:
         method: AudienceSearchMethod,
     ) -> AudienceSearchResult:
         apply_score_threshold = spec.template_id != CUSTOM_STRUCTURED_TEMPLATE_ID
+        materialize_raw_exact = getattr(
+            self._repository,
+            "materialize_raw_exact_members",
+            None,
+        )
+        if (
+            spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+            and callable(materialize_raw_exact)
+        ):
+            member_count = materialize_raw_exact(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                vector_version=spec.vector_version,
+                source_cutoff=source_cutoff,
+                hard_predicate_keys=spec.hard_predicate_keys,
+                predicate_parameters=spec.predicate_parameters,
+            )
+            effective_corpus_count = max(corpus_user_count, member_count)
+            return AudienceSearchResult(
+                method=method,
+                members=(),
+                corpus_user_count=effective_corpus_count,
+                hard_match_user_count=member_count,
+                requested_k=member_count,
+                recall_audit=None,
+                policy_version=self._policy.version,
+                materialized_member_count=member_count,
+                members_relation="audience_exact_members",
+            )
         materialize_exact = getattr(
             self._repository,
             "materialize_exact_members",

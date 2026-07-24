@@ -447,6 +447,104 @@ class PgClickHouseAudienceVectorSearchRepository:
             score_threshold=None,
         )
 
+    def materialize_raw_exact_members(
+        self,
+        *,
+        project_id: str,
+        vector_generation_id: str,
+        vector_version: str,
+        source_cutoff: str | datetime,
+        hard_predicate_keys: Sequence[str],
+        predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+    ) -> int:
+        generation_window_start, raw_event_received_cutoff = (
+            self._generation_window(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                vector_version=vector_version,
+                source_cutoff=source_cutoff,
+            )
+        )
+        window_start = _observation_window_start(
+            generation_window_start=generation_window_start,
+            source_cutoff=source_cutoff,
+            predicate_parameters=predicate_parameters,
+        )
+        exclusion_context = self._exclusions_by_generation.get(
+            vector_generation_id
+        )
+        result = self._clickhouse.query(
+            _hard_predicate_query(
+                hard_predicate_keys,
+                filter_user_ids=False,
+                exclude_promotion_users=exclusion_context is not None,
+                predicate_parameters=predicate_parameters,
+            ),
+            parameters={
+                "project_id": project_id,
+                "window_start": _datetime_string(window_start),
+                "window_end": _datetime_string(source_cutoff),
+                "raw_event_received_cutoff": _datetime_string(
+                    raw_event_received_cutoff
+                ),
+                "destinations": list(
+                    predicate_parameters.get("destinations", ())
+                ),
+                "season_months": list(
+                    predicate_parameters.get("season_months", ())
+                ),
+                "benefit_keys": list(
+                    predicate_parameters.get("benefit_keys", ())
+                ),
+                **_structured_query_parameters(predicate_parameters),
+                **_clickhouse_exclusion_parameters(exclusion_context),
+            },
+        )
+        rows = (
+            list(result.named_results())
+            if hasattr(result, "named_results")
+            else list(result.result_rows)
+        )
+        user_ids = sorted(
+            {
+                str(row["user_id"] if isinstance(row, Mapping) else row[0])
+                for row in rows
+            }
+        )
+
+        member_relation = "audience_exact_members"
+        self._drop_temp_relation(member_relation)
+        self._postgres.execute(
+            f"""
+            CREATE TEMP TABLE {member_relation} (
+                user_id text PRIMARY KEY,
+                behavior_fit_score double precision NOT NULL,
+                retrieval_rank integer NOT NULL
+            ) ON COMMIT DROP
+            """
+        )
+        for offset in range(0, len(user_ids), PREDICATE_CHUNK_SIZE):
+            chunk = user_ids[offset : offset + PREDICATE_CHUNK_SIZE]
+            self._postgres.execute(
+                f"""
+                INSERT INTO {member_relation} (
+                    user_id, behavior_fit_score, retrieval_rank
+                )
+                SELECT *
+                FROM unnest(
+                    %s::text[],
+                    %s::double precision[],
+                    %s::integer[]
+                )
+                """,
+                (
+                    list(chunk),
+                    [1.0] * len(chunk),
+                    list(range(offset + 1, offset + len(chunk) + 1)),
+                ),
+            )
+        return len(user_ids)
+
     def materialize_ann_candidates(
         self,
         *,
