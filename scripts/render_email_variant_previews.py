@@ -601,7 +601,10 @@ def _verify_local_preview_html(
         raise PreviewValidationError(
             f"{variant} preview is missing the brand-blue CTA"
         )
-    if variant == "offer_cards" and html_body.count("숙소 확인하기") != 8:
+    if (
+        variant == "offer_cards"
+        and html_body.count('href="{{offer_redirect_url_') != 8
+    ):
         raise PreviewValidationError(
             "offer_cards preview must contain eight accommodation CTAs"
         )

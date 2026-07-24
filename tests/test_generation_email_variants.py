@@ -37,13 +37,13 @@ def test_editorial_variant_builds_two_destination_sections() -> None:
     assert [
         offer["destination_id"] for offer in extensions["featured_offers"]
     ] == ["jeju", "okinawa"]
-    assert extensions["link_targets"] == [
-        {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
-    ]
     assert extensions["hero_image_url"] == (
         "https://demo-shoppingmall.dev.loop-ad.org/"
         "stayloop/promotions/hotel-2.png"
     )
+    assert extensions["link_targets"] == [
+        {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
+    ]
     assert reusable_catalog_image_url(extensions) == extensions["hero_image_url"]
 
     content_values = _content_values(extensions)
@@ -78,7 +78,7 @@ def test_offer_card_variant_builds_eight_redirect_targets_and_email_html() -> No
     )
 
     assert extensions["variant_type"] == OFFER_CARDS_VARIANT
-    assert extensions["template_version"] == "email.offer-cards.v2"
+    assert extensions["template_version"] == "email.offer-cards.v3"
     assert len(extensions["offers"]) == 8
     assert len(extensions["link_targets"]) == 9
     assert extensions["link_targets"][0] == {
@@ -110,7 +110,7 @@ def test_offer_card_variant_builds_eight_redirect_targets_and_email_html() -> No
     )
     EmailHtmlSource.model_validate(source)
 
-    assert rendered.count("숙소 확인하기") == 8
+    assert rendered.count("전체 프로모션 보기") == 9
     assert "제주 추천" in rendered
     assert "오키나와 추천" in rendered
     assert "278,000원" in rendered
@@ -170,6 +170,55 @@ def test_comparison_variant_builds_four_rows_and_primary_redirect_only() -> None
     ]
 
 
+def test_offer_card_variant_preserves_catalog_deal_query_for_offer_redirects() -> None:
+    landing_url = (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "search?deal=summer-lastcall"
+    )
+    extensions = build_email_creative_extensions(
+        option_index=2,
+        landing_url=landing_url,
+        offer_links=_offer_links()[:4],
+        offer_catalog=_offer_catalog(deal_code="summer-lastcall"),
+    )
+
+    assert extensions["link_targets"][0] == {
+        "placeholder": "{{redirect_url}}",
+        "target_type": "promotion",
+    }
+    selected_offers = extensions["offers"]
+    assert isinstance(selected_offers, list)
+    assert len(selected_offers) == 4
+    offer_targets = extensions["link_targets"][1:]
+    assert len(offer_targets) == 4
+    for index, (offer, target) in enumerate(
+        zip(selected_offers, offer_targets, strict=True),
+        start=1,
+    ):
+        expected_destination_url = (
+            "https://demo-shoppingmall.dev.loop-ad.org/"
+            f"hotel/{offer['offer_id']}?deal=summer-lastcall"
+        )
+        assert offer["destination_url"] == expected_destination_url
+        assert target == {
+            "placeholder": f"{{{{offer_redirect_url_{index}}}}}",
+            "target_type": "offer",
+            "offer_id": offer["offer_id"],
+            "destination_url": expected_destination_url,
+        }
+
+    content_values = _content_values(extensions)
+    content_values["landing_url"] = landing_url
+    rendered = render_email_html(content_values)
+
+    # Dispatch wraps these placeholders in attributed redirect URLs. The raw
+    # destination, including its deal query, remains in link_targets above.
+    assert 'href="{{redirect_url}}"' in rendered
+    for index in range(1, 5):
+        assert f'{{{{offer_redirect_url_{index}}}}}' in rendered
+    assert rendered.count("전체 프로모션 보기") == 5
+
+
 def _content_values(extensions: dict[str, object]) -> dict[str, object]:
     return {
         "subject": "제주·오키나와 여름 숙소 추천",
@@ -195,24 +244,28 @@ def _offer_links() -> tuple[PromotionOfferLink, ...]:
     )
 
 
-def _offer_catalog() -> dict[str, object]:
+def _offer_catalog(*, deal_code: str | None = None) -> dict[str, object]:
     hotels = []
     for index, hotel_id in enumerate(HOTEL_IDS):
         destination_id = "jeju" if hotel_id.startswith("jeju-") else "okinawa"
-        hotels.append(
-            {
-                "offer_id": hotel_id,
-                "hotel_name": f"StayLoop Hotel {index + 1}",
-                "destination_id": destination_id,
-                "currency": "KRW",
-                "sale_price_per_night": 278000 - index * 10000,
-                "original_price_per_night": 342000 - index * 10000,
-                "discount_rate_percent": 19,
-                "image_path": f"/stayloop/promotions/hotel-{index + 1}.png",
-                "asset_id": f"hotel-{index + 1}-hero",
-            }
-        )
-    return {
+        hotel = {
+            "offer_id": hotel_id,
+            "hotel_name": f"StayLoop Hotel {index + 1}",
+            "destination_id": destination_id,
+            "currency": "KRW",
+            "sale_price_per_night": 278000 - index * 10000,
+            "original_price_per_night": 342000 - index * 10000,
+            "discount_rate_percent": 19,
+            "image_path": f"/stayloop/promotions/hotel-{index + 1}.png",
+            "asset_id": f"hotel-{index + 1}-hero",
+        }
+        if deal_code is not None:
+            hotel["destination_url"] = (
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                f"hotel/{hotel_id}?deal={deal_code}"
+            )
+        hotels.append(hotel)
+    catalog = {
         "schema_version": "stayloop.promotion-price-catalog.v1",
         "catalog_id": "black-friday-hotels",
         "catalog_version": "v2",
@@ -221,3 +274,10 @@ def _offer_catalog() -> dict[str, object]:
         "price_basis": "one_room_one_night",
         "hotels": hotels,
     }
+    if deal_code is not None:
+        catalog["deal_code"] = deal_code
+        catalog["landing_url"] = (
+            "https://demo-shoppingmall.dev.loop-ad.org/"
+            f"search?deal={deal_code}"
+        )
+    return catalog

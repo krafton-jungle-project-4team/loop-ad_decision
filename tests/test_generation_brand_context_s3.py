@@ -30,6 +30,9 @@ HOME_HERO_KEY = f"{PREFIX}{PROJECT_ID}/assets/home-hero/v1/original.jpg"
 OFFER_CATALOG_KEY = (
     f"{PREFIX}{PROJECT_ID}/catalogs/black-friday-hotels/v2/catalog.json"
 )
+LASTCALL_OFFER_CATALOG_KEY = (
+    f"{PREFIX}{PROJECT_ID}/catalogs/black-friday-hotels-lastcall/v3/catalog.json"
+)
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 MARKDOWN_CONTENT_TYPE = "text/markdown; charset=utf-8"
 
@@ -225,6 +228,111 @@ def test_s3_loader_loads_verified_offer_catalog_with_public_image_path() -> None
         }
     ]
     assert OFFER_CATALOG_KEY in loader._s3_client.get_calls
+
+
+def test_s3_loader_selects_summer_base_offer_set_from_shared_manifest() -> None:
+    loader, snapshot, catalog_bytes = dual_offer_set_loader()
+
+    catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+        offer_set_id="summer-base",
+    )
+
+    assert catalog is not None
+    assert catalog["offer_set_id"] == "summer-base"
+    assert catalog["catalog_id"] == "black-friday-hotels"
+    assert catalog["catalog_version"] == "v2"
+    assert catalog["catalog_sha256"] == hashlib.sha256(
+        catalog_bytes["summer-base"]
+    ).hexdigest()
+    assert catalog["landing_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/search"
+    )
+    assert "deal_code" not in catalog
+    assert catalog["hotels"][0]["original_price_per_night"] == 342000
+    assert catalog["hotels"][0]["sale_price_per_night"] == 278000
+    assert catalog["hotels"][0]["destination_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "hotel/jeju-ocean-breeze-006"
+    )
+
+
+def test_s3_loader_selects_summer_lastcall_without_reusing_base_cache() -> None:
+    loader, snapshot, catalog_bytes = dual_offer_set_loader()
+    base_catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+        offer_set_id="summer-base",
+    )
+
+    catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+        offer_set_id="summer-lastcall",
+    )
+
+    assert base_catalog is not None
+    assert catalog is not None
+    assert catalog is not base_catalog
+    assert catalog["offer_set_id"] == "summer-lastcall"
+    assert catalog["catalog_id"] == "black-friday-hotels-lastcall"
+    assert catalog["catalog_version"] == "v3"
+    assert catalog["catalog_sha256"] == hashlib.sha256(
+        catalog_bytes["summer-lastcall"]
+    ).hexdigest()
+    assert catalog["landing_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/search?deal=summer-lastcall"
+    )
+    assert catalog["deal_code"] == "summer-lastcall"
+    assert catalog["hotels"][0]["original_price_per_night"] == 278000
+    assert catalog["hotels"][0]["sale_price_per_night"] == 250200
+    assert catalog["hotels"][0]["destination_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/"
+        "hotel/jeju-ocean-breeze-006?deal=summer-lastcall"
+    )
+    assert OFFER_CATALOG_KEY in loader._s3_client.get_calls
+    assert LASTCALL_OFFER_CATALOG_KEY in loader._s3_client.get_calls
+
+
+def test_s3_loader_rejects_unknown_offer_set() -> None:
+    loader, snapshot, _ = dual_offer_set_loader()
+
+    with pytest.raises(PermanentGenerationError) as exc_info:
+        loader.load_offer_catalog(
+            project_id=PROJECT_ID,
+            snapshot=snapshot,
+            offer_set_id="summer-unknown",
+        )
+
+    assert exc_info.value.code == "brand_context_offer_set_unknown"
+
+
+def test_s3_loader_accepts_catalog_reference_offer_set_fallback() -> None:
+    loader, snapshot, _ = dual_offer_set_loader(include_offer_sets=False)
+
+    catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+        offer_set_id="summer-base",
+    )
+
+    assert catalog is not None
+    assert catalog["catalog_id"] == "black-friday-hotels"
+    assert catalog["offer_set_id"] == "summer-base"
+
+
+def test_s3_loader_without_offer_set_preserves_legacy_required_selection() -> None:
+    loader, snapshot, _ = dual_offer_set_loader()
+
+    catalog = loader.load_offer_catalog(
+        project_id=PROJECT_ID,
+        snapshot=snapshot,
+    )
+
+    assert catalog is not None
+    assert catalog["catalog_id"] == "black-friday-hotels-lastcall"
+    assert catalog["catalog_version"] == "v3"
 
 
 def test_s3_loader_returns_none_when_project_pointer_is_absent() -> None:
@@ -453,3 +561,177 @@ def _json_bytes(value: Any) -> bytes:
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
+
+
+def dual_offer_set_loader(
+    *,
+    include_offer_sets: bool = True,
+) -> tuple[S3BrandContextLoader, Any, dict[str, bytes]]:
+    hotel_id = "jeju-ocean-breeze-006"
+    hotel_image_key = (
+        f"{PREFIX}{PROJECT_ID}/assets/hotel-{hotel_id}-hero/v2/original.png"
+    )
+    hotel_image_bytes = b"hotel-image"
+    base_landing_url = "https://demo-shoppingmall.dev.loop-ad.org/search"
+    lastcall_landing_url = f"{base_landing_url}?deal=summer-lastcall"
+    base_catalog_bytes = _json_bytes(
+        offer_catalog(
+            catalog_id="black-friday-hotels",
+            catalog_version="v2",
+            offer_set_id="summer-base",
+            original_price=342000,
+            sale_price=278000,
+            landing_url=base_landing_url,
+            destination_url=(
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                f"hotel/{hotel_id}"
+            ),
+        )
+    )
+    lastcall_catalog_bytes = _json_bytes(
+        offer_catalog(
+            catalog_id="black-friday-hotels-lastcall",
+            catalog_version="v3",
+            offer_set_id="summer-lastcall",
+            original_price=278000,
+            sale_price=250200,
+            landing_url=lastcall_landing_url,
+            destination_url=(
+                "https://demo-shoppingmall.dev.loop-ad.org/"
+                f"hotel/{hotel_id}?deal=summer-lastcall"
+            ),
+            deal_code="summer-lastcall",
+        )
+    )
+    offer_sets: list[dict[str, Any]] = []
+    if include_offer_sets:
+        offer_sets = [
+            {
+                "offer_set_id": "summer-base",
+                "catalog_id": "black-friday-hotels",
+                "catalog_version": "v2",
+                "landing_url": base_landing_url,
+            },
+            {
+                "offer_set_id": "summer-lastcall",
+                "catalog_id": "black-friday-hotels-lastcall",
+                "catalog_version": "v3",
+                "landing_url": lastcall_landing_url,
+            },
+        ]
+    objects = bundle_objects(
+        manifest_patch={
+            "offer_sets": offer_sets,
+            "catalogs": [
+                {
+                    "catalog_id": "black-friday-hotels",
+                    "offer_set_id": "summer-base",
+                    **reference(
+                        OFFER_CATALOG_KEY,
+                        base_catalog_bytes,
+                        JSON_CONTENT_TYPE,
+                        version="v2",
+                    ),
+                    "required": False,
+                    "applies_to": ["email"],
+                },
+                {
+                    "catalog_id": "black-friday-hotels-lastcall",
+                    "offer_set_id": "summer-lastcall",
+                    **reference(
+                        LASTCALL_OFFER_CATALOG_KEY,
+                        lastcall_catalog_bytes,
+                        JSON_CONTENT_TYPE,
+                        version="v3",
+                    ),
+                    "required": True,
+                    "applies_to": ["email"],
+                },
+            ],
+            "assets": [
+                {
+                    "asset_id": f"hotel-{hotel_id}-hero",
+                    **reference(
+                        hotel_image_key,
+                        hotel_image_bytes,
+                        "image/png",
+                        version="v2",
+                    ),
+                    "role": "hotel",
+                    "active": True,
+                    "advertising_use": "demo_only",
+                    "frontend_path": (
+                        "/stayloop/promotions/jeju-resort-exterior.png"
+                    ),
+                    "entity_refs": [
+                        {
+                            "type": "hotel",
+                            "id": hotel_id,
+                            "usage": "primary",
+                        },
+                        {"type": "destination", "id": "jeju"},
+                    ],
+                }
+            ],
+        }
+    )
+    objects[OFFER_CATALOG_KEY] = (base_catalog_bytes, JSON_CONTENT_TYPE)
+    objects[LASTCALL_OFFER_CATALOG_KEY] = (
+        lastcall_catalog_bytes,
+        JSON_CONTENT_TYPE,
+    )
+    objects[hotel_image_key] = (hotel_image_bytes, "image/png")
+    loader = S3BrandContextLoader(
+        bucket_name=BUCKET,
+        base_prefix=PREFIX,
+        s3_client=FakeS3Client(objects),
+    )
+    snapshot = loader.resolve_snapshot(project_id=PROJECT_ID)
+    assert snapshot is not None
+    return (
+        loader,
+        snapshot,
+        {
+            "summer-base": base_catalog_bytes,
+            "summer-lastcall": lastcall_catalog_bytes,
+        },
+    )
+
+
+def offer_catalog(
+    *,
+    catalog_id: str,
+    catalog_version: str,
+    offer_set_id: str,
+    original_price: int,
+    sale_price: int,
+    landing_url: str,
+    destination_url: str,
+    deal_code: str | None = None,
+) -> dict[str, Any]:
+    value: dict[str, Any] = {
+        "schema_version": "stayloop.promotion-price-catalog.v1",
+        "project_id": PROJECT_ID,
+        "catalog_id": catalog_id,
+        "catalog_version": catalog_version,
+        "offer_set_id": offer_set_id,
+        "promotion_label": "제주·오키나와 프로모션",
+        "price_basis": "one_room_one_night",
+        "currency": "KRW",
+        "landing_url": landing_url,
+        "hotels": [
+            {
+                "hotel_id": "jeju-ocean-breeze-006",
+                "hotel_name": "Jeju Ocean Breeze Resort",
+                "destination_id": "jeju",
+                "currency": "KRW",
+                "sale_price_per_night": sale_price,
+                "original_price_per_night": original_price,
+                "discount_rate_percent": 10,
+                "destination_url": destination_url,
+            }
+        ],
+    }
+    if deal_code is not None:
+        value["deal_code"] = deal_code
+    return value

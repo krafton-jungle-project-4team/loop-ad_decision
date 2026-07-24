@@ -392,7 +392,7 @@ def test_email_candidate_strategies_match_three_renderer_variants() -> None:
 
     assert [plan.visual_direction for plan in plans] == [
         ("editorial destination story with a hero and two travel sections",),
-        ("eight accommodation offer cards using verified catalog images",),
+        ("accommodation offer cards using verified catalog images",),
         (
             "concise four-accommodation comparison using verified catalog images",
         ),

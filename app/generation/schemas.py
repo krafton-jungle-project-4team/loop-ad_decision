@@ -3,7 +3,7 @@ from enum import StrEnum
 import re
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class ContentChannel(StrEnum):
@@ -76,6 +76,24 @@ class GenerationRequest(BaseModel):
     promotion_id: str = Field(min_length=1)
     analysis_id: str = Field(min_length=1)
     segment_ids: list[str] | None = Field(default=None, min_length=1)
+    offer_set_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,99}$",
+    )
+    expected_catalog_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[a-z0-9][a-z0-9._-]{0,99}$",
+    )
+    expected_catalog_version: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$",
+    )
     content_option_count: int = Field(ge=1)
     operator_instruction: str | None = None
 
@@ -89,6 +107,22 @@ class GenerationRequest(BaseModel):
         if len(segment_ids) != len(set(segment_ids)):
             raise ValueError("segment_ids must not contain duplicates")
         return segment_ids
+
+    @model_validator(mode="after")
+    def validate_offer_selection(self) -> "GenerationRequest":
+        expected_values = (
+            self.expected_catalog_id,
+            self.expected_catalog_version,
+        )
+        if any(expected_values) and self.offer_set_id is None:
+            raise ValueError(
+                "offer_set_id is required with expected catalog identity"
+            )
+        if any(expected_values) and not all(expected_values):
+            raise ValueError(
+                "expected_catalog_id and expected_catalog_version must be provided together"
+            )
+        return self
 
 
 class CreativeArtifact(BaseModel):

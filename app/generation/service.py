@@ -72,6 +72,9 @@ from app.generation.submission import (
     INTERNAL_IDEMPOTENCY_KEY_PREFIX,
     build_generation_input_snapshot,
     generation_request_fingerprint,
+    promotion_with_selected_offer_catalog,
+    validate_selected_offer_catalog,
+    validate_submission_offer_links,
 )
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -657,6 +660,16 @@ class GenerationService:
             promotion=promotion,
             snapshot=brand_context,
         )
+        promotion = promotion_with_selected_offer_catalog(
+            request=request,
+            promotion=promotion,
+            catalog=offer_catalog,
+        )
+        if offer_catalog is not None and promotion.offer_links:
+            validate_submission_offer_links(
+                offer_links=promotion.offer_links,
+                catalog=offer_catalog,
+            )
         build_values: dict[str, Any] = {
             "request": request,
             "promotion": promotion,
@@ -687,7 +700,7 @@ class GenerationService:
         promotion: PromotionPromptInput,
         snapshot: BrandContextSnapshot | None,
     ) -> Mapping[str, Any] | None:
-        if not promotion.offer_links:
+        if not promotion.offer_links and request.offer_set_id is None:
             return None
         if promotion.channel != ContentChannel.EMAIL:
             raise GenerationInputUnavailable(
@@ -706,14 +719,22 @@ class GenerationService:
             raise GenerationInputUnavailable(
                 "brand context offer catalog loader is unavailable"
             )
-        catalog = load_offer_catalog(
-            project_id=request.project_id,
-            snapshot=snapshot,
-        )
+        if request.offer_set_id is None:
+            catalog = load_offer_catalog(
+                project_id=request.project_id,
+                snapshot=snapshot,
+            )
+        else:
+            catalog = load_offer_catalog(
+                project_id=request.project_id,
+                snapshot=snapshot,
+                offer_set_id=request.offer_set_id,
+            )
         if not isinstance(catalog, Mapping):
             raise GenerationInputUnavailable(
                 "brand context offer catalog is unavailable"
             )
+        validate_selected_offer_catalog(request=request, catalog=catalog)
         return dict(catalog)
 
     def _build_content_candidate_records(
