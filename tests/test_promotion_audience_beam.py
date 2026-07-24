@@ -338,6 +338,39 @@ def test_beam_keeps_all_allowlisted_property_conditions_in_members_and_spec() ->
     )
 
 
+def test_beam_keeps_property_anchor_when_every_sampled_profile_matches() -> None:
+    age_condition = SegmentPropertyCondition(
+        event_name="page_view",
+        property_key="age_group",
+        operator="in",
+        value="20s,30s",
+    )
+    result = search_promotion_audience_candidates(
+        promotion_id="promo-all-property-match",
+        destination_ids=(),
+        season_months=(),
+        benefit_keys=(),
+        desired_behavior_keys=(),
+        property_conditions=(age_condition,),
+        profiles=[
+            _profile("matched-001", segment_property_match=1),
+            _profile("matched-002", segment_property_match=1),
+        ],
+        min_sample_size=2,
+    )
+
+    assert len(result.candidates) == 1
+    candidate = result.candidates[0]
+    assert candidate.strategy_key == "beam_property_anchor"
+    assert candidate.depth == 0
+    assert candidate.user_ids == ("matched-001", "matched-002")
+    assert {
+        property_filter["key"]
+        for condition in candidate.structured_conditions
+        for property_filter in condition["property_filters"]
+    } == {"age_group"}
+
+
 def test_beam_relaxes_demographic_hint_when_exact_anchor_is_empty() -> None:
     age_condition = SegmentPropertyCondition(
         event_name="page_view",
