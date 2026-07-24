@@ -24,6 +24,8 @@ CUSTOM_STRUCTURED_TEMPLATE_ID = "custom_structured_condition"
 CUSTOM_STRUCTURED_TEMPLATE_VERSION = 1
 CUSTOM_STRUCTURED_CANDIDATE_TYPE = "custom_structured"
 CUSTOM_STRUCTURED_WINDOW_DAYS = 30
+CUSTOM_STRUCTURED_MIN_WINDOW_DAYS = 1
+CUSTOM_STRUCTURED_MAX_WINDOW_DAYS = 365
 CUSTOM_STRUCTURED_PARAMETER_POLICY_ID = "custom_structured_parameters.v1"
 CUSTOM_STRUCTURED_SELECTION_POLICY_ID = "exact_predicate_membership.v1"
 CUSTOM_STRUCTURED_ANCHOR_POLICY_ID = "structured_conditions_no_anchor.v1"
@@ -35,39 +37,57 @@ CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID = (
     "source_membership_with_optional_structured_conditions.v1"
 )
 CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY = "source_audience_membership"
-_CUSTOM_STRUCTURED_TEMPLATE_SEMANTICS = {
-    "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
-    "conditions": "allowlisted_event_property_count_conjunction",
-    "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
-    "selection": "exact_predicate_membership_vector_tiebreak_only",
-    "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
-    "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
-    "window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
-}
-CUSTOM_STRUCTURED_TEMPLATE_HASH = hashlib.sha256(
-    json.dumps(
-        _CUSTOM_STRUCTURED_TEMPLATE_SEMANTICS,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-).hexdigest()
-_CUSTOM_SOURCE_REFINEMENT_TEMPLATE_SEMANTICS = {
-    "base_membership": "canonical_source_suggestion_user_ids",
-    "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
-    "conditions": "optional_allowlisted_event_property_count_conjunction",
-    "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
-    "selection": "source_membership_with_optional_exact_predicate_membership",
-    "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
-    "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
-    "window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
-}
-CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH = hashlib.sha256(
-    json.dumps(
-        _CUSTOM_SOURCE_REFINEMENT_TEMPLATE_SEMANTICS,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-).hexdigest()
+
+
+def custom_structured_template_hash(
+    *,
+    template_version: int,
+    window_days: int,
+) -> str:
+    if (
+        not isinstance(window_days, int)
+        or isinstance(window_days, bool)
+        or not CUSTOM_STRUCTURED_MIN_WINDOW_DAYS
+        <= window_days
+        <= CUSTOM_STRUCTURED_MAX_WINDOW_DAYS
+    ):
+        raise ValueError("custom structured window must be between 1 and 365 days")
+    if template_version == CUSTOM_STRUCTURED_TEMPLATE_VERSION:
+        semantics = {
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "conditions": "allowlisted_event_property_count_conjunction",
+            "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+            "selection": "exact_predicate_membership_vector_tiebreak_only",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+            "window_days": window_days,
+        }
+    elif template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
+        semantics = {
+            "base_membership": "canonical_source_suggestion_user_ids",
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "conditions": "optional_allowlisted_event_property_count_conjunction",
+            "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+            "selection": "source_membership_with_optional_exact_predicate_membership",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+            "window_days": window_days,
+        }
+    else:
+        raise ValueError("unsupported custom structured template version")
+    return hashlib.sha256(
+        json.dumps(semantics, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+CUSTOM_STRUCTURED_TEMPLATE_HASH = custom_structured_template_hash(
+    template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+    window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
+)
+CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH = custom_structured_template_hash(
+    template_version=CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+    window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
+)
 
 CUSTOM_STRUCTURED_EVENT_NAMES = frozenset(
     {
@@ -201,6 +221,9 @@ class SegmentAudienceSpec:
                     sort_keys=True,
                     separators=(",", ":"),
                 ),
+            )
+            parameters["observation_window_days"] = (
+                self.observation_window_days,
             )
         if self.is_source_refinement:
             parameters["base_user_ids"] = self.base_user_ids
@@ -470,29 +493,55 @@ def _parse_custom_structured_spec(
     schema_version: str,
     raw_spec: Mapping[str, Any],
 ) -> SegmentAudienceSpec:
+    raw_parameters = raw_spec.get("parameters")
+    if not isinstance(raw_parameters, Mapping):
+        raise _error(
+            "segment_audience_parameters_invalid",
+            segment_id,
+            "custom structured parameters must be an object",
+        )
+    lookback_days = raw_parameters.get("lookback_days")
+    if (
+        not isinstance(lookback_days, int)
+        or isinstance(lookback_days, bool)
+        or not CUSTOM_STRUCTURED_MIN_WINDOW_DAYS
+        <= lookback_days
+        <= CUSTOM_STRUCTURED_MAX_WINDOW_DAYS
+    ):
+        raise _error(
+            "segment_audience_window_invalid",
+            segment_id,
+            "custom structured lookback_days must be between 1 and 365",
+        )
     template_version = raw_spec.get("template_version")
     if template_version == CUSTOM_STRUCTURED_TEMPLATE_VERSION:
         expected_static = {
             "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
-            "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+            "template_semantic_hash": custom_structured_template_hash(
+                template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+                window_days=lookback_days,
+            ),
             "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
             "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
             "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
             "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
-            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+            "observation_window_days": lookback_days,
         }
         is_source_refinement = False
     elif template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
         expected_static = {
             "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
-            "template_semantic_hash": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
+            "template_semantic_hash": custom_structured_template_hash(
+                template_version=CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+                window_days=lookback_days,
+            ),
             "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
             "parameter_policy_id": CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
             "semantic_selection_policy_id": (
                 CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
             ),
             "semantic_anchor_policy_id": CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
-            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+            "observation_window_days": lookback_days,
         }
         is_source_refinement = True
     else:
@@ -509,20 +558,6 @@ def _parse_custom_structured_spec(
                 f"{field_name} does not match the custom structured template",
             )
 
-    raw_parameters = raw_spec.get("parameters")
-    if not isinstance(raw_parameters, Mapping):
-        raise _error(
-            "segment_audience_parameters_invalid",
-            segment_id,
-            "custom structured parameters must be an object",
-        )
-    lookback_days = raw_parameters.get("lookback_days")
-    if lookback_days != CUSTOM_STRUCTURED_WINDOW_DAYS:
-        raise _error(
-            "segment_audience_window_invalid",
-            segment_id,
-            "saved custom segments must use the active 30-day behavior window",
-        )
     custom_conditions = _canonical_custom_conditions(
         raw_parameters.get("conditions"),
         segment_id=segment_id,
@@ -626,7 +661,7 @@ def _parse_custom_structured_spec(
             expected_static["semantic_selection_policy_id"]
         ),
         semantic_anchor_policy_id=str(expected_static["semantic_anchor_policy_id"]),
-        observation_window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
+        observation_window_days=lookback_days,
         spec_hash=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
         custom_conditions=custom_conditions,
         base_user_ids=base_user_ids,

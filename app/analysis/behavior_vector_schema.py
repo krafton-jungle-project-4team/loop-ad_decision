@@ -10,17 +10,16 @@ from typing import Mapping, Sequence
 from app.audience_contract import (
     CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
     CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID,
-    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
     CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
     CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
     CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
-    CUSTOM_STRUCTURED_TEMPLATE_HASH,
     CUSTOM_STRUCTURED_TEMPLATE_ID,
     LEGACY_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_QUERY_COMPILER_HASH,
     SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
     SegmentAudienceSpec,
+    custom_structured_template_hash,
 )
 from app.analysis.behavior_manifest import (
     behavior_manifest_hash,
@@ -527,7 +526,10 @@ class HotelBookingBehaviorSchemaV2:
         if not spec.is_custom_structured:
             raise ValueError("custom audience compiler requires a custom template")
         if spec.template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
-            expected_template_hash = CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH
+            expected_template_hash = custom_structured_template_hash(
+                template_version=CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+                window_days=spec.observation_window_days,
+            )
             expected_selection_policy = CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
             expected_anchor_policy = CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID
             query_compiler_version = CUSTOM_SOURCE_REFINEMENT_QUERY_COMPILER_VERSION
@@ -535,7 +537,10 @@ class HotelBookingBehaviorSchemaV2:
             calibration_version = "custom_source_refinement_exact.v1"
             semantic_selection_status = "exact_source_refinement"
         else:
-            expected_template_hash = CUSTOM_STRUCTURED_TEMPLATE_HASH
+            expected_template_hash = custom_structured_template_hash(
+                template_version=spec.template_version,
+                window_days=spec.observation_window_days,
+            )
             expected_selection_policy = CUSTOM_STRUCTURED_SELECTION_POLICY_ID
             expected_anchor_policy = CUSTOM_STRUCTURED_ANCHOR_POLICY_ID
             query_compiler_version = CUSTOM_STRUCTURED_QUERY_COMPILER_VERSION

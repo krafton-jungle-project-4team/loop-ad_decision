@@ -804,6 +804,7 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
                 _render_offer_card_cell(
                     raw_offer,
                     position=original_position,
+                    cta=cta,
                 )
                 for original_position, raw_offer in pair
             ]
@@ -879,7 +880,12 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
     return html_body
 
 
-def _render_offer_card_cell(raw_offer: object, *, position: int) -> str:
+def _render_offer_card_cell(
+    raw_offer: object,
+    *,
+    position: int,
+    cta: str,
+) -> str:
     if not isinstance(raw_offer, Mapping):
         raise ArtifactRenderError("offer card entry must be an object")
     hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
@@ -918,7 +924,7 @@ def _render_offer_card_cell(raw_offer: object, *, position: int) -> str:
             f'        <strong style="display:block;min-height:42px;font-size:15px;line-height:21px;color:#10233f;">{hotel_name}</strong>',
             f'        <span style="display:block;margin:4px 0 12px;font-size:12px;line-height:18px;color:#718096;">{destination}</span>',
             f'        <div style="margin-bottom:12px;"><strong style="color:#e74773;font-size:18px;">{sale_price}</strong>{original_html}<span style="color:#718096;font-size:11px;"> / 박</span></div>',
-            f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#0F55C8;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">숙소 확인하기</a>',
+            f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#0F55C8;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">{cta}</a>',
             "      </td>",
             "    </tr>",
             "  </table>",

@@ -122,6 +122,39 @@ def test_source_request_fingerprint_is_stable_for_segment_id_order() -> None:
     )
 
 
+def test_source_request_fingerprint_includes_selected_catalog_identity() -> None:
+    base = prompt_input(segment_ids=["seg_a"])
+    selected = replace(
+        base,
+        request=base.request.model_copy(
+            update={"offer_set_id": "summer-lastcall"}
+        ),
+        offer_catalog={
+            "catalog_id": "black-friday-hotels-lastcall",
+            "catalog_version": "v3",
+            "catalog_sha256": "b" * 64,
+            "hotels": [],
+        },
+    )
+    changed_catalog = replace(
+        selected,
+        offer_catalog={
+            **selected.offer_catalog,
+            "catalog_sha256": "c" * 64,
+        },
+    )
+
+    assert source_request_fingerprint(
+        identity=IDENTITY,
+        prompt_input=selected,
+        option_index=1,
+    ) != source_request_fingerprint(
+        identity=IDENTITY,
+        prompt_input=changed_catalog,
+        option_index=1,
+    )
+
+
 def test_source_manifest_key_uses_private_hierarchical_prefix() -> None:
     assert source_manifest_key(
         base_prefix="genai-source/",

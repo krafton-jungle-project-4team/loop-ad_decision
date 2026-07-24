@@ -362,6 +362,11 @@ class BookingIntentCohortRecord(NamedTuple):
     booking_complete_user_count: int
     booking_abandon_median_revenue: Decimal | None
     booking_complete_median_revenue: Decimal | None
+    high_price_booking_start_user_count: int = 0
+    high_price_booking_abandon_user_count: int = 0
+    high_price_booking_complete_user_count: int = 0
+    booking_abandon_median_nightly_price: Decimal | None = None
+    booking_complete_median_nightly_price: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -2729,6 +2734,18 @@ class EvaluationMetricRepository:
             if destination_ids
             else ""
         )
+        price_destination = clickhouse_canonical_destination_sql(
+            "coalesce("
+            "nullIf(JSONExtractString(price_events.properties_json, 'destination_id'), ''), "
+            "nullIf(JSONExtractString(price_events.properties_json, 'destination_name'), ''), "
+            "nullIf(JSONExtractString(price_events.properties_json, 'hotel_city'), '')"
+            ")"
+        )
+        price_destination_predicate = (
+            f"AND {price_destination} IN {{destination_ids:Array(String)}}"
+            if destination_ids
+            else ""
+        )
         result = self._client.query(
             f"""
             WITH
@@ -2803,16 +2820,51 @@ class EvaluationMetricRepository:
                      AND bookings.event_time <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
                     GROUP BY responses.user_id
                 ),
+                booking_start_prices AS (
+                    SELECT
+                        responses.user_id AS user_id,
+                        argMax(
+                            toFloat64OrNull(
+                                nullIf(
+                                    JSONExtractString(
+                                        price_events.properties_json,
+                                        'price'
+                                    ),
+                                    ''
+                                )
+                            ),
+                            price_events.event_time
+                        ) AS nightly_price
+                    FROM response_users AS responses
+                    INNER JOIN raw_events AS price_events
+                      ON price_events.project_id = {{project_id:String}}
+                     AND price_events.user_id = responses.user_id
+                     AND price_events.validation_status = 'valid'
+                     AND price_events.event_name = 'booking_start'
+                     AND price_events.event_time >= responses.response_at
+                     AND price_events.event_time
+                         <= {{evaluation_cutoff_at:DateTime64(3, 'UTC')}}
+                     {price_destination_predicate}
+                    WHERE toFloat64OrNull(
+                        nullIf(
+                            JSONExtractString(price_events.properties_json, 'price'),
+                            ''
+                        )
+                    ) IS NOT NULL
+                    GROUP BY responses.user_id
+                ),
                 audience AS (
                     SELECT
                         responses.user_id AS user_id,
                         behavior.detail_view_count AS detail_view_count,
                         ifNull(bookings.booking_start_at, no_event) AS booking_start_at,
                         ifNull(bookings.booking_complete_at, no_event) AS booking_complete_at,
-                        bookings.booking_start_revenue AS booking_start_revenue
+                        bookings.booking_start_revenue AS booking_start_revenue,
+                        prices.nightly_price AS nightly_price
                     FROM response_users AS responses
                     LEFT JOIN pre_experiment_behavior AS behavior USING (user_id)
                     LEFT JOIN booking_journeys AS bookings USING (user_id)
+                    LEFT JOIN booking_start_prices AS prices USING (user_id)
                 )
             SELECT
                 (SELECT count() FROM click_users) AS ad_click_count,
@@ -2843,7 +2895,31 @@ class EvaluationMetricRepository:
                     ifNull(booking_start_revenue, 0),
                     booking_complete_at != no_event
                     AND isNotNull(booking_start_revenue)
-                ) AS booking_complete_median_revenue
+                ) AS booking_complete_median_revenue,
+                countIf(
+                    booking_start_at != no_event
+                    AND nightly_price > {{high_price_threshold:Float64}}
+                ) AS high_price_booking_start_user_count,
+                countIf(
+                    booking_start_at != no_event
+                    AND booking_complete_at = no_event
+                    AND nightly_price > {{high_price_threshold:Float64}}
+                ) AS high_price_booking_abandon_user_count,
+                countIf(
+                    booking_complete_at != no_event
+                    AND nightly_price > {{high_price_threshold:Float64}}
+                ) AS high_price_booking_complete_user_count,
+                quantileExactIf(0.5)(
+                    ifNull(nightly_price, 0),
+                    booking_start_at != no_event
+                    AND booking_complete_at = no_event
+                    AND isNotNull(nightly_price)
+                ) AS booking_abandon_median_nightly_price,
+                quantileExactIf(0.5)(
+                    ifNull(nightly_price, 0),
+                    booking_complete_at != no_event
+                    AND isNotNull(nightly_price)
+                ) AS booking_complete_median_nightly_price
             FROM audience
             """,
             parameters={
@@ -2861,6 +2937,7 @@ class EvaluationMetricRepository:
                 "destination_ids": list(destination_ids),
                 "evaluation_cutoff_at": evaluation_cutoff_at,
                 "lookback_days": lookback_days,
+                "high_price_threshold": 200000.0,
             },
         )
         return _booking_intent_cohort_from_result(result)
@@ -3028,6 +3105,21 @@ def _booking_intent_cohort_from_result(result: Any) -> BookingIntentCohortRecord
         ),
         booking_complete_median_revenue=_optional_decimal(
             _clickhouse_value(row, "booking_complete_median_revenue", 8)
+        ),
+        high_price_booking_start_user_count=int(
+            _clickhouse_value(row, "high_price_booking_start_user_count", 9)
+        ),
+        high_price_booking_abandon_user_count=int(
+            _clickhouse_value(row, "high_price_booking_abandon_user_count", 10)
+        ),
+        high_price_booking_complete_user_count=int(
+            _clickhouse_value(row, "high_price_booking_complete_user_count", 11)
+        ),
+        booking_abandon_median_nightly_price=_optional_decimal(
+            _clickhouse_value(row, "booking_abandon_median_nightly_price", 12)
+        ),
+        booking_complete_median_nightly_price=_optional_decimal(
+            _clickhouse_value(row, "booking_complete_median_nightly_price", 13)
         ),
     )
 

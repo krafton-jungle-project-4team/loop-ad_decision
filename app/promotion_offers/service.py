@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
-from urllib.parse import quote
+from urllib.parse import quote, urlencode, urlsplit
 
 from app.generation.brand_context import BrandContextSnapshot
 from app.generation.errors import (
@@ -20,7 +20,10 @@ from app.promotion_offers.schemas import (
 STOREFRONT_ORIGIN = "https://demo-shoppingmall.dev.loop-ad.org"
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 _OFFER_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_OFFER_SET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_DEAL_CODE_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 _CURRENCY_PATTERN = re.compile(r"^[A-Z]{3}$")
+_STOREFRONT_URL = urlsplit(STOREFRONT_ORIGIN)
 
 
 class PromotionOfferCatalogLoader(Protocol):
@@ -35,11 +38,16 @@ class PromotionOfferCatalogLoader(Protocol):
         *,
         project_id: str,
         snapshot: BrandContextSnapshot,
+        offer_set_id: str | None = None,
     ) -> Mapping[str, Any] | None: ...
 
 
 class PromotionOfferCatalogInvalidProjectId(ValueError):
     """The project cannot be resolved inside the brand-context namespace."""
+
+
+class PromotionOfferCatalogInvalidOfferSetId(ValueError):
+    """The offer set cannot be resolved safely inside the project manifest."""
 
 
 class PromotionOfferCatalogNotFound(RuntimeError):
@@ -55,13 +63,29 @@ class PromotionOfferCatalogService:
         self._loader = loader
 
     @log_context_scope
-    def list_offers(self, *, project_id: str) -> PromotionOfferCatalogResponse:
+    def list_offers(
+        self,
+        *,
+        project_id: str,
+        offer_set_id: str | None = None,
+    ) -> PromotionOfferCatalogResponse:
         started_at = now_ms()
-        log.info("started", {"projectIdLength": len(str(project_id))})
+        log.info(
+            "started",
+            {
+                "projectIdLength": len(str(project_id)),
+                "offerSetIdProvided": offer_set_id is not None,
+            },
+        )
         try:
             project_id = _validated_project_id(project_id)
         except PromotionOfferCatalogInvalidProjectId as exc:
             log.warn("promotion_offer_project_id_invalid", {"err": exc})
+            raise
+        try:
+            offer_set_id = _validated_offer_set_id(offer_set_id)
+        except PromotionOfferCatalogInvalidOfferSetId as exc:
+            log.warn("promotion_offer_set_id_invalid", {"err": exc})
             raise
         log.assign_context({"projectId": project_id})
         try:
@@ -72,10 +96,17 @@ class PromotionOfferCatalogService:
                     {"reason": "brand_context_snapshot_missing"},
                 )
                 raise PromotionOfferCatalogNotFound
-            catalog = self._loader.load_offer_catalog(
-                project_id=project_id,
-                snapshot=snapshot,
-            )
+            if offer_set_id is None:
+                catalog = self._loader.load_offer_catalog(
+                    project_id=project_id,
+                    snapshot=snapshot,
+                )
+            else:
+                catalog = self._loader.load_offer_catalog(
+                    project_id=project_id,
+                    snapshot=snapshot,
+                    offer_set_id=offer_set_id,
+                )
             if catalog is None:
                 log.warn(
                     "promotion_offer_catalog_not_found",
@@ -88,10 +119,13 @@ class PromotionOfferCatalogService:
             log.warn("promotion_offer_catalog_unavailable", {"err": exc})
             raise PromotionOfferCatalogUnavailable from exc
         except PermanentGenerationError as exc:
-            if exc.code == "brand_context_object_missing":
+            if exc.code in {
+                "brand_context_object_missing",
+                "brand_context_offer_set_unknown",
+            }:
                 log.warn(
                     "promotion_offer_catalog_not_found",
-                    {"err": exc, "reason": "catalog_object_missing"},
+                    {"err": exc, "reason": exc.code},
                 )
                 raise PromotionOfferCatalogNotFound from exc
             log.warn("promotion_offer_catalog_unavailable", {"err": exc})
@@ -109,11 +143,58 @@ class PromotionOfferCatalogService:
             )
             raise PromotionOfferCatalogUnavailable
 
-        offers = _normalised_offers(catalog.get("hotels"))
+        selected_offer_set_id = _optional_identifier(
+            catalog.get("offer_set_id"),
+            pattern=_OFFER_SET_ID_PATTERN,
+        )
+        if selected_offer_set_id is _INVALID or (
+            offer_set_id is not None and selected_offer_set_id != offer_set_id
+        ):
+            log.warn(
+                "promotion_offer_catalog_invalid",
+                {"reason": "offer_set_identity_invalid"},
+            )
+            raise PromotionOfferCatalogUnavailable
+
+        landing_url = _optional_storefront_url(catalog.get("landing_url"))
+        if landing_url is _INVALID:
+            log.warn(
+                "promotion_offer_catalog_invalid",
+                {"reason": "landing_url_invalid"},
+            )
+            raise PromotionOfferCatalogUnavailable
+
+        deal_code = _optional_identifier(
+            catalog.get("deal_code"),
+            pattern=_DEAL_CODE_PATTERN,
+        )
+        if deal_code is _INVALID:
+            log.warn(
+                "promotion_offer_catalog_invalid",
+                {"reason": "deal_code_invalid"},
+            )
+            raise PromotionOfferCatalogUnavailable
+        if (
+            deal_code is not None
+            and landing_url is not None
+            and landing_url != canonical_promotion_landing_url(deal_code)
+        ):
+            log.warn(
+                "promotion_offer_catalog_invalid",
+                {"reason": "landing_url_price_tier_mismatch"},
+            )
+            raise PromotionOfferCatalogUnavailable
+
+        offers = _normalised_offers(
+            catalog.get("hotels"),
+            deal_code=deal_code,
+        )
         response = PromotionOfferCatalogResponse(
             project_id=project_id,
             catalog_id=catalog_id,
             catalog_version=catalog_version,
+            offer_set_id=selected_offer_set_id,
+            landing_url=landing_url,
             offers=offers,
         )
         log.info(
@@ -121,6 +202,7 @@ class PromotionOfferCatalogService:
             {
                 "catalogId": response.catalog_id,
                 "catalogVersion": response.catalog_version,
+                "offerSetId": response.offer_set_id,
                 "durationMs": duration_ms(started_at),
                 "offerCount": len(response.offers),
             },
@@ -128,13 +210,48 @@ class PromotionOfferCatalogService:
         return response
 
 
-def canonical_offer_destination_url(offer_id: str) -> str:
+def canonical_offer_destination_url(
+    offer_id: str,
+    deal_code: str | None = None,
+) -> str:
     """Return the canonical demo-storefront detail URL for an offer."""
 
     normalized_offer_id = _required_text(offer_id)
     if normalized_offer_id is None:
         raise ValueError("offer_id is required")
-    return f"{STOREFRONT_ORIGIN}/hotel/{quote(normalized_offer_id, safe='')}"
+    destination_url = (
+        f"{STOREFRONT_ORIGIN}/hotel/{quote(normalized_offer_id, safe='')}"
+    )
+    normalized_deal_code = _optional_identifier(
+        deal_code,
+        pattern=_DEAL_CODE_PATTERN,
+    )
+    if normalized_deal_code is _INVALID:
+        raise ValueError("deal_code is invalid")
+    if normalized_deal_code is None:
+        return destination_url
+    return f"{destination_url}?{urlencode({'deal': normalized_deal_code})}"
+
+
+def canonical_promotion_landing_url(deal_code: str | None = None) -> str:
+    """Return the demo-storefront promotion URL for one catalog price tier."""
+
+    normalized_deal_code = _optional_identifier(
+        deal_code,
+        pattern=_DEAL_CODE_PATTERN,
+    )
+    if normalized_deal_code is _INVALID:
+        raise ValueError("deal_code is invalid")
+    landing_url = f"{STOREFRONT_ORIGIN}/search"
+    if normalized_deal_code is None:
+        return landing_url
+    return f"{landing_url}?{urlencode({'deal': normalized_deal_code})}"
+
+
+def validated_storefront_url(value: object) -> str:
+    """Validate and return an HTTPS URL owned by the demo storefront."""
+
+    return _storefront_url(value)
 
 
 def public_offer_image_url(image_path: str) -> str:
@@ -158,7 +275,20 @@ def _validated_project_id(value: object) -> str:
     return project_id
 
 
-def _normalised_offers(value: object) -> list[PromotionOfferResponse]:
+def _validated_offer_set_id(value: object) -> str | None:
+    if value is None:
+        return None
+    offer_set_id = str(value).strip()
+    if not _OFFER_SET_ID_PATTERN.fullmatch(offer_set_id):
+        raise PromotionOfferCatalogInvalidOfferSetId
+    return offer_set_id
+
+
+def _normalised_offers(
+    value: object,
+    *,
+    deal_code: str | None,
+) -> list[PromotionOfferResponse]:
     if not isinstance(value, Sequence) or isinstance(value, str | bytes):
         raise PromotionOfferCatalogUnavailable
 
@@ -167,7 +297,7 @@ def _normalised_offers(value: object) -> list[PromotionOfferResponse]:
     for raw_offer in value:
         if not isinstance(raw_offer, Mapping):
             continue
-        offer = _normalised_offer(raw_offer)
+        offer = _normalised_offer(raw_offer, deal_code=deal_code)
         if offer is None or offer.offer_id in seen_offer_ids:
             continue
         seen_offer_ids.add(offer.offer_id)
@@ -182,7 +312,11 @@ def _normalised_offers(value: object) -> list[PromotionOfferResponse]:
     )
 
 
-def _normalised_offer(value: Mapping[str, Any]) -> PromotionOfferResponse | None:
+def _normalised_offer(
+    value: Mapping[str, Any],
+    *,
+    deal_code: str | None,
+) -> PromotionOfferResponse | None:
     offer_id = _required_text(value.get("offer_id"))
     hotel_name = _required_text(value.get("hotel_name"))
     destination_id = _required_text(value.get("destination_id"))
@@ -210,7 +344,18 @@ def _normalised_offer(value: Mapping[str, Any]) -> PromotionOfferResponse | None
         return None
     try:
         image_url = public_offer_image_url(image_path)
-        destination_url = canonical_offer_destination_url(offer_id)
+        raw_destination_url = value.get("destination_url")
+        expected_destination_url = canonical_offer_destination_url(
+            offer_id,
+            deal_code=deal_code,
+        )
+        destination_url = (
+            expected_destination_url
+            if raw_destination_url is None
+            else _storefront_url(raw_destination_url)
+        )
+        if destination_url != expected_destination_url:
+            raise ValueError("catalog destination_url is not canonical")
     except ValueError:
         return None
     return PromotionOfferResponse(
@@ -234,6 +379,49 @@ def _required_text(value: object) -> str | None:
         return None
     text = value.strip()
     return text or None
+
+
+def _optional_identifier(
+    value: object,
+    *,
+    pattern: re.Pattern[str],
+) -> str | None | object:
+    if value is None:
+        return None
+    text = _required_text(value)
+    if text is None or pattern.fullmatch(text) is None:
+        return _INVALID
+    return text
+
+
+def _optional_storefront_url(value: object) -> str | None | object:
+    if value is None:
+        return None
+    try:
+        return _storefront_url(value)
+    except ValueError:
+        return _INVALID
+
+
+def _storefront_url(value: object) -> str:
+    url = _required_text(value)
+    if url is None or "\\" in url:
+        raise ValueError("catalog URL is invalid")
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("catalog URL is invalid") from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() != _STOREFRONT_URL.hostname
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ValueError("catalog URL must use the HTTPS demo storefront origin")
+    return url
 
 
 def _nonnegative_int(value: object) -> int | None:

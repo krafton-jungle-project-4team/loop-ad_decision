@@ -7,6 +7,7 @@ from app.main import create_app
 from app.promotion_offers.router import get_promotion_offer_catalog_service
 from app.promotion_offers.schemas import PromotionOfferCatalogResponse
 from app.promotion_offers.service import (
+    PromotionOfferCatalogInvalidOfferSetId,
     PromotionOfferCatalogInvalidProjectId,
     PromotionOfferCatalogNotFound,
     PromotionOfferCatalogUnavailable,
@@ -25,6 +26,10 @@ def test_api_returns_the_decision_promotion_offer_contract() -> None:
                     "project_id": "demo_project",
                     "catalog_id": "black-friday-hotels",
                     "catalog_version": "v2",
+                    "offer_set_id": "summer-base",
+                    "landing_url": (
+                        "https://demo-shoppingmall.dev.loop-ad.org/search"
+                    ),
                     "offers": [
                         {
                             "offer_id": "jeju-ocean-breeze-006",
@@ -59,6 +64,40 @@ def test_api_returns_the_decision_promotion_offer_contract() -> None:
     assert response.json()["offers"][0]["destination_url"] == (
         "https://demo-shoppingmall.dev.loop-ad.org/hotel/jeju-ocean-breeze-006"
     )
+    assert response.json()["offer_set_id"] == "summer-base"
+    assert response.json()["landing_url"] == (
+        "https://demo-shoppingmall.dev.loop-ad.org/search"
+    )
+
+
+def test_api_passes_optional_offer_set_id_to_service() -> None:
+    response_model = PromotionOfferCatalogResponse.model_validate(
+        {
+            "project_id": "demo_project",
+            "catalog_id": "black-friday-hotels-lastcall",
+            "catalog_version": "v3",
+            "offer_set_id": "summer-lastcall",
+            "landing_url": (
+                "https://demo-shoppingmall.dev.loop-ad.org"
+                "/search?deal=summer-lastcall"
+            ),
+            "offers": [],
+        }
+    )
+    service = OfferSetAwareService(response_model)
+    client, headers = make_client(service)
+
+    response = client.get(
+        (
+            "/decision/v1/projects/demo_project/promotion-offers"
+            "?offer_set_id=summer-lastcall"
+        ),
+        headers=headers,
+    )
+
+    assert response.status_code == 200
+    assert response.json()["offer_set_id"] == "summer-lastcall"
+    assert service.requested_offer_set_id == "summer-lastcall"
 
 
 def test_api_requires_the_internal_key() -> None:
@@ -101,6 +140,26 @@ def test_api_returns_the_documented_invalid_project_error_envelope() -> None:
     response = request_with_error(PromotionOfferCatalogInvalidProjectId())
 
     assert_error_envelope(response, status_code=400, code="project_id_invalid")
+
+
+def test_api_returns_the_documented_invalid_offer_set_error_envelope() -> None:
+    client, headers = make_client(
+        OfferSetAwareRaisingService(PromotionOfferCatalogInvalidOfferSetId())
+    )
+
+    response = client.get(
+        (
+            "/decision/v1/projects/demo_project/promotion-offers"
+            "?offer_set_id=../lastcall"
+        ),
+        headers={**headers, "X-Request-Id": REQUEST_ID},
+    )
+
+    assert_error_envelope(
+        response,
+        status_code=400,
+        code="offer_set_id_invalid",
+    )
 
 
 def test_api_returns_the_documented_not_found_error_envelope() -> None:
@@ -191,4 +250,34 @@ class RaisingService:
 
     def list_offers(self, *, project_id: str) -> PromotionOfferCatalogResponse:
         del project_id
+        raise self.error
+
+
+class OfferSetAwareService:
+    def __init__(self, response: PromotionOfferCatalogResponse) -> None:
+        self.response = response
+        self.requested_offer_set_id: str | None = None
+
+    def list_offers(
+        self,
+        *,
+        project_id: str,
+        offer_set_id: str | None = None,
+    ) -> PromotionOfferCatalogResponse:
+        assert project_id == "demo_project"
+        self.requested_offer_set_id = offer_set_id
+        return self.response
+
+
+class OfferSetAwareRaisingService:
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    def list_offers(
+        self,
+        *,
+        project_id: str,
+        offer_set_id: str | None = None,
+    ) -> PromotionOfferCatalogResponse:
+        del project_id, offer_set_id
         raise self.error
