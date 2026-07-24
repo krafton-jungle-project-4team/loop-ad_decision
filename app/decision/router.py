@@ -370,6 +370,9 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
                     exclusion_reader=analysis_exclusion_repository,
                 )
             ),
+            next_loop_source_assignment_reader=UserSegmentAssignmentRepository(
+                executor
+            ),
         )
         content_generator = None
         artifact_publisher = None
