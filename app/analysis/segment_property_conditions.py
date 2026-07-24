@@ -134,7 +134,7 @@ def segment_property_conditions_from_hints(
     if "20s_30s" in hints:
         conditions.append(
             SegmentPropertyCondition(
-                event_name="hotel_search",
+                event_name="page_view",
                 property_key="age_group",
                 operator="in",
                 value=",".join(_AGE_TWENTIES_THIRTIES),
@@ -145,7 +145,7 @@ def segment_property_conditions_from_hints(
         gender = next(iter(requested_genders))
         conditions.append(
             SegmentPropertyCondition(
-                event_name="hotel_search",
+                event_name="page_view",
                 property_key="gender",
                 operator="in",
                 value=",".join(_GENDER_VALUES[gender]),
@@ -223,9 +223,30 @@ def segment_property_filter_label(property_filter: Mapping[str, Any]) -> str:
     if operator == "exists":
         return f"{label} 있음"
     if operator == "gte":
-        return f"{label} {value} 이상"
+        numeric_value = _decimal_or_none(value)
+        if (
+            key in {"price", "revenue"}
+            and numeric_value is not None
+            and numeric_value > 0
+            and numeric_value % Decimal("10000") == 1
+        ):
+            return (
+                f"{label} {_format_korean_currency(numeric_value - 1)} 초과"
+            )
+        display_value = (
+            _format_korean_currency(numeric_value)
+            if key in {"price", "revenue"} and numeric_value is not None
+            else value
+        )
+        return f"{label} {display_value} 이상"
     if operator == "lte":
-        return f"{label} {value} 이하"
+        numeric_value = _decimal_or_none(value)
+        display_value = (
+            _format_korean_currency(numeric_value)
+            if key in {"price", "revenue"} and numeric_value is not None
+            else value
+        )
+        return f"{label} {display_value} 이하"
     if operator == "contains":
         return f"{label} {value} 포함"
     if operator == "in":
@@ -233,6 +254,19 @@ def segment_property_filter_label(property_filter: Mapping[str, Any]) -> str:
     if key in {"deal", "free_cancellation", "breakfast_included"}:
         return f"{label} 관심" if value == "true" else f"{label} 제외"
     return f"{label} {value}".strip()
+
+
+def _decimal_or_none(value: str) -> Decimal | None:
+    try:
+        return Decimal(value)
+    except InvalidOperation:
+        return None
+
+
+def _format_korean_currency(value: Decimal) -> str:
+    if value % Decimal("10000") == 0:
+        return f"{value / Decimal('10000'):g}만원"
+    return f"{value:,.0f}원"
 
 
 def property_parameter_value(condition: SegmentPropertyCondition) -> Any:

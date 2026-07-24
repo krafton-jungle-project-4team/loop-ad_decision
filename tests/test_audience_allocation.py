@@ -118,6 +118,8 @@ def test_allocation_winner_sql_uses_template_priority_then_normalized_fit() -> N
     assert "promotion_audience_exclusion_members" in winner_query
     assert "NOT EXISTS" in winner_query
     assert "target.status <> 'stopped'" in winner_query
+    assert "promotion_run_target_bindings" in winner_query
+    assert "active_run.status NOT IN" in winner_query
 
 
 def test_confirmation_reservation_uses_the_advanced_revision() -> None:
@@ -160,7 +162,11 @@ def test_confirmation_reservation_uses_the_advanced_revision() -> None:
     assert "winner.segment_id" in reservation_query
     assert "ON CONFLICT (project_id, promotion_id, user_id)" in reservation_query
     assert "state = 'released'" in reservation_query
-    assert "stale_target.status = 'stopped'" in reservation_query
+    assert "stale_target.status <> 'stopped'" in reservation_query
+    assert "promotion_run_target_bindings" in reservation_query
+    assert "active_run.status NOT IN" in reservation_query
+    assert "'goal_met'" in reservation_query
+    assert "'goal_not_met'" in reservation_query
     assert "stale_target.allocation_plan_id" in reservation_query
     assert "stale_target.audience_snapshot_id" in reservation_query
     assert "released_at = NULL" in reservation_query

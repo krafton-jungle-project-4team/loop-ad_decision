@@ -15,6 +15,7 @@ from app.audience_exclusions import (
     PromotionAudienceExclusionContext,
     PromotionAudienceExclusionReader,
     SegmentAudienceExclusionError,
+    promotion_target_is_active_sql,
 )
 from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 
@@ -1072,7 +1073,7 @@ class PostgresAudienceAllocationRepository:
                       AND excluded.promotion_id = %s
                       AND excluded.user_id = member.user_id
                       AND excluded.state IN ('reserved', 'consumed')
-                      AND target.status <> 'stopped'
+                      AND {promotion_target_is_active_sql("target")}
                 )
             )
             SELECT *
@@ -1376,7 +1377,9 @@ class PostgresAudienceAllocationRepository:
                                       {POSTGRES_EXCLUSION_RELATION}.allocation_plan_id
                               AND stale_target.audience_snapshot_id =
                                       {POSTGRES_EXCLUSION_RELATION}.final_snapshot_id
-                              AND stale_target.status = 'stopped'
+                              AND NOT (
+                                  {promotion_target_is_active_sql("stale_target")}
+                              )
                        )
                     RETURNING user_id
                 )

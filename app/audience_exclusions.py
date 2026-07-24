@@ -16,6 +16,54 @@ EXCLUSION_REVISION_RELATION = "promotion_audience_exclusion_state"
 CLICKHOUSE_PROJECTION_REVISION_RELATION = (
     "promotion_audience_exclusion_projection_status"
 )
+TERMINAL_PROMOTION_RUN_STATUSES_SQL = """(
+    'goal_met',
+    'goal_not_met',
+    'partial_goal_met',
+    'insufficient_data',
+    'stopped'
+)"""
+
+
+def promotion_target_is_active_sql(target_alias: str = "target") -> str:
+    """Return the shared reservation rule for a promotion target.
+
+    An unbound confirmation is still active. Once it is bound to a run, the
+    reservation remains active only while the run is non-terminal.
+    """
+
+    return f"""
+        {target_alias}.status <> 'stopped'
+        AND (
+            NOT EXISTS (
+                SELECT 1
+                FROM promotion_run_target_bindings AS target_binding
+                WHERE target_binding.target_analysis_id =
+                          {target_alias}.analysis_id
+                  AND target_binding.segment_id = {target_alias}.segment_id
+                  AND target_binding.allocation_plan_id =
+                          {target_alias}.allocation_plan_id
+                  AND target_binding.final_snapshot_id =
+                          {target_alias}.audience_snapshot_id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM promotion_run_target_bindings AS active_binding
+                JOIN promotion_runs AS active_run
+                  ON active_run.promotion_run_id =
+                     active_binding.promotion_run_id
+                WHERE active_binding.target_analysis_id =
+                          {target_alias}.analysis_id
+                  AND active_binding.segment_id = {target_alias}.segment_id
+                  AND active_binding.allocation_plan_id =
+                          {target_alias}.allocation_plan_id
+                  AND active_binding.final_snapshot_id =
+                          {target_alias}.audience_snapshot_id
+                  AND active_run.status NOT IN
+                      {TERMINAL_PROMOTION_RUN_STATUSES_SQL}
+            )
+        )
+    """
 
 
 class SegmentAudienceExclusionError(RuntimeError):
@@ -150,7 +198,7 @@ class PromotionAudienceExclusionRepository:
                         WHERE member.project_id = %s
                           AND member.promotion_id = state.promotion_id
                           AND member.state IN ('reserved', 'consumed')
-                          AND target.status <> 'stopped'
+                          AND {promotion_target_is_active_sql("target")}
                     ) AS excluded_user_count
                 FROM {EXCLUSION_REVISION_RELATION} AS state
                 WHERE state.promotion_id = %s
@@ -168,11 +216,14 @@ class PromotionAudienceExclusionRepository:
         excluded_user_count = (
             int(row["excluded_user_count"]) if row is not None else 0
         )
-        projection = self._load_projection_revision(
+        projection, projected_active_user_count = self._load_projection_state(
             project_id=project_id,
             promotion_id=promotion_id,
         )
-        if projection < revision:
+        if projection < revision or (
+            projected_active_user_count is not None
+            and projected_active_user_count != excluded_user_count
+        ):
             projection = self._synchronize_projection(
                 project_id=project_id,
                 campaign_id=campaign_id,
@@ -205,11 +256,13 @@ class PromotionAudienceExclusionRepository:
             SELECT
                 member.user_id,
                 CASE
-                    WHEN target.status = 'stopped' THEN 'released'
+                    WHEN NOT ({promotion_target_is_active_sql("target")})
+                        THEN 'released'
                     ELSE member.state
                 END AS state,
                 CASE
-                    WHEN target.status = 'stopped' THEN %s
+                    WHEN NOT ({promotion_target_is_active_sql("target")})
+                        THEN %s
                     ELSE member.revision
                 END AS revision,
                 coalesce(
@@ -282,16 +335,24 @@ class PromotionAudienceExclusionRepository:
         )
         return revision
 
-    def _load_projection_revision(
+    def _load_projection_state(
         self,
         *,
         project_id: str,
         promotion_id: str,
-    ) -> int:
+    ) -> tuple[int, int | None]:
         try:
             result = self._clickhouse.query(
                 f"""
-                SELECT applied_revision
+                SELECT
+                    applied_revision,
+                    (
+                        SELECT count()
+                        FROM {CLICKHOUSE_EXCLUSION_RELATION}
+                        WHERE project_id = {{project_id:String}}
+                          AND promotion_id = {{promotion_id:String}}
+                          AND state IN ('reserved', 'consumed')
+                    ) AS active_user_count
                 FROM {CLICKHOUSE_PROJECTION_REVISION_RELATION}
                 WHERE project_id = {{project_id:String}}
                   AND promotion_id = {{promotion_id:String}}
@@ -320,11 +381,16 @@ class PromotionAudienceExclusionRepository:
             else list(result.result_rows)
         )
         if not rows:
-            return 0
+            return 0, None
         row = rows[0]
         if isinstance(row, Mapping):
-            return int(row["applied_revision"])
-        return int(row[0])
+            active_user_count = row.get("active_user_count")
+            return int(row["applied_revision"]), (
+                int(active_user_count)
+                if active_user_count is not None
+                else None
+            )
+        return int(row[0]), (int(row[1]) if len(row) > 1 else None)
 
 
 def _is_missing_clickhouse_contract(exc: Exception) -> bool:

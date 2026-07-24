@@ -15,6 +15,7 @@ from app.audience_exclusions import (
     PromotionAudienceExclusionContext,
     PromotionAudienceExclusionReader,
     PromotionAudienceExclusionRepository,
+    promotion_target_is_active_sql,
 )
 
 
@@ -111,7 +112,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     AND excluded.promotion_id = %s
                     AND excluded.user_id = search.user_id
                     AND excluded.state IN ('reserved', 'consumed')
-                    AND target.status <> 'stopped'
+                    AND {promotion_target_is_active_sql("target")}
               )
             """
             exclusion_params = (promotion_id,)
@@ -1091,7 +1092,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                   AND excluded.promotion_id = %s
                   AND excluded.user_id = {user_expression}
                   AND excluded.state IN ('reserved', 'consumed')
-                  AND target.status <> 'stopped'
+                  AND {promotion_target_is_active_sql("target")}
             )
             """,
             (context.promotion_id,),
