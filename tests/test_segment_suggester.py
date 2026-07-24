@@ -873,6 +873,74 @@ def test_raw_event_suggester_applies_demographic_instruction_to_profiles() -> No
     assert "profile_hint" in segments[0].rule_json["compiled_conditions"]
 
 
+def test_raw_event_suggester_relaxes_demographic_then_season_anchor() -> None:
+    raw_reader = FakeRawEventSignalRepository(
+        [
+            raw_signal(
+                "destination_detail_001",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=0,
+                destination_values=("제주 호텔",),
+                segment_property_match_count=0,
+            ),
+            raw_signal(
+                "destination_detail_002",
+                hotel_search_count=2,
+                hotel_detail_view_count=2,
+                destination_match_count=1,
+                season_match_count=0,
+                destination_values=("오키나와 호텔",),
+                segment_property_match_count=0,
+            ),
+            raw_signal(
+                "destination_baseline_001",
+                hotel_search_count=1,
+                destination_match_count=1,
+                season_match_count=0,
+                destination_values=("제주 호텔",),
+                segment_property_match_count=0,
+            ),
+        ]
+    )
+    suggester = VectorClusterSegmentSuggester(
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        raw_event_signal_repository=raw_reader,
+        promotion_intent_extractor=DeterministicPromotionIntentExtractor(),
+        vector_pool_limit=10,
+        vector_sample_limit=10,
+        max_suggested_segments=3,
+        min_cluster_size=2,
+    )
+
+    segments = suggester.suggest_segments(
+        promotion=promotion_record(
+            message_brief=(
+                "여름 휴가를 준비하는 20~30대 사용자를 대상으로 "
+                "제주/오키나와 숙소 예약을 유도합니다."
+            ),
+        )
+    )
+
+    assert segments
+    for segment in segments:
+        beam_search = segment.profile_json["beam_search"]
+        assert beam_search["relaxed_condition_keys"] == [
+            "age_group",
+            "season_months",
+        ]
+        assert "season_match" not in segment.rule_json["compiled_conditions"]
+        assert "profile_hint" not in segment.rule_json["compiled_conditions"]
+        ast = segment.rule_json["promotion_audience_ast"]
+        assert ast["season_months"] == []
+        assert not any(
+            property_filter["key"] == "age_group"
+            for condition in ast["structured_conditions"]
+            for property_filter in condition["property_filters"]
+        )
+
+
 def test_openai_intent_extractor_keeps_segment_candidate_constraint() -> None:
     captured: dict[str, Any] = {}
 
@@ -1593,9 +1661,10 @@ def test_raw_event_suggester_selects_diverse_portfolio_without_rank_copy() -> No
         "bounded_beam_search"
     )
     assert first_profile["beam_search"]["policy_version"] == (
-        "promotion-audience-beam.v2"
+        "promotion-audience-beam.v3"
     )
     assert first_profile["beam_search"]["depth"] == 1
+    assert first_profile["beam_search"]["relaxed_condition_keys"] == []
     estimate = first_profile["performance_estimate"]
     assert estimate["label"] == "행동 기반 예상 예약 전환율"
     assert estimate["is_incremental_effect"] is False

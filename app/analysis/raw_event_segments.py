@@ -864,6 +864,9 @@ def _generate_beam_candidates(
                 "maximum_final_candidates": result.policy.maximum_final_candidates,
                 "generated_candidate_count": result.generated_candidate_count,
                 "pruned_candidate_counts": dict(result.pruned_candidate_counts),
+                "relaxed_condition_keys": list(
+                    result.relaxed_condition_keys
+                ),
             },
         )
         if candidate is not None:
@@ -888,6 +891,23 @@ def _raw_event_candidate_from_beam(
         for user_id in beam_candidate.user_ids
         if user_id in profiles_by_user_id
     ]
+    relaxed_condition_keys = {
+        str(value)
+        for value in beam_search_metadata.get(
+            "relaxed_condition_keys",
+            (),
+        )
+    }
+    active_property_conditions = tuple(
+        condition
+        for condition in intent.segment_property_conditions
+        if condition.property_key not in relaxed_condition_keys
+    )
+    active_season_months = (
+        ()
+        if "season_months" in relaxed_condition_keys
+        else season_months_from_intent(intent)
+    )
     matched_condition_keys = tuple(
         choice.predicate_key for choice in beam_candidate.choices
     )
@@ -896,9 +916,9 @@ def _raw_event_candidate_from_beam(
             *matched_condition_keys,
             "recent_destination_search",
         )
-    if intent.season:
+    if active_season_months:
         matched_condition_keys = (*matched_condition_keys, "season_match")
-    if intent.segment_property_conditions:
+    if active_property_conditions:
         matched_condition_keys = (*matched_condition_keys, "profile_hint")
     candidate = _candidate_from_profiles(
         candidate_type=beam_candidate.candidate_type,
@@ -917,7 +937,7 @@ def _raw_event_candidate_from_beam(
         identity_strategy_key=beam_candidate.strategy_key,
         audience_parameters=RawEventAudienceParameters(
             destination_ids=tuple(intent.destinations),
-            season_months=season_months_from_intent(intent),
+            season_months=active_season_months,
             benefit_keys=tuple(intent.benefits),
         ),
     )
