@@ -931,7 +931,14 @@ def _render_offer_card_cell(
         if discount_rate
         else '<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#edf2f7;color:#53657d;font-size:11px;font-weight:700;">특별가</span>'
     )
-    price_html = _offer_card_price_html(price_tiers)
+    price_html = _offer_card_price_html(
+        price_tiers,
+        offer_id=required_value(raw_offer, "offer_id"),
+        price_display_mode=price_display_mode,
+        additional_discount_rate=_optional_percentage(
+            raw_offer.get("additional_discount_rate_percent")
+        ),
+    )
     return "\n".join(
         [
             '<td width="50%" valign="top" style="width:50%;padding:7px;">',
@@ -1517,7 +1524,9 @@ def _destination_label(value: object) -> str:
 
 @dataclass(frozen=True)
 class _OfferPriceTier:
+    key: str
     label: str
+    amount: int
     formatted: str
     emphasized: bool
     struck: bool = False
@@ -1540,21 +1549,23 @@ def _offer_price_tiers(
     *,
     price_display_mode: str | None,
 ) -> tuple[_OfferPriceTier, ...]:
-    final_price = _won_price(raw_offer.get("sale_price_per_night"))
-    regular_price = _optional_won_price(
+    final_amount = _price_amount(raw_offer.get("sale_price_per_night"))
+    regular_amount = _optional_price_amount(
         raw_offer.get("original_price_per_night")
     )
-    promotion_price = _optional_won_price(
+    promotion_amount = _optional_price_amount(
         raw_offer.get("promotion_price_per_night")
     )
 
-    if promotion_price is not None:
+    if promotion_amount is not None:
         tiers: list[_OfferPriceTier] = []
-        if price_display_mode == PRICE_DISPLAY_ALL_TIERS and regular_price:
+        if price_display_mode == PRICE_DISPLAY_ALL_TIERS and regular_amount is not None:
             tiers.append(
                 _OfferPriceTier(
+                    key="original",
                     label="정상가",
-                    formatted=regular_price,
+                    amount=regular_amount,
+                    formatted=_format_won_price(regular_amount),
                     emphasized=False,
                     struck=True,
                 )
@@ -1562,39 +1573,49 @@ def _offer_price_tiers(
         tiers.extend(
             (
                 _OfferPriceTier(
+                    key="promotion",
                     label="프로모션가",
-                    formatted=promotion_price,
+                    amount=promotion_amount,
+                    formatted=_format_won_price(promotion_amount),
                     emphasized=False,
                     struck=True,
                 ),
                 _OfferPriceTier(
+                    key="final",
                     label="추가 할인가",
-                    formatted=final_price,
+                    amount=final_amount,
+                    formatted=_format_won_price(final_amount),
                     emphasized=True,
                 ),
             )
         )
         return tuple(tiers)
 
-    if regular_price is not None:
+    if regular_amount is not None:
         return (
             _OfferPriceTier(
+                key="original",
                 label="정상가",
-                formatted=regular_price,
+                amount=regular_amount,
+                formatted=_format_won_price(regular_amount),
                 emphasized=False,
                 struck=True,
             ),
             _OfferPriceTier(
+                key="promotion",
                 label="프로모션가",
-                formatted=final_price,
+                amount=final_amount,
+                formatted=_format_won_price(final_amount),
                 emphasized=True,
             ),
         )
 
     return (
         _OfferPriceTier(
+            key="final",
             label="1박",
-            formatted=final_price,
+            amount=final_amount,
+            formatted=_format_won_price(final_amount),
             emphasized=True,
         ),
     )
@@ -1616,43 +1637,75 @@ def _offer_discount_percentage(raw_offer: Mapping[str, Any]) -> str | None:
 
 def _offer_card_price_html(
     price_tiers: tuple[_OfferPriceTier, ...],
+    *,
+    offer_id: str,
+    price_display_mode: str | None,
+    additional_discount_rate: str | None,
 ) -> str:
     rows: list[str] = []
     for price_tier in price_tiers:
         if price_tier.emphasized:
+            label = price_tier.label
+            if additional_discount_rate and price_tier.key == "final":
+                label = f"{additional_discount_rate} 추가 할인가"
             rows.append(
-                '<span style="display:block;color:#ef476f;font-size:19px;'
-                'line-height:25px;font-weight:800;">'
-                f"{html.escape(price_tier.label)} "
+                f'<span data-loopad-price-tier="{price_tier.key}" '
+                f'data-loopad-price-amount="{price_tier.amount}" '
+                'style="display:block;white-space:nowrap;word-break:keep-all;'
+                'color:#ef476f;font-size:14px;line-height:22px;'
+                'font-weight:800;letter-spacing:0;">'
+                f"{html.escape(label)} "
                 f"{html.escape(price_tier.formatted)} / 박"
                 "</span>"
             )
             continue
         text_decoration = "text-decoration:line-through;" if price_tier.struck else ""
         rows.append(
-            '<span style="display:block;color:#718096;font-size:12px;'
-            f'line-height:18px;{text_decoration}">'
+            f'<span data-loopad-price-tier="{price_tier.key}" '
+            f'data-loopad-price-amount="{price_tier.amount}" '
+            'style="display:block;white-space:nowrap;word-break:keep-all;'
+            'color:#718096;font-size:11px;line-height:17px;letter-spacing:0;'
+            f'{text_decoration}">'
             f"{html.escape(price_tier.label)} "
             f"{html.escape(price_tier.formatted)}"
             "</span>"
         )
-    return "".join(rows)
+    display_mode = price_display_mode or "legacy"
+    return (
+        f'<div data-loopad-price-contract="offer-price.v1" '
+        f'data-loopad-price-offer-id="{html.escape(offer_id, quote=True)}" '
+        f'data-loopad-price-display-mode="{html.escape(display_mode, quote=True)}">'
+        f'{"".join(rows)}</div>'
+    )
 
 
 def _won_price(value: object) -> str:
+    return _format_won_price(_price_amount(value))
+
+
+def _price_amount(value: object) -> int:
     try:
         amount = int(value)
     except (TypeError, ValueError) as exc:
         raise ArtifactRenderError("offer sale price must be an integer") from exc
     if amount < 0:
         raise ArtifactRenderError("offer sale price must not be negative")
+    return amount
+
+
+def _format_won_price(amount: int) -> str:
     return f"{amount:,}원"
 
 
 def _optional_won_price(value: object) -> str | None:
+    amount = _optional_price_amount(value)
+    return _format_won_price(amount) if amount is not None else None
+
+
+def _optional_price_amount(value: object) -> int | None:
     if value is None:
         return None
-    return _won_price(value)
+    return _price_amount(value)
 
 
 def _optional_percentage(value: object) -> str | None:
