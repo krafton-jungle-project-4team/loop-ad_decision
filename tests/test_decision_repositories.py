@@ -2278,7 +2278,24 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
 def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -> None:
     cutoff = datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
     client = FakeClickHouseClient(
-        rows=[(216, 130, 16, 350, 9, 40, 24, Decimal("720000"), Decimal("510000"))]
+        rows=[
+            (
+                216,
+                130,
+                16,
+                350,
+                9,
+                40,
+                24,
+                Decimal("720000"),
+                Decimal("510000"),
+                103,
+                82,
+                21,
+                Decimal("238000"),
+                Decimal("184000"),
+            )
+        ]
     )
     repo = EvaluationMetricRepository(client)
 
@@ -2302,6 +2319,11 @@ def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -
         booking_complete_user_count=24,
         booking_abandon_median_revenue=Decimal("720000"),
         booking_complete_median_revenue=Decimal("510000"),
+        high_price_booking_start_user_count=103,
+        high_price_booking_abandon_user_count=82,
+        high_price_booking_complete_user_count=21,
+        booking_abandon_median_nightly_price=Decimal("238000"),
+        booking_complete_median_nightly_price=Decimal("184000"),
     )
     call = client.calls[0]
     sql = compact_sql(call.query)
@@ -2310,6 +2332,9 @@ def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -
     assert "tointervalday({lookback_days:uint16})" in sql
     assert "in {destination_ids:array(string)}" in sql
     assert "quantileexactif(0.5)" in sql
+    assert "booking_start_prices" in sql
+    assert "jsonextractstring(price_events.properties_json, 'price')" in sql
+    assert "nightly_price > {high_price_threshold:float64}" in sql
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
@@ -2319,6 +2344,7 @@ def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -
         "destination_ids": ["jeju", "okinawa"],
         "evaluation_cutoff_at": cutoff,
         "lookback_days": 30,
+        "high_price_threshold": 200000.0,
     }
 
 

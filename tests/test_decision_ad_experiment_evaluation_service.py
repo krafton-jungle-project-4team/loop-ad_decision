@@ -118,7 +118,7 @@ def test_ad_experiment_evaluation_calculates_booking_goal_not_met() -> None:
         "denominator": "promotion_click",
     }
     diagnosis = inserted.result_json["diagnosis"]
-    assert diagnosis["version"] == "dec.evaluation-diagnosis.v3"
+    assert diagnosis["version"] == "dec.evaluation-diagnosis.v4"
     assert diagnosis["status"] == "goal_not_met"
     assert diagnosis["summary"] == response.feedback
     assert diagnosis["observed_bottleneck"] == (
@@ -188,6 +188,11 @@ def test_goal_not_met_includes_booking_intent_cohort_analysis() -> None:
             booking_complete_user_count=24,
             booking_abandon_median_revenue=Decimal("720000"),
             booking_complete_median_revenue=Decimal("510000"),
+            high_price_booking_start_user_count=103,
+            high_price_booking_abandon_user_count=82,
+            high_price_booking_complete_user_count=21,
+            booking_abandon_median_nightly_price=Decimal("238000"),
+            booking_complete_median_nightly_price=Decimal("184000"),
         ),
     )
 
@@ -197,30 +202,23 @@ def test_goal_not_met_includes_booking_intent_cohort_analysis() -> None:
     )
 
     diagnosis = repos.evaluations.inserted[0].result_json["diagnosis"]
-    analysis = diagnosis["audience_intent_analysis"]
+    assert diagnosis["audience_intent_analysis"] is None
+    analysis = diagnosis["price_abandonment_analysis"]
     assert analysis["title"] == (
-        "초기 고객군 안에서 현재 예약 의도의 차이가 확인됐습니다"
+        "높은 1박 가격이 예약 완료에 부담이 되었을 가능성이 있습니다"
     )
-    assert analysis["cohort_comparison"] == {
-        "lookback_days": 30,
-        "repeat_detail_minimum_count": 2,
-        "repeat_view_user_count": 130,
-        "repeat_view_booking_count": 16,
-        "repeat_view_conversion_rate": "0.123077",
-        "comparison_user_count": 350,
-        "comparison_booking_count": 9,
-        "comparison_conversion_rate": "0.025714",
-    }
-    assert analysis["booking_value_comparison"] == {
+    assert analysis["price_abandonment"] == {
         "currency": "KRW",
-        "abandoned_user_count": 40,
-        "completed_user_count": 24,
-        "abandoned_median_revenue": "720000",
-        "completed_median_revenue": "510000",
+        "nightly_price_threshold": "200000",
+        "booking_start_user_count": 103,
+        "booking_abandon_user_count": 82,
+        "booking_complete_user_count": 21,
+        "booking_abandon_median_nightly_price": "238000",
+        "booking_complete_median_nightly_price": "184000",
     }
     assert analysis["next_segment_hypothesis"]["condition_labels"] == [
         "20~30대",
-        "최근 30일 제주·오키나와 숙소 상세 2회 이상",
+        "최근 7일 제주·오키나와 숙소 1박 가격 20만 원 초과",
         "예약 시작 후 미완료",
     ]
     assert any("가능성이 있습니다" in item for item in analysis["paragraphs"])

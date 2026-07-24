@@ -1067,7 +1067,7 @@ def _build_evaluation_diagnosis(
             "CTA 문구와 연결되는 랜딩 내용의 일치도 강화",
         ]
 
-    audience_intent_analysis = _build_audience_intent_analysis(
+    price_abandonment_analysis = _build_price_abandonment_analysis(
         status=status,
         target_value=target_value,
         actual_value=actual_value,
@@ -1078,7 +1078,7 @@ def _build_evaluation_diagnosis(
     )
 
     return {
-        "version": "dec.evaluation-diagnosis.v3",
+        "version": "dec.evaluation-diagnosis.v4",
         "status": status,
         "summary": summary,
         "observed_bottleneck": bottleneck,
@@ -1089,12 +1089,13 @@ def _build_evaluation_diagnosis(
         "evidence_strength": evidence_strength,
         "limitations": limitations,
         "data_origin": _evaluation_data_origin(counts.funnel),
-        "audience_intent_analysis": audience_intent_analysis,
+        "audience_intent_analysis": None,
+        "price_abandonment_analysis": price_abandonment_analysis,
         "funnel": funnel,
     }
 
 
-def _build_audience_intent_analysis(
+def _build_price_abandonment_analysis(
     *,
     status: str,
     target_value: Decimal,
@@ -1109,20 +1110,10 @@ def _build_audience_intent_analysis(
         status != PromotionEvaluationStatus.GOAL_NOT_MET.value
         or funnel is None
         or cohorts is None
-        or cohorts.repeat_view_user_count == 0
-        or cohorts.comparison_user_count == 0
+        or cohorts.high_price_booking_start_user_count == 0
     ):
         return None
 
-    repeat_rate = _ratio_decimal(
-        cohorts.repeat_view_booking_count,
-        cohorts.repeat_view_user_count,
-    )
-    comparison_rate = _ratio_decimal(
-        cohorts.comparison_booking_count,
-        cohorts.comparison_user_count,
-    )
-    has_intent_difference = repeat_rate > comparison_rate
     destination_label = _destination_display_label(destination_ids)
     destination_phrase = (
         f"{destination_label} 숙소"
@@ -1134,87 +1125,64 @@ def _build_audience_intent_analysis(
         (
             f"목표 예약 전환율은 {_format_percent(target_value)}였지만 실제 전환율은 "
             f"{_format_percent(actual_value)}였습니다. 광고 반응 고객 "
-            f"{counts.denominator_count}명 중 {cohorts.ad_click_count}명이 광고 링크를 "
-            f"눌렀고 {funnel.hotel_detail_view_count}명이 숙소 상세까지 확인해 "
-            "여행지와 프로모션에 대한 관심은 확인됐습니다."
+            f"{counts.denominator_count}명 중 {funnel.booking_start_count}명이 예약을 "
+            f"시작했고 {funnel.booking_complete_count}명만 완료했습니다."
         ),
         (
-            f"하지만 예약을 시작한 {funnel.booking_start_count}명 중 "
-            f"{funnel.booking_complete_count}명만 예약을 완료했습니다. 가장 큰 이탈은 "
-            "예약 시작과 완료 사이에서 발생했습니다."
+            f"이 가운데 1박 가격이 20만 원을 초과한 {destination_phrase}를 선택하고 "
+            f"예약을 시작한 고객은 {cohorts.high_price_booking_start_user_count}명이었고, "
+            f"{cohorts.high_price_booking_abandon_user_count}명이 예약을 완료하지 "
+            "않았습니다. 높은 1박 가격이 결제 직전 결정에 부담이 되었을 가능성이 "
+            "있습니다."
         ),
         (
-            "초기 고객군은 프로모션 관심 고객을 확보한다는 점에서는 합리적이었습니다. "
-            f"다만 실험 전 {destination_phrase}를 반복 조회한 고객의 전환율은 "
-            f"{_format_rate_one_decimal(repeat_rate)}, 일회성 또는 과거 조회 고객은 "
-            f"{_format_rate_one_decimal(comparison_rate)}로 현재 예약 의도에 "
-            f"{'차이가 있었습니다.' if has_intent_difference else '뚜렷한 차이가 확인되지 않았습니다.'}"
+            "가격과 예약 이탈의 연관성은 관측됐지만 가격이 직접 원인이라고 단정할 수는 "
+            "없습니다. 다음 실험에서 해당 고객에게 추가 할인을 제시해 가설을 검증해 "
+            "보세요."
         ),
     ]
-    value_comparison = _booking_value_comparison(cohorts)
-    if value_comparison is not None:
-        paragraphs.append(value_comparison["narrative"])
-    paragraphs.append(
-        f"다음 실험에서는 {destination_phrase}를 반복해서 확인하고 예약 단계까지 "
-        "진입한 고객을 별도로 검증해 보세요."
-    )
 
     condition_labels: list[str] = []
     if age_groups:
         condition_labels.append(_age_group_display_label(age_groups))
     condition_labels.extend(
         [
-            f"최근 30일 {destination_phrase} 상세 2회 이상",
+            f"최근 7일 {destination_phrase} 1박 가격 20만 원 초과",
             "예약 시작 후 미완료",
         ]
     )
     return {
-        "version": "dec.audience-intent-analysis.v1",
-        "title": "초기 고객군 안에서 현재 예약 의도의 차이가 확인됐습니다",
+        "version": "dec.price-abandonment-analysis.v1",
+        "title": "높은 1박 가격이 예약 완료에 부담이 되었을 가능성이 있습니다",
         "paragraphs": paragraphs,
-        "cohort_comparison": {
-            "lookback_days": 30,
-            "repeat_detail_minimum_count": 2,
-            "repeat_view_user_count": cohorts.repeat_view_user_count,
-            "repeat_view_booking_count": cohorts.repeat_view_booking_count,
-            "repeat_view_conversion_rate": str(repeat_rate),
-            "comparison_user_count": cohorts.comparison_user_count,
-            "comparison_booking_count": cohorts.comparison_booking_count,
-            "comparison_conversion_rate": str(comparison_rate),
-        },
-        "booking_value_comparison": (
-            None if value_comparison is None else value_comparison["facts"]
-        ),
-        "next_segment_hypothesis": {
-            "lookback_days": 30,
-            "condition_labels": condition_labels,
-            "validation_note": (
-                "관측된 행동 차이를 바탕으로 만든 다음 실험 가설이며 성공을 보장하지 않습니다."
+        "price_abandonment": {
+            "currency": "KRW",
+            "nightly_price_threshold": "200000",
+            "booking_start_user_count": cohorts.high_price_booking_start_user_count,
+            "booking_abandon_user_count": (
+                cohorts.high_price_booking_abandon_user_count
+            ),
+            "booking_complete_user_count": (
+                cohorts.high_price_booking_complete_user_count
+            ),
+            "booking_abandon_median_nightly_price": (
+                None
+                if cohorts.booking_abandon_median_nightly_price is None
+                else str(cohorts.booking_abandon_median_nightly_price)
+            ),
+            "booking_complete_median_nightly_price": (
+                None
+                if cohorts.booking_complete_median_nightly_price is None
+                else str(cohorts.booking_complete_median_nightly_price)
             ),
         },
-    }
-
-
-def _booking_value_comparison(
-    cohorts: BookingIntentCohortRecord,
-) -> dict[str, Any] | None:
-    abandoned = cohorts.booking_abandon_median_revenue
-    completed = cohorts.booking_complete_median_revenue
-    if abandoned is None or completed is None or abandoned <= completed:
-        return None
-    return {
-        "narrative": (
-            "또한 예약 이탈 고객이 선택한 숙소 총액의 중앙값은 "
-            f"{_format_won(abandoned)}으로 예약 완료 고객의 {_format_won(completed)}보다 "
-            "높았습니다. 성수기 숙박 총액이나 취소 조건이 최종 결정에 부담이 "
-            "되었을 가능성이 있습니다."
-        ),
-        "facts": {
-            "currency": "KRW",
-            "abandoned_user_count": cohorts.booking_abandon_user_count,
-            "completed_user_count": cohorts.booking_complete_user_count,
-            "abandoned_median_revenue": str(abandoned),
-            "completed_median_revenue": str(completed),
+        "next_segment_hypothesis": {
+            "lookback_days": 7,
+            "condition_labels": condition_labels,
+            "validation_note": (
+                "관측된 가격과 이탈의 연관성을 바탕으로 만든 다음 실험 가설이며 "
+                "성공을 보장하지 않습니다."
+            ),
         },
     }
 
@@ -1228,6 +1196,9 @@ def _validate_booking_intent_cohorts(cohorts: BookingIntentCohortRecord) -> None
         cohorts.comparison_booking_count,
         cohorts.booking_abandon_user_count,
         cohorts.booking_complete_user_count,
+        cohorts.high_price_booking_start_user_count,
+        cohorts.high_price_booking_abandon_user_count,
+        cohorts.high_price_booking_complete_user_count,
     )
     if any(value < 0 for value in count_fields):
         raise ValueError("booking intent cohort counts must not be negative")
@@ -1235,9 +1206,17 @@ def _validate_booking_intent_cohorts(cohorts: BookingIntentCohortRecord) -> None
         raise ValueError("repeat-view bookings exceed cohort users")
     if cohorts.comparison_booking_count > cohorts.comparison_user_count:
         raise ValueError("comparison bookings exceed cohort users")
+    if (
+        cohorts.high_price_booking_abandon_user_count
+        + cohorts.high_price_booking_complete_user_count
+        > cohorts.high_price_booking_start_user_count
+    ):
+        raise ValueError("high-price outcomes exceed booking-start users")
     for value in (
         cohorts.booking_abandon_median_revenue,
         cohorts.booking_complete_median_revenue,
+        cohorts.booking_abandon_median_nightly_price,
+        cohorts.booking_complete_median_nightly_price,
     ):
         if value is not None and value < 0:
             raise ValueError("booking intent cohort revenue must not be negative")

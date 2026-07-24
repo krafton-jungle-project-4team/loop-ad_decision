@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 from app.analysis.audience_search import SearchCandidate
@@ -162,6 +162,7 @@ class PgClickHouseAudienceVectorSearchRepository:
         vector_version: str,
         source_revision_cutoff: datetime,
         window_start: datetime,
+        vector_window_start: datetime,
         window_end: datetime,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
@@ -192,6 +193,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     source_revision_cutoff
                 ),
                 "window_start": _datetime_string(window_start),
+                "vector_window_start": _datetime_string(vector_window_start),
                 "window_end": _datetime_string(window_end),
                 "destinations": list(predicate_parameters.get("destinations", ())),
                 "season_months": list(predicate_parameters.get("season_months", ())),
@@ -277,6 +279,7 @@ class PgClickHouseAudienceVectorSearchRepository:
         source_revision_cutoff: datetime,
         source_cutoff: datetime,
         window_start: datetime,
+        vector_window_start: datetime,
         query_vector: Sequence[float],
         score_threshold: float,
         hard_predicate_keys: Sequence[str],
@@ -307,6 +310,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     source_revision_cutoff
                 ),
                 "window_start": _datetime_string(window_start),
+                "vector_window_start": _datetime_string(vector_window_start),
                 "window_end": _datetime_string(source_cutoff),
                 "destinations": list(predicate_parameters.get("destinations", ())),
                 "season_months": list(predicate_parameters.get("season_months", ())),
@@ -1004,11 +1008,16 @@ class PgClickHouseAudienceVectorSearchRepository:
     ) -> list[SearchCandidate]:
         if not candidates:
             return []
-        window_start, raw_event_received_cutoff = self._generation_window(
+        generation_window_start, raw_event_received_cutoff = self._generation_window(
             project_id=project_id,
             vector_generation_id=vector_generation_id,
             vector_version=vector_version,
             source_cutoff=source_cutoff,
+        )
+        window_start = _observation_window_start(
+            generation_window_start=generation_window_start,
+            source_cutoff=source_cutoff,
+            predicate_parameters=predicate_parameters,
         )
         exclusion_context = self._exclusions_by_generation.get(
             vector_generation_id
@@ -1638,7 +1647,7 @@ def _hard_predicate_query(
               WHERE project_id = {project_id:String}
                 AND vector_version = {vector_version:String}
                 AND window_start = toDateTime64(
-                    parseDateTimeBestEffort({window_start:String}), 3, 'UTC'
+                    parseDateTimeBestEffort({vector_window_start:String}), 3, 'UTC'
                 )
                 AND window_end = toDateTime64(
                     parseDateTimeBestEffort({window_end:String}), 3, 'UTC'
@@ -1731,3 +1740,36 @@ def _datetime_string(value: str | datetime) -> str:
             value = value.astimezone(UTC)
         return value.strftime("%Y-%m-%d %H:%M:%S.%f")
     return value
+
+
+def _observation_window_start(
+    *,
+    generation_window_start: str | datetime,
+    source_cutoff: str | datetime,
+    predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+) -> datetime:
+    generation_start = _utc_datetime(generation_window_start)
+    window_values = predicate_parameters.get("observation_window_days", ())
+    if not window_values:
+        return generation_start
+    if len(window_values) != 1:
+        raise ValueError("observation_window_days must contain exactly one value")
+    window_days = window_values[0]
+    if (
+        not isinstance(window_days, int)
+        or isinstance(window_days, bool)
+        or not 1 <= window_days <= 365
+    ):
+        raise ValueError("observation_window_days must be between 1 and 365")
+    requested_start = _utc_datetime(source_cutoff) - timedelta(days=window_days)
+    return max(generation_start, requested_start)
+
+
+def _utc_datetime(value: str | datetime) -> datetime:
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
