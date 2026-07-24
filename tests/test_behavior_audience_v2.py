@@ -78,14 +78,12 @@ from app.audience_contract import (
     CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
     CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
     CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID,
-    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH,
     CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
     CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
     CUSTOM_STRUCTURED_CANDIDATE_TYPE,
     CUSTOM_STRUCTURED_CONDITION_KEY,
     CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
     CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
-    CUSTOM_STRUCTURED_TEMPLATE_HASH,
     CUSTOM_STRUCTURED_TEMPLATE_ID,
     CUSTOM_STRUCTURED_TEMPLATE_VERSION,
     CUSTOM_STRUCTURED_WINDOW_DAYS,
@@ -96,6 +94,7 @@ from app.audience_contract import (
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
     contract_score_threshold,
+    custom_structured_template_hash,
 )
 from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.vector_service import SegmentVectorBuildResult
@@ -278,6 +277,10 @@ def test_custom_structured_segment_compiles_exact_conditions_without_semantic_fi
     compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
         spec=resolution.spec
     )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
     assert compiled.hard_predicate_keys == (CUSTOM_STRUCTURED_CONDITION_KEY,)
     assert compiled.score_threshold == -1.0
     assert compiled.semantic_margin == 2.0
@@ -335,6 +338,39 @@ def test_custom_structured_segment_compiles_multiple_age_groups_as_one_filter() 
     parameters = _structured_query_parameters(compiled.predicate_parameters)
     assert "has({custom_0_property_0:Array(String)}, lowerUTF8(" in sql
     assert parameters["custom_0_property_0"] == ["20대", "30대"]
+
+
+def test_custom_structured_segment_preserves_seven_day_observation_window() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "booking_start",
+                "label": "고가 숙소 예약 시작",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [
+                    {"key": "price", "operator": "gte", "value": "200001"}
+                ],
+            }
+        ],
+        query_signal_keys=("booking_start_intensity",),
+        lookback_days=7,
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="recent_high_price_booking_start",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.observation_window_days == 7
+    assert resolution.spec.predicate_parameters["observation_window_days"] == (7,)
+    assert resolution.spec.template_semantic_hash == custom_structured_template_hash(
+        template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+        window_days=7,
+    )
 
 
 def test_source_refinement_intersects_structured_conditions_with_source_users() -> None:
@@ -1737,6 +1773,7 @@ def _custom_structured_rule(
     conditions: Sequence[Mapping[str, object]],
     query_signal_keys: Sequence[str],
     base_user_ids: Sequence[str] = (),
+    lookback_days: int = CUSTOM_STRUCTURED_WINDOW_DAYS,
 ) -> dict[str, object]:
     is_source_refinement = bool(base_user_ids)
     condition_keys = (
@@ -1758,16 +1795,21 @@ def _custom_structured_rule(
                 else CUSTOM_STRUCTURED_TEMPLATE_VERSION
             ),
             "template_semantic_hash": (
-                CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH
-                if is_source_refinement
-                else CUSTOM_STRUCTURED_TEMPLATE_HASH
+                custom_structured_template_hash(
+                    template_version=(
+                        CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+                        if is_source_refinement
+                        else CUSTOM_STRUCTURED_TEMPLATE_VERSION
+                    ),
+                    window_days=lookback_days,
+                )
             ),
             "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
             "condition_keys": condition_keys,
             "query_signal_keys": list(query_signal_keys),
             "hard_predicate_keys": condition_keys,
             "parameters": {
-                "lookback_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+                "lookback_days": lookback_days,
                 "conditions": list(conditions),
                 **(
                     {"base_user_ids": list(base_user_ids)}
@@ -1790,7 +1832,7 @@ def _custom_structured_rule(
                 if is_source_refinement
                 else CUSTOM_STRUCTURED_ANCHOR_POLICY_ID
             ),
-            "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+            "observation_window_days": lookback_days,
         },
     }
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.audience_contract import (
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
     SegmentAudienceContractError,
     SegmentAudienceSpec,
     SegmentDefinitionAudienceAdapter,
@@ -356,7 +358,12 @@ class AudienceV2Coordinator:
         window_days = int(
             (context.source_cutoff - context.window_start).total_seconds() / 86400
         )
-        if window_days != observation_window_days:
+        window_matches = (
+            observation_window_days <= window_days
+            if spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+            else observation_window_days == window_days
+        )
+        if not window_matches:
             raise SegmentAudienceContractError(
                 code="segment_audience_generation_incompatible",
                 segment_id=segment_id,
@@ -422,7 +429,8 @@ class AudienceV2Coordinator:
                         project_id=project_id,
                         vector_version=item.spec.vector_version,
                         source_revision_cutoff=context.source_revision_cutoff,
-                        window_start=context.window_start,
+                        window_start=self._observation_window_start(item),
+                        vector_window_start=context.window_start,
                         window_end=context.source_cutoff,
                         hard_predicate_keys=item.spec.hard_predicate_keys,
                         predicate_parameters=item.spec.predicate_parameters,
@@ -449,7 +457,8 @@ class AudienceV2Coordinator:
                 vector_version=spec.vector_version,
                 source_revision_cutoff=context.source_revision_cutoff,
                 source_cutoff=context.source_cutoff,
-                window_start=context.window_start,
+                window_start=self._observation_window_start(item),
+                vector_window_start=context.window_start,
                 query_vector=spec.query_vector,
                 score_threshold=spec.score_threshold,
                 hard_predicate_keys=spec.hard_predicate_keys,
@@ -488,7 +497,7 @@ class AudienceV2Coordinator:
                 segment_vector_id=item.segment_vector_id,
                 vector_generation_id=context.vector_generation_id,
                 source_cutoff=context.source_cutoff,
-                window_start=context.window_start,
+                window_start=self._observation_window_start(item),
                 window_end=context.source_cutoff,
                 spec=spec,
                 search_result=search_result,
@@ -525,6 +534,13 @@ class AudienceV2Coordinator:
                 else 0
             ),
         )
+
+    @staticmethod
+    def _observation_window_start(item: _CompiledAudience):
+        requested_start = item.context.source_cutoff - timedelta(
+            days=item.observation_window_days
+        )
+        return max(item.context.window_start, requested_start)
 
 
 def load_bundled_candidate_calibrations(
