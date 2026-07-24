@@ -220,10 +220,12 @@ def test_s3_loader_loads_verified_offer_catalog_with_public_image_path() -> None
             "hotel_name": "Jeju Ocean Breeze Resort",
             "destination_id": "jeju",
             "currency": "KRW",
-            "sale_price_per_night": 278000,
-            "original_price_per_night": 342000,
-            "discount_rate_percent": 19,
-            "image_path": "/stayloop/promotions/jeju-resort-exterior.png",
+                "sale_price_per_night": 278000,
+                "original_price_per_night": 342000,
+                "promotion_price_per_night": None,
+                "discount_rate_percent": 19,
+                "additional_discount_rate_percent": None,
+                "image_path": "/stayloop/promotions/jeju-resort-exterior.png",
             "asset_id": "hotel-jeju-ocean-breeze-006-hero",
         }
     ]

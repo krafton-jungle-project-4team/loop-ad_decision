@@ -13,6 +13,8 @@ from app.generation.email_variants import (
     COMPARISON_VARIANT,
     EDITORIAL_VARIANT,
     OFFER_CARDS_VARIANT,
+    PRICE_DISPLAY_ALL_TIERS,
+    PRICE_DISPLAY_PROMOTION_AND_FINAL,
     email_required_placeholders,
 )
 from app.generation.schemas import ContentChannel, CreativeFormat
@@ -50,6 +52,7 @@ CREATIVE_CONTRACT_FIELDS = (
     "featured_offers",
     "comparison_offers",
     "catalog",
+    "price_display_mode",
 )
 _CREATIVE_SOURCE_META_PATTERN = re.compile(
     rf'<meta name="{re.escape(CREATIVE_SOURCE_META_NAME)}" content="([A-Za-z0-9_-]+)">'
@@ -613,8 +616,13 @@ def render_editorial_email(content_values: Mapping[str, Any]) -> str:
     raw_featured_offers = content_values.get("featured_offers")
     if not isinstance(raw_featured_offers, list) or not raw_featured_offers:
         raise ArtifactRenderError("editorial email requires featured_offers")
+    price_display_mode = _price_display_mode(content_values)
     story_sections = [
-        _render_editorial_offer_section(raw_offer, position=index)
+        _render_editorial_offer_section(
+            raw_offer,
+            position=index,
+            price_display_mode=price_display_mode,
+        )
         for index, raw_offer in enumerate(raw_featured_offers, start=1)
     ]
     html_body = "\n".join(
@@ -690,7 +698,12 @@ def render_editorial_email(content_values: Mapping[str, Any]) -> str:
     return html_body
 
 
-def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
+def _render_editorial_offer_section(
+    raw_offer: object,
+    *,
+    position: int,
+    price_display_mode: str | None,
+) -> str:
     if not isinstance(raw_offer, Mapping):
         raise ArtifactRenderError("editorial featured offer must be an object")
     hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
@@ -700,10 +713,14 @@ def _render_editorial_offer_section(raw_offer: object, *, position: int) -> str:
         required_value(raw_offer, "image_url"),
         label="editorial offer image_url",
     )
-    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
-    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
+    price_copy = _inline_price_copy(
+        _offer_price_tiers(
+            raw_offer,
+            price_display_mode=price_display_mode,
+        )
+    )
+    discount_rate = _offer_discount_percentage(raw_offer)
     title, description = _destination_editorial_copy(destination_id)
-    price_copy = f"{sale_price} / 1박"
     if discount_rate:
         price_copy = f"{price_copy} · {discount_rate} 할인"
     image_cell = "\n".join(
@@ -777,6 +794,7 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
     first_offer = raw_offers[0]
     if not isinstance(first_offer, Mapping):
         raise ArtifactRenderError("offer card entry must be an object")
+    price_display_mode = _price_display_mode(content_values)
     image_url = escaped_absolute_url(
         required_value(first_offer, "image_url"),
         label="offer image_url",
@@ -805,6 +823,7 @@ def render_offer_cards_email(content_values: Mapping[str, Any]) -> str:
                     raw_offer,
                     position=original_position,
                     cta=cta,
+                    price_display_mode=price_display_mode,
                 )
                 for original_position, raw_offer in pair
             ]
@@ -885,6 +904,7 @@ def _render_offer_card_cell(
     *,
     position: int,
     cta: str,
+    price_display_mode: str | None,
 ) -> str:
     if not isinstance(raw_offer, Mapping):
         raise ArtifactRenderError("offer card entry must be an object")
@@ -898,19 +918,20 @@ def _render_offer_card_cell(
     expected_placeholder = f"{{{{offer_redirect_url_{position}}}}}"
     if placeholder != expected_placeholder:
         raise ArtifactRenderError("offer redirect placeholder order is invalid")
-    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
-    original_price = _optional_won_price(raw_offer.get("original_price_per_night"))
-    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
+    price_tiers = _offer_price_tiers(
+        raw_offer,
+        price_display_mode=price_display_mode,
+    )
+    discount_rate = _offer_discount_percentage(raw_offer)
+    has_additional_discount = (
+        raw_offer.get("additional_discount_rate_percent") is not None
+    )
     badge = (
-        f'<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#e8f1ff;color:#0f55c8;font-size:11px;font-weight:700;">{discount_rate} 할인</span>'
+        f'<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#e8f1ff;color:#0f55c8;font-size:11px;font-weight:700;">{"추가 " if has_additional_discount else ""}{discount_rate} 할인</span>'
         if discount_rate
         else '<span style="display:inline-block;padding:3px 7px;border-radius:999px;background:#edf2f7;color:#53657d;font-size:11px;font-weight:700;">특별가</span>'
     )
-    original_html = (
-        f'<span style="margin-left:6px;color:#8896a8;font-size:12px;text-decoration:line-through;">{original_price}</span>'
-        if original_price
-        else ""
-    )
+    price_html = _offer_card_price_html(price_tiers)
     return "\n".join(
         [
             '<td width="50%" valign="top" style="width:50%;padding:7px;">',
@@ -923,7 +944,7 @@ def _render_offer_card_cell(
             f'        <div style="margin-bottom:7px;">{badge}</div>',
             f'        <strong style="display:block;min-height:42px;font-size:15px;line-height:21px;color:#10233f;">{hotel_name}</strong>',
             f'        <span style="display:block;margin:4px 0 12px;font-size:12px;line-height:18px;color:#718096;">{destination}</span>',
-            f'        <div style="margin-bottom:12px;"><strong style="color:#e74773;font-size:18px;">{sale_price}</strong>{original_html}<span style="color:#718096;font-size:11px;"> / 박</span></div>',
+            f'        <div style="margin-bottom:12px;">{price_html}</div>',
             f'        <a href="{placeholder}" style="display:block;padding:10px 8px;border-radius:7px;background:#0F55C8;color:#ffffff;font-size:13px;line-height:18px;font-weight:700;text-align:center;text-decoration:none;">{cta}</a>',
             "      </td>",
             "    </tr>",
@@ -944,6 +965,7 @@ def render_comparison_email(content_values: Mapping[str, Any]) -> str:
     first_offer = raw_comparison_offers[0]
     if not isinstance(first_offer, Mapping):
         raise ArtifactRenderError("comparison offer must be an object")
+    price_display_mode = _price_display_mode(content_values)
     image_url = escaped_absolute_url(
         required_value(first_offer, "image_url"),
         label="comparison image_url",
@@ -962,9 +984,12 @@ def render_comparison_email(content_values: Mapping[str, Any]) -> str:
             _render_comparison_offer_row(
                 raw_offer,
                 destination_position=destination_positions[destination_id],
+                price_display_mode=price_display_mode,
             )
         )
-        raw_discount = raw_offer.get("discount_rate_percent")
+        raw_discount = raw_offer.get("additional_discount_rate_percent")
+        if raw_discount is None:
+            raw_discount = raw_offer.get("discount_rate_percent")
         if raw_discount is not None:
             try:
                 discount_rates.append(int(raw_discount))
@@ -1039,6 +1064,7 @@ def _render_comparison_offer_row(
     raw_offer: Mapping[str, Any],
     *,
     destination_position: int,
+    price_display_mode: str | None,
 ) -> str:
     hotel_name = html.escape(required_value(raw_offer, "hotel_name"))
     destination = html.escape(
@@ -1048,9 +1074,13 @@ def _render_comparison_offer_row(
         required_value(raw_offer, "image_url"),
         label="comparison image_url",
     )
-    sale_price = _won_price(raw_offer.get("sale_price_per_night"))
-    discount_rate = _optional_percentage(raw_offer.get("discount_rate_percent"))
-    price_copy = f"{sale_price} / 1박"
+    price_copy = _inline_price_copy(
+        _offer_price_tiers(
+            raw_offer,
+            price_display_mode=price_display_mode,
+        )
+    )
+    discount_rate = _offer_discount_percentage(raw_offer)
     if discount_rate:
         price_copy = f"{price_copy} · {discount_rate} 할인"
     return "\n".join(
@@ -1483,6 +1513,130 @@ def _destination_label(value: object) -> str:
     labels = {"jeju": "제주", "okinawa": "오키나와"}
     destination_id = str(value or "").strip().casefold()
     return labels.get(destination_id, destination_id or "추천 여행지")
+
+
+@dataclass(frozen=True)
+class _OfferPriceTier:
+    label: str
+    formatted: str
+    emphasized: bool
+    struck: bool = False
+
+
+def _price_display_mode(content_values: Mapping[str, Any]) -> str | None:
+    value = str(content_values.get("price_display_mode") or "").strip()
+    if not value:
+        return None
+    if value not in {
+        PRICE_DISPLAY_PROMOTION_AND_FINAL,
+        PRICE_DISPLAY_ALL_TIERS,
+    }:
+        raise ArtifactRenderError("email price display mode is invalid")
+    return value
+
+
+def _offer_price_tiers(
+    raw_offer: Mapping[str, Any],
+    *,
+    price_display_mode: str | None,
+) -> tuple[_OfferPriceTier, ...]:
+    final_price = _won_price(raw_offer.get("sale_price_per_night"))
+    regular_price = _optional_won_price(
+        raw_offer.get("original_price_per_night")
+    )
+    promotion_price = _optional_won_price(
+        raw_offer.get("promotion_price_per_night")
+    )
+
+    if promotion_price is not None:
+        tiers: list[_OfferPriceTier] = []
+        if price_display_mode == PRICE_DISPLAY_ALL_TIERS and regular_price:
+            tiers.append(
+                _OfferPriceTier(
+                    label="정상가",
+                    formatted=regular_price,
+                    emphasized=False,
+                    struck=True,
+                )
+            )
+        tiers.extend(
+            (
+                _OfferPriceTier(
+                    label="프로모션가",
+                    formatted=promotion_price,
+                    emphasized=False,
+                    struck=True,
+                ),
+                _OfferPriceTier(
+                    label="추가 할인가",
+                    formatted=final_price,
+                    emphasized=True,
+                ),
+            )
+        )
+        return tuple(tiers)
+
+    if regular_price is not None:
+        return (
+            _OfferPriceTier(
+                label="정상가",
+                formatted=regular_price,
+                emphasized=False,
+                struck=True,
+            ),
+            _OfferPriceTier(
+                label="프로모션가",
+                formatted=final_price,
+                emphasized=True,
+            ),
+        )
+
+    return (
+        _OfferPriceTier(
+            label="1박",
+            formatted=final_price,
+            emphasized=True,
+        ),
+    )
+
+
+def _inline_price_copy(price_tiers: tuple[_OfferPriceTier, ...]) -> str:
+    return " · ".join(
+        f"{price_tier.label} {price_tier.formatted}"
+        for price_tier in price_tiers
+    )
+
+
+def _offer_discount_percentage(raw_offer: Mapping[str, Any]) -> str | None:
+    value = raw_offer.get("additional_discount_rate_percent")
+    if value is None:
+        value = raw_offer.get("discount_rate_percent")
+    return _optional_percentage(value)
+
+
+def _offer_card_price_html(
+    price_tiers: tuple[_OfferPriceTier, ...],
+) -> str:
+    rows: list[str] = []
+    for price_tier in price_tiers:
+        if price_tier.emphasized:
+            rows.append(
+                '<span style="display:block;color:#ef476f;font-size:19px;'
+                'line-height:25px;font-weight:800;">'
+                f"{html.escape(price_tier.label)} "
+                f"{html.escape(price_tier.formatted)} / 박"
+                "</span>"
+            )
+            continue
+        text_decoration = "text-decoration:line-through;" if price_tier.struck else ""
+        rows.append(
+            '<span style="display:block;color:#718096;font-size:12px;'
+            f'line-height:18px;{text_decoration}">'
+            f"{html.escape(price_tier.label)} "
+            f"{html.escape(price_tier.formatted)}"
+            "</span>"
+        )
+    return "".join(rows)
 
 
 def _won_price(value: object) -> str:

@@ -402,7 +402,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     editorial_creative = result.content_candidates[0].metadata_json["creative"]
     assert len(editorial_creative["featured_offers"]) == 2
     assert editorial_creative["renderer"]["template_version"] == (
-        "email.editorial.v3"
+        "email.editorial.v4"
     )
     assert editorial_creative["link_targets"] == [
         {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
@@ -410,7 +410,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     card_creative = result.content_candidates[1].metadata_json["creative"]
     assert len(card_creative["link_targets"]) == 3
     assert card_creative["renderer"]["template_version"] == (
-        "email.offer-cards.v3"
+        "email.offer-cards.v4"
     )
     assert card_creative["source"]["required_placeholders"] == [
         "{{redirect_url}}",
@@ -422,7 +422,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     comparison_creative = result.content_candidates[2].metadata_json["creative"]
     assert len(comparison_creative["comparison_offers"]) == 2
     assert comparison_creative["renderer"]["template_version"] == (
-        "email.comparison.v1"
+        "email.comparison.v2"
     )
     assert comparison_creative["link_targets"] == [
         {"placeholder": "{{redirect_url}}", "target_type": "promotion"}

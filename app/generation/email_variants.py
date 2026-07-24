@@ -16,9 +16,11 @@ EMAIL_VARIANT_SEQUENCE = (
     OFFER_CARDS_VARIANT,
     COMPARISON_VARIANT,
 )
-EDITORIAL_TEMPLATE_VERSION = "email.editorial.v3"
-OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v3"
-COMPARISON_TEMPLATE_VERSION = "email.comparison.v1"
+EDITORIAL_TEMPLATE_VERSION = "email.editorial.v4"
+OFFER_CARDS_TEMPLATE_VERSION = "email.offer-cards.v4"
+COMPARISON_TEMPLATE_VERSION = "email.comparison.v2"
+PRICE_DISPLAY_PROMOTION_AND_FINAL = "promotion_and_final"
+PRICE_DISPLAY_ALL_TIERS = "all_price_tiers"
 PRIMARY_REDIRECT_PLACEHOLDER = "{{redirect_url}}"
 OPEN_PIXEL_PLACEHOLDER = "{{open_pixel_url}}"
 UNSUBSCRIBE_PLACEHOLDER = "{{unsubscribe_url}}"
@@ -31,6 +33,7 @@ def build_email_creative_extensions(
     landing_url: str | None,
     offer_links: Sequence[PromotionOfferLink],
     offer_catalog: Mapping[str, Any] | None,
+    operator_instruction: str | None = None,
 ) -> dict[str, Any]:
     if not offer_links:
         return {}
@@ -85,9 +88,17 @@ def build_email_creative_extensions(
                 catalog_hotel,
                 "original_price_per_night",
             ),
+            "promotion_price_per_night": _optional_nonnegative_int(
+                catalog_hotel,
+                "promotion_price_per_night",
+            ),
             "discount_rate_percent": _optional_nonnegative_int(
                 catalog_hotel,
                 "discount_rate_percent",
+            ),
+            "additional_discount_rate_percent": _optional_nonnegative_int(
+                catalog_hotel,
+                "additional_discount_rate_percent",
             ),
             "image_url": image_url,
             "destination_url": _offer_destination_url(
@@ -108,6 +119,10 @@ def build_email_creative_extensions(
             offer["redirect_placeholder"] = placeholder
         offers.append(offer)
 
+    if any(offer["promotion_price_per_night"] is not None for offer in offers):
+        extensions["price_display_mode"] = _price_display_mode(
+            operator_instruction
+        )
     extensions["catalog"] = {
         "catalog_id": _required_text(offer_catalog, "catalog_id"),
         "catalog_version": _required_text(
@@ -150,6 +165,19 @@ def build_email_creative_extensions(
             }
         )
     return extensions
+
+
+def _price_display_mode(operator_instruction: str | None) -> str:
+    instruction = str(operator_instruction or "").strip().casefold()
+    regular_price_terms = (
+        "정상가",
+        "원래가",
+        "regular price",
+        "original price",
+    )
+    if any(term in instruction for term in regular_price_terms):
+        return PRICE_DISPLAY_ALL_TIERS
+    return PRICE_DISPLAY_PROMOTION_AND_FINAL
 
 
 def reusable_catalog_image_url(
