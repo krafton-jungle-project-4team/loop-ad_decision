@@ -13,6 +13,10 @@ venv/
 .env.local
 .env.*.local
 artifacts/
+# Keep only the committed boundary note for ANN experiment artifacts.
+!performance-tests/ann-search/artifacts/
+performance-tests/ann-search/artifacts/*
+!performance-tests/ann-search/artifacts/README.md
 evaluation_manifests/**/*.execution-started.json
 evaluation_manifests/**/*.execution-started.json.lock
 

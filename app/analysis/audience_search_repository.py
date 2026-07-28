@@ -53,9 +53,13 @@ class PgClickHouseAudienceVectorSearchRepository:
         postgres: PostgresExecutor,
         clickhouse: ClickHouseClient,
         exclusion_repository: PromotionAudienceExclusionReader | None = None,
+        predicate_chunk_size: int = PREDICATE_CHUNK_SIZE,
     ) -> None:
+        if predicate_chunk_size <= 0:
+            raise ValueError("predicate_chunk_size must be positive")
         self._postgres = postgres
         self._clickhouse = clickhouse
+        self._predicate_chunk_size = predicate_chunk_size
         self._exclusion_repository = (
             exclusion_repository
             or PromotionAudienceExclusionRepository(
@@ -200,6 +204,45 @@ class PgClickHouseAudienceVectorSearchRepository:
         row = rows[0]
         return int(
             row["matching_user_count"] if isinstance(row, Mapping) else row[0]
+        )
+
+    def count_hard_matches_for_user_ids(
+        self,
+        *,
+        project_id: str,
+        vector_generation_id: str,
+        vector_version: str,
+        source_cutoff: str | datetime,
+        hard_predicate_keys: Sequence[str],
+        predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
+        user_ids: Sequence[str],
+    ) -> int:
+        """Count hard matches inside an explicitly bounded corpus.
+
+        Production generations use ``count_hard_matches`` because the
+        ClickHouse vector population and PostgreSQL search corpus are equal.
+        Offline nested cohorts are smaller than their frozen source generation,
+        so they must bind H to the cohort IDs before deriving H/N and E/N.
+        """
+
+        candidates = tuple(
+            SearchCandidate(
+                user_id=str(user_id),
+                behavior_fit_score=0.0,
+                retrieval_rank=index,
+            )
+            for index, user_id in enumerate(user_ids, start=1)
+        )
+        return len(
+            self._filter_hard_predicates(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                vector_version=vector_version,
+                source_cutoff=source_cutoff,
+                hard_predicate_keys=hard_predicate_keys,
+                predicate_parameters=predicate_parameters,
+                candidates=candidates,
+            )
         )
 
     def count_hard_matches_batch(
@@ -866,7 +909,7 @@ class PgClickHouseAudienceVectorSearchRepository:
                     after_user_id,
                     score_threshold,
                     score_threshold,
-                    PREDICATE_CHUNK_SIZE,
+                    self._predicate_chunk_size,
                 ),
             )
             if not rows:
@@ -902,13 +945,13 @@ class PgClickHouseAudienceVectorSearchRepository:
                     )
                     """,
                     (
-                        tuple(member.user_id for member in matched),
-                        tuple(member.behavior_fit_score for member in matched),
-                        tuple(member.retrieval_rank for member in matched),
+                        [member.user_id for member in matched],
+                        [member.behavior_fit_score for member in matched],
+                        [member.retrieval_rank for member in matched],
                     ),
                 )
             after_user_id = str(rows[-1]["user_id"])
-            if len(rows) < PREDICATE_CHUNK_SIZE:
+            if len(rows) < self._predicate_chunk_size:
                 break
         return self._count_temp_relation(member_relation)
 
@@ -947,14 +990,14 @@ class PgClickHouseAudienceVectorSearchRepository:
             "user_id text PRIMARY KEY) ON COMMIT DROP"
         )
         self._postgres.execute(f"TRUNCATE {table_name}")
-        for offset in range(0, len(user_ids), PREDICATE_CHUNK_SIZE):
-            chunk = user_ids[offset : offset + PREDICATE_CHUNK_SIZE]
+        for offset in range(0, len(user_ids), self._predicate_chunk_size):
+            chunk = user_ids[offset : offset + self._predicate_chunk_size]
             self._postgres.execute(
                 f"INSERT INTO {table_name} (user_id) "
                 "SELECT DISTINCT rows.user_id "
                 "FROM unnest(%s::text[]) AS rows(user_id) "
                 "ON CONFLICT (user_id) DO NOTHING",
-                (tuple(chunk),),
+                (list(chunk),),
             )
 
     def _filter_hard_predicates(
@@ -980,8 +1023,8 @@ class PgClickHouseAudienceVectorSearchRepository:
             vector_generation_id
         )
         matched_user_ids: set[str] = set()
-        for offset in range(0, len(candidates), PREDICATE_CHUNK_SIZE):
-            chunk = candidates[offset : offset + PREDICATE_CHUNK_SIZE]
+        for offset in range(0, len(candidates), self._predicate_chunk_size):
+            chunk = candidates[offset : offset + self._predicate_chunk_size]
             result = self._clickhouse.query(
                 _hard_predicate_query(
                     hard_predicate_keys,
@@ -1249,10 +1292,8 @@ def _hard_predicate_batch_query(
                     AND window_end = toDateTime64(
                         parseDateTimeBestEffort({{window_end:String}}), 3, 'UTC'
                     )
-                    AND ingested_at <= toDateTime64(
-                        parseDateTimeBestEffort(
-                            {{source_revision_cutoff:String}}
-                        ), 6, 'UTC'
+                    AND ingested_at <= parseDateTime64BestEffort(
+                        {{source_revision_cutoff:String}}, 6, 'UTC'
                     )
                   GROUP BY user_id
               )
@@ -1382,10 +1423,8 @@ def _hard_predicate_query(
                 AND window_end = toDateTime64(
                     parseDateTimeBestEffort({window_end:String}), 3, 'UTC'
                 )
-                AND ingested_at <= toDateTime64(
-                    parseDateTimeBestEffort({source_revision_cutoff:String}),
-                    6,
-                    'UTC'
+                AND ingested_at <= parseDateTime64BestEffort(
+                    {source_revision_cutoff:String}, 6, 'UTC'
                 )
               GROUP BY user_id
           )

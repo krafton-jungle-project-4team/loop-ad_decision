@@ -154,9 +154,19 @@ def test_hard_match_population_is_frozen_by_vector_revision_cutoff() -> None:
     )
     assert "FROM user_behavior_vector_revisions" in sql
     assert "ingested_at <=" in sql
+    assert "parseDateTime64BestEffort(" in sql
     assert "vector_version = {vector_version:String}" in sql
     assert "received_at <=" in sql
     assert "raw_event_received_cutoff" in sql
+
+
+def test_predicate_chunk_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="predicate_chunk_size must be positive"):
+        PgClickHouseAudienceVectorSearchRepository(
+            postgres=_UnusedRepository(),
+            clickhouse=_UnusedRepository(),
+            predicate_chunk_size=0,
+        )
 
 
 def test_hard_match_rate_sample_uses_stable_salted_order() -> None:

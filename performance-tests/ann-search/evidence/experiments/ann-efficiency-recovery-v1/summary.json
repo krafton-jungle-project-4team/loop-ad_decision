@@ -1,0 +1,162 @@
+{
+  "schemaVersion": 1,
+  "id": "ann-efficiency-recovery-v1",
+  "experimentVersion": "audience_search.ann-efficiency-recovery.v1",
+  "status": "follow_up_required",
+  "recordedAt": "2026-07-20",
+  "checkpointedAt": "2026-07-28",
+  "claimScope": "query_specific_candidate_retrieval_only",
+  "hypothesis": "At sufficiently large audience sizes, HNSW can reduce candidate-retrieval latency while preserving Recall@K relative to Exact search.",
+  "dataset": {
+    "name": "Expedia hotel behavior",
+    "vectorVersion": "hotel_behavior.v2",
+    "dimensions": 64,
+    "sourceUserCount": 1198786,
+    "maxMeasuredCohortUsers": 1000000,
+    "windowStart": "2013-01-01T00:00:00+00:00",
+    "windowEnd": "2015-01-01T00:00:00+00:00",
+    "sourceFingerprintSha256": "de0f2e562e2b54e729c32e63955e758d147137a4c645a55d972b98b421fbbad5",
+    "membershipSha256": "c928368ef641f89e7ce4e3c20e9e10c45d28479b8d659495668b27c4a4458f18"
+  },
+  "gates": {
+    "minimumRecallAtK": 0.95,
+    "minimumWilsonLowerBound": 0.95,
+    "maximumAnnToExactP95Ratio": 0.8,
+    "requireHnswIndex": true,
+    "requireNoSpillOrOom": true,
+    "warmRuns": 300,
+    "databaseColdRuns": 30
+  },
+  "representativeResult": {
+    "candidateType": "funnel_recovery",
+    "corpusUsers": 1000000,
+    "requestedK": 500,
+    "hnsw": {
+      "efSearch": 200,
+      "iterativeScan": "relaxed_order",
+      "maxScanTuples": 20000
+    },
+    "warm": {
+      "exactP95Ms": 113.2,
+      "annP95Ms": 6.94,
+      "speedup": 16.31,
+      "recallAtK": 0.988,
+      "wilsonLowerBound": 0.9741,
+      "bootstrapP95RatioUpperBound": 0.0646
+    },
+    "databaseCold": {
+      "p95ImprovementFraction": 0.785
+    }
+  },
+  "validCandidateRetrievalRegions": [
+    {
+      "candidateType": "funnel_recovery",
+      "minUsers": 1000000,
+      "requestedK": 500
+    },
+    {
+      "candidateType": "intent_matched",
+      "minUsers": 1000000,
+      "requestedK": 1000
+    },
+    {
+      "candidateType": "target_destination_affinity",
+      "minUsers": 1000000,
+      "requestedK": 500
+    },
+    {
+      "candidateType": "target_destination_affinity",
+      "minUsers": 1000000,
+      "requestedK": 5000
+    }
+  ],
+  "measurementScope": {
+    "validPhaseCells": 5687,
+    "storedRawRows": 73110,
+    "logicalQueryOrPlanInvocations": 105970,
+    "warmConfirmationRows": 38,
+    "databaseColdConfirmationRows": 19,
+    "partBCandidateCount": 46,
+    "partBPreconfirmationPassedRows": 0,
+    "partBFinalConfirmationRows": 0,
+    "measurementWallClock": "approximately 11h 2m",
+    "invalidatedInitialScreeningRawRows": 17570
+  },
+  "decision": {
+    "candidateRetrievalPassed": true,
+    "fullMembershipPassed": false,
+    "deployableCommonSetting": false,
+    "annPolicyCandidate": false,
+    "runtimePolicy": "keep_exact_fallback"
+  },
+  "limitations": [
+    "Candidate retrieval does not establish a full-membership or product-policy winner.",
+    "The passing regions are query-specific and do not establish one common runtime setting.",
+    "One candidate type has no distinct independent confirmation query.",
+    "The largest measured cohort is 1M users, so persistence beyond 1M is unproven.",
+    "A prior Goal 2 result was invalidated because ANN membership omitted the exact score threshold; this checkpoint uses the corrected Goal 3 definition."
+  ],
+  "nextExperiments": [
+    "Define and validate a query-independent runtime setting or schedule.",
+    "Measure whether the crossover persists beyond 1M users.",
+    "Add an independent confirmation query for general_destination_explorer.",
+    "Test a corrected membership-recovery strategy before considering an ANN product policy."
+  ],
+  "measurementCode": [
+    {
+      "path": "offline_evaluation/ann_search_benchmark.py",
+      "measurementRunSha256": "cf9aa96703a87a9b349b2537a951441ddb8fc7a65258b0dad3082cd06e5700bf",
+      "checkpointSha256": "cf9aa96703a87a9b349b2537a951441ddb8fc7a65258b0dad3082cd06e5700bf"
+    },
+    {
+      "path": "offline_evaluation/ann_search_goal3.py",
+      "measurementRunSha256": "9c98918edd7bf89440c83db70754ea5b056f098062239976d5ebad88d716696f",
+      "checkpointSha256": "9c98918edd7bf89440c83db70754ea5b056f098062239976d5ebad88d716696f"
+    },
+    {
+      "path": "scripts/run_ann_scale_goal3.py",
+      "measurementRunSha256": "2fcca55105f44af4d368f239fa2e99beed840586f31db25762a57a46d0b1f7ae",
+      "checkpointSha256": "f2a4f83f1084f89c03e293ef795fcccd6c172283e665b2bfbd581e2fa3765b28",
+      "note": "The checkpoint contains post-measurement runner changes; the immutable measurement fingerprint remains recorded separately."
+    }
+  ],
+  "sourceEvidence": [
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/conclusion.json",
+      "bytes": 2206,
+      "sha256": "01713185d12879cba0fba91e39caba43fb5ff17e708067dce438f7edaca4dc38"
+    },
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/integrated-experiment-report.md",
+      "bytes": 18741,
+      "sha256": "9dc96578475b9d9fe629019890f0c011e4e489d1d6788f17953411b33f21871d"
+    },
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/kernel-confirmation.jsonl",
+      "bytes": 292211,
+      "sha256": "adb14f48baa19c43df25e27c8767c60506038d6845b7f568c0f9c71cd4d4346a"
+    },
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/kernel-cold-confirmation.jsonl",
+      "bytes": 38513,
+      "sha256": "c7d5533764f7453bf8bb7b1dc1a053dda9cafa869258a7287525f63eeecf652e"
+    },
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/execution-code-fingerprint-finalization.json",
+      "bytes": 1544,
+      "sha256": "6b13242041b60e11e8457bedf508284eabe88b0613e38ecd8fbc1a83aeb5ede6"
+    },
+    {
+      "path": "artifacts/ann-search/scale-series-v2/ann-efficiency-recovery/integrity-report.json",
+      "bytes": 377152,
+      "sha256": "74d3ddedf6a72f593ffa691c84ed562470d1118e8dbccb1a3f69d7300b268a16"
+    }
+  ],
+  "historicalVerification": {
+    "fullRegression": "1065 passed, 7 skipped",
+    "missingRequiredArtifacts": 0,
+    "jsonlParseErrors": 0,
+    "graphSourceHashMismatches": 0,
+    "rawResultReconciliationPassed": true
+  }
+}
