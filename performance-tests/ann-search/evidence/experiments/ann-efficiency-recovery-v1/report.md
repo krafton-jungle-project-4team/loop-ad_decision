@@ -33,6 +33,27 @@ Query-specific candidate retrieval passed in four regions at the 1M cohort:
 The representative `funnel_recovery` cell was approximately 16.3 times
 faster at warm p95 while maintaining Recall@500 of 0.988.
 
+### Representative scale transition
+
+The same `funnel_recovery`, K=500, `ef_search=200`, relaxed-order,
+20K-scan setting was confirmed at both 750K and 1M users:
+
+| Cohort | Cache state | Runs | Exact p95 | HNSW p95 | Exact / HNSW | Final gate |
+|---:|---|---:|---:|---:|---:|---|
+| 750K | warm | 300 | 81.15 ms | 7.73 ms | 10.50x | warm evidence only |
+| 750K | database-cold | 30 | 80.38 ms | 95.03 ms | 0.85x | failed |
+| 1M | warm | 300 | 113.20 ms | 6.94 ms | 16.31x | warm passed |
+| 1M | database-cold | 30 | 131.03 ms | 28.13 ms | 4.66x | passed |
+
+Recall@500 was 0.988 with an aggregate Wilson lower bound of 0.9741 at both
+cohort sizes. The 750K warm result showed a clear kernel speedup, but its
+database-cold companion was slower than Exact. Therefore 1M, not 750K, is the
+first confirmed crossover for this fixed setting under the final warm and
+database-cold gates.
+
+- [Scale-transition chart](scale-crossover.svg)
+- [Machine-readable measurements](scale-crossover.csv)
+
 The corrected full-membership stage tested 46 candidate settings. None passed
 pre-confirmation, so no final full-membership confirmation was run. Therefore:
 
