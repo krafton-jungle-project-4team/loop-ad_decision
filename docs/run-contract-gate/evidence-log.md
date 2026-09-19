@@ -1,0 +1,277 @@
+# Run Contract Gate 근거 기록
+
+| 항목 | 내용 |
+|---|---|
+| 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
+| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
+| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 마지막 확인 | 2026-09-19 KST |
+
+## 기록 규칙
+
+이 기록은 운영 로그나 자동 테스트 보고서가 아니다. 사람이 중요한 결정과 실제 증거를 연결한다. 실행 전에는 미실행, 측정 전에는 미측정으로 남긴다. 0회 실패·100% 통과처럼 실행이 있었던 것으로 오인될 숫자를 기입하지 않는다.
+
+각 새 실행은 날짜, 목적, 후보 commit/source digest, baseline·Contract SHA, 환경 digest, 명령, case/lane 결과, artifact 위치, 관찰, 한계를 기록한다. raw log·DB dump·credential·실사용자 자료를 이 문서에 복사하지 않는다.
+
+## 현재 조사 기록
+
+아래 E-01~E-08은 최초 조사 시점 기록이다. 이후 구현·병합·실행은 E-09~E-12에 순서대로 남겼다.
+
+| ID | 확인 내용 | 방법·근거 | 한계 |
+|---|---|---|---|
+| E-01 | 원격 Decision dev = e1de8b29b902b54df3a58f21f1daa27c1171fe80 | credential helper를 끈 익명 git ls-remote --heads origin dev 성공. 기존 로컬 origin/dev와 일치 | 조회 시점의 ref 확인. 배포 상태 증거 아님 |
+| E-02 | 원격 Contract main = 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 | 같은 방식의 익명 원격 ref 조회 성공. 로컬 HEAD와 일치 | CI 취득·전체 DDL 실행·image 준비는 미검증 |
+| E-03 | Dashboard 조사 HEAD = 40af537b0e48a26f738f9cbf4dfc5fbcf2055d62 | 로컬 Git 및 실제 client/controller/flow 코드 확인. cached origin/main은 df9daf13b57324d52a0eacb15b33c845a399c79f | 원격 최신·배포 미확인 |
+| E-04 | 실제 transaction dependency 존재 | [router.py](../../app/decision/router.py), get_promotion_run_service | 새 Gate에서 실행한 결과는 아직 없음 |
+| E-05 | 현재 service/API 테스트의 fake 경계 확인 | [service fixture](../../tests/test_decision_run_service.py), [API wiring](../../tests/test_decision_run_api.py) | fake 테스트가 무가치하다는 의미 아님 |
+| E-06 | 기존 actual DB lifecycle 테스트 존재 | [lean integration](../../tests/test_lean_audience_contract_integration.py) | run 직접 INSERT 및 마지막 rollback. 새 API commit 검증과 다름 |
+| E-07 | V2 target 중복 binding 제약 확인 | [DDL](https://github.com/krafton-jungle-project-4team/loop-ad_data-source_contract/blob/0ec2cef0290f4659ad21ccc1dd2a20df2801ff50/postgres/schema.sql#L2187), [repository](../../app/decision/audience_snapshots.py) | 이번에는 코드·DDL 읽기만 수행 |
+| E-08 | 별도 worktree·로컬 통합/PR 1 branch 준비 | integration/run-contract-gate 및 feat/run-contract-gate-db, 기준 E-01 | remote push·commit·PR·merge 없음 |
+
+처음 제한된 네트워크 환경에서는 DNS 조회가 실패했다. 이후 허용된 네트워크 조회에서 E-01/E-02를 확인했다. 이 후속 증거로 원격 SHA의 미확인은 해소됐지만, GitHub Actions에서의 접근·실행은 여전히 미확인이다. 로컬 SHA가 같았으므로 추가 fetch는 필요하지 않았다.
+
+원래 main 작업 공간의 사용자 변경과 untracked 파일은 그대로 두었다. 기존 학습·계획 자료 일부는 로컬에만 있고 기준 Git tree에 없었다. 새 문서는 그 자료를 복제하거나 필수 링크로 삼지 않고 실제 추적 코드·테스트를 연결했다.
+
+## 이전부터 존재한 기능과 본인의 기존 기여
+
+아래는 이번 문서 작업에서 구현한 기능이 아니다. Giran Oh의 author 정보와 해당 commit 내용을 기존 기여의 근거로 구분한다.
+
+| ID | 기존 기여 | commit 근거 | 주장 범위 |
+|---|---|---|---|
+| P-01 | run의 고객군 scope 멱등성 보강 | [d07fd6d](https://github.com/krafton-jungle-project-4team/loop-ad_decision/commit/d07fd6d9545f7f60793b8782a5020bc8d60f4b8d) | 기존 구현 기여 |
+| P-02 | scope 멱등성 검증 추가 | [6d9da30](https://github.com/krafton-jungle-project-4team/loop-ad_decision/commit/6d9da30600833dfd7f0ab399dbe2dbfc3fbcf39a) | 기존 테스트 기여; 새 Gate 결과 아님 |
+| P-03 | 카드별 run을 lean snapshot 계약에 맞춤 | [f263626](https://github.com/krafton-jungle-project-4team/loop-ad_decision/commit/f2636263bfdda7eba5580193dcdc1dabd96f23b9) | 기존 application·contract 연결 |
+| P-04 | lean 사용자군 lifecycle actual DB 통합 테스트 | [fa10316](https://github.com/krafton-jungle-project-4team/loop-ad_decision/commit/fa103168402c712bb53a0b912f15572d2622b9c6) | 기존 실제 DB 테스트; 이번 새 요청/commit Gate와 구분 |
+
+run 서비스 전체, Dashboard, canonical schema, 배포 시스템을 혼자 만들었다고 쓰지 않는다. next-loop 재시도·동시성 관련 기존 기여가 있더라도 이번 Gate의 실제 동시성 검증이 완료됐다는 근거로 전용하지 않는다.
+
+## 이번 과제에서 새로 한 일
+
+| ID | 수행 내용 | 상태·근거 |
+|---|---|---|
+| N-01 | fake/actual DB/consumer 경계를 조사하고 개선 과제 선택 | 조사 완료 — E-04~E-07 |
+| N-02 | 고정 필수·최신 경고, 컨테이너, baseline fixture, PR 전략 합의 | 설계 완료 — [개발 계획](implementation-plan.md) |
+| N-03 | 문서 7개를 새 worktree에서 작성 | 문서 작성 — [안내](README.md) |
+| N-03a | 문서 7개만 Git 변경으로 보이도록 .gitignore 예외 추가 | 기존 *.md 제외를 유지하고 파일별 예외 7줄 추가 |
+| N-04 | Gate 실제 DB 테스트·runner·fixture | 전체 로컬 Gate·고정 기존 row fixture 완료 — E-12; CI는 PR 2 |
+| N-05 | 로컬·CI 검증과 성능/신뢰성 측정 | 로컬 정상·실패 주입 E-12; CI·장기 신뢰성·생산성 비교 미측정 |
+
+## 주요 결정의 이유
+
+| 결정 | 선택 이유 | 수용한 비용·한계 |
+|---|---|---|
+| 실제 API → DB 먼저 | 기존 fake와 직접 SQL integration 사이의 공백을 보충 | Dashboard까지 보장하지 않음 |
+| snapshot 기반 V2 run 우선 | 현재 source/binding 경계에 집중 | legacy 전체 제외 |
+| 순차 retry 먼저 | 초기 구현·fixture·transaction을 좁은 범위에서 완성 | 실제 동시성은 필수 후속 |
+| baseline 생성 row 고정 | 새 writer와 reader가 같은 방식으로 틀리는 위험 줄임 | provenance와 기준 유지 비용 |
+| fixed/latest 분리 | 안정된 회귀 기준과 외부 변화 탐지를 함께 제공 | DB 검사 시간·네트워크 의존 증가 |
+| runner와 DB 컨테이너 | 로컬·CI 실행 환경을 가깝게 맞춤 | image·lock·cleanup 관리 |
+| 개인 통합 PR 2개 후 dev Draft | 로컬 도구와 CI를 나눠 검토하고 통합 검증 후 제출 | 순차 선행 관계 존재 |
+
+## 앞으로 기록할 실행 근거
+
+아래는 비어 있는 기록 양식이며 실제 실행 사실이 아니다.
+
+| 필드 | 현재 값 |
+|---|---|
+| 실행 날짜·실행 ID | 미실행 |
+| 실행 목적·명령 | 미실행 |
+| 후보 commit·allowlist digest·dirty 여부 | 미기록 |
+| baseline producer / fixed / latest SHA | 실행 결과 미기록 |
+| dependency lock·image digest·architecture | 미검증 |
+| fixed verdict·필수 case 수·누락/skip | 미실행 |
+| latest verdict·경고 분류 | 미실행 |
+| JSON·JUnit·CI run URL | 없음 |
+| cleanup 결과 | 미실행 |
+| 관찰한 문제와 분석 | 새 실행에서 채울 항목 |
+| 다음 행동 | 새 실행에서 채울 항목 |
+
+실행이 생기면 기록 양식을 날짜별 subsection으로 추가한다. 최신 결과로 과거 실패를 덮어쓰지 않는다.
+
+## 측정 계획
+
+| 지표 | 측정 방법 | 현재 |
+|---|---|---|
+| 필수 case 실행·통과·누락 | manifest와 실제 결과 대조 | E-12: RCG/CTRL 필수 전부 통과, 누락 0 |
+| cold/warm 소요 시간 | dependency/image 준비와 test 시간을 구분 | 미측정 |
+| fixed/latest 각각의 소요 시간 | lane별 monotonic elapsed | E-12 및 result.json |
+| 반복 실행 신뢰성 | 실행 횟수·기간·환경 실패 종류를 함께 기록 | 미측정 |
+| 탐지한 회귀 | 의도적 실패/자연 발생 결함을 구분해 case·commit 연결 | E-09 서비스 결함, E-12 제어 목적 실패 주입 |
+| 개발 편의 개선 | 실제 사용 전후의 환경 준비·명령·수동 작업을 비교 | 미측정 |
+
+검증 명령이 하나가 됐다는 사실과 개발 시간 감소율은 다르다. 시간 절감률은 이전 절차의 동일 조건 측정이 있을 때만 계산한다.
+
+## 문서 검수 기록
+
+문서 파일 수, 20개 개발 계획 항목, 상대 링크·고정 commit 링크의 형식, 필수 case 대응, 상태·revision 표기, 금지 경로 변경 여부를 정적으로 확인한다. 이 검수는 서비스 테스트·Gate·CI 성공을 의미하지 않는다.
+
+검수 결과는 작업 완료 시 아래에 기록한다.
+
+- 문서 정적 검수: 문서 7개, 개발 계획 20개 항목, 내부 링크 52개, 고정 commit 링크 12개의 로컬 object/path/line 존재를 확인했다. 실행 명세는 RCG-01~09와 CTRL-01~05에 대응한다. 원격 웹 페이지의 HTTP 응답이나 Gate 실행을 검증한 것은 아니다.
+- 최초 문서 검수 시 서비스 테스트·컨테이너는 미실행이었다. 이후 초기 재현 실행은 E-09에 별도 기록했다.
+- 최초 문서 검수 시 commit·push·PR·merge는 수행하지 않았다. 이후 승인된 PR 0 작업은 E-11에 기록했다.
+
+## E-09: PR 1 초기 실행과 중단
+
+2026-09-19 KST, 기존 worktree `/Users/ran/loop-ad/loop-ad_decision-run-contract-gate`, branch `feat/run-contract-gate-db`, HEAD `e1de8b29b902b54df3a58f21f1daa27c1171fe80`에서 시작했다. 기존 문서 7개와 .gitignore를 보존했다. 사용자 승인 범위는 PR 1이며 서비스 수정·PR 2·commit·push·PR·merge는 제외다.
+
+### 실제 명령과 결과
+
+```bash
+./scripts/reproduce-run-contract-commit.sh   /Users/ran/loop-ad/loop-ad_data-source_contract   /private/tmp/rcg-commit-repro-20260919
+```
+
+실행 결과: **1 passed, 1 failed, skip 0, pytest 1.23초, exit 1**. 준비 시간을 포함한 cold/warm 성능은 측정하지 않았다. 다른 case를 반복 실행하거나 전체 suite를 통과했다고 주장하지 않는다.
+
+| 항목 | 근거 |
+|---|---|
+| 실행 목적 | baseline 정상 commit 및 RCG-07의 지연 제약 오류와 HTTP 응답 순서 재현 |
+| producer | e1de8b29b902b54df3a58f21f1daa27c1171fe80의 Git archive; 후보 writer로 대체하지 않음 |
+| canonical DDL | 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50의 postgres/schema.sql, SHA-256 bad4948fe47485e7508a3cd389e9db84fdda3edfed4a1f4883b03554bcb38691 |
+| 의존성 lock hash | 150c68697cc7eb2ec9df230ec705976a454c6d96b4cf366ec6ff100e778d82af |
+| 주요 runtime | Python 3.12.14, FastAPI 0.141.1, Starlette 1.6.0, psycopg 3.3.6, PostgreSQL 16.10, Linux/arm64 |
+| Python image | python:3.12-slim@sha256:b699c2a51f4f834fa1a5f7f7cba0356e71d82fae37d4628223b11d93b71e9ebe |
+| PostgreSQL image | pgvector/pgvector:0.8.0-pg16@sha256:a132765ec351c65111b5b675928a3a0515a466a40f97277329db8b8209ad8bc9 |
+| runner image ID | sha256:3986d52f880eb0887a67ec73b407166531ef9fc7328af64149255c9dd432406d |
+| source 상태 | HEAD 유지, uncommitted Gate 파일 있음. 재현 application은 baseline archive이며 source/test hash는 provenance.txt에 기록 |
+| artifact | `/private/tmp/rcg-commit-repro-20260919/`: RCG-01.json, RCG-07.json, junit.xml, pytest.log, provenance.txt, database.log, cleanup.log |
+| cleanup | 단일 재현 명령의 소유 label 컨테이너·socket volume 삭제 확인. 별도 탐색용 DB·socket도 삭제. 이미지·build cache는 유지 |
+| 한계 | 전체 Gate result.json 판정기·manifest·CTRL·latest·고정 기존 row fixture는 미완료 |
+
+### 무엇이 통과했고 무엇이 실패했는가
+
+- **RCG-01 PASS:** A/B/C seed에서 A/B 요청, HTTP 200; 독립 connection에서 run 1개·experiment 2개·binding 2개, 정확한 scope/fingerprint와 ID 관계, plan locked, A/B consumed·C reserved를 확인했다.
+- **RCG-07 FAIL:** 테스트에서 binding 동작만 생략. 실제 run·experiment INSERT 뒤 실제 dependency commit에서 `CheckViolation`, SQLSTATE `23514`, `run binding set must match the run segment scope`가 발생했다. 독립 connection의 전체 관찰 row는 요청 전과 같아 rollback은 확인됐지만 HTTP는 200이었다.
+- 필수 논리 case 14개(RCG 9 + CTRL 5) 중 2개 실행, 1개 통과·1개 실패·12개 미실행. RCG-05/06 하위 case는 전부 미실행이다.
+- **fixed 기준:** 관찰한 RCG-07은 FAIL이다. 전체 fixed lane과 제어 판정기를 완성했다는 뜻은 아니다. **latest:** 미실행, WARN_UNVERIFIED에 해당하며 최신 resolved SHA를 이번 재현 명령이 조회하지 않았다.
+- baseline이 생성한 정상 row는 독립 조회 artifact에만 남겼다. RCG-08용 관계 closure export·복원·고정 expected/provenance fixture는 생성하지 않았다. 이를 완료된 기존 row fixture로 취급하지 않는다.
+
+### 재현과 원인 분석
+
+처음 임시 probe로 정상 요청을 확인한 뒤 binding 생략을 주입했다. `raise_server_exceptions=False`에서는 200+빈 run 테이블, `True`에서는 router.py 201행의 실제 `connection.commit()`에서 CheckViolation이 확인됐다. 이를 정식 RCG-01/07 pytest 재현으로 남겨 동일 결과를 확인했다.
+
+바깥 ASGI wrapper가 기록한 순서는 `binding_omitted_for_RCG_07` → `http.response.start(status=200)` → body 완료 → `CheckViolation(23514)`다. 단순히 TestClient가 예외를 숨겼다는 추정이 아니라 실제 응답 전송 이후 예외 순서를 기록했다. 로그도 commit 실패 전에 `http_request_completed` success를 남긴다.
+
+[router dependency](../../app/decision/router.py)의 commit은 yield 뒤에 있고, [POST handler](../../app/decision/router.py)는 scope 없는 `Depends(get_promotion_run_service)`를 사용한다. 설치된 FastAPI 0.141.1의 `dependencies/utils.py`는 이 yield dependency를 request AsyncExitStack에 등록한다. `routing.request_response`는 `await response(scope, receive, send)` 후 그 stack을 종료하므로 성공 응답 이후 commit하게 된다. 실제 PostgreSQL deferred constraint는 올바르게 transaction을 거절했다.
+
+검증된 것은 이 baseline과 고정 runtime 조합이다. 운영 배포의 FastAPI 버전과 실서비스 장애 여부는 확인하지 않았다. pyproject.toml은 `fastapi>=0.115.0`이므로 이번 고정 버전은 허용된 의존성 범위다. 구버전으로 낮춰 테스트를 녹색으로 만들지 않았다.
+
+### 중단 결정과 별도 수정 후보
+
+[개발 계획 18절](implementation-plan.md#18-구현-순서와-중단-기준)의 “서비스 결함은 재현과 원인 분석까지 수행하고 수정 범위를 별도로 결정한다”와 사용자의 같은 지시를 적용했다. 서비스 app/·pyproject.toml·기존 tests/conftest.py는 변경하지 않았다.
+
+별도 승인받을 수정 목표는 **POST /runs 성공 응답 전에 commit 성공을 보장하는 트랜잭션 경계**와 해당 회귀 검증이다. endpoint의 dependency scope를 function으로 지정하는 방법 등을 비교하되, 현재 FastAPI 최소 버전 호환과 같은 dependency를 공유하는 다른 endpoint의 영향부터 검토해야 한다. 아직 방법을 확정하거나 runtime을 수정하지 않았다.
+
+서비스 수정 범위가 결정된 뒤 후보 코드 검증 경로를 구현하고, 나머지 RCG/CTRL·기존 row fixture·fixed/latest·결과 판정·cleanup 예외 검증을 이어간다. 실제 동시성 검증은 **필수 후속 개발**로 유지한다.
+
+### E-09 시점 검토한 정확한 파일 목록
+
+기존 변경 보존: `.gitignore` 및 아래 문서 7개. 나머지 7개는 이번에 새로 작성한 재현 자산이다.
+
+- `.gitignore`
+- `docs/run-contract-gate/README.md`
+- `docs/run-contract-gate/implementation-plan.md`
+- `docs/run-contract-gate/verification-spec.md`
+- `docs/run-contract-gate/developer-guide.md`
+- `docs/run-contract-gate/learning-guide.md`
+- `docs/run-contract-gate/evidence-log.md`
+- `docs/run-contract-gate/portfolio-case-study.md`
+- `Dockerfile.run-contract-gate`
+- `Dockerfile.run-contract-gate.dockerignore`
+- `scripts/reproduce-run-contract-commit.sh`
+- `tools/run_contract_gate/requirements.lock`
+- `tests/run_contract_gate/__init__.py`
+- `tests/run_contract_gate/seed.py`
+- `tests/run_contract_gate/test_run_db.py`
+
+## E-10: 선행 서비스 수정 PR 0 분리
+
+사용자가 “이 결함은 Run Contract Gate PR 1에 섞지 말고 선행 서비스 버그 수정 PR 0 범위로 분리”하도록 승인했다. 기존 PR 1 작업 공간과 변경을 보존하고, 같은 baseline e1de8b2에서 `/Users/ran/loop-ad/loop-ad_decision-run-commit-fix`, `fix/run-commit-before-response`를 만들었다. PR 0은 `app/decision/router.py`, `pyproject.toml`, `tests/test_decision_run_api.py` 3개 파일만 변경했다. commit·push·PR 생성·merge는 하지 않았다.
+
+수정은 POST /runs dependency의 function scope와 FastAPI 최소 0.121.0이다. 정상 응답 전 commit/close, commit CheckViolation·SerializationFailure의 500/rollback/close 회귀 테스트를 추가했다. 새 테스트 3개는 수정 전 모두 실패했고, 수정 후 run API/service 115개가 통과했다. 최소 FastAPI 0.121.0에서 관련 API/config/service 218 passed·4 skipped이며, skip은 기존 generation PostgreSQL locking opt-in 테스트다.
+
+실제 canonical DB에 PR 0 candidate를 연결한 RCG-01/07은 **2 passed**다. RCG-07은 HTTP 500, 동일한 SQLSTATE 23514, 전체 rollback이다. 별도 baseline producer 프로세스가 만든 row를 candidate 프로세스로 재요청해 같은 응답과 전체 관찰 row 불변도 확인했다. 테스트 기대값·canonical DDL·PR 1 코드는 바꾸지 않았다.
+
+근거: `/private/tmp/rcg-pr0-20260919/PR0-review.md`, `artifacts/`의 red/current/minimum JUnit, `database-candidate/`의 RCG-01/07 JSON·JUnit, `old-rows/produce.json` 및 `consume.json`. 실제 테스트 컨테이너·socket volume은 정리했고 이미지/cache만 유지한다.
+
+PR 순서는 **PR 0 서비스 수정 → PR 1 로컬 Gate → PR 2 CI**로 갱신했다. PR 1의 기존 baseline 재현 명령은 여전히 고정 과거 코드를 검사하므로 실패하는 것이 맞다. PR 0의 PASS를 PR 1 전체 Gate PASS로 기록하지 않는다. 선행 반영과 PR 1의 candidate 검사·나머지 필수 case 구현은 아직 남았다. Dashboard consumer 테스트·배포 smoke·실제 동시성은 이번 검증에 포함하지 않았다.
+
+## E-11: PR 0 병합과 PR 1 기반 반영
+
+사용자가 PR 0을 개인 통합으로 생성·검증·병합한 뒤 기존 PR 1 파일을 보존하고 개발을 계속하도록 승인했다. 각 원격 쓰기 전에 repository·base/head branch·commit 범위·3개 파일·77 additions/2 deletions와 diff를 제시했다.
+
+- 서비스 commit: `ae741026488773b0bd0f404daf59e1f158251233`, branch `fix/run-commit-before-response`.
+- 대상: `integration/run-contract-gate`, 기존 dev 기준 `e1de8b29b902b54df3a58f21f1daa27c1171fe80`에서 생성.
+- [PR #394](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/394): 위 3개 파일만 확인하고 mergeable 상태를 조회했다. 이 개인 통합 대상에는 실행된 CI check가 없었으며, E-10의 로컬 검증을 근거로 사용했다.
+- merge commit: `09442f29e8da514df1d1a5f2a52b03646c92e170`, GitHub merge 완료 시각 `2026-09-19T06:02:47Z`.
+- 원격 main/dev·배포 workflow·branch protection은 변경하지 않았고 원격 branch를 삭제하지 않았다.
+
+PR 1의 기존 작업 파일 15개를 `/private/tmp/rcg-pr0-merge-20260919/pr1-working-files.tar`와 hash 목록으로 보존했다. 기존 `feat/run-contract-gate-db`에서 통합 commit을 fast-forward 반영한 직후 15개 hash가 전부 같음을 확인했다. 서비스 수정은 기반 commit에 있고 PR 1 diff에 중복하지 않는다.
+
+반영 직후 RCG-01/07은 2 passed였다. 이어 RCG-02/03/04/05/06/09를 추가해 실제 DB 16개 case가 통과했다. 오류 code 기대값의 오타는 실제 service 상수를 확인해 수정했으며 새 서비스 결함은 없었다. 해당 단계 artifact는 `/private/tmp/rcg-pr0-merge-20260919/recheck/`와 `scenarios-verified/`다.
+
+## E-12: PR 1 로컬 Gate 검증
+
+### 고정 baseline fixture
+
+명령: `./scripts/generate-run-contract-baseline.sh /Users/ran/loop-ad/loop-ad_data-source_contract /private/tmp/rcg-baseline-final-20260919`.
+
+고정 producer e1de8b2의 실제 API가 생성한 합성 row를 export했다. 18개 table의 초기 45행·commit 후 50행과 expected 응답을 보존했다. baseline 코드·DDL·lock·image·seed/생성 코드 hash·파일 hash·생성 시각은 [provenance](../../tests/fixtures/run_contract_gate/baseline/provenance.json)에 있다. 운영 dump·실제 사용자·credential은 포함하지 않는다.
+
+초기 복원 시 DDL 기본 fallback 행 중복과 locked/consumed 직접 INSERT 금지에 걸렸다. DDL 기본 행을 제외하고, baseline의 생성 전/후 이미지를 valid SQL lifecycle 전이로 복원했다. canonical 제약·트리거를 비활성화하지 않았다. 새 DB에서 baseline reader가 같은 응답과 행을 재사용하는 검사는 **1 passed / exit 0**이다. 평소 Gate는 이 고정 fixture를 읽기만 하며 후보 writer로 재생성하지 않는다.
+
+### 정상 실행
+
+최종 후보 명령·digest·시간은 아래 최종 검증 표에 기록한다. PR 1은 기반 commit에 미커밋 Gate 파일을 더한 후보이며 clean 최종 commit 검증으로 표현하지 않는다. 고정·최신 SHA가 같아도 각각 새 case DB를 만들어 실행했다.
+
+- RCG-01~09 논리 9개 → lane별 실제 17개 case. missing source 3개, wrong generation 1개, outside/empty/blank/fallback 4개, 실제 쓰기 후 실패 주입 2개를 모두 포함한다.
+- CTRL-01~05 → 실제 30개 case. 실제 pytest subprocess로 skip/xfail/xpass·미수집을 확인하고, 결과/JUnit·SHA/DDL hash 불일치와 cleanup/timeout/중단을 검사한다.
+- RCG-07은 HTTP 500·SQLSTATE 23514·run/experiment/binding/target/plan/exclusion member와 revision rollback을 확인한다.
+- RCG-08은 고정 baseline 행을 fresh DDL에 복원한 뒤 후보 API의 동일 응답과 전체 export 행 불변을 확인한다.
+- Python/pgvector image는 digest 고정, 직접·간접 Python dependency는 버전 lock이다. 패키지 wheel hash까지 고정한 lock은 아니다. 검증 architecture는 Linux/arm64다.
+
+### 의도적 실패와 정리
+
+아래는 서비스 결함으로 해석하지 않는 테스트 전용 임시 복사본의 주입이다. 실제 저장소 runtime·canonical 원본·고정 fixture는 변경하지 않았다. 각 디렉터리에 result.json, 로그, 실행 복사본을 남겼다.
+
+| 주입 | 실제 결과 | artifact 디렉터리 (`/private/tmp/rcg-gate-fault-probes-20260919/` 아래) |
+|---|---|---|
+| 정상 DB 검사 뒤 assertion 실패 | fixed FAIL, latest WARN_DRIFT, exit 1, cleanup 성공 | `assertion-output/` |
+| 최신 ref 조회 실패 | fixed PASS, latest WARN_UNVERIFIED, exit 0, cleanup 성공 | `latest-unavailable-output/` |
+| runner timeout | INCOMPLETE, exit 2, cleanup 성공 | `timeout-bounded-output/` |
+| 임시 fixed DDL에 잘못된 SQL 추가 | fixed INCOMPLETE, latest PASS여도 exit 2, cleanup 성공 | `schema-invalid-output/` |
+| 실행 중 자기 Gate 프로세스에 SIGTERM | INCOMPLETE, exit 2, cleanup 성공 | `interrupt-reviewed-output/` |
+
+첫 timeout 주입은 Docker CLI가 TERM을 proxy한 뒤 대기하여 47초가 걸렸다. CLI의 종료 유예도 제한하고 서버 측 컨테이너를 cleanup하도록 보강한 뒤 같은 유형의 주입은 전체 15초에 INCOMPLETE로 끝났다. 이는 준비 단계도 포함한 두 실행의 관찰값이며 성능 개선율로 환산하지 않는다. TERM 무시 subprocess를 사용하는 제어 case도 추가했다. 중단 시 터미널 요약이 lane 로그로 흘러가는 문제는 원래 출력 descriptor를 보존해 수정했다.
+
+### 보장과 남은 범위
+
+소유 label 조회로 검증 컨테이너·socket volume이 남지 않았음을 확인했다. 이미지/cache·artifact는 의도적으로 남긴다. `.gitignore`의 정확한 문서 예외 7줄과 Gate 자산만 PR 1 변경이며 app/·pyproject.toml·기존 API 테스트·tests/conftest.py·CI workflow에 추가 diff가 없다. PR 1 commit·push·PR 생성은 하지 않았다.
+
+로컬 Gate 범위는 완료했다. PR 2 CI, 개인 통합의 clean 최종 commit 검증, dev Draft, 실제 동시성, Dashboard consumer·배포 smoke, 전체 legacy/migration, 다른 architecture는 완료하지 않았다. 특히 실제 동시 요청은 **필수 후속 개발**이다. 장기 신뢰성·cold build 시간·개발 시간 절감률·운영 장애 감소는 측정하지 않았다.
+
+### 최종 검증 표
+
+| 항목 | 실제 값 |
+|---|---|
+| 명령 | `./scripts/run-contract-gate.sh /private/tmp/rcg-gate-pr1-verified-20260919` |
+| 실행 ID | `rcg-rcg-work.pa0nil` |
+| 후보 기반 / dirty | `09442f29e8da514df1d1a5f2a52b03646c92e170` / `true` |
+| allowlist source SHA-256 | `e632a860ae5f70c13f4a9c945ace0b636bf3f345edd390cff6bb827b37176803` |
+| fixed / latest SHA | 모두 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`, 별도 실행 |
+| DDL SHA-256 | `bad4948fe47485e7508a3cd389e9db84fdda3edfed4a1f4883b03554bcb38691` |
+| lock SHA-256 | `150c68697cc7eb2ec9df230ec705976a454c6d96b4cf366ec6ff100e778d82af` |
+| runner image / architecture | `sha256:3986d52f880eb0887a67ec73b407166531ef9fc7328af64149255c9dd432406d` / `linux/arm64` |
+| fixed | PASS, 17 passed, 누락·skip 0, 6.929초 |
+| latest | PASS, 17 passed, 누락·skip 0, 5.947초 |
+| controls | PASS, 30 passed, 누락·skip 0, 7.823초 |
+| 전체 / cleanup | PASS / exit 0 / 34초 / 소유 자원 정리 성공 |
+| artifact | `/private/tmp/rcg-gate-pr1-verified-20260919/result.json`, `fixed/junit.xml`, `latest/junit.xml`, `controls/junit.xml` |
+
+마지막 실행에 기록된 allowlist 파일 hash와 현재 파일을 모두 대조해 동일함을 확인했다. 이후 문서만 갱신했다. 위 시간은 캐시가 있는 단일 환경의 한 실행이며 통계적 성능·장기 안정성 수치가 아니다. Python AST·Bash 구문·fixture 파일 hash·필수 manifest 17/30·문서 상대 링크 73개·diff whitespace도 확인했다.
+
+## E-13: PR 1 제출 범위
+
+사용자가 PR 1의 commit·push·PR 생성을 승인했고 merge는 명시적으로 제외했다. 제출 대상은 `feat/run-contract-gate-db` → `integration/run-contract-gate`다. 제출 준비 시 31개 파일이 E-12 뒤 보존한 검토 snapshot과 같음을 hash로 확인했다. 서비스·Gate 실행 소스는 유지하고, 문서에서 E-12의 커밋 전 근거와 제출 commit 검증을 구분했다.
+
+제출 commit SHA·clean 상태 재실행 결과·원격 PR 정보는 PR 본문에 기록한다. 이 문단은 실행하지 않은 원격 작업의 완료 근거가 아니며 E-12의 과거 결과를 덮어쓰지 않는다.
