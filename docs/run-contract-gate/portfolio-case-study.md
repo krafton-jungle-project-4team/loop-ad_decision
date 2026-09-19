@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 채용 담당자, 백엔드 면접관, 프로젝트 리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A 로컬 PASS · PR 3A CI 제출 전 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
@@ -81,7 +81,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 - 실제 FastAPI·PostgreSQL 경계를 검증하는 Gate를 구현해 고정·최신 계약 각각 17개 DB 시나리오와 30개 제어 검사를 통과하고, commit 실패 후 HTTP 성공 응답이 전송되는 문제를 별도 서비스 PR로 수정.
 - 고정 baseline의 생성 전후 행과 expected 응답을 보존하고, canonical lifecycle 제약을 유지한 복원·후보 reader 재사용으로 한 baseline의 호환성을 검증.
 
-PR 2 CI 한 실행의 결과는 확보했다. 장기 안정성·생산성 향상률·운영 개선 수치는 확보하지 않았다. PR 3A의 동시성과 bundle은 로컬 구현·검증 성과로 설명할 수 있다. 3A CI는 제출 전이며 Dashboard 소비·운영 개선 수치는 주장하지 않는다.
+PR 2 CI 한 실행의 결과는 확보했다. 장기 안정성·생산성 향상률·운영 개선 수치는 확보하지 않았다. PR 3A의 동시성과 bundle은 로컬 구현·검증 성과로 설명할 수 있다. 3A의 제출/CI revision·결과는 PR 본문에서 별도로 확인한다. Dashboard 소비·운영 개선 수치는 주장하지 않는다.
 
 ### 구현 완료 후에만 사용할 문장 틀
 

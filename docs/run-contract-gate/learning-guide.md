@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 설계를 이해하고 자신의 말로 설명하려는 개발자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A 로컬 PASS · PR 3A CI 제출 전 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 

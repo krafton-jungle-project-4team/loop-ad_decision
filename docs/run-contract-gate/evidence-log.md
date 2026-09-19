@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A 로컬 PASS · PR 3A CI 제출 전 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
@@ -425,3 +425,20 @@ TestClient/별도 실제 PG connection 경합이며 TCP 서버·운영 pool·부
 `/private/tmp/rcg-pr3a-final-review/result.json`의 run `rcg-rcg-work.0xmwwf`는 fixed/latest 각 21 passed, CTRL 54 passed, cleanup true, Gate PASS/0이다. 전체 37초이며 두 lane의 원본 응답 12개씩을 검증했다. 초기 52개 CTRL에 fixed/latest bundle 누락을 실제 finalizer에 전달하는 2개를 추가해 공통 INCOMPLETE/2와 정상 bundle의 최종 verdict 갱신까지 검사했다. source digest는 `baa5da3c26d2a9f6e69d2cdc77eb280a3e526b33f8c5d8c4b40b3826bcf6c9bd`다. 이후 manifest의 JSON 줄바꿈만 정리했으며 clean commit에서 다시 실행한다.
 
 자체 검토는 서비스/DDL/Dashboard 변경 없음, 허용한 파일만 staging, JSON·JUnit·실제 응답과 producer 연결, 명시적 409와 최종 row/소비 상태, bounded wait와 owner cleanup, 실패 artifact 보존을 확인했다. 문서 상대 파일 링크 104개·anchor 39개와 세로 Mermaid 3개의 기본 구조, Python compile·shell syntax·diff whitespace도 검사했다. Mermaid 렌더 QA·운영 부하 시험의 근거는 아니다.
+
+### Clean 구현 commit 재검증
+
+| 필드 | 실제 값 |
+|---|---|
+| 구현 commit / dirty | `187432d49f83b6bb488094ef26a4057a7c478532` / false |
+| 실행 명령 | `bash scripts/run-contract-gate.sh /private/tmp/rcg-pr3a-clean-submit` |
+| run / 시간 | `rcg-rcg-work.cxrjhi` / 37초 |
+| 결과 | fixed 21 passed / latest 21 passed / CTRL 54 passed / PASS·exit 0 / cleanup true |
+| source digest | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| fixed bundle hash | `03f0aff8eadfbf2bc5fb6ede33800e74368fa977cd603d741394ae7bef0aabd6` |
+| latest bundle hash | `587b685e31d9b5d821be700b2e73f46a3f66467d4519b5f1f5388454a4d13c45` |
+| 응답 수 | 각 12개, bundle VERIFIED |
+
+같은 경합에서 target read 진단을 확인했다. 두 overlap 모두 후행 요청의 `audience_reservation_state=consumed`, `reservation_count=0`, `every_member_reserved=false`를 실제 `_load_binding_target` 반환값으로 기록했다. 최종 응답은 409이고 rollback 완료가 HTTP 응답 시작보다 앞선다.
+
+이 검증 기록을 추가하는 후속 commit은 문서 7개만 바꾼다. 검증한 구현 commit과 문서 기록 commit을 구분하고, Gate allowlist의 source/test/tool/workflow 변경이 없는지 확인한다. 최종 제출 head와 CI checkout SHA·source digest·artifact 링크는 PR 본문에서 이 로컬 근거와 연결한다. PR 3A는 merge하지 않고 PR 3B는 pending으로 남긴다.
