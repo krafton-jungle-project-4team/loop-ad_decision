@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 채용 담당자, 백엔드 면접관, 프로젝트 리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
@@ -94,7 +94,7 @@ PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답
 
 ## 30초 설명 — 기존 로컬·CI와 PR 3A 로컬 검증 완료
 
-“광고 실험을 시작하는 API에서 같은 요청을 다시 보내도 실험이 중복되지 않고, 실패하면 데이터가 반쯤 남지 않아야 합니다. 기존 테스트가 실제 DB의 commit까지 확인하는지 조사했고, 그 경계를 반복 검증하는 도구를 설계했습니다. 실제 DB 검증을 시작하자 commit이 실패해도 HTTP 성공 응답이 먼저 나가는 문제가 재현됐습니다. 실패를 보존하고 별도 서비스 PR로 수정했습니다. 이후 기존 행 호환성까지 포함한 Gate를 로컬과 CI에서 검증했습니다. 다음 단계는 Decision의 실제 동시성 검사와 Dashboard의 실제 소비 검사를 저장소별 PR로 나누고, 두 revision의 결과를 연결하는 것입니다.”
+“광고 실험을 시작하는 API에서 같은 요청을 다시 보내도 실험이 중복되지 않고, 실패하면 데이터가 반쯤 남지 않아야 합니다. 기존 테스트가 실제 DB의 commit까지 확인하는지 조사했고, 그 경계를 반복 검증하는 도구를 설계했습니다. 실제 DB 검증을 시작하자 commit이 실패해도 HTTP 성공 응답이 먼저 나가는 문제가 재현됐습니다. 실패를 보존하고 별도 서비스 PR로 수정했습니다. 이후 기존 행 호환성까지 포함한 Gate를 로컬과 CI에서 검증했습니다. 이어서 실제 DB lock 경합과 rollback을 검증하고 원본 응답 bundle까지 만들었습니다. 다음 단계는 이 bundle을 Dashboard의 실제 소비 코드에 연결하고 두 revision의 결과를 함께 확인하는 것입니다.”
 
 ## 3분 기술 설명의 순서
 
@@ -103,7 +103,7 @@ PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답
 3. **설계:** 실제 dependency commit 후 독립 connection으로 확인하며 baseline fixture를 보존하는 이유를 말한다.
 4. **실패 가능성:** 중간 쓰기 실패, 지연 제약 실패, 누락된 case의 잘못된 PASS를 예로 든다.
 5. **Trade-off:** DB 컨테이너만 쓰는 방식보다 재현성 비용을 수용했고, 최신 DDL은 배포를 흔드는 필수 기준으로 쓰지 않았다고 설명한다.
-6. **결과와 한계:** E-12 미커밋 후보, E-15 clean head·CI checkout의 차이를 밝힌다. 실제 결과 하나를 제시하고 동시성·Dashboard·운영 효과의 미검증 범위를 덧붙인다.
+6. **결과와 한계:** E-12 미커밋 후보, E-15 clean head·CI checkout의 차이를 밝힌다. E-17의 실제 동시 경합 결과를 제시하고 운영 pool·부하·Dashboard 소비·운영 효과의 미검증 범위를 덧붙인다.
 
 ## 3분 데모 순서
 
@@ -115,7 +115,7 @@ PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답
 | 2:10~2:40 | fixed/latest JSON·JUnit 또는 CI 결과 | 기준과 경고의 분리 |
 | 2:40~3:00 | 미검증 범위와 필수 후속 | 보장의 한계를 정확히 설명 |
 
-실행이 3분보다 길면 실제 사전 실행 artifact를 제시하고 “사전 실행 결과”라고 표시한다. 녹화·저장된 결과를 즉석 실시간 실행처럼 보여주지 않는다. 현재 로컬 Gate와 저장된 JSON/JUnit을 시연할 수 있다. CI는 E-15의 실제 실행과 artifact를 제시할 수 있다. PR 3 동시성·consumer 데모는 아직 없다.
+실행이 3분보다 길면 실제 사전 실행 artifact를 제시하고 “사전 실행 결과”라고 표시한다. 녹화·저장된 결과를 즉석 실시간 실행처럼 보여주지 않는다. 현재 로컬 Gate와 저장된 JSON/JUnit을 시연할 수 있다. CI는 E-15의 실제 실행과 artifact를 제시할 수 있다. PR 3A의 경합 timeline·원본 응답 bundle은 E-17의 로컬·CI artifact로 시연할 수 있다. PR 3B consumer 데모는 아직 없다.
 
 ## 예상 면접 질문과 답변 방향
 

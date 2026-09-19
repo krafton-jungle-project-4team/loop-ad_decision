@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
@@ -442,3 +442,22 @@ TestClient/별도 실제 PG connection 경합이며 TCP 서버·운영 pool·부
 같은 경합에서 target read 진단을 확인했다. 두 overlap 모두 후행 요청의 `audience_reservation_state=consumed`, `reservation_count=0`, `every_member_reserved=false`를 실제 `_load_binding_target` 반환값으로 기록했다. 최종 응답은 409이고 rollback 완료가 HTTP 응답 시작보다 앞선다.
 
 이 검증 기록을 추가하는 후속 commit은 문서 7개만 바꾼다. 검증한 구현 commit과 문서 기록 commit을 구분하고, Gate allowlist의 source/test/tool/workflow 변경이 없는지 확인한다. 최종 제출 head와 CI checkout SHA·source digest·artifact 링크는 PR 본문에서 이 로컬 근거와 연결한다. PR 3A는 merge하지 않고 PR 3B는 pending으로 남긴다.
+
+### PR #398 CI와 업로드 artifact 검증
+
+[PR #398](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/398)은 `feat/run-contract-gate-concurrency` → `integration/run-contract-gate`, OPEN이며 merge하지 않았다. [Actions 35430880753](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753)의 `Fixed contract (required)`가 SUCCESS다.
+
+| 필드 | 실제 값 |
+|---|---|
+| PR head / base | `c333c83730a5825152cbb48f73900e30b0ab60cf` / `6de82a36ddc1cf51c88a431d65e84f873ea8f472` |
+| 실제 CI checkout / dirty | `be3b5024e43eb1b9d01fbcba01413a352374be6d` / false (`refs/pull/398/merge`) |
+| Gate run / 시간 | `rcg-rcg-work.xgqchw` / Gate 74초, job 83초 |
+| 결과 | fixed 21 / latest 21 / CTRL 54 모두 pass; cleanup·artifacts·controls true |
+| source digest | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1`; clean 로컬 구현 실행과 동일 |
+| fixed manifest | `431408e4e530a95114494da69b28f588164ea92d1691513a9c66ae24b8b71ae4` |
+| latest manifest | `519c8164c29f3939eda335910b4336e22cc626be0f987a8ca57adedbf9b1a56f` |
+| required artifact | [10580128654](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753/artifacts/10580128654) |
+| latest artifact | [10580103725](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753/artifacts/10580103725) |
+| 다운로드 검증 | `/private/tmp/rcg-pr3a-ci-35430880753/`; 두 bundle의 파일 inventory·digest·lane·producer·JSON/JUnit·원본 응답 12개씩 재검증 |
+
+CI metadata의 PR head/base와 실제 checkout SHA를 구분하고, Gate producer가 checkout과 일치함을 확인했다. 위 수치는 이 CI 실행의 값이다. 이 기록 및 포트폴리오의 과거 미래형 표현을 정리하는 후속 commit은 문서만 바꾸며 최종 head CI는 PR check/본문에서 확인한다. PR 3 milestone은 **3A verified / 3B pending**이고 전체 consumer 경계는 incomplete evidence다. artifact 보관 기간은 workflow의 14일이며 이후 필요하면 같은 명시적 revision으로 재생성하고 새 run/hash를 기록한다.

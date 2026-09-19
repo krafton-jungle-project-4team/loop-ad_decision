@@ -3,7 +3,7 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 개발자, 구현 에이전트, 리뷰어, 포트폴리오 독자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬 PASS · 제출/CI는 PR 기록 · PR 3B pending |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
 | 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
@@ -45,7 +45,7 @@
 | Gate 테스트·컨테이너 실행기·CI | PR 3A 로컬 Gate·bundle PASS; 3A 제출/CI는 PR 기록·3B pending |
 | 기준 코드가 생성한 기존 row fixture | 생성·새 DB 복원·baseline/candidate 재사용 확인 |
 | 로컬·CI 실행 결과와 소요 시간 | PR 3A 로컬 fixed/latest 각 21 passed, controls 54 passed; E-17. 기존 PR 2 CI는 E-15 |
-| PR / dev Draft | PR 0 #394·PR 1 #395·PR 2 #396·문서 #397 통합 병합; PR 3A 제출 준비, merge 제외 |
+| PR / dev Draft | PR 0 #394·PR 1 #395·PR 2 #396·문서 #397 통합 병합; [PR 3A #398](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/398) OPEN, merge 제외 |
 
 ## 구현·제출 경계
 
@@ -53,9 +53,9 @@ PR 0은 응답 전 commit 서비스 수정, PR 1은 로컬 Gate, PR 2는 같은 
 
 | 작업 | 저장소 | 끝까지 검증할 경계 | 현재 상태 |
 |---|---|---|---|
-| PR 3A | Decision | 복수 실제 DB connection의 경합·commit/rollback → 원본 응답·결과 artifact | 구현·로컬 검증 완료 |
+| PR 3A | Decision | 복수 실제 DB connection의 경합·commit/rollback → 원본 응답·결과 artifact | 구현·로컬/CI 검증 완료 |
 | PR 3B | Dashboard | 원본 artifact → 실제 client → 공유 변환 → 실제 launch의 다음 operation 인자 | 계획 확정·미구현 |
-| PR 3 milestone | 두 저장소의 증거 연결 | Decision/Dashboard/Contract revision과 실제 소비 bundle hash가 연결된 결과 | 3A local verified / 3B pending |
+| PR 3 milestone | 두 저장소의 증거 연결 | Decision/Dashboard/Contract revision과 실제 소비 bundle hash가 연결된 결과 | 3A verified / 3B pending |
 
 **개발자·AI의 시작점:** [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약) → [새 검증 기준](verification-spec.md#pr-3-검증-경계--3a-구현-3b-계획) → [인수인계 절차](developer-guide.md#9-pr-3a에서-pr-3b로-넘기는-절차). 먼저 학습하려면 [7~9단원](learning-guide.md#7-pr-3a-동시-시작과-실제-경합은-다르다)을 읽는다. 완료 여부는 [E-16 대장](evidence-log.md#e-16-pr-3-milestone-결정과-증거-대장)으로 확인한다.
 
