@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 설계를 이해하고 자신의 말로 설명하려는 개발자 |
-| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
-| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
+| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 한 번에 전체 service 파일을 읽지 않는다. 각 단원의 작은 조각을 읽고 입력·출력·부작용을 세 문장으로 설명한다. 해설을 읽기 전에 질문에 답한다. 아래 일반 실패 상황은 설명을 위한 가정이다. 다만 2026-09-19 RCG-07에서 HTTP 200 이후 commit 실패가 실제로 재현됐으며, 운영 사고라는 의미는 아니다.
@@ -26,7 +26,7 @@ flowchart TD
     H --> I["고정 계약 필수 판정 / 최신 계약 경고"]
 ```
 
-Dashboard client와 화면 실행은 이 그림 뒤의 후속 경계다. TestClient는 프로세스 내부의 HTTP 요청 경로를 검사하며 ALB·TCP·배포 서버까지 실행하지 않는다.
+이 그림은 구현 완료된 PR 1·2의 경계다. PR 3A 실제 경합과 PR 3B consumer 연결 계획은 7~9장에서 따로 설명한다. TestClient는 프로세스 내부의 HTTP 요청 경로를 검사하며 ALB·TCP·배포 서버까지 실행하지 않는다.
 
 ## 1. Fake 테스트와 실제 DB 테스트
 
@@ -125,7 +125,7 @@ DB는 composite UNIQUE로 같은 scope의 중복 run을 막는다. experiment는
 
 순차 재시도는 이미 commit된 row를 다시 읽는 경로를 확인한다. 실제 동시성은 두 transaction의 관측 시점, unique 충돌, lock 대기, 승자 commit과 패자 재조회까지 관련된다.
 
-기존 fake race 테스트는 삽입 패배 이후 코드 분기를 검증하지만 실제 PostgreSQL transaction의 실행 순서를 만들지는 않는다. 이번 RCG-02는 첫 번째 상황을 다룬다. 두 번째 상황은 필수 후속 개발이다.
+기존 fake race 테스트는 삽입 패배 이후 코드 분기를 검증하지만 실제 PostgreSQL transaction의 실행 순서를 만들지는 않는다. 이번 RCG-02는 첫 번째 상황을 다룬다. 두 번째 상황은 PR 3A의 필수 구현 계획이며 아직 검증하지 않았다.
 
 ### 이해 확인 질문
 
@@ -241,7 +241,7 @@ Decision 코드는 바꾸지 않았는데 외부 Contract main이나 Python depe
 - 동일 scope 재사용과 V2 target 중복 binding 금지의 차이.
 - 실제 commit 결과를 관찰하는 방법.
 - 고정 fixture를 바꾸지 않아야 할 이유.
-- 실제 동시성·Dashboard·운영 경험을 이번 성과와 구분하는 방법.
+- 구현 완료된 PR 1·2와 계획 단계인 PR 3A/3B, 운영 경험의 차이를 설명하는 방법.
 
 답을 외우기보다 “어떤 변경을 넣으면 어느 RCG case가 실패해야 하는가”를 예측한다. 실제 실행 후 예상과 결과가 달랐던 지점은 근거 기록에 추가한다.
 
@@ -261,3 +261,96 @@ Decision 코드는 바꾸지 않았는데 외부 Contract main이나 Python depe
 - 6장: [판정기](../../tools/run_contract_gate/report.py)와 [제어 검사](../../tests/run_contract_gate/test_runner_control.py)를 읽는다. pytest exit 0이어도 skip/xfail/xpass/필수 누락이 있으면 왜 INCOMPLETE인지 확인한다.
 
 추가 질문: Docker CLI에 종료 신호를 보냈다는 사실이 컨테이너 종료의 증거인가? 아니다. 신호 대기도 제한하고, host가 이번 실행의 이름과 소유 label을 대조해 컨테이너·socket volume을 정리해야 한다. 실제 timeout 주입에서 이 차이를 확인했다.
+
+## 7. PR 3A: 동시 시작과 실제 경합은 다르다
+
+### 실패 예시
+
+두 worker를 동시에 시작했지만 A가 모두 끝난 뒤 B가 DB에 도착할 수 있다. 둘 다 같은 run을 받았어도 이는 순차 재사용 검증일 수 있다. 반대로 A가 lock을 잡은 채 B의 도착을 기다리고 B는 그 lock 때문에 도착하지 못하면 테스트가 스스로 교착을 만든다.
+
+### 따라 읽기
+
+[기존 RCG-02](../../tests/run_contract_gate/test_run_db.py)의 순차 요청과 [insert_if_absent](../../app/decision/repositories.py)의 실제 `ON CONFLICT DO NOTHING`을 비교한다. 다음 그림은 PR 3A에서 만들 **예정 순서**이지 현재 실행 결과가 아니다.
+
+```mermaid
+flowchart TD
+    A["같은 DB · 서로 다른 connection A/B"] --> B["동일 scope 없음 확인"]
+    B --> C["A 실제 INSERT · transaction 유지"]
+    C --> D["B 실제 쓰기 시도"]
+    D --> E["B가 A를 기다리는 DB 증거 확인"]
+    E --> F{"A 종료를 허용"}
+    F -->|commit| G["B 삽입 패배 · committed run 재조회"]
+    F -->|rollback| H["B 쓰기 성공 · 자기 transaction commit"]
+    G --> I["요청 종료 후 새 connection으로 전체 상태 확인"]
+    H --> I
+```
+
+### 설명
+
+barrier는 실행 순서를 제어하고, PostgreSQL 관찰은 실제 경합을 증명한다. 둘이 같은 역할은 아니다. DB 대기를 확인하기 전 요청이 끝나면 의도한 case가 성립하지 않았으므로 INCOMPLETE다. 대기를 확인했고 결과가 잘못됐으면 불변식 실패다. 재시도 횟수를 늘려 우연히 성공한 결과만 고르지 않는다.
+
+rollback case의 최종 run 수는 0이 아니라 1일 수 있다. A가 실패한 뒤 B가 정상 생성했기 때문이다. “rollback했으니 모든 row가 0”이라는 assertion 대신 A의 부분 쓰기가 없고 B의 완전한 결과만 남았는지 확인한다.
+
+### 이해 확인과 해설
+
+1. 두 요청의 시작 시각이 같으면 충분한가? **아니다.** 서로 다른 backend PID와 실제 blocker/wait·종료 순서가 필요하다.
+2. A 실패 후 B 성공인데 run이 1개면 rollback 실패인가? **아니다.** 최종 row의 identity·binding·소비 상태가 B의 성공과 일치하는지 본다.
+3. `sleep(1)`을 늘려 테스트가 통과하면 해결인가? **아니다.** 준비 순서와 대기 증거를 확정하고 모든 대기에 종료 제한을 둬야 한다.
+
+## 8. PR 3B: 실제 consumer 코드를 사용한다는 뜻
+
+### 실패 예시
+
+테스트가 Dashboard 변환 로직을 복사해 올바른 `promotionRunId`를 만들지만 화면의 실제 hook에는 오타가 남을 수 있다. client schema만 통과해도 이후 launch가 scope를 거절하거나 잘못된 experiment ID를 보낼 수 있다.
+
+### 따라 읽기
+
+[개발 계획 10절](implementation-plan.md#10-dashboard-소비-코드-연결-방식)의 실제 client, hook, launch 코드 순서로 읽는다. 현재 변환은 hook 안에 있으므로 PR 3B에서 공유 순수 함수로 추출하고 화면과 테스트가 함께 사용하게 할 계획이다. 함수 추출은 구현 예정이며 아직 적용하지 않았다.
+
+```mermaid
+flowchart TD
+    A["3A 실제 status/body + provenance"] --> B["로컬 replay 서버"]
+    B --> C["실제 Dashboard client · schema"]
+    C --> D["화면과 공유하는 실제 변환 함수"]
+    D --> E["실제 launchPromotionExperiment"]
+    E --> F["build/start/dispatch 대역의 인자·순서 기록"]
+    F --> G["원본 run/experiment ID와 비교"]
+```
+
+### 설명
+
+이 검사는 실제 DB가 만든 응답을 실제 consumer가 사용할 수 있는지 확인한다. replay 서버는 고정된 원본 status/body를 제공한다. downstream 대역은 launch가 어떤 요청을 만들었는지 관찰한다. 둘 다 경계를 명확하게 제한하기 위한 것이며, 실제 client·변환·launch를 통째로 fake로 바꾸는 것과 다르다.
+
+브라우저, Dashboard API 전체 proxy 경로, 실제 assignment·start·발송은 이 그림에서 실행하지 않는다. 따라서 정확한 이름은 run-consumer 통합 검증이다. 예를 들어 dispatch 대역이 한 번 호출됐다는 사실은 이메일이 전송됐다는 증거가 아니다.
+
+### 이해 확인과 해설
+
+1. 테스트와 화면이 같은 코드를 쓴다는 것은 어떻게 보장하는가? **공유 함수 하나를 실제 hook과 연결 검사에서 사용하고 wiring·기존 회귀도 확인한다.** 테스트에 변환을 복제하지 않는다.
+2. 원본 응답을 Dashboard 타입에 맞게 고쳐서 연결해도 되는가? **안 된다.** 실제 불일치를 숨긴다. 오류 검사용 변형은 별도 파생 입력으로 표시한다.
+3. schema 검사가 통과하면 소비 검증은 끝인가? **아니다.** 변환 후 scope와 다음 operation의 ID까지 확인한다.
+
+## 9. 두 PR의 PASS와 하나의 milestone
+
+### 실패 예시
+
+Decision D1의 bundle을 Dashboard H1이 읽고 PASS했다. 이후 Decision을 D2로 바꿨는데 H1의 과거 PASS를 그대로 붙이면 D2/H1 조합은 검증하지 않은 상태다. PR 번호가 같아도 commit이 바뀔 수 있다.
+
+### 설명
+
+milestone은 PR 두 개의 체크 표시를 모은 것이 아니라 **특정 producer·consumer·Contract 조합의 증거**다. PR 번호는 작업 위치를 찾는 링크이고 실제 checkout SHA·source digest·bundle hash는 무엇을 검사했는지 확인하는 값이다.
+
+- Decision SHA: 어떤 코드가 응답을 만들었는가.
+- Contract SHA/DDL hash: 어떤 DB 계약에서 만들었는가.
+- bundle/response hash: Dashboard가 어떤 bytes를 소비했는가.
+- Dashboard SHA: 어떤 client·변환·launch가 소비했는가.
+- 결과/CI 링크: 그 조합이 어떻게 끝났는가.
+
+같은 SHA로 다시 실행해도 run ID·시각·bundle hash는 달라질 수 있다. 새 실행을 소비했다면 그 새 artifact를 연결해야 한다. 과거 baseline expected는 별도로 보존해 현재 writer·reader가 함께 같은 방식으로 틀리는 것을 감시한다.
+
+### 이해 확인과 해설
+
+1. 3A PASS, 3B PASS인데 bundle hash가 다르면 milestone PASS인가? **그 두 결과의 연결을 증명하지 못했다.** 맞는 입력으로 소비 검증을 다시 하거나 정확한 실행 관계를 찾아야 한다.
+2. 3A만 완료했으면 어떻게 적는가? **`3A verified / 3B pending`.** 전체 PR 3 완료라고 쓰지 않는다.
+3. PR 3 verified면 merge·배포도 승인됐는가? **아니다.** 검증 상태와 원격 작업 승인은 별개다.
+
+다 읽은 뒤 [E-16 대장](evidence-log.md#e-16-pr-3-milestone-결정과-증거-대장)의 한 조합을 보고 “누가 무엇을 만들어서 누가 어떻게 읽었는가”를 설명할 수 있어야 한다. 아직 값이 비어 있는 것은 문서 누락이 아니라 미구현 상태를 명시한 것이다.
