@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 기록 규칙
@@ -275,3 +275,28 @@ PR 1의 기존 작업 파일 15개를 `/private/tmp/rcg-pr0-merge-20260919/pr1-w
 사용자가 PR 1의 commit·push·PR 생성을 승인했고 merge는 명시적으로 제외했다. 제출 대상은 `feat/run-contract-gate-db` → `integration/run-contract-gate`다. 제출 준비 시 31개 파일이 E-12 뒤 보존한 검토 snapshot과 같음을 hash로 확인했다. 서비스·Gate 실행 소스는 유지하고, 문서에서 E-12의 커밋 전 근거와 제출 commit 검증을 구분했다.
 
 제출 commit SHA·clean 상태 재실행 결과·원격 PR 정보는 PR 본문에 기록한다. 이 문단은 실행하지 않은 원격 작업의 완료 근거가 아니며 E-12의 과거 결과를 덮어쓰지 않는다.
+
+## E-14: PR 2 CI 구현과 로컬 검증
+
+2026-09-19 PR #395가 `integration/run-contract-gate`에 `fe7e8e67f58b51dc03779929f7040eea4bc744e1`로 병합됐음을 GitHub에서 확인하고, 원격 최신 통합에서 `feat/run-contract-gate-ci`를 생성했다. 변경은 `.github/workflows/run-contract-gate.yml`과 기존 안내 문서 7개다. 서비스·PR 1 Gate·판정·fixture·배포 workflow·branch protection은 변경하지 않았다.
+
+workflow는 개인 통합·dev 대상 PR과 수동 실행을 선언하며, `ubuntu-24.04-arm`에서 기존 Gate 명령을 실행한다. Gate exit를 그대로 필수 check에 전달하고 latest는 최종 JSON 기반 경고로 표시한다. required와 latest JSON/JUnit은 별도 `always()` artifact로 보관한다. CI context에는 base/head/checkout SHA를 구분한다. `contents: read`와 credential 비보존 checkout을 사용하고, 공식 Actions는 조회한 v7.0.1 commit SHA로 고정했다.
+
+| 검증 | 실제 결과 |
+|---|---|
+| actionlint v1.7.12 | 공식 release checksum 확인 후 실행, workflow 통과. shellcheck는 설치되지 않아 비활성화 |
+| Bash 구문 | workflow에서 추출한 3개 run block의 `bash -n` 통과 |
+| CI provenance | 실제 checkout SHA 기록 및 branch 문자열의 shell 비실행 확인 |
+| 종료 코드 전달 | 임시 Gate 대역의 0/1/2를 그대로 전달. 실제 서비스 회귀 주입 검사가 아닌 CI 연결 경계 검사 |
+| latest 표시 | PR 1 실제 PASS·WARN_DRIFT·WARN_UNVERIFIED JSON과 결과 누락을 입력해 표시·exit 0 확인; 필수 결과를 재계산하지 않음 |
+| workflow 구조 | 두 PR 대상·수동 trigger·read 권한·SHA pin·3개 always step·분리 artifact·continue-on-error 미사용 확인 |
+| 기존 명령 로컬 재실행 | `./scripts/run-contract-gate.sh /private/tmp/rcg-pr2-local-20260919`, CI와 같은 종료 코드 전달 block 사용 |
+| 실제 DB 결과 | fixed 17 passed / latest 17 passed / controls 30 passed, JUnit errors/failures/skipped 모두 0 |
+| 전체 / 정리 | PASS / exit 0 / 34초 / cleanup_ok=true; 소유 label 조회로 컨테이너·volume 잔존 없음 |
+| 후보 기반 / dirty | `fe7e8e67f58b51dc03779929f7040eea4bc744e1` / true (workflow 미커밋 후보) |
+| source SHA-256 | `e632a860ae5f70c13f4a9c945ace0b636bf3f345edd390cff6bb827b37176803` — PR 1과 동일 |
+| Contract / architecture | fixed·latest 모두 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`, 각각 실행 / linux/arm64 |
+
+로컬 검증 도구·추출한 step은 `/private/tmp/rcg-pr2-validation-20260919/`, 실제 Gate JSON/JUnit은 `/private/tmp/rcg-pr2-local-20260919/`에 있다. 임시 도구와 raw artifact는 커밋하지 않는다. 문서에는 사람이 검토한 결과만 기록한다. 이 34초는 캐시가 있는 단일 로컬 실행이며 GitHub runner 성능 수치가 아니다.
+
+제출 commit에서 clean 재실행 후 그 SHA와 결과를 PR 본문에 기록한다. 실제 GitHub-hosted runner의 실행·익명 Contract 취득·artifact 업로드는 PR 생성 후 확인한다. 실패 경로의 실제 GitHub artifact 업로드, 수동 dispatch, 장기 CI 안정성, 통합 최종 commit, dev Draft는 이 로컬 검증으로 완료 처리하지 않는다. PR 2는 생성까지만 승인됐으며 merge하지 않는다.
