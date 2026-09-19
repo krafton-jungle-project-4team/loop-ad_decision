@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 3A merged (`9ace3b6`) · Dashboard #246/#247 merged · PR 3 milestone 구현·consumer artifact 검증 완료 · Decision 문서 PR #399 OPEN |
+| 기준 revision | Decision producer `9ace3b6` → Dashboard fix merge `7d4a8a2` → 3B head `a813993` / CI checkout `a6c868d` / main merge `adb7d29`; 전체 SHA·hash는 E-17 마지막 실행 조합 참조 |
+| 마지막 확인 | 2026-09-20 KST |
 
 ## 기록 규칙
 
@@ -461,3 +461,115 @@ TestClient/별도 실제 PG connection 경합이며 TCP 서버·운영 pool·부
 | 다운로드 검증 | `/private/tmp/rcg-pr3a-ci-35430880753/`; 두 bundle의 파일 inventory·digest·lane·producer·JSON/JUnit·원본 응답 12개씩 재검증 |
 
 CI metadata의 PR head/base와 실제 checkout SHA를 구분하고, Gate producer가 checkout과 일치함을 확인했다. 위 수치는 이 CI 실행의 값이다. 이 기록 및 포트폴리오의 과거 미래형 표현을 정리하는 후속 commit은 문서만 바꾸며 최종 head CI는 PR check/본문에서 확인한다. PR 3 milestone은 **3A verified / 3B pending**이고 전체 consumer 경계는 incomplete evidence다. artifact 보관 기간은 workflow의 14일이며 이후 필요하면 같은 명시적 revision으로 재생성하고 새 run/hash를 기록한다.
+
+
+### PR 3B merge producer 고정 및 RCC-04 중단 (2026-09-19)
+
+**당시 중간 상태: `3B stopped / fix pending`.** 아래는 중단 당시 기록이며, 후속 사용자 지시에 따른 stacked 검증 결과는 다음 절에 분리한다. 중복 experiment identity는 별도 Dashboard `fix/reject-duplicate-experiment-identity` 브랜치에서 수정한다. 3B의 기대값·변환 추출·재현 evidence는 보존하며 이 로컬 문서는 commit·push하지 않는다. 수정 PR merge와 3B 전체 검증 완료 뒤에만 최종 revision 조합으로 갱신한다. 별도 [Dashboard 수정 PR #246](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/pull/246)의 head는 `b77b90165682e4dc9bb63bf93b04f19133e2965d`이며 생성 후 merge하지 않았다. 이 SHA는 수정 PR 참고 정보이며 최종 consumer 검증 revision이 아니다.
+
+이 기록은 위 PR #398 OPEN 시점의 후속 상태다. 사용자가 PR #398을 2026-09-19 08:32:15 UTC에 `integration/run-contract-gate`로 merge했으며 merge SHA는 `9ace3b6ef5d1aaa7851d7ffbb180f1802f5c7008`이다. [최종 PR head CI 35431051367](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35431051367)는 SUCCESS이고 PR head `71c989d`와 merge SHA의 tree diff는 없다. merge SHA 자체의 Actions 실행은 확인되지 않아 CI 성공을 그 SHA의 직접 실행으로 표시하지 않는다.
+
+| 조합 필드 | 실제 값 |
+| --- | --- |
+| Decision producer revision | `9ace3b6ef5d1aaa7851d7ffbb180f1802f5c7008`, clean detached checkout |
+| Dashboard base revision | `df9daf13b57324d52a0eacb15b33c845a399c79f` |
+| Dashboard 실행 상태 | `feat/run-consumer-integration`, uncommitted extraction/probe; 실행 파일별 hash는 consumer JSON에 기록 |
+| fixed / latest Contract | 각각 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50` (같은 revision) |
+| producer source hash | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| Gate run | `rcg-rcg-work.zzd4hw` |
+| producer 결과 | fixed 21 / latest 21 / controls 54 PASS, cleanup true |
+| fixed bundle manifest hash | `179ada3261572a329bd7437a8e4751a7e8c279018934b10260274ac1d2297223` |
+| latest bundle manifest hash | `f8a82b130996fae3e5cd827dda31244473c0399478c734eea9814482f486851a` |
+| bundle 검증 | pinned producer validator로 각 lane VERIFIED; inventory, provenance, hashes, JSON/JUnit, 원본 응답 12개 검증 |
+| consumer focused probe | 6개 실행: 원본/중복 행 control 4 PASS, 중복 experiment identity 2 FAIL; exit 1 / STOP_REQUIRED |
+| consumer CI / artifact / PR | 미구현·미제출. 로컬 JSON/JUnit만 보존. 전체 RCC gate는 incomplete |
+
+Dashboard의 실제 client → 추출된 공유 변환 → 실제 `launchPromotionExperiment`를 loopback HTTP replay로 실행했다. RCG-01 원본에서 `ad_experiments[1].ad_experiment_id`만 첫 번째 ID로 바꾸고 서로 다른 segment IDs를 유지하면 client/launch가 거절하지 않고 build 대역을 1회, 같은 experiment ID의 start 대역을 2회 호출한다. fixed/latest 모두 동일하다. 실험 행 전체를 중복하면 launch가 downstream 전에 거절하므로 행 중복과 identity 중복은 구분한다. 원본 producer가 중복 ID를 반환한 것은 아니며 RCC-04용 파생 입력이다. 원본 채널이 onsite_banner여서 dispatch 호출은 없었다.
+
+원인은 client의 문자열 타입 검사와 launch의 고객군별 개수 검사에 experiment ID 유일성 검사가 없기 때문이다. 해결은 Dashboard 검증 동작 변경이어서 사용자가 지정한 중단 조건에 따라 production 수정 없이 멈췄다. 기존 hook 반환식은 그대로 순수 함수로 추출했으며 AST 동일성, 기존 관련 테스트 31 PASS, web typecheck, 변경 파일 eslint로 확인했다. 실제 assignment/start/dispatch·browser E2E·배포는 수행하지 않았다.
+
+재현 코드와 상세 보고서는 로컬 Dashboard worktree `/Users/ran/loop-ad/loop-ad_dashboard-run-consumer`의 `tools/run-consumer/reproduce-duplicate-identity.ts`, `docs/run-consumer/PR3B-STOP.md`, `docs/run-consumer/evidence/2026-09-19-duplicate-identity/{result.json,junit.xml}`에 있다. parent/body/source hash와 원본·파생 body, 호출 순서·인자, 미구현 목록을 보존했다. producer 전체 출력은 `/private/tmp/rcg-pr3b-producer-9ace3b6`에 있다. RCC-02/03/05/06과 나머지 RCC-01/04, 전체 consumer gate 및 CI/artifact는 완료로 표시하지 않는다. 이 E-17 후속 기록은 `docs/run-consumer-stop-evidence` 로컬 branch의 미커밋 문서 변경이며 고정 producer/보호 branch에는 쓰지 않았다. 중단 조건으로 commit·push·PR 생성은 하지 않았다.
+
+
+### PR 3B: 미병합 fix 위의 전체 consumer 검증 (2026-09-19)
+
+**현재 상태: `3A merged / 3B stacked verified / Dashboard #246·#247 unmerged`.** 사용자의 후속 지시에 따라 수정 PR을 먼저 merge한다는 이전 조건을 변경했다. 정확한 `b77b901`에서 새 worktree와 `feat/run-consumer-integration`을 만들고, [Dashboard PR #247](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/pull/247)의 base를 `fix/reject-duplicate-experiment-identity`로 지정했다. main으로 rebase·retarget하지 않았다. 아래 성공은 이 명시적 조합의 검증이며 main·배포의 성공을 뜻하지 않는다.
+
+| revision 연결 | 검증한 실제 값 |
+| --- | --- |
+| Decision producer | `9ace3b6ef5d1aaa7851d7ffbb180f1802f5c7008` (clean checkout에서 새 bundle 생성) |
+| producer source SHA-256 | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| Dashboard fix / PR #247 base | [#246](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/pull/246) / `b77b90165682e4dc9bb63bf93b04f19133e2965d` |
+| PR #247 head | `58a2133d3d612b1a23c462295265dc4b6fa7c4fb` |
+| 실제 CI checkout / dirty | `5535ffb287aa9d92ace7c65b6f6f9c34d69e16da` / false (`refs/pull/247/merge`) |
+| Dashboard source SHA-256 | `c20e803e173279d71711cf5e1b41e76144ed03288be6a137d65061f20238d5ce`; clean local head와 파일별 hash도 동일 |
+| baseline producer / expected hash | `e1de8b29b902b54df3a58f21f1daa27c1171fe80` / `0fb6c279a84c65e585cc17edaa0103288f952a7061cb5c4d4de0711814f6c2f9` |
+| fixed / latest Contract | 각각 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`; 별도 lane이지만 같은 DDL revision |
+| DDL SHA-256 | `bad4948fe47485e7508a3cd389e9db84fdda3edfed4a1f4883b03554bcb38691` |
+| Node / npm | `v25.2.1` / `11.6.2`; lock와 파일 hash는 artifact `inputs.json`에 기록 |
+
+#### CI bundle과 artifact
+
+[Actions 35438441960, attempt 1](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35438441960)의 `Fixed consumer (required)`는 SUCCESS다. job은 2026-09-19 10:49:32~10:51:41 UTC에 실행됐다. 실행 시작·종료 시 #246이 OPEN, 미병합이고 head가 고정 SHA와 같음을 구조화 자료로 보관했다.
+
+| CI 실행 필드 | 실제 값 |
+| --- | --- |
+| producer run | `rcg-rcg-work.ec2rlb` |
+| fixed bundle manifest SHA-256 | `2320861c624832e9fd71d1256b1639b2c53247fe477aef70adac63a7caf87b76` |
+| latest bundle manifest SHA-256 | `addaf58d9895f3107405d05a5704ec5b5760d0d6904c466a557ab6b7689d6a8c` |
+| producer 결과 | fixed 21 / latest 21 / controls 54 PASS, cleanup true |
+| consumer 결과 | fixed 34 / latest 34 / controls 23 PASS, exit 0, cleanup true |
+| 기존 관련·변환/wiring 테스트 | 40 PASS; workspace(shared/api/web)·consumer typecheck PASS |
+| artifact | [run-consumer-gate-35438441960-1 / 10583515965](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35438441960/artifacts/10583515965) |
+| 업로드 ZIP digest | `sha256:99f72129caedc0636ceff2b323ab56a9a7d5427555e4f80720bee05bbd0fac76` (Actions metadata) |
+| 내부 artifact-manifest.json SHA-256 | `3a93d63b494f9c970ccc54a560aa30b83c379329e62f02d90d6ba2549c236a0f` |
+| 다운로드 후 검증 | 164개 파일 inventory/hash, 두 bundle provenance·원본 응답·JSON/JUnit·controls VERIFIED |
+
+검증 명령은 Dashboard의 `python3 tools/run-consumer-gate/verify.py /private/tmp/rcc-ci-35438441960 --producer-checkout /private/tmp/rcg-decision-producer-9ace3b6`이다. 외부 producer validator의 소스 파일도 고정 commit의 실제 파일과 대조했다. artifact 보관 기간은 14일이다. hash는 무결성 연결이며 서명이나 운영 배포 증거가 아니다.
+
+최종 clean local head에서도 `bash scripts/run-consumer-gate.sh /private/tmp/rcc-resumed-complete-head`로 producer부터 새로 실행했다. producer run은 `rcg-rcg-work.nvbvgv`, fixed manifest는 `f2c380ace942697ba75a6d69796df731f95000f55f27eef5af651858aa80c8ad`, latest manifest는 `27f9e73e70774c27df5e70551f57fb36d6c93ecc2b0d411ffbb6bf05808cf5b3`이다. consumer fixed/latest 각 34, controls 23 PASS와 164개 artifact 파일을 재검증했다. 내부 artifact manifest hash는 `d4561d44fdfdda46e22115463ec0b8649744f900c35a0aa5d49355960764c4d8`이다. 로컬과 CI는 별도 run이므로 서로의 bundle hash를 대신 쓰지 않는다.
+
+#### RCC 범위와 중단 재현의 전후 비교
+
+실제 Dashboard HTTP client → hook과 공유하는 순수 변환 → 실제 `launchPromotionExperiment`를 loopback HTTP로 실행한다. downstream build/start/dispatch만 호출 인자를 기록하는 대역이다. RCC-01 2개, RCC-02 7개, RCC-03 1개, RCC-04 8개, RCC-05 3개, RCC-06 13개로 lane당 34개다. 각 lane의 원본 응답 12개를 모두 소비하며 정상·retry·동시 성공·baseline·실제 409와 파생 오류 DTO/scope/ID·fallback 분기를 구분한다. 요청과 변환 결과의 scope/ID, 호출 순서·인자·미호출, 거절 단계를 JSON/JUnit으로 검증한다. baseline 기대값은 producer 출력에서 다시 만들지 않고 고정 expected 파일을 사용한다.
+
+중단 당시와 동일한 파생 중복 ID body SHA-256 `18a1d5a32de8d8e320f9ae17b59fbe17eeb12af8f67343a4a5897ee35ac6a34a`를 원래 bundle로 재실행했다. 이전에는 build 1회/start 2회였고, `b77b901` 위에서는 실제 launch가 거절해 build/start/dispatch가 모두 0회였다. 원본 producer 응답의 결함으로 서술하지 않으며 RCC-04 기대값도 완화하지 않았다. #247의 production 변경은 hook의 기존 반환식 추출 두 파일뿐이고, base 반환식과 AST 동일성 및 hook wiring을 검증했다. client/launch의 추가 동작 변경은 없다.
+
+원래 중단 worktree와 `PR3B-STOP.md`, JSON/JUnit 및 미커밋 추출은 보존 브랜치 `wip/run-consumer-integration-stopped-20260919`에 남겼다. 원본 중단 JSON hash는 `45541ded4f8cf977ba91716361245171f427e919180ae23021c79fa0d5e375d1`, JUnit hash는 `adc4a6ed829ce49bc1e1c2f3129ef46d748013f27befe1b371507775aa958d8e`다. 기존 Decision `docs/run-consumer-stop-evidence`의 미커밋 문서도 그대로 보존했다. 최종 검증은 별도 clean checkout에서 수행했다.
+
+#### CI 실패 이력과 증거의 한계
+
+초기 [35438021217](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35438021217)은 workflow의 job-level env에서 허용되지 않는 `runner.temp` context 때문에 실행 전 실패했다. `5416a22`에서 해당 env를 step으로 옮기고 actionlint로 검증했다. 다음 [35438163351](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35438163351)은 테스트·RCC가 통과한 뒤 Linux Docker 출력의 소유권 때문에 임시 디렉터리 정리가 실패했다. 이 실패 run의 PASS JSON은 완료 증거로 채택하지 않는다.
+
+최종 `58a2133`은 producer 원본 출력을 임시 scratch 밖의 별도 보존 경로에 두고, host scratch 정리 결과를 확인한 뒤 최종 verdict를 기록한다. 정리 오류는 INCOMPLETE/2·cleanup false가 되며 실제 PermissionError 주입 control도 추가했다. 이 변경은 검증 도구의 실행·정리 수정이고 서비스 계약·기대값 변경이 아니다. 최종 성공 실행에서 추가 production 계약 불일치·500·비결정적 timeout은 관찰하지 않았다.
+
+실제 downstream assignment/start/dispatch, 브라우저 E2E, 배포·발송, 운영 부하 및 장기간 flaky 비율은 검증하지 않았다. Decision producer와 Dashboard consumer의 제한된 경계 검증이 완료된 것이며 PR 병합이나 main 승인을 대신하지 않는다. #246 변경 또는 merge가 생기면 이 조합과 차이를 먼저 보고하고 자동 rebase·retarget하지 않는다. 본 Decision 후속 PR은 `docs/run-contract-gate/evidence-log.md` 한 파일만 변경하며 producer 구현·bundle을 변경하지 않는다.
+
+
+### Dashboard 병합 후 통합 제출 확인 (2026-09-20 KST)
+
+사용자가 Dashboard 관련 PR 병합을 알리고 구현 완료 시 통합 브랜치 대상으로 PR 제출을 요청했다. Decision 구현 PR #394~#398은 `integration/run-contract-gate@9ace3b6`에 반영돼 있고, E-17 문서 PR [#399](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/399)는 이미 같은 통합 브랜치 대상으로 열려 있다. 중복 PR을 만들지 않고 이 문서 PR에 병합 후 근거를 추가한다. 이전 stacked 실행 결과는 당시 revision의 이력으로 보존한다.
+
+| 연결 | 실제 확인 값 |
+| --- | --- |
+| Dashboard fix #246 | head `b77b90165682e4dc9bb63bf93b04f19133e2965d`; main merge `7d4a8a231e102eaaf6e6eae816902cbd45e1abcb` (2026-09-19 14:55:44 UTC) |
+| Dashboard consumer #247 | 최종 head `a813993efce6c8b68d31eb81949f46804fd761c3`; main merge `adb7d29363a6d423f21aa1d9dd5010e3f75e72d8` (2026-09-19 15:27:24 UTC) |
+| 최종 PR CI | [35451441072 / attempt 1](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35451441072), SUCCESS |
+| CI head / base | `a813993efce6c8b68d31eb81949f46804fd761c3` / `7d4a8a231e102eaaf6e6eae816902cbd45e1abcb` (`main`) |
+| 실제 CI checkout / dirty | `a6c868d8f2bab76c89e2a368c279ad4f5f289e88` / false (`refs/pull/247/merge`) |
+| Dashboard source SHA-256 | `5c0af6ea6e238db6daa3ffab3c315514dac0b65cbec0693388bf3003440f16a6` |
+| Decision producer / source | `9ace3b6ef5d1aaa7851d7ffbb180f1802f5c7008` / `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| producer run | `rcg-rcg-work.w8iycr` |
+| fixed bundle manifest SHA-256 | `8e33e7cfdf00b16526537856663a885f3047184324725928859da41cc23874a4` |
+| latest bundle manifest SHA-256 | `cc8a23460cb3e6587b925a9e3facde4f3fac5ffb249a64cc9db439b3ccf9344b` |
+| fixed / latest Contract | 각각 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`; DDL hash는 위 실행과 동일 |
+| 결과 | producer fixed/latest 각 21·controls 54 PASS; consumer fixed/latest 각 34·controls 23 PASS; cleanup true |
+| artifact | [10587410522 / run-consumer-gate-35451441072-1](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35451441072/artifacts/10587410522) |
+| 업로드 ZIP digest | `sha256:89431a6fac48385537da43797bd42a85705235006f22112d76b5eae372f18fe1` (Actions metadata) |
+| 내부 artifact-manifest.json SHA-256 | `d4eb19cffade1dd1db0ef54caa6a6938ba053e9a21ba254627ee66cdc9a8ae87` |
+
+`58a2133..a813993` 차이는 `.github/workflows/run-consumer-gate.yml`, `docs/run-consumer/README.md`, `tools/run-consumer-gate/{pins.json,run.py,verify.py}` 5개 파일이다. CI 대상을 main으로 바꾸고 #246의 고정 merge SHA·PR head/base ancestry·실제 checkout을 검증하도록 조정했으며 production client/변환/launch와 RCC 기대값은 동일하다. 이 변경과 retarget·merge는 이번 확인 전에 반영돼 있었고, 이 문서 작업에서 Dashboard branch를 rebase·retarget·merge하지 않았다.
+
+최종 Dashboard head `a813993`과 main merge `adb7d29`의 tree diff가 비어 있음을 확인했다. 병합 commit의 별도 detached checkout에서 최종 CI artifact를 내려받아 `python3 tools/run-consumer-gate/verify.py /private/tmp/rcc-ci-35451441072 --producer-checkout /private/tmp/rcg-decision-producer-9ace3b6`를 실행했다. 164개 파일 inventory/hash, fixed/latest bundle provenance, JSON/JUnit, controls가 VERIFIED였고 artifact의 모든 소스 파일 hash가 병합 tree와 일치했다. main merge SHA 자체에서 CI를 새로 실행했다고 표시하지 않는다.
+
+**구현 완료 판단:** 합의한 PR 0~3 범위의 Decision actual DB/transaction·동시성·고정 기존 row 호환·bundle 및 Dashboard actual client→공유 변환→actual launch 검증은 완료됐다. 기존 downstream 대역·browser/배포 비범위는 그대로다. 통합 브랜치 대상 #399는 근거 문서만 추가하며 새 런타임 의존성이나 구현 변경이 없다. 배포 여정 전체에 대한 merge-safety verdict는 여전히 `incomplete evidence`다. 실제 assignment/start/dispatch·배포 smoke를 실행한 근거가 없기 때문이다. 이 한계는 구현 미완료나 문서 PR 제출 차단으로 해석하지 않으며, dev merge·배포 승인을 대신하지 않는다. `AGENTS.md`, `agent/`, 원본 stop evidence·개인 로컬 변경은 제출에서 제외한다.
