@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 3A merged (`9ace3b6`) · PR 3B stacked local/CI/artifact verified · Dashboard #246/#247 OPEN (미병합) |
-| 기준 revision | Decision producer `9ace3b6` → Dashboard fix `b77b901` → 3B head `58a2133` / 실제 CI checkout `5535ffb`; 전체 SHA·hash는 E-17 마지막 실행 조합 참조 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 3A merged (`9ace3b6`) · Dashboard #246/#247 merged · PR 3 milestone 구현·consumer artifact 검증 완료 · Decision 문서 PR #399 OPEN |
+| 기준 revision | Decision producer `9ace3b6` → Dashboard fix merge `7d4a8a2` → 3B head `a813993` / CI checkout `a6c868d` / main merge `adb7d29`; 전체 SHA·hash는 E-17 마지막 실행 조합 참조 |
+| 마지막 확인 | 2026-09-20 KST |
 
 ## 기록 규칙
 
@@ -544,3 +544,32 @@ Dashboard의 실제 client → 추출된 공유 변환 → 실제 `launchPromoti
 최종 `58a2133`은 producer 원본 출력을 임시 scratch 밖의 별도 보존 경로에 두고, host scratch 정리 결과를 확인한 뒤 최종 verdict를 기록한다. 정리 오류는 INCOMPLETE/2·cleanup false가 되며 실제 PermissionError 주입 control도 추가했다. 이 변경은 검증 도구의 실행·정리 수정이고 서비스 계약·기대값 변경이 아니다. 최종 성공 실행에서 추가 production 계약 불일치·500·비결정적 timeout은 관찰하지 않았다.
 
 실제 downstream assignment/start/dispatch, 브라우저 E2E, 배포·발송, 운영 부하 및 장기간 flaky 비율은 검증하지 않았다. Decision producer와 Dashboard consumer의 제한된 경계 검증이 완료된 것이며 PR 병합이나 main 승인을 대신하지 않는다. #246 변경 또는 merge가 생기면 이 조합과 차이를 먼저 보고하고 자동 rebase·retarget하지 않는다. 본 Decision 후속 PR은 `docs/run-contract-gate/evidence-log.md` 한 파일만 변경하며 producer 구현·bundle을 변경하지 않는다.
+
+
+### Dashboard 병합 후 통합 제출 확인 (2026-09-20 KST)
+
+사용자가 Dashboard 관련 PR 병합을 알리고 구현 완료 시 통합 브랜치 대상으로 PR 제출을 요청했다. Decision 구현 PR #394~#398은 `integration/run-contract-gate@9ace3b6`에 반영돼 있고, E-17 문서 PR [#399](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/399)는 이미 같은 통합 브랜치 대상으로 열려 있다. 중복 PR을 만들지 않고 이 문서 PR에 병합 후 근거를 추가한다. 이전 stacked 실행 결과는 당시 revision의 이력으로 보존한다.
+
+| 연결 | 실제 확인 값 |
+| --- | --- |
+| Dashboard fix #246 | head `b77b90165682e4dc9bb63bf93b04f19133e2965d`; main merge `7d4a8a231e102eaaf6e6eae816902cbd45e1abcb` (2026-09-19 14:55:44 UTC) |
+| Dashboard consumer #247 | 최종 head `a813993efce6c8b68d31eb81949f46804fd761c3`; main merge `adb7d29363a6d423f21aa1d9dd5010e3f75e72d8` (2026-09-19 15:27:24 UTC) |
+| 최종 PR CI | [35451441072 / attempt 1](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35451441072), SUCCESS |
+| CI head / base | `a813993efce6c8b68d31eb81949f46804fd761c3` / `7d4a8a231e102eaaf6e6eae816902cbd45e1abcb` (`main`) |
+| 실제 CI checkout / dirty | `a6c868d8f2bab76c89e2a368c279ad4f5f289e88` / false (`refs/pull/247/merge`) |
+| Dashboard source SHA-256 | `5c0af6ea6e238db6daa3ffab3c315514dac0b65cbec0693388bf3003440f16a6` |
+| Decision producer / source | `9ace3b6ef5d1aaa7851d7ffbb180f1802f5c7008` / `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| producer run | `rcg-rcg-work.w8iycr` |
+| fixed bundle manifest SHA-256 | `8e33e7cfdf00b16526537856663a885f3047184324725928859da41cc23874a4` |
+| latest bundle manifest SHA-256 | `cc8a23460cb3e6587b925a9e3facde4f3fac5ffb249a64cc9db439b3ccf9344b` |
+| fixed / latest Contract | 각각 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`; DDL hash는 위 실행과 동일 |
+| 결과 | producer fixed/latest 각 21·controls 54 PASS; consumer fixed/latest 각 34·controls 23 PASS; cleanup true |
+| artifact | [10587410522 / run-consumer-gate-35451441072-1](https://github.com/krafton-jungle-project-4team/loop-ad_dashboard/actions/runs/35451441072/artifacts/10587410522) |
+| 업로드 ZIP digest | `sha256:89431a6fac48385537da43797bd42a85705235006f22112d76b5eae372f18fe1` (Actions metadata) |
+| 내부 artifact-manifest.json SHA-256 | `d4eb19cffade1dd1db0ef54caa6a6938ba053e9a21ba254627ee66cdc9a8ae87` |
+
+`58a2133..a813993` 차이는 `.github/workflows/run-consumer-gate.yml`, `docs/run-consumer/README.md`, `tools/run-consumer-gate/{pins.json,run.py,verify.py}` 5개 파일이다. CI 대상을 main으로 바꾸고 #246의 고정 merge SHA·PR head/base ancestry·실제 checkout을 검증하도록 조정했으며 production client/변환/launch와 RCC 기대값은 동일하다. 이 변경과 retarget·merge는 이번 확인 전에 반영돼 있었고, 이 문서 작업에서 Dashboard branch를 rebase·retarget·merge하지 않았다.
+
+최종 Dashboard head `a813993`과 main merge `adb7d29`의 tree diff가 비어 있음을 확인했다. 병합 commit의 별도 detached checkout에서 최종 CI artifact를 내려받아 `python3 tools/run-consumer-gate/verify.py /private/tmp/rcc-ci-35451441072 --producer-checkout /private/tmp/rcg-decision-producer-9ace3b6`를 실행했다. 164개 파일 inventory/hash, fixed/latest bundle provenance, JSON/JUnit, controls가 VERIFIED였고 artifact의 모든 소스 파일 hash가 병합 tree와 일치했다. main merge SHA 자체에서 CI를 새로 실행했다고 표시하지 않는다.
+
+**구현 완료 판단:** 합의한 PR 0~3 범위의 Decision actual DB/transaction·동시성·고정 기존 row 호환·bundle 및 Dashboard actual client→공유 변환→actual launch 검증은 완료됐다. 기존 downstream 대역·browser/배포 비범위는 그대로다. 통합 브랜치 대상 #399는 근거 문서만 추가하며 새 런타임 의존성이나 구현 변경이 없다. 배포 여정 전체에 대한 merge-safety verdict는 여전히 `incomplete evidence`다. 실제 assignment/start/dispatch·배포 smoke를 실행한 근거가 없기 때문이다. 이 한계는 구현 미완료나 문서 PR 제출 차단으로 해석하지 않으며, dev merge·배포 승인을 대신하지 않는다. `AGENTS.md`, `agent/`, 원본 stop evidence·개인 로컬 변경은 제출에서 제외한다.
