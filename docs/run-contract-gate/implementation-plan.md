@@ -3,16 +3,16 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현 개발자·에이전트, 리뷰어 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
-| Merge-safety verdict | **incomplete evidence** — 로컬 Gate PASS; PR 1 최종 commit·PR 2 CI·Dashboard 배포 여정은 미검증 |
+| Merge-safety verdict | **incomplete evidence** — 로컬 Gate PASS; PR 2 Actions·통합 최종 commit·Dashboard 배포 여정은 미검증 |
 
 ## 1. 결정 요약
 
 개인 Decision 변경과 AI 생성 변경을 검증할 로컬·PR CI 도구를 만든다. 실제 FastAPI TestClient 요청이 실제 service·repository·PostgreSQL commit을 통과해야 한다. 고정 Contract 검사는 필수이며 최신 Contract 검사는 별도 경고다. 테스트 실행기와 DB를 별도 컨테이너로 실행한다.
 
-2026-09-19 사용자가 PR 1 구현·의존성 준비·전용 컨테이너·로컬 검증을 승인했다. RCG-01/07 구현 후 서비스 결함을 재현하여 18절 중단 기준을 적용했다. 이후 서비스 수정은 별도 PR 0 #394로 구현·검증·개인 통합 병합했다. PR 1의 작업 파일 15개를 hash로 보존 확인한 뒤 09442f2를 fast-forward 반영했다. 로컬 Gate를 완성한 뒤 사용자가 PR 1 commit·push·PR 생성을 승인했다. PR 1 merge와 PR 2 CI는 이번 제출 범위가 아니다.
+2026-09-19 사용자가 PR 1 구현·의존성 준비·전용 컨테이너·로컬 검증을 승인했다. RCG-01/07 구현 후 서비스 결함을 재현하여 18절 중단 기준을 적용했다. 이후 서비스 수정은 별도 PR 0 #394로 구현·검증·개인 통합 병합했다. PR 1의 작업 파일 15개를 hash로 보존 확인한 뒤 09442f2를 fast-forward 반영했다. 로컬 Gate를 완성한 뒤 사용자가 PR 1 commit·push·PR 생성을 승인했다. PR 1은 #395로 개인 통합에 병합됐다. 현재 PR 2는 통합 commit `fe7e8e6`에서 분기했고, 동일 Gate 명령의 CI 연결·artifact·문서만 변경한다. 정적·로컬 검증은 E-14, 제출 commit 및 Actions 결과는 PR 본문에 기록한다. PR 2 merge는 승인 범위 밖이다.
 
 ## 2. 해결하려는 실제 문제와 코드 근거
 

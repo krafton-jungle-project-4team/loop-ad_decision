@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 테스트 구현자, 리뷰어 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 실행 경계와 공통 fixture
@@ -107,3 +107,5 @@ JUnit은 fixed/latest를 구분해 저장하고 latest assertion을 전체 필�
 초기 고정 baseline 실행은 RCG-01 PASS·RCG-07 FAIL이었다. binding 생략 시 실제 commit은 SQLSTATE 23514로 실패했지만 HTTP 200이 이미 나갔다. [E-09](evidence-log.md#e-09-pr-1-초기-실행과-중단)의 실패는 보존했다.
 
 별도 PR 0을 개인 통합에 병합하고 PR 1에 기반으로 반영한 뒤 고정·최신 lane 각각 17개, 제어 30개가 통과했다. RCG-07은 실제 오류 응답과 전체 rollback을 확인한다. baseline fixture를 복원한 RCG-08도 통과했다. 의도적 assertion·timeout·최신 취득 실패의 결과는 [E-12](evidence-log.md#e-12-pr-1-로컬-gate-검증)에 구분해 기록한다. E-12의 결과는 커밋 전 후보 기준이다. 제출 commit 재검증 결과는 PR 본문에 별도로 기록하며 CI는 PR 2 범위다.
+
+PR 2는 위 판정 규칙을 바꾸지 않고 Gate 종료 코드를 필수 check에 전달한다. latest 경고 표시와 JSON/JUnit 보관은 [개발자 안내 8절](developer-guide.md#8-pr-2-ci와-최종-제출), 정적·로컬 근거는 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증)를 따른다.

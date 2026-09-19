@@ -3,13 +3,13 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 변경을 검증하는 개발자·리뷰어 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 1. 준비할 환경
 
-host에는 로컬 Docker daemon, Git, Bash와 기본 Unix 도구가 필요하다. Python·pytest·DB client는 전용 이미지에 포함한다. Linux/arm64에서 검증했으며 다른 architecture·CI는 아직 검증하지 않았다.
+host에는 로컬 Docker daemon, Git, Bash와 기본 Unix 도구가 필요하다. Python·pytest·DB client는 전용 이미지에 포함한다. Linux/arm64에서 검증했으며 다른 architecture는 아직 검증하지 않았다. CI workflow는 같은 arm64 runner를 사용하며, 로컬 검증과 Actions 실행 근거는 E-14에서 구분한다.
 
 처음에는 공개 Python/pgvector 이미지와 pinned Python 의존성을 내려받는다. 매 실행에서 공개 Contract 고정 SHA를 취득하고 main을 한 번 조회해 최신 SHA를 고정한다. 준비 단계는 네트워크가 필요하다. Git credential helper와 사용자 Git config를 끄고, Docker도 비어 있는 임시 config를 사용한다. private registry나 운영 credential은 필요하지 않다.
 
@@ -114,6 +114,21 @@ fixture 생성은 평소 Gate 실행과 분리한 수동 절차다.
 
 ## 8. PR 2 CI와 최종 제출
 
-CI workflow는 이번 PR 1에 없다. PR 2에서 같은 명령을 개인 통합·dev 대상 PR과 수동 실행에 연결하고, 실패 시에도 JSON/JUnit을 보존할 예정이다. 최소 권한과 익명 Contract 읽기부터 검증한다. 로컬 성공은 GitHub Actions 성공의 근거가 아니다.
+[Run Contract Gate workflow](../../.github/workflows/run-contract-gate.yml)는 `integration/run-contract-gate`·`dev` 대상 PR의 opened/synchronize/reopened와 `workflow_dispatch`를 선언한다. 경로 필터는 없다. 수동 실행은 workflow가 기본 브랜치에도 있어야 사용할 수 있으므로 개인 통합 PR 단계에서는 Actions UI의 실행 가능 여부를 따로 확인한다.
 
-개인 통합에 반영된 최종 commit을 로컬·CI에서 재검증한 뒤 dev Draft 제출을 준비한다. E-12는 커밋 전 로컬 증거이고, PR 1 제출 commit 재검증 결과는 PR 본문에서 확인한다. 배포 workflow·branch protection·Dashboard·운영 DB는 이번 범위에 포함하지 않는다. 실제 동시 요청 검증은 **필수 후속 개발**이다.
+GitHub-hosted `ubuntu-24.04-arm`에서 로컬과 같은 `./scripts/run-contract-gate.sh "$RCG_OUTPUT"`를 실행한다. checkout/upload-artifact는 공식 commit SHA에 고정하고 `contents: read`, `persist-credentials: false`만 사용한다. Contract는 PR 1의 익명 취득 절차를 그대로 사용하며 배포 credential은 필요 없다.
+
+`Fixed contract (required)` check는 Gate의 exit 0/1/2를 그대로 전달한다. FAIL·INCOMPLETE는 check 실패이며, latest WARN_DRIFT·WARN_UNVERIFIED는 별도 `Latest contract (warning only)` step의 경고다. 이 step은 최종 `result.json`을 읽기만 하고 판정을 다시 계산하지 않는다. check 이름의 required는 검증 역할을 뜻하며 branch protection을 설정하지 않는다.
+
+결과 보관 step은 `always()`로 실행한다. 두 artifact를 14일 보관한다.
+
+| artifact 이름 앞부분 | 보관 내용 |
+|---|---|
+| `run-contract-gate-required-` | CI context·Gate exit, 전체 result/inputs JSON, fixed·controls JSON/JUnit |
+| `run-contract-gate-latest-warning-` | latest JSON/JUnit; 필수 검사 통계에 합산하지 않음 |
+
+이름 뒤의 run ID·attempt로 재실행을 구분한다. artifact에서 먼저 전체 `result.json`과 `run-contract-gate-ci.json`을 대조한다. 후자는 PR base/head SHA와 실제 checkout SHA를 구분한다. 일반 PR에서는 checkout SHA가 GitHub의 PR merge commit이며 PR head SHA와 다를 수 있다. Gate의 `inputs.candidate_commit`은 실제 checkout SHA와 일치해야 한다.
+
+JSON·JUnit과 CI 실행 메타데이터만 명시한 경로로 업로드하며 전체 작업 디렉터리·환경변수·원문 로그는 업로드하지 않는다. 준비 실패로 생성되지 않은 JUnit을 만들어내지 않는다. 일반 실패에서도 생성된 결과의 업로드를 시도하지만 runner 강제 종료·job timeout·GitHub artifact 서비스 장애까지 보관을 보장하지는 않는다. artifact 업로드 자체의 실패는 check 실패다.
+
+정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증)에 기록했다. 제출 commit의 clean 재실행과 실제 Actions 결과는 PR 본문에 추가한다. 로컬 성공을 GitHub Actions 성공으로 간주하지 않는다. 개인 통합의 최종 commit 재검증·dev Draft는 다음 제출 단계이며 실제 동시 요청 검증은 **필수 후속 개발**이다.

@@ -3,13 +3,13 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 채용 담당자, 백엔드 면접관, 프로젝트 리뷰어 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 한 문장 설명
 
-LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은 고객군 요청을 안전하게 재사용하고 실패 시 부분 데이터를 남기지 않는지, 로컬에서 반복 확인하는 검증 도구를 구현했다. PR CI 적용은 다음 단계다.
+LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은 고객군 요청을 안전하게 재사용하고 실패 시 부분 데이터를 남기지 않는지, 로컬에서 반복 확인하는 검증 도구를 구현했다. 같은 명령의 PR CI workflow도 구현했고 정적·로컬 검증을 마쳤다. 실제 Actions 실행 근거는 제출 PR에서 확인한다.
 
 초기 RCG-07에서 응답 전송 뒤 commit이 실패하는 결함을 재현했다. 별도 서비스 PR #394로 수정·개인 통합 병합한 뒤 고정·최신 lane 각각 17개, 제어 30개가 통과했다. 고정 baseline row 복원·재사용과 단일 실행 명령도 검증했다. 아래 수치는 커밋 전 로컬 후보의 결과다. 제출 commit 재검증은 PR 본문에 별도로 기록하며 CI·운영 효과는 아직 검증하지 않았다.
 
@@ -31,7 +31,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 | 초기 구현·진단 | RCG-01/07과 합성 seed·컨테이너 재현 명령 | E-09: 1 passed / 1 failed; 서비스 미수정 |
 | 로컬 Gate 구현 | RCG-01~09, 제어 판정·cleanup, baseline fixture·provenance | E-12: fixed/latest 각 17 passed, controls 30 passed |
 | 선행 서비스 수정 | 응답 전에 commit·close, commit 실패 회귀 검사 | PR #394, E-10/E-11 |
-| 앞으로 할 구현 | PR 2 CI·최종 commit 검증 | 미완료 |
+| CI 연결 구현 | 동일 명령·종료 코드 전달, latest 경고, 분리 artifact | E-14: 정적·로컬 검증; Actions 실행 대기 |
 | 후속 개발 | 실제 동시성, Dashboard 실제 consumer 연결 | 현재 성공 범위에서 제외 |
 
 ## 선택한 설계와 이유
@@ -49,7 +49,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 
 | JD 관심사 | 이 과제의 증거 | 표현의 경계 |
 |---|---|---|
-| 안전한 개발 환경·자동화 도구 | 실제 DB 검증과 단일 명령·JSON/JUnit·실패/정리 제어 | 로컬 실행 근거 확보; CI 미구현 |
+| 안전한 개발 환경·자동화 도구 | 실제 DB 검증과 단일 명령·JSON/JUnit·실패/정리 제어 | 로컬 실행·workflow 정적 검증 근거 확보; Actions 실행 대기 |
 | 배포·모니터링·장애 대응 | 배포 전 계약 검증과 실패 원인 분리 | 운영 모니터링·실제 장애 대응 경험으로 바꾸지 않음 |
 | 기존 동작 분석·호환성 검증 | 기존 테스트 분석, baseline row와 후보 reader | 전체 legacy migration 수행 주장 제외 |
 | AI 코딩 도구 활용 | AI 변경을 사람의 명세와 deterministic assertion으로 검증하는 절차 | 도구를 만들기 전 생산성 향상 수치 주장 제외 |
@@ -129,7 +129,7 @@ CI·장기 안정성·운영 개선 수치는 아직 확보하지 않았다.
 | 자동화가 잘못 PASS하는 것은 어떻게 막나? | case manifest, skip/누락·result corruption 검사, 독립 DB 관찰 |
 | 다른 개발자는 어떻게 쓰나? | 개발자 안내의 단일 명령과 result.json/JUnit 사용 |
 | 실제 운영 경험과 무엇이 다른가? | 배포 전 검증 준비도를 개선하는 과제이며 운영 사고 대응 근거는 없음 |
-| 도구가 배포를 막나? | 로컬 Gate이며 PR 2에서 PR check를 추가할 예정. deploy·branch protection은 바꾸지 않음 |
+| 도구가 배포를 막나? | PR 2에서 PR check workflow를 추가했다. deploy·branch protection은 바꾸지 않음 |
 | 어떤 성과를 측정했나? | E-12의 실행 시간·case 결과·실패 주입과 E-09의 실제 결함 탐지; 생산성 개선율은 미측정 |
 
 ## 제출 전 확인

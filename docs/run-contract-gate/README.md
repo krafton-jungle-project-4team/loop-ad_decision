@@ -3,15 +3,15 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 개발자, 구현 에이전트, 리뷰어, 포트폴리오 독자 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
-**선택 고객군으로 run을 생성할 때, 실제 PostgreSQL 계약을 통과하고 재시도·실패 이후에도 올바른 데이터가 남는지 로컬과 PR CI에서 반복 검증하는 도구다. 로컬 Gate를 구현했으며 PR CI는 다음 단계다.**
+**선택 고객군으로 run을 생성할 때, 실제 PostgreSQL 계약을 통과하고 재시도·실패 이후에도 올바른 데이터가 남는지 로컬과 PR CI에서 반복 검증하는 도구다. 로컬 Gate와 같은 명령의 PR CI workflow를 구현했다. 실제 Actions 실행 결과는 별도 확인한다.**
 
 초기 Gate가 **HTTP 200 전송 후 commit 실패·전체 rollback**을 발견했다. 이를 선행 서비스 [PR #394](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/394)로 분리해 `integration/run-contract-gate`에 병합했다. 기존 PR 1 작업 파일을 보존하고 통합 commit을 반영한 뒤 전체 로컬 Gate를 구현했다.
 
-[기본 명령](developer-guide.md#2-로컬-기본-실행)은 고정·최신 DDL 각각 17개 DB 시나리오와 30개 제어 검사를 실행하고 JSON/JUnit·소스 증거·정리 결과를 남긴다. 고정 baseline의 실제 API가 만든 행과 provenance도 보존했다. 문서의 E-12는 커밋 전 로컬 검증 근거이며 제출 commit 재검증 결과는 PR 본문에 기록한다. CI·실제 동시성·Dashboard 실행은 미검증이다. [최신 실행 근거](evidence-log.md#e-12-pr-1-로컬-gate-검증)
+[기본 명령](developer-guide.md#2-로컬-기본-실행)은 고정·최신 DDL 각각 17개 DB 시나리오와 30개 제어 검사를 실행하고 JSON/JUnit·소스 증거·정리 결과를 남긴다. 고정 baseline의 실제 API가 만든 행과 provenance도 보존했다. PR 1 #395는 개인 통합에 병합됐다. PR 2의 정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit 재검증·Actions 결과는 PR 본문에 기록한다. 실제 동시성·Dashboard 실행은 미검증이다.
 
 ## 읽는 순서
 
@@ -42,10 +42,10 @@
 | 실제 service·repository·transaction 경로 조사 | 확인 |
 | 원격 Decision dev / Contract main SHA 익명 조회 | 확인 — [조회 범위](evidence-log.md#현재-조사-기록) |
 | 새 worktree와 로컬 브랜치 | 준비 |
-| Gate 테스트·컨테이너 실행기·CI | 로컬 Gate 완료; PR 2 CI 미구현 |
+| Gate 테스트·컨테이너 실행기·CI | 로컬 Gate·PR 2 workflow 구현; Actions 실행 대기 |
 | 기준 코드가 생성한 기존 row fixture | 생성·새 DB 복원·baseline/candidate 재사용 확인 |
-| 로컬·CI 실행 결과와 소요 시간 | fixed/latest 각각 17 passed, controls 30 passed; CI 미실행. 시간은 E-12 |
-| PR / dev Draft | PR 0 #394 병합 완료; PR 1 제출 단계; PR 2·dev Draft 미생성 |
+| 로컬·CI 실행 결과와 소요 시간 | fixed/latest 각각 17 passed, controls 30 passed; Actions 실행 대기. 로컬 시간은 E-12/E-14 |
+| PR / dev Draft | PR 0 #394·PR 1 #395 개인 통합 병합 완료; PR 2 제출 준비, dev Draft 미생성 |
 
 ## 구현·제출 경계
 

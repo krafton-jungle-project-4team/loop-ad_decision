@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 설계를 이해하고 자신의 말로 설명하려는 개발자 |
-| 상태 | PR 0 개인 통합 병합 완료 · PR 1 로컬 구현·검증 완료 · PR 2 CI 미구현 |
-| 기준 revision | 후보 기반 09442f29e8da514df1d1a5f2a52b03646c92e170 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
+| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 한 번에 전체 service 파일을 읽지 않는다. 각 단원의 작은 조각을 읽고 입력·출력·부작용을 세 문장으로 설명한다. 해설을 읽기 전에 질문에 답한다. 아래 일반 실패 상황은 설명을 위한 가정이다. 다만 2026-09-19 RCG-07에서 HTTP 200 이후 commit 실패가 실제로 재현됐으며, 운영 사고라는 의미는 아니다.
