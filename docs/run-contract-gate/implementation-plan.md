@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현 개발자·에이전트, 리뷰어 |
-| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
-| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A 로컬 PASS · PR 3A CI 제출 전 · PR 3B pending |
+| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 | Merge-safety verdict | **incomplete evidence** — PR 2 로컬·CI PASS; PR 3 동시성·Dashboard 소비 검증 및 배포 여정은 미검증 |
 
@@ -14,7 +14,7 @@
 
 PR 0 #394는 응답 전 commit을 보장하는 서비스 수정, PR 1 #395는 실제 DB 로컬 Gate, PR 2 #396은 같은 명령의 CI 연결로 개인 통합에 병합됐다. PR 2 제출 SHA의 로컬·CI 결과와 병합 revision은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 구분해 기록한다.
 
-2026-09-19 사용자는 후속을 **PR 3A — Decision 동시성·artifact**, **PR 3B — Dashboard 실제 consumer 검증**으로 나누고 두 저장소의 revision·결과를 **PR 3 milestone**으로 묶기로 결정했다. 현재 승인·수행 범위는 문서화다. PR 3 구현·원격 쓰기·merge가 완료됐다는 의미가 아니다. 구현자가 따라야 할 범위·선행 관계는 이 문서 21절, 합격 기준은 검증 명세의 PR 3 절이 기준이다.
+2026-09-19 사용자는 후속을 **PR 3A — Decision 동시성·artifact**, **PR 3B — Dashboard 실제 consumer 검증**으로 나누고 두 저장소의 revision·결과를 **PR 3 milestone**으로 묶기로 결정했다. 문서 PR #397이 `6de82a3`으로 통합된 뒤 `feat/run-contract-gate-concurrency`에서 PR 3A를 구현했다. PR 3A의 commit·push·PR 생성은 승인됐고 merge는 제외한다. 3B는 이번 구현 범위 밖이다. 구현자가 따라야 할 범위·선행 관계는 이 문서 21절, 합격 기준은 검증 명세의 PR 3 절이 기준이다.
 
 ## 2. 해결하려는 실제 문제와 코드 근거
 
@@ -61,13 +61,13 @@ run의 안전성은 HTTP 응답뿐 아니라 저장된 scope·experiment·snapsh
 
 PR 1·2 완료 범위: 명시적 analysis_id·generation_id·segment_ids의 일반 run 생성, 순차 재시도, scope/ID/row 일치, V2 binding, 실패 rollback, 고정 기존 row 재사용, 로컬 실행, PR CI, 결과 보관.
 
-PR 3A 계획 범위: 같은 전용 DB의 복수 실제 connection에서 요청을 경합시키고 commit·rollback·재조회를 확인한다. Dashboard가 소비할 실제 요청/응답과 DB 근거를 provenance가 있는 artifact로 내보낸다.
+PR 3A 구현 범위: 같은 전용 DB의 복수 실제 connection에서 요청을 경합시키고 commit·rollback·재조회를 확인한다. Dashboard가 소비할 실제 요청/응답과 DB 근거를 provenance가 있는 artifact로 내보낸다.
 
 PR 3B 계획 범위: 실제 Dashboard client·응답 변환·launch flow에 PR 3A 응답을 연결하고 다음 operation에 전달되는 run/experiment ID, scope, 호출 순서와 오류 차단을 검사한다. 응답 변환 추출이 필요하면 Dashboard 내 동작 보존 refactor까지 포함한다.
 
 공통 비범위: 브라우저 전체 E2E, 배포 서버·ALB 검증, 실제 assignment 처리·start 상태 전이·발송, next-loop activation, ClickHouse·외부 AI, 분석/콘텐츠 생성 전체 파이프라인, 전체 migration·legacy 호환, 운영 데이터, 배포/branch protection 변경. PR 3B의 operation 호출 기록은 downstream 처리 성공의 증거가 아니다.
 
-동시성과 consumer 검증은 **계획 확정·미구현**이다. 기존 순차 테스트나 PR 2 CI 성공으로 PR 3를 완료 처리하지 않는다.
+동시성과 producer bundle은 **3A 로컬 검증 완료**, consumer는 **3B pending**이다. 기존 순차 테스트나 PR 2 CI 성공으로 PR 3 전체를 완료 처리하지 않는다.
 
 ## 7. Producer → row → consumer → Dashboard action
 
@@ -144,7 +144,7 @@ runner는 운영 Dockerfile과 분리하고 필요한 소스·테스트·설정�
 | PR 0 → 개인 통합 | POST /runs 응답 전 commit, 최소 FastAPI 지원 버전, 회귀 테스트 | Gate 구현·fixture·CI | 선행 서비스 수정. PR #394 → 개인 통합에 09442f2로 병합 완료 |
 | PR 1 → 개인 통합 | 실제 DB 시나리오, baseline fixture/provenance, runner·DB 준비/정리, lock, JSON/JUnit, 문서 | CI workflow·Dashboard·서비스 동작 수정 | 로컬 단일 명령으로 완결. 단독 사용 가능 |
 | PR 2 → 개인 통합 | 같은 명령의 CI 호출, 고정/최신 결과 분리, artifact 보관, 문서 갱신 | 배포 workflow·branch protection | PR 1 반영 후 진행. PR 1 없이 독립 실행 가능한 변경이 아님 |
-| PR 3A → Decision 개인 통합 | 실제 동시성, Gate manifest·결과/응답 bundle·제어 검사·CI artifact 확장 | Dashboard runtime·서비스 결함 수정 | PR 2 통합 후 구현; 3B 없이 독립 실행·검토 가능 |
+| PR 3A → Decision 개인 통합 | 실제 동시성, Gate manifest·결과/응답 bundle·제어 검사·CI artifact 확장 | Dashboard runtime·서비스 결함 수정 | 문서 #397 통합 후 구현·로컬 PASS; 3B 없이 독립 실행·검토 가능 |
 | PR 3B → Dashboard 합의한 통합 branch | 실제 client·공유 변환·launch 소비 검사, 전용 실행·CI·결과 | Decision runtime·실제 assignment/발송·브라우저 E2E | 3A의 고정 producer SHA·bundle 계약 필요; Dashboard base는 착수 시 확인 |
 | PR 3 milestone | 3A·3B revision 조합 및 각 결과·artifact hash 연결 | 별도 구현 PR 번호나 GitHub Milestone 자동 생성 | 두 저장소의 검증 근거를 같은 조합으로 연결해야 완료 |
 | 통합 → dev Draft | 저장소별 통합 결과·최종 검증 근거 | 검토되지 않은 추가 기능 | 기존 PR 1·2 제출과 PR 3 milestone 완료는 별도 상태; 실제 제출 시 포함 범위를 명시 |
@@ -168,7 +168,7 @@ PR 2 변경: .github/workflows/run-contract-gate.yml. PR 3은 21절의 소유 �
 - 현재 문서 worktree: /Users/ran/loop-ad/loop-ad_decision-run-contract-gate.
 - 최종 Draft의 base: dev. main은 대상이 아니다.
 
-PR 0·1·2는 개인 통합에 병합됐다. 현재 문서 작업은 `14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e`에서 분기했으며 Dashboard 파일은 변경하지 않는다. PR 3A/3B branch 생성·구현과 원격 쓰기는 후속 작업이다. 원래 main 작업 공간의 변경·untracked 파일은 옮기지 않는다.
+PR 0·1·2와 milestone 문서 #397은 개인 통합에 병합됐다. PR 3A branch는 `6de82a36ddc1cf51c88a431d65e84f873ea8f472`에서 분기했으며 Dashboard 파일은 변경하지 않는다. PR 3A를 구현·검증해 개인 통합 대상 PR로 제출하고 merge는 수행하지 않는다. PR 3B는 후속 작업이다. 원래 main 작업 공간의 변경·untracked 파일은 옮기지 않는다.
 
 실제 원격 쓰기 전 repository·branch·commit 범위·diff/stat·정확한 파일을 검토하고 해당 작업 승인을 받는다. AGENTS.md, agent/, .codex/, .env, 출력물·캐시·개인 기록은 포함하지 않는다. 광범위한 git add를 사용하지 않는다.
 
@@ -200,7 +200,7 @@ PR 0·1·2는 개인 통합에 병합됐다. 현재 문서 작업은 `14e54cda5c
 
 이번 rollback은 Gate workflow·도구·문서 변경을 되돌리는 범위다. 운영 DB migration이나 운영 데이터 rollback을 수행하지 않는다.
 
-합의한 후속 PR 3A: 실제 동시 요청·복수 connection에서 같은 scope 생성 경합, insert 패배 경로, lock·commit·rollback 결과 검증. PR 3B: Dashboard 실제 소비 코드 연결. 두 PR은 하나의 PR 3 milestone으로 추적한다. legacy 전체 호환·배포 차단·전체 migration suite는 필요를 재평가한 뒤 결정한다.
+구현한 PR 3A: 실제 동시 요청·복수 connection에서 같은 scope 생성 경합, insert 패배 경로, lock·commit·rollback 결과 검증. PR 3B: Dashboard 실제 소비 코드 연결. 두 PR은 하나의 PR 3 milestone으로 추적한다. legacy 전체 호환·배포 차단·전체 migration suite는 필요를 재평가한 뒤 결정한다.
 
 ## 17. 지표와 완료 조건
 
@@ -246,7 +246,7 @@ PR 1·2 완료 조건(이 목록 통과만으로 PR 3 milestone이 완료되지�
 
 ## 20. 구현 중 이해해야 할 핵심 개념
 
-[학습 안내](learning-guide.md)의 1~6단원은 기존 Gate, 7~9단원은 PR 3 계획을 따른다. 설명할 수 있어야 할 차이는 fake/실DB, 멱등성/동시성, statement/commit, scope/ID/binding, baseline fixture/현재 writer, 필수 판정/최신 경고, PR check/배포 차단이다.
+[학습 안내](learning-guide.md)의 1~6단원은 기존 Gate, 7~9단원은 PR 3A 구현·3B 계획을 따른다. 설명할 수 있어야 할 차이는 fake/실DB, 멱등성/동시성, statement/commit, scope/ID/binding, baseline fixture/현재 writer, 필수 판정/최신 경고, PR check/배포 차단이다.
 
 이 설계는 운영 경험을 새로 만드는 기능이 아니다. 실제 코드·DB 경계를 검증하고 재현 가능한 증거를 쌓는 개발 안전성 과제다.
 
@@ -260,7 +260,7 @@ PR 3A/3B는 문서상 논리 이름이다. 서로 다른 저장소의 GitHub PR 
 | 구분 | PR 3A: Decision | PR 3B: Dashboard |
 |---|---|---|
 | 소유자 관점 | writer·transaction·실제 응답 생산 | client·변환·launch의 실제 소비 |
-| 예정 변경 위치 | tests/run_contract_gate/, tools/run_contract_gate/, scripts/run-contract-gate.sh, 전용 lock/image가 필요하면 해당 파일, Gate workflow·문서 | api-server client contract 테스트, web-client 변환 함수·hook·launch 테스트, 전용 bundle 검증/실행 도구·CI·문서 |
+| 변경 위치 / 3B 예정 위치 | tests/run_contract_gate/, tools/run_contract_gate/, scripts/run-contract-gate.sh, 전용 lock/image가 필요하면 해당 파일, Gate workflow·문서 | api-server client contract 테스트, web-client 변환 함수·hook·launch 테스트, 전용 bundle 검증/실행 도구·CI·문서 |
 | production 변경 | service/repository/API 의미 변경 제외 | hook의 기존 변환을 공유 함수로 추출하는 동작 보존 변경만 허용 |
 | 필수 결과 | 경합 증거·최종 DB 상태·응답 bundle·JSON/JUnit | 동일 bundle을 소비한 client/변환/launch 결과·JSON/JUnit |
 | 독립 완료 의미 | Decision 동시성·producer 검증 완료 | 특정 Decision revision과 Dashboard revision 조합의 소비 검증 완료 |
@@ -285,8 +285,8 @@ Dashboard 최신 branch까지 추가하는 조합 검사는 PR 3 범위 밖이�
 
 ### Milestone 완료 기준
 
-- [ ] 3A 기존·새 필수 case가 모두 실행되고, 실제 DB 경합·commit/rollback·정리 증거가 있다.
-- [ ] 3A artifact가 실제 응답과 DB 검증을 같은 실행으로 연결하며 누락·손상·hash 불일치 탐지 제어 검사가 있다.
+- [x] 3A 기존·새 필수 case가 모두 실행되고, 실제 DB 경합·commit/rollback·정리 증거가 있다. 로컬 E-17 기준.
+- [x] 3A artifact가 실제 응답과 DB 검증을 같은 실행으로 연결하며 누락·손상·hash 불일치 탐지 제어 검사가 있다. 로컬 E-17 기준.
 - [ ] 3B의 실제 client → 공유 변환 → 실제 launch 연결 검사가 정상·retry·baseline·오류 입력을 다룬다.
 - [ ] 각각의 clean revision·CI 결과·Contract SHA·lock/image·bundle hash·소비 결과가 같은 조합으로 연결된다.
 - [ ] latest 경고가 있으면 원인과 영향이 기록돼 있고 필수 통과로 합산되지 않는다.
@@ -299,7 +299,7 @@ Dashboard 최신 branch까지 추가하는 조합 검사는 PR 3 범위 밖이�
 
 | 항목 | 계획 단계의 결론 |
 |---|---|
-| Verdict | incomplete evidence — 구현·실행 전 |
+| Verdict | 3A local verified / 3B pending — 전체 milestone은 incomplete evidence |
 | Affected Dashboard journey | run 생성 응답 수신 → 변환 → launch의 다음 operation 인자 확인; 실제 downstream 실행은 제외 |
 | Contract impact | 기존 run DTO·identity·DDL은 유지. 새 계약은 테스트용 producer bundle뿐이며 v1과 hash로 관리 |
 | Existing-data compatibility | 고정 baseline row → 후보 Decision 재사용 응답 → 후보 Dashboard client/변환/launch |

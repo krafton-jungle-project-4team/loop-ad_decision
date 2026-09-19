@@ -5,10 +5,11 @@ import os
 from pathlib import Path
 import sys
 from .report import aggregate, validate_lane, SHA
+from .bundle import build_bundle, validate_bundle, write_manifest, digest
 
 
-def main():
-    output = Path('/output')
+def main(output=None):
+    output = Path('/output') if output is None else Path(output)
     lanes = {}
     artifacts_ok = True
     for lane in ('fixed','latest'):
@@ -36,6 +37,32 @@ def main():
                    lanes=lanes, controls=controls, duration_seconds=int(os.environ['RCG_DURATION']),
                    artifacts={'fixed_junit':'fixed/junit.xml','latest_junit':'latest/junit.xml','controls_junit':'controls/junit.xml'},
                    cleanup_log='cleanup.log', resources={'containers':[os.environ['RCG_RUN_ID']+'-db', os.environ['RCG_RUN_ID']+'-runner'], 'volumes':[os.environ['RCG_RUN_ID']+'-socket']})
+    bundles = {}
+    for lane in ('fixed', 'latest'):
+        if not (output/(lane+'.completed')).exists():
+            bundles[lane] = dict(status='INCOMPLETE', reason='lane not completed')
+            continue
+        try:
+            directory = build_bundle(output/lane, lane=lane, run_id=summary['run_id'],
+                                     producer=provenance, gate_status=summary['status'])
+            bundles[lane] = validate_bundle(directory, lane=lane,
+                producer_sha=provenance['candidate_commit'], source_sha256=provenance['source_sha256'],
+                run_id=summary['run_id'], gate_status=summary['status'])
+        except (OSError, ValueError, KeyError, TypeError, AssertionError) as exc:
+            bundles[lane] = dict(status='INCOMPLETE', reason=str(exc))
+            summary.update(status='INCOMPLETE', exit_code=2, artifacts_ok=False)
+            if lane == 'latest':
+                summary['latest_status'] = 'WARN_UNVERIFIED'
+    # A shared integrity failure applies to both lanes. Keep valid manifests truthful.
+    for lane, bundle in bundles.items():
+        if bundle['status'] == 'VERIFIED':
+            directory = output/lane/'consumer'
+            manifest = json.loads((directory/'manifest.json').read_text())
+            manifest['gate_status'] = summary['status']
+            write_manifest(directory, manifest)
+            bundle.update(gate_status=summary['status'], manifest_sha256=digest(directory/'manifest.json'),
+                          directory=lane+'/consumer')
+    summary['consumer_bundles'] = bundles
     (output/'result.json').write_text(json.dumps(summary, indent=2, sort_keys=True)+'\n')
     (output/'finalizer.exit').write_text(str(summary['exit_code'])+'\n')
     print(f"Run Contract Gate: {summary['status']} (exit {summary['exit_code']})")

@@ -102,6 +102,8 @@ jobs:
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/inputs.json
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/*.json
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/junit.xml
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/responses/
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/consumer/
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/controls/*.json
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/controls/junit.xml
 
@@ -115,3 +117,5 @@ jobs:
           path: |
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/*.json
             ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/junit.xml
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/responses/
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/consumer/

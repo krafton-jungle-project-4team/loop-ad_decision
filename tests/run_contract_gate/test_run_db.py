@@ -17,6 +17,7 @@ from psycopg.rows import dict_row
 from app.config import REQUIRED_ENV_NAMES, load_settings
 from app.decision.audience_snapshots import AudienceSnapshotRepository
 from app.main import create_app
+from .responses import capture
 from .seed import ANALYSIS, PROMOTION, REQUEST, SEGMENTS, seed
 
 pytestmark = pytest.mark.skipif(
@@ -78,6 +79,7 @@ def test_create_commits_exact_scope(database):
     """RCG-01: actual API, actual commit, independent rows and lifecycle checks."""
     with TestClient(make_app(database), raise_server_exceptions=False) as client:
         response = client.post('/decision/v1/promotions/' + PROMOTION + '/runs', json=REQUEST)
+    capture('RCG-01', 'create', REQUEST, response)
     stored = observe(database)
     evidence('RCG-01', {'http_status': response.status_code, 'response': response.json(), 'rows': stored})
     assert response.status_code == 200
@@ -152,13 +154,16 @@ def post(database, payload):
 
 def test_retry_reuses_committed_run(database):
     first = post(database, REQUEST)
+    capture('RCG-02', 'first', REQUEST, first)
     assert first.status_code == 200
     before = observe(database)
     # A new client/request models retry after losing the already committed response.
     retry = post(database, REQUEST)
+    capture('RCG-02', 'retry', REQUEST, retry)
     assert retry.status_code == 200
     assert retry.json() == first.json()
     assert observe(database) == before
+    evidence('RCG-02', {'rows_unchanged': True, 'rows': before})
 
 
 def test_scope_order_and_duplicates(database):
@@ -268,9 +273,70 @@ def test_baseline_rows_are_reused(baseline_database):
     with psycopg.connect(**database) as connection:
         before = export_rows(connection)
     response = post(database, expected['request'])
+    capture('RCG-08', 'reuse', expected['request'], response)
     assert response.status_code == 200, response.text
     assert response.json() == expected['response']
     with psycopg.connect(**database) as connection:
         assert export_rows(connection) == before
     evidence('RCG-08', {'http_status': response.status_code, 'response': response.json(),
                         'baseline_rows_unchanged': True})
+
+
+@pytest.fixture(params=['commit', 'rollback', 'overlap', 'overlap-reverse'])
+def contention(request, database, monkeypatch):
+    from .concurrency import run_contention
+    return run_contention(database, monkeypatch, request.param, make_app, observe)
+
+
+def test_concurrent_requests_preserve_atomic_scope(contention):
+    """RCG-10/11/12: setup proves blocking; call checks actual API/DB invariants."""
+    result = contention
+    responses, events, rows = result['responses'], result['timeline'], result['after']
+    statuses = {name: value['status'] for name, value in responses.items()}
+    if result['mode'] == 'commit':
+        assert statuses == {'A': 200, 'B': 200}, responses
+        assert json.loads(responses['A']['body']) == json.loads(responses['B']['body'])
+        assert any(e['request_id'] == 'B' and e['event'] == 'insert_complete' and not e['inserted'] for e in events)
+        assert any(e['request_id'] == 'B' and e['event'] == 'scope_read' and e['number'] == 2 and e['found'] for e in events)
+    else:
+        assert sorted(statuses.values()) == [200, 409], responses
+        loser = next(name for name, status in statuses.items() if status == 409)
+        detail = json.loads(responses[loser]['body'])['detail']
+        if result['mode'] == 'rollback':
+            assert loser == 'A'
+            assert detail == 'rcg_test_rollback_after_real_writes'
+        else:
+            assert detail == dict(code='segment_audience_run_binding_invalid',
+                segment_id=','.join(responses[loser]['request']['segment_ids']),
+                reason='segment_audience_exclusion_binding_invalid: '+SEGMENTS[0]), detail
+    winner = next(name for name, status in statuses.items() if status == 200)
+    payload = json.loads(responses[winner]['body'])
+    scope = payload['segment_ids']
+    assert len(rows['promotion_runs']) == 1
+    assert rows['promotion_runs'][0]['promotion_run_id'] == payload['promotion_run_id']
+    assert rows['promotion_runs'][0]['segment_scope_json'] == scope
+    assert len(rows['ad_experiments']) == len(rows['promotion_run_target_bindings']) == len(scope)
+    assert {row['ad_experiment_id'] for row in rows['ad_experiments']} == {row['ad_experiment_id'] for row in payload['ad_experiments']}
+    for table in ('ad_experiments', 'promotion_run_target_bindings'):
+        assert {row['segment_id'] for row in rows[table]} == set(scope)
+        assert all(row['promotion_run_id'] == payload['promotion_run_id'] for row in rows[table])
+    assert {row['segment_id']: row['audience_reservation_state'] for row in rows['promotion_target_segments']} == {
+        segment: 'consumed' if segment in scope else 'reserved' for segment in SEGMENTS}
+    assert all(row['state'] == ('consumed' if row['segment_id'] in scope else 'reserved') for row in rows['promotion_audience_exclusion_members'])
+    assert len(rows['promotion_audience_exclusion_members']) == 6
+    assert {row['status'] for row in rows['segment_audience_allocation_plans']} == {'locked'}
+    before_revision = result['before']['promotion_audience_exclusion_state'][0]['revision']
+    assert rows['promotion_audience_exclusion_state'][0]['revision'] == before_revision + 1
+    targets = {row['segment_id']: row for row in rows['promotion_target_segments']}
+    for row in rows['promotion_run_target_bindings']:
+        assert row['target_analysis_id'] == ANALYSIS
+        assert row['final_snapshot_id'] == targets[row['segment_id']]['audience_snapshot_id']
+        assert row['allocation_plan_id'] == targets[row['segment_id']]['allocation_plan_id']
+    for name, status in statuses.items():
+        own = [event for event in events if event['request_id'] == name]
+        end = 'commit_complete' if status == 200 else 'rollback_complete'
+        assert len([event for event in own if event['event'] == end]) == 1
+        assert next(event['sequence'] for event in own if event['event'] == end) < next(event['sequence'] for event in own if event['event'] == 'http_response_start')
+        assert not any(event['event'] == ('rollback_complete' if status == 200 else 'commit_complete') for event in own)
+    assert result['pids']['A'] != result['pids']['B']
+    assert not result['workers_alive']
