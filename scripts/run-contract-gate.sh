@@ -57,9 +57,9 @@ while IFS= read -r file; do
     [ -f "$ROOT/$file" ] || continue
     mkdir -p "$WORK/source/$(dirname "$file")"; cp "$ROOT/$file" "$WORK/source/$file"
 done < <(git -C "$ROOT" ls-files --cached --others --exclude-standard app pyproject.toml)
-for file in __init__.py seed.py baseline.py test_run_db.py test_runner_control.py; do cp "$ROOT/tests/run_contract_gate/$file" "$WORK/gate/tests/run_contract_gate/$file"; done
+for file in __init__.py seed.py baseline.py responses.py concurrency.py test_run_db.py test_runner_control.py; do cp "$ROOT/tests/run_contract_gate/$file" "$WORK/gate/tests/run_contract_gate/$file"; done
 for file in rows.json expected.json provenance.json; do cp "$ROOT/tests/fixtures/run_contract_gate/baseline/$file" "$WORK/gate/tests/fixtures/run_contract_gate/baseline/$file"; done
-for file in __init__.py report.py lane.py finalize.py inputs.py resources.sh manifest.json control-manifest.json; do cp "$ROOT/tools/run_contract_gate/$file" "$WORK/gate/tools/run_contract_gate/$file"; done
+for file in __init__.py report.py contention.py bundle.py lane.py finalize.py inputs.py resources.sh manifest.json control-manifest.json; do cp "$ROOT/tools/run_contract_gate/$file" "$WORK/gate/tools/run_contract_gate/$file"; done
 cp "$ROOT/tools/run_contract_gate/requirements.lock" "$WORK/context/tools/run_contract_gate/requirements.lock"
 cp "$ROOT/Dockerfile.run-contract-gate" "$WORK/context/Dockerfile.run-contract-gate"
 cp "$ROOT/scripts/run-contract-gate.sh" "$WORK/gate/run-contract-gate.sh"

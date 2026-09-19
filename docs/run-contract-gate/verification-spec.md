@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 테스트 구현자, 리뷰어 |
-| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
-| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
+| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 실행 경계와 공통 fixture
@@ -19,7 +19,7 @@
 
 ## 필수 시나리오
 
-RCG-01~09는 [test_run_db.py](../../tests/run_contract_gate/test_run_db.py)에 구현했다. 9개 논리 ID가 17개 실제 pytest case에 대응한다. CTRL-01~05는 30개 제어 case로 검증한다. 논리 ID는 이름이 바뀌어도 보존한다.
+RCG-01~12는 [test_run_db.py](../../tests/run_contract_gate/test_run_db.py)에 구현했다. 기존 17개와 동시성 4개를 합쳐 lane별 21개다. 기존 CTRL 30개에 bundle 16개·경합 증거 판정 5개·worker 회수 1개·finalizer 전파 2개를 더해 54개 제어 case로 검증한다. 논리 ID는 이름이 바뀌어도 보존한다.
 
 필수 목록: [DB manifest](../../tools/run_contract_gate/manifest.json), [제어 manifest](../../tools/run_contract_gate/control-manifest.json). 수집된 이름·각 setup/call/teardown 결과·JUnit을 대조한다.
 
@@ -98,9 +98,9 @@ JUnit은 fixed/latest를 구분해 저장하고 latest assertion을 전체 필�
 
 ## 제외한 보장과 다음 단계
 
-PR 1·2 성공에는 실제 concurrent request와 Dashboard 변환·launch 검증이 포함되지 않는다. 이를 PR 3A·3B로 계획했다. 실제 Decision/Dashboard 서버를 함께 띄운 live HTTP 여정·브라우저 전체 실행·assignment 처리·운영 DB·전체 migration·모든 dependency/architecture 조합은 PR 3에서도 보장하지 않는다.
+PR 1·2 성공에는 실제 concurrent request와 Dashboard 변환·launch 검증이 포함되지 않는다. 3A는 새 경합 case로 검증했고, Dashboard 변환·launch는 3B 계획이다. 실제 Decision/Dashboard 서버를 함께 띄운 live HTTP 여정·브라우저 전체 실행·assignment 처리·운영 DB·전체 migration·모든 dependency/architecture 조합은 PR 3에서도 보장하지 않는다.
 
-**필수 후속 동시성 검증:** 최소 두 실제 DB connection과 동시 요청으로 같은 scope를 경합시켜 승자·패자 응답의 identity, row 수, lock·commit·rollback을 확인한다. PR 3A로 수행할 계획이며 현재 fake race 분기 테스트나 RCG-02로 대체하지 않는다.
+**필수 후속 동시성 검증:** 최소 두 실제 DB connection과 동시 요청으로 같은 scope를 경합시켜 승자·패자 응답의 identity, row 수, lock·commit·rollback을 확인한다. PR 3A의 RCG-10~12로 수행하며 fake race 분기 테스트나 RCG-02로 대체하지 않는다.
 
 ## 2026-09-19 실제 확인 상태
 
@@ -110,11 +110,11 @@ PR 1·2 성공에는 실제 concurrent request와 Dashboard 변환·launch 검�
 
 PR 2는 위 판정 규칙을 바꾸지 않고 Gate 종료 코드를 필수 check에 전달한다. latest 경고 표시와 JSON/JUnit 보관은 [개발자 안내 8절](developer-guide.md#8-pr-2-ci와-최종-제출), 정적·로컬 근거는 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증)를 따른다.
 
-## PR 3 검증 경계 — 계획, 아직 실행하지 않음
+## PR 3 검증 경계 — 3A 구현, 3B 계획
 
-PR 3A와 PR 3B의 소유·순서는 [개발 계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)이 기준이다. 아래 ID는 새 논리 case의 예약이며 구현된 테스트명·통과 개수가 아니다. 기존 RCG-01~09와 CTRL-01~05의 의미를 바꾸지 않는다. 실제 매개변수 case는 구현 시 각 저장소의 manifest에 모두 열거한다.
+PR 3A와 PR 3B의 소유·순서는 [개발 계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)이 기준이다. RCG-10~12는 구현됐고 RCC-01~06은 3B 예약 ID다. 기존 RCG-01~09와 CTRL-01~05의 의미를 바꾸지 않는다. 3A의 실제 매개변수 case는 [manifest](../../tools/run_contract_gate/manifest.json)와 [control manifest](../../tools/run_contract_gate/control-manifest.json)에 모두 열거했다.
 
-### PR 3A 실제 DB 동시성 검증 계획
+### PR 3A 실제 DB 동시성 검증
 
 각 case의 두 요청은 **같은 전용 DB·합성 seed**에 접근하고, 서로 다른 실제 PostgreSQL connection/transaction을 사용한다. 실제 API dependency·service·repository·commit/rollback을 통과한다. `TestClient`를 사용할 수 있지만 요청별 실행 context와 connection을 분리하고 요청 중첩을 관찰한다. TCP·별도 서버 process·운영 connection pool의 검증으로 확대하지 않는다.
 
@@ -132,9 +132,13 @@ PR 3A와 PR 3B의 소유·순서는 [개발 계획 21절](implementation-plan.md
 
 서비스가 기대 불변식을 만족하지 못하면 실제 실패를 보존한다. 관찰 결과에 맞춰 성공 기준을 낮추거나 production retry/lock을 검증 PR에 추가하지 않는다. 현재 순차 RCG-09는 HTTP 409와 `segment_audience_target_already_run_bound`를 확인하며, router는 unique 위반에도 409를 반환한다. RCG-12는 충돌 409를 요구하되, 제어한 경합이 어느 실제 handler 경로에 도달하는지 확인해 정확한 오류 형태를 고정한다. 임의 500이나 timeout을 정상 충돌 응답으로 인정하지 않는다.
 
-### PR 3A 결과·응답 bundle 계약 계획
+구현은 `commit`, `rollback`, `overlap`, `overlap-reverse` 4개 case다. 겹치는 scope는 좁은 scope가 선행하는 경우와 넓은 scope가 선행하는 경우를 각각 실행하며 assertion은 성공 응답에서 승자를 찾는다. `read committed`, statement 20초·lock 18초·event/관찰/worker 대기 12초를 기록한다. 준비·증거 검사는 pytest fixture setup, API/DB 불변식은 call 단계에 두어 INCOMPLETE와 FAIL을 구분한다.
 
-제안 schema 식별자는 `rcg-run-consumer.v1`이다. 이 표는 구현할 계약이며 파일/옵션이 이미 존재한다는 뜻이 아니다. 기존 `result.json`·JSON/JUnit을 보존하고 별도 consumer bundle을 추가한다.
+제어한 두 overlap case의 실제 409는 `detail.code=segment_audience_run_binding_invalid`, `reason=segment_audience_exclusion_binding_invalid: rcg_segment_a`다. lock 이후 target의 consumed 상태와 해당 SQL snapshot의 reservation count가 맞지 않아 `_validate_binding_target`에서 거절되고, 서비스가 명시적 `RunAudienceContractError`로 변환한다. 순차 RCG-09의 `target_already_run_bound` 코드와 다르다. 최초 초안의 순차 코드 assertion은 이 실제 경로를 조사한 뒤 문서의 “명시적 409 + 실제 handler 형태 고정” 기준으로 정정했다. 500·timeout을 허용하거나 서비스·DDL을 바꾸지 않았다. 자세한 관찰은 E-17이다.
+
+### PR 3A 결과·응답 bundle 계약
+
+구현 schema 식별자는 `rcg-run-consumer.v1`이다. [bundle.py](../../tools/run_contract_gate/bundle.py)가 기존 `result.json`·JSON/JUnit을 보존하면서 lane별 `consumer/manifest.json`과 원본 body·진단 자료를 만든다. 검증 명령은 [개발자 안내](developer-guide.md#9-pr-3a에서-pr-3b로-넘기는-절차)를 따른다.
 
 | 필드 묶음 | 필수 내용 |
 |---|---|
@@ -168,7 +172,7 @@ Dashboard의 실제 client가 로컬 replay 서버에서 3A의 원본 status/bod
 
 ### PR 3 제어 검사와 판정 연결
 
-추가 제어 검사는 3A의 경합 미성립·worker timeout·응답 bundle 누락/손상, 3B의 producer SHA/response hash 불일치·실제 consumer case 누락·수집 0·skip, 그리고 fixed 실패와 latest 성공의 잘못된 합산을 다룬다. 실제 제어 case 수는 구현 후 manifest·JUnit에서 집계하며 지금 숫자를 정하지 않는다.
+3A는 54개 제어 case로 기존 판정·소유자 정리와 새 경합 증거 누락, worker timeout/회수, bundle 누락·손상·SHA/producer/lane 혼동을 검사한다. 3B consumer case 누락·수집 0·skip 검증은 후속 계획이다. fixed 실패를 latest 성공으로 덮는 기존 제어도 유지한다.
 
 3A/3B 모두 fixed가 필수이며 latest는 별도 경고다. latest bundle이 없으면 해당 lane을 WARN_UNVERIFIED로 기록하고 빈 consumer 실행을 PASS로 표시하지 않는다. 유효한 최신 입력의 계약 불일치는 WARN_DRIFT다. 공통 준비·결과 무결성·cleanup 실패는 필수 INCOMPLETE다. 각 PR의 결과와 milestone의 revision 연결을 별도로 확인하며 JUnit 개수를 두 번 합산하지 않는다.
 

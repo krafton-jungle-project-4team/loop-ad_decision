@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 변경을 검증하는 개발자·리뷰어 |
-| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
-| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
+| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 1. 준비할 환경
@@ -43,16 +43,16 @@ fixed assertion 실패 후에도 가능한 경우 latest를 실행한다. 최신
 ```text
 Run Contract Gate: PASS (exit 0)
 fixed: PASS; latest: PASS; controls: PASS; cleanup: True
-fixed: SHA=0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 cases=17 reason=
-latest: SHA=0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 cases=17 reason=
+fixed: SHA=0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 cases=21 reason=
+latest: SHA=0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 cases=21 reason=
 ```
 
 | 결과 | 의미 |
 |---|---|
-| fixed PASS / exit 0 | 고정 계약의 17개 case와 필수 제어 검사를 통과하고 결과·정리 확인 |
+| fixed PASS / exit 0 | 고정 계약의 21개 case와 필수 제어 검사를 통과하고 결과·정리 확인 |
 | fixed FAIL / exit 1 | 실제 assertion 불일치 확인 |
 | fixed INCOMPLETE / exit 2 | 준비 실패·필수 case 누락/skip·timeout 등으로 필수 검증 불가 |
-| latest PASS | 해석한 최신 SHA에서 17개 case 통과 |
+| latest PASS | 해석한 최신 SHA에서 21개 case 통과 |
 | latest WARN_DRIFT | 최신 lane의 assertion 불일치. fixed 결과는 유지 |
 | latest WARN_UNVERIFIED | 최신 취득·환경·setup 등으로 결론 불가. fixed 결과는 유지 |
 
@@ -131,19 +131,40 @@ GitHub-hosted `ubuntu-24.04-arm`에서 로컬과 같은 `./scripts/run-contract-
 
 JSON·JUnit과 CI 실행 메타데이터만 명시한 경로로 업로드하며 전체 작업 디렉터리·환경변수·원문 로그는 업로드하지 않는다. 준비 실패로 생성되지 않은 JUnit을 만들어내지 않는다. 일반 실패에서도 생성된 결과의 업로드를 시도하지만 runner 강제 종료·job timeout·GitHub artifact 서비스 장애까지 보관을 보장하지는 않는다. artifact 업로드 자체의 실패는 check 실패다.
 
-정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit의 clean 재실행·실제 Actions 성공과 개인 통합 병합은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 기록했다. PR 2 CI는 PR의 checkout merge SHA를 검사한 결과이며 이후 개인 통합 merge SHA를 다시 실행한 결과로 바꾸어 기록하지 않는다. 실제 동시성과 Dashboard 소비 검증은 PR 3A·3B의 계획 범위다.
+정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit의 clean 재실행·실제 Actions 성공과 개인 통합 병합은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 기록했다. PR 2 CI는 PR의 checkout merge SHA를 검사한 결과이며 이후 개인 통합 merge SHA를 다시 실행한 결과로 바꾸어 기록하지 않는다. 실제 동시성과 응답 bundle은 3A로 구현했다. Dashboard 소비 검증은 3B 계획 범위다.
 
-## 9. PR 3A에서 PR 3B로 넘기는 절차 — 구현 예정
+## 9. PR 3A에서 PR 3B로 넘기는 절차
 
-지금 실행 가능한 명령은 2절의 기존 Gate다. PR 3A의 bundle exporter와 PR 3B의 consumer 명령은 아직 없으며, 문서에 없는 옵션을 추측해 실행하지 않는다. 구현 PR에서 실제 실행 파일·인수·종료 코드·필수 환경을 이 절에 추가한다.
+2절의 같은 Gate 명령이 동시성 검사와 lane별 consumer bundle 생성까지 수행한다. 추가 dependency·환경변수·production flag는 없다. 3B의 실제 consumer 명령은 아직 구현하지 않았다.
 
 ### Decision 개발자: PR 3A
 
 1. PR 2가 반영된 개인 통합 SHA를 확인하고 3A 작업 branch를 만든다. 기존 Gate를 실행해 기반 상태를 확인한다.
-2. [RCG-10~12](verification-spec.md#pr-3a-실제-db-동시성-검증-계획)의 실제 경합을 구현한다. 요청별 PID·단계·대기·commit/rollback·최종 DB 증거를 확인한다.
+2. [RCG-10~12](verification-spec.md#pr-3a-실제-db-동시성-검증)의 실제 경합을 실행한다. 요청별 PID·단계·대기·commit/rollback·최종 DB 증거를 확인한다.
 3. 정상·retry·baseline·동시 요청의 원본 status/body를 consumer bundle로 기록하고 manifest·hash·누락 제어 검사를 연결한다. 기존 fixed/latest 결과와 섞지 않는다.
 4. clean한 제출 SHA에서 로컬·CI를 실행하고 결과·소요 시간·정리를 기록한다. 아직 실패 중인 bundle은 진단용이라고 표시한다.
 5. Dashboard에 전달할 자료는 producer SHA·source digest, Contract SHA, bundle/response hash, 생성 명령, Gate result·JSON/JUnit, CI 실행 링크다. 고정 baseline expected는 함께 참조하되 재생성하지 않는다.
+
+### Bundle 생성·검증 명령
+
+```bash
+./scripts/run-contract-gate.sh /tmp/rcg-new-output
+python3 -m tools.run_contract_gate.bundle /tmp/rcg-new-output/fixed/consumer \
+  --lane fixed \
+  --producer-sha <검토한-실제-checkout-40자리-SHA> \
+  --source-sha256 <result.inputs.source_sha256> \
+  --manifest-sha256 <검토한-result.consumer_bundles.fixed.manifest_sha256>
+```
+
+`<...>`는 실제 실행에서 검토한 값으로 바꾼다. 검증기는 Python 표준 라이브러리만 사용하고 exit 0=VERIFIED, 2=INCOMPLETE다. **VERIFIED는 bundle의 무결성 판정**이며 Gate 성공을 대신하지 않는다. 출력의 `gate_status`, `lane_status`와 원본 Gate/CI 결과를 함께 확인한다. producer SHA·manifest hash는 같은 bundle의 자기 선언만 믿지 말고 선택한 checkout·CI provenance와 대조한다. latest는 별도로 `--lane latest`와 그 lane의 hash를 사용한다.
+
+`consumer/` 하나에는 manifest·digest, 원본 `responses/*.body` 12개, `result.json`, `junit.xml`, RCG-01/02/08/10/11/12/reverse 진단 JSON이 있다. 요청과 HTTP status/content type은 manifest의 `samples`에 있고 body는 decode·정규화하지 않은 원본 바이트다. RCG-11의 A 응답은 **테스트에서 실제 write 후 주입한 conflict**이며 자연 발생 실패로 표시하지 않는다. RCG-12 두 오류는 실제 runtime 경로에서 발생한 409다. 각 sample의 case outcome·DB assertion 여부를 확인한다.
+
+응답 12개의 구성은 정상 1·순차 재사용 2·baseline 1·경합 4쌍 8이다. 실패 실행은 partial `responses/`와 진단 JSON을 먼저 보존한다. 준비 실패로 생성되지 않은 응답을 만들지 않는다. 필수 bundle 누락·무결성 오류는 공통 INCOMPLETE로 판정한다. latest 자체를 실행하지 못한 경우는 기존 WARN_UNVERIFIED 규칙을 유지한다. CI는 두 lane의 `responses/`와 `consumer/`를 각각 기존 artifact에 보관한다.
+
+### Timeout·중단 검증 범위
+
+CTRL은 실제 shell cleanup/timeout 함수에 Docker 대역을 연결해 이름·owner label 거절을 검사하고, 새 worker 제어는 실제 대기 thread를 cancel 후 join한다. E-17에서는 별도 로컬 probe로 실제 Docker도 확인했다. timeout은 임시 runner 사본의 lane 제한만 180초→1초로 바꿨고, interrupt는 fixed runner 시작 후 원래 Gate process에 SIGTERM을 보냈다. 다른 owner label의 검증용 container/volume은 그대로 남았고 각 Gate 소유 자원만 사라졌다. 두 probe는 INCOMPLETE/exit 2이며 일반 PASS 실행으로 합산하지 않는다. 강제 종료(SIGKILL)·host/Docker daemon 자체 소실은 이 검증 범위 밖이다.
 
 ### Dashboard 개발자: PR 3B
 

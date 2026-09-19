@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 설계를 이해하고 자신의 말로 설명하려는 개발자 |
-| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
-| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
+| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 한 번에 전체 service 파일을 읽지 않는다. 각 단원의 작은 조각을 읽고 입력·출력·부작용을 세 문장으로 설명한다. 해설을 읽기 전에 질문에 답한다. 아래 일반 실패 상황은 설명을 위한 가정이다. 다만 2026-09-19 RCG-07에서 HTTP 200 이후 commit 실패가 실제로 재현됐으며, 운영 사고라는 의미는 아니다.
@@ -125,7 +125,7 @@ DB는 composite UNIQUE로 같은 scope의 중복 run을 막는다. experiment는
 
 순차 재시도는 이미 commit된 row를 다시 읽는 경로를 확인한다. 실제 동시성은 두 transaction의 관측 시점, unique 충돌, lock 대기, 승자 commit과 패자 재조회까지 관련된다.
 
-기존 fake race 테스트는 삽입 패배 이후 코드 분기를 검증하지만 실제 PostgreSQL transaction의 실행 순서를 만들지는 않는다. 이번 RCG-02는 첫 번째 상황을 다룬다. 두 번째 상황은 PR 3A의 필수 구현 계획이며 아직 검증하지 않았다.
+기존 fake race 테스트는 삽입 패배 이후 코드 분기를 검증하지만 실제 PostgreSQL transaction의 실행 순서를 만들지는 않는다. 이번 RCG-02는 첫 번째 상황을 다룬다. 두 번째 상황은 PR 3A의 RCG-10/11로 실제 경합을 검증했다.
 
 ### 이해 확인 질문
 
@@ -241,7 +241,7 @@ Decision 코드는 바꾸지 않았는데 외부 Contract main이나 Python depe
 - 동일 scope 재사용과 V2 target 중복 binding 금지의 차이.
 - 실제 commit 결과를 관찰하는 방법.
 - 고정 fixture를 바꾸지 않아야 할 이유.
-- 구현 완료된 PR 1·2와 계획 단계인 PR 3A/3B, 운영 경험의 차이를 설명하는 방법.
+- 구현한 PR 1·2·3A와 계획 단계인 PR 3B, 운영 경험의 차이를 설명하는 방법.
 
 답을 외우기보다 “어떤 변경을 넣으면 어느 RCG case가 실패해야 하는가”를 예측한다. 실제 실행 후 예상과 결과가 달랐던 지점은 근거 기록에 추가한다.
 
@@ -270,7 +270,7 @@ Decision 코드는 바꾸지 않았는데 외부 Contract main이나 Python depe
 
 ### 따라 읽기
 
-[기존 RCG-02](../../tests/run_contract_gate/test_run_db.py)의 순차 요청과 [insert_if_absent](../../app/decision/repositories.py)의 실제 `ON CONFLICT DO NOTHING`을 비교한다. 다음 그림은 PR 3A에서 만들 **예정 순서**이지 현재 실행 결과가 아니다.
+[기존 RCG-02](../../tests/run_contract_gate/test_run_db.py)의 순차 요청과 [insert_if_absent](../../app/decision/repositories.py)의 실제 `ON CONFLICT DO NOTHING`을 비교한다. [concurrency.py](../../tests/run_contract_gate/concurrency.py)는 다음 순서를 실제 DB에서 구현한다. RCG-10/11의 실행 근거는 E-17이다.
 
 ```mermaid
 flowchart TD
@@ -296,6 +296,12 @@ rollback case의 최종 run 수는 0이 아니라 1일 수 있다. A가 실패�
 1. 두 요청의 시작 시각이 같으면 충분한가? **아니다.** 서로 다른 backend PID와 실제 blocker/wait·종료 순서가 필요하다.
 2. A 실패 후 B 성공인데 run이 1개면 rollback 실패인가? **아니다.** 최종 row의 identity·binding·소비 상태가 B의 성공과 일치하는지 본다.
 3. `sleep(1)`을 늘려 테스트가 통과하면 해결인가? **아니다.** 준비 순서와 대기 증거를 확정하고 모든 대기에 종료 제한을 둬야 한다.
+
+### 원본 응답을 보관해도 검증은 더 필요하다
+
+두 성공 응답은 JSON의 key 순서가 달라도 같은 identity를 가질 수 있다. API/DB assertion은 의미를 비교하고, producer bundle은 바이트를 바꾸지 않고 각각 저장한다. consumer는 선택한 producer SHA와 manifest hash를 확인한 뒤 그 원본을 replay한다. 해시는 파일이 바뀌었는지 확인하지만 그 파일의 작성자가 믿을 만한지 증명하지는 않는다.
+
+RCG-12에서는 순차 재요청과 동시 lock 대기 뒤의 오류 코드가 달랐다. 최초 초안에서 순차 코드를 가정한 assertion이 실패했다. 요청 PID·대기·SQL 반환 row·서비스 exception 변환을 조사해 둘 다 명시적 409임을 확인하고 동시 경합의 실제 코드를 고정했다. 이 결정은 “어떤 오류든 통과”가 아니다. 500·timeout·rollback 누락은 계속 실패이며 운영 코드는 바꾸지 않았다.
 
 ## 8. PR 3B: 실제 consumer 코드를 사용한다는 뜻
 
@@ -353,4 +359,4 @@ milestone은 PR 두 개의 체크 표시를 모은 것이 아니라 **특정 pro
 2. 3A만 완료했으면 어떻게 적는가? **`3A verified / 3B pending`.** 전체 PR 3 완료라고 쓰지 않는다.
 3. PR 3 verified면 merge·배포도 승인됐는가? **아니다.** 검증 상태와 원격 작업 승인은 별개다.
 
-다 읽은 뒤 [E-16 대장](evidence-log.md#e-16-pr-3-milestone-결정과-증거-대장)의 한 조합을 보고 “누가 무엇을 만들어서 누가 어떻게 읽었는가”를 설명할 수 있어야 한다. 아직 값이 비어 있는 것은 문서 누락이 아니라 미구현 상태를 명시한 것이다.
+다 읽은 뒤 [E-16 대장](evidence-log.md#e-16-pr-3-milestone-결정과-증거-대장)의 한 조합을 보고 “누가 무엇을 만들어서 누가 어떻게 읽었는가”를 설명할 수 있어야 한다. 3A의 실제 실행은 E-17에 연결했고 3B 값은 아직 비어 있다. 이는 Dashboard 소비를 실행하지 않았다는 뜻이다.

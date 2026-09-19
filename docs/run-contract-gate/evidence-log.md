@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
-| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
+| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 기록 규칙
@@ -336,9 +336,9 @@ PR 2 작업에서는 PR 생성·CI 확인까지만 수행했다. 이 문서화 �
 - Dashboard 코드는 로컬 `40af537b0e48a26f738f9cbf4dfc5fbcf2055d62`에서 읽었다. client의 fetch/schema, hook 안의 run 변환, launch의 scope 검사·operation 호출을 확인했다. 이는 Dashboard 배포 또는 원격 최신 확인이 아니다.
 - 이번 변경은 Decision의 기존 문서 7개에 한정한다. PR 3 runtime·테스트·CI·bundle은 미구현이며 Dashboard 저장소는 변경하지 않았다.
 
-### Revision 조합 대장
+### Revision 조합 대장 — 문서 작성 당시의 미실행 상태
 
-구현 후 아래 표를 실행 조합별로 복제해 채운다. 실제 값이 없으면 `미실행`을 유지한다. 예시 hash·가상 PR 번호를 실제 근거처럼 넣지 않는다.
+아래 표는 문서 작성 당시의 상태다. 3A 구현 결과는 E-17에 별도 실행 조합으로 추가했다. 이후 소비 실행도 조합별로 추가한다. 실제 값이 없으면 `미실행`을 유지한다. 예시 hash·가상 PR 번호를 실제 근거처럼 넣지 않는다.
 
 | 필드 | 현재 값 |
 |---|---|
@@ -362,6 +362,102 @@ PR 2 작업에서는 PR 생성·CI 확인까지만 수행했다. 이 문서화 �
 
 3A CI와 3B CI 안에서 재생성한 producer 실행은 run ID가 달라도 된다. 사용한 Decision source·Contract·환경을 대조하고 **3B가 실제 소비한 그 실행의 bundle hash**를 연결한다. 다른 실행의 hash를 대신 붙이지 않는다. Dashboard 변경 후 과거 소비 결과를 재사용하거나 Decision 최신 branch를 묵시적으로 선택하지 않는다.
 
-최종 완료는 [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)의 체크리스트와 [검증 명세](verification-spec.md#pr-3-검증-경계--계획-아직-실행하지-않음)를 따른다. 실행 결과가 생기면 이 대장에 추가하고, 과거 E-09~15의 실패·성공 범위를 소급해서 바꾸지 않는다.
+최종 완료는 [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)의 체크리스트와 [검증 명세](verification-spec.md#pr-3-검증-경계--3a-구현-3b-계획)를 따른다. 실행 결과가 생기면 이 대장에 추가하고, 과거 E-09~15의 실패·성공 범위를 소급해서 바꾸지 않는다.
 
 문서 검수: 변경 파일은 기존 문서 7개뿐임을 확인했다. 상대 파일 링크 98개·문서 anchor 37개, code fence 및 세로 Mermaid 3개의 기본 구조, diff whitespace를 검사했다. 영향 분류기는 문서 속 ID/DTO/DB 용어로 T0 신호를 냈지만 실행 코드 diff는 없다. 이 검수는 PR 3 테스트·CI 성공의 근거가 아니며 런타임 테스트는 실행하지 않았다.
+
+
+## E-17: PR 3A 구현과 실제 경합·bundle 검증
+
+### 기반과 변경 경계
+
+문서 [PR #397](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/397)의 CI run `35429683125`가 성공한 뒤 사용자 승인으로 개인 통합에 merge했다. 통합 SHA는 `6de82a36ddc1cf51c88a431d65e84f873ea8f472`다. 이 SHA에서 `feat/run-contract-gate-concurrency`를 생성했다. PR 3A는 test·runner·manifest·artifact workflow·문서만 변경하며 서비스, DDL, baseline expected, Dashboard는 변경하지 않는다. PR 3A merge는 승인·수행 범위 밖이다.
+
+### 실제 경합과 최초 assertion 조사
+
+- RCG-10: A/B가 모두 scope 없음 확인 → A 실제 run/experiment/binding 쓰기 → B INSERT의 blocker PID 확인 → A commit → B insert false·재조회 → 같은 identity·단일 row 집합.
+- RCG-11: 같은 경합에서 A가 실제 binding/consumption까지 쓴 후 테스트용 `RunConflictError`를 주입했다. A rollback·409 뒤 B insert true·commit·200. 최종 단일 집합과 소비 상태, exclusion revision 증가가 정확히 1회임을 검사한다.
+- RCG-12: 좁은/넓은 scope 선행 순서를 바꾼 두 case. 승자는 success 응답에서 찾고 패자는 명시적 409·rollback이다. 최종 run 1개·승자 scope의 experiment/binding만 남고 다른 고객군은 reserved다.
+- 요청별 PID·read committed·timeline·실제 `pg_blocking_pids`·SQL target 반환 row·commit/rollback·HTTP 시작·원본 응답·독립 connection의 최종 row를 기록한다. event 12초, statement 20초, lock 18초, worker join 12초 후 cancel/추가 join 3초, 외부 lane 상한 180초다.
+
+최초 `/private/tmp/rcg-pr3a-first-contention` 실행은 lane별 19 pass/1 fail였다. overlap의 명시적 409 code가 초안에서 가정한 순차 RCG-09 코드와 달랐다. 실제 코드는 `segment_audience_run_binding_invalid`이며 `AudienceSnapshotContractError` → `RunAudienceContractError` → router HTTP 409로 변환됐다. lock 뒤 `consumed` target과 SQL snapshot의 `reservation_count=0`, `every_member_reserved=false`가 검증에서 거절되는 경로다. 문서가 요구한 “명시적 409 + 실제 handler 형태 고정”에 따라 assertion을 정정하고 반대 scope 순서도 추가했다. HTTP 500, 성공 후 rollback, 중복/부분 row, deadlock, 비결정적 timeout, 미변환 conflict는 관찰되지 않았다. 기존 RCG-06/07의 의도적인 fault injection은 기존 회귀 기준대로 유지한다. 서비스 코드를 고쳐 통과시킨 결과가 아니다.
+
+### 초기 통합 실행 — commit 전 후보
+
+| 필드 | 실제 결과 |
+|---|---|
+| milestone | 3A local verified / 3B pending |
+| checkout / dirty | `6de82a36ddc1cf51c88a431d65e84f873ea8f472` / true; 아직 제출 commit 검증이 아님 |
+| source digest | `f385e696f634eff61036cc600832a22a6cf5577d2c2152dea8286e39679f4727` |
+| 명령 / 보관 | `bash scripts/run-contract-gate.sh /private/tmp/rcg-pr3a-bundle-first` |
+| Gate run / 전체 시간 | `rcg-rcg-work.etqrey` / 37초 (로컬 cache 환경) |
+| fixed / latest | 각 21 passed / 모두 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`; 서로 다른 DDL drift를 관찰한 실행은 아님 |
+| CTRL / cleanup | 52 passed / true |
+| DDL hash | `bad4948fe47485e7508a3cd389e9db84fdda3edfed4a1f4883b03554bcb38691` |
+| baseline producer | `e1de8b29b902b54df3a58f21f1daa27c1171fe80`; 기존 fixture/expected 유지 |
+| lock / architecture | `150c68697cc7eb2ec9df230ec705976a454c6d96b4cf366ec6ff100e778d82af` / `linux/arm64` |
+| runner image | `sha256:3986d52f880eb0887a67ec73b407166531ef9fc7328af64149255c9dd432406d` |
+| fixed manifest hash | `512ce5b1232a667ec0b39ede9839aabb34beb7e7570561fab5a485972d6aea06` |
+| latest manifest hash | `7a019418298de69d2ebe280695a54de567630d56ed5d1b7622bd8f869ad3e990` |
+| bundle | 각 12개 원본 HTTP body, case/DB outcome, lane JSON/JUnit·경합 증거; VERIFIED |
+| Dashboard / Node lock / 소비 hash | 미실행; 3B pending |
+| 3A CI / PR | 제출 전; 최종 clean revision 검증과 PR 본문으로 추가 연결 |
+
+추가 target read 진단 instrumentation과 최종 문서 정리 후 clean 제출 revision에서 전체 Gate를 다시 검증한다. 위 초기 실행의 hash를 후속 실행에 재사용하지 않는다. `consumer/manifest.json`의 `gate_status`/`lane_status`와 `result.json.consumer_bundles`를 함께 확인한다. 전체 raw log·환경변수·DSN은 consumer bundle에 포함하지 않는다.
+
+### 실제 Docker timeout·중단 정리 probe
+
+`/private/tmp/rcg-pr3a-lifecycle/probe-result.json`에 결과를 보관했다. 원래 Gate script의 SHA-256은 `7eec356bc110a79840547b675dee708c519d6e790eaa70f032b06715d8cfdd61`이다. 별도 임시 사본에서 lane 실행 상한만 180→1초로 바꿔 timeout을 주입했다. 사본 hash는 `0312cb421486a62ad381dc147c8dded94aca2126af1d3d285991be9d14cd259a`다. repository script에 시험용 runtime flag를 넣지 않았다.
+
+| 주입 | 실제 run | 결과 |
+|---|---|---|
+| lane timeout | `rcg-rcg-work.q7j61s` | runner exit 124 → Gate INCOMPLETE/2, cleanup true |
+| fixed runner 시작 후 SIGTERM | `rcg-rcg-work.c1toeu` | interrupted 기록 → Gate INCOMPLETE/2, cleanup true |
+
+다른 owner label의 검증용 sentinel container·volume을 두 실행 내내 보존했고 각 실행 후 Docker 자원 inventory가 시작 전과 같았다. 마지막에 probe가 만든 sentinel만 명시적으로 지운 뒤 원래 inventory로 복원됐다. 실제 운영 데이터/컨테이너를 정리 대상으로 사용하지 않았다. 이 두 실행은 의도적 fault probe이며 정상 통과 횟수에 더하지 않는다. CTRL 52개에는 shell owner 확인·timeout/interrupt와 새 실제 worker thread cancel/join·경합 증거 누락·bundle 변조 제어가 포함된다.
+
+### 남은 한계와 후속 연결
+
+TestClient/별도 실제 PG connection 경합이며 TCP 서버·운영 pool·부하·장기간 flaky 비율은 검증하지 않았다. source/manifest hash는 byte 무결성 검사이며 서명이 아니다. Dashboard 3B, 실제 downstream assignment/start/dispatch, 브라우저·배포 smoke는 미실행이다. 따라서 PR 3 milestone 전체 verdict는 incomplete evidence다. PR 3A CI·clean 최종 SHA 결과는 제출 기록에 별도 연결하며 merge로 자동 전환하지 않는다.
+
+### 최종 자체 검토 후보
+
+`/private/tmp/rcg-pr3a-final-review/result.json`의 run `rcg-rcg-work.0xmwwf`는 fixed/latest 각 21 passed, CTRL 54 passed, cleanup true, Gate PASS/0이다. 전체 37초이며 두 lane의 원본 응답 12개씩을 검증했다. 초기 52개 CTRL에 fixed/latest bundle 누락을 실제 finalizer에 전달하는 2개를 추가해 공통 INCOMPLETE/2와 정상 bundle의 최종 verdict 갱신까지 검사했다. source digest는 `baa5da3c26d2a9f6e69d2cdc77eb280a3e526b33f8c5d8c4b40b3826bcf6c9bd`다. 이후 manifest의 JSON 줄바꿈만 정리했으며 clean commit에서 다시 실행한다.
+
+자체 검토는 서비스/DDL/Dashboard 변경 없음, 허용한 파일만 staging, JSON·JUnit·실제 응답과 producer 연결, 명시적 409와 최종 row/소비 상태, bounded wait와 owner cleanup, 실패 artifact 보존을 확인했다. 문서 상대 파일 링크 104개·anchor 39개와 세로 Mermaid 3개의 기본 구조, Python compile·shell syntax·diff whitespace도 검사했다. Mermaid 렌더 QA·운영 부하 시험의 근거는 아니다.
+
+### Clean 구현 commit 재검증
+
+| 필드 | 실제 값 |
+|---|---|
+| 구현 commit / dirty | `187432d49f83b6bb488094ef26a4057a7c478532` / false |
+| 실행 명령 | `bash scripts/run-contract-gate.sh /private/tmp/rcg-pr3a-clean-submit` |
+| run / 시간 | `rcg-rcg-work.cxrjhi` / 37초 |
+| 결과 | fixed 21 passed / latest 21 passed / CTRL 54 passed / PASS·exit 0 / cleanup true |
+| source digest | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1` |
+| fixed bundle hash | `03f0aff8eadfbf2bc5fb6ede33800e74368fa977cd603d741394ae7bef0aabd6` |
+| latest bundle hash | `587b685e31d9b5d821be700b2e73f46a3f66467d4519b5f1f5388454a4d13c45` |
+| 응답 수 | 각 12개, bundle VERIFIED |
+
+같은 경합에서 target read 진단을 확인했다. 두 overlap 모두 후행 요청의 `audience_reservation_state=consumed`, `reservation_count=0`, `every_member_reserved=false`를 실제 `_load_binding_target` 반환값으로 기록했다. 최종 응답은 409이고 rollback 완료가 HTTP 응답 시작보다 앞선다.
+
+이 검증 기록을 추가하는 후속 commit은 문서 7개만 바꾼다. 검증한 구현 commit과 문서 기록 commit을 구분하고, Gate allowlist의 source/test/tool/workflow 변경이 없는지 확인한다. 최종 제출 head와 CI checkout SHA·source digest·artifact 링크는 PR 본문에서 이 로컬 근거와 연결한다. PR 3A는 merge하지 않고 PR 3B는 pending으로 남긴다.
+
+### PR #398 CI와 업로드 artifact 검증
+
+[PR #398](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/398)은 `feat/run-contract-gate-concurrency` → `integration/run-contract-gate`, OPEN이며 merge하지 않았다. [Actions 35430880753](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753)의 `Fixed contract (required)`가 SUCCESS다.
+
+| 필드 | 실제 값 |
+|---|---|
+| PR head / base | `c333c83730a5825152cbb48f73900e30b0ab60cf` / `6de82a36ddc1cf51c88a431d65e84f873ea8f472` |
+| 실제 CI checkout / dirty | `be3b5024e43eb1b9d01fbcba01413a352374be6d` / false (`refs/pull/398/merge`) |
+| Gate run / 시간 | `rcg-rcg-work.xgqchw` / Gate 74초, job 83초 |
+| 결과 | fixed 21 / latest 21 / CTRL 54 모두 pass; cleanup·artifacts·controls true |
+| source digest | `2b83b5433f7271559ffb23fc69b1d3221850816abcc3505e068ba649fcba19f1`; clean 로컬 구현 실행과 동일 |
+| fixed manifest | `431408e4e530a95114494da69b28f588164ea92d1691513a9c66ae24b8b71ae4` |
+| latest manifest | `519c8164c29f3939eda335910b4336e22cc626be0f987a8ca57adedbf9b1a56f` |
+| required artifact | [10580128654](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753/artifacts/10580128654) |
+| latest artifact | [10580103725](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35430880753/artifacts/10580103725) |
+| 다운로드 검증 | `/private/tmp/rcg-pr3a-ci-35430880753/`; 두 bundle의 파일 inventory·digest·lane·producer·JSON/JUnit·원본 응답 12개씩 재검증 |
+
+CI metadata의 PR head/base와 실제 checkout SHA를 구분하고, Gate producer가 checkout과 일치함을 확인했다. 위 수치는 이 CI 실행의 값이다. 이 기록 및 포트폴리오의 과거 미래형 표현을 정리하는 후속 commit은 문서만 바꾸며 최종 head CI는 PR check/본문에서 확인한다. PR 3 milestone은 **3A verified / 3B pending**이고 전체 consumer 경계는 incomplete evidence다. artifact 보관 기간은 workflow의 14일이며 이후 필요하면 같은 명시적 revision으로 재생성하고 새 run/hash를 기록한다.

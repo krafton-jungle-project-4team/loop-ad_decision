@@ -7,5 +7,8 @@
   "RCG-06": ["test_failure_after_real_writes_rolls_back[experiment-insert]", "test_failure_after_real_writes_rolls_back[target-binding]"],
   "RCG-07": ["test_deferred_binding_failure_rolls_back"],
   "RCG-08": ["test_baseline_rows_are_reused"],
-  "RCG-09": ["test_overlapping_target_binding_is_rejected"]
+  "RCG-09": ["test_overlapping_target_binding_is_rejected"],
+  "RCG-10": ["test_concurrent_requests_preserve_atomic_scope[commit]"],
+  "RCG-11": ["test_concurrent_requests_preserve_atomic_scope[rollback]"],
+  "RCG-12": ["test_concurrent_requests_preserve_atomic_scope[overlap]", "test_concurrent_requests_preserve_atomic_scope[overlap-reverse]"]
 }
