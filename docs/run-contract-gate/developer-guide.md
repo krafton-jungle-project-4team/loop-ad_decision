@@ -3,13 +3,13 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 변경을 검증하는 개발자·리뷰어 |
-| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
-| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
+| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 1. 준비할 환경
 
-host에는 로컬 Docker daemon, Git, Bash와 기본 Unix 도구가 필요하다. Python·pytest·DB client는 전용 이미지에 포함한다. Linux/arm64에서 검증했으며 다른 architecture는 아직 검증하지 않았다. CI workflow는 같은 arm64 runner를 사용하며, 로컬 검증과 Actions 실행 근거는 E-14에서 구분한다.
+host에는 로컬 Docker daemon, Git, Bash와 기본 Unix 도구가 필요하다. Python·pytest·DB client는 전용 이미지에 포함한다. Linux/arm64에서 검증했으며 다른 architecture는 아직 검증하지 않았다. CI workflow는 같은 arm64 runner를 사용한다. 정적·로컬 검증은 E-14, 실제 Actions 성공은 E-15에서 확인한다.
 
 처음에는 공개 Python/pgvector 이미지와 pinned Python 의존성을 내려받는다. 매 실행에서 공개 Contract 고정 SHA를 취득하고 main을 한 번 조회해 최신 SHA를 고정한다. 준비 단계는 네트워크가 필요하다. Git credential helper와 사용자 Git config를 끄고, Docker도 비어 있는 임시 config를 사용한다. private registry나 운영 credential은 필요하지 않다.
 
@@ -131,4 +131,46 @@ GitHub-hosted `ubuntu-24.04-arm`에서 로컬과 같은 `./scripts/run-contract-
 
 JSON·JUnit과 CI 실행 메타데이터만 명시한 경로로 업로드하며 전체 작업 디렉터리·환경변수·원문 로그는 업로드하지 않는다. 준비 실패로 생성되지 않은 JUnit을 만들어내지 않는다. 일반 실패에서도 생성된 결과의 업로드를 시도하지만 runner 강제 종료·job timeout·GitHub artifact 서비스 장애까지 보관을 보장하지는 않는다. artifact 업로드 자체의 실패는 check 실패다.
 
-정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증)에 기록했다. 제출 commit의 clean 재실행과 실제 Actions 결과는 PR 본문에 추가한다. 로컬 성공을 GitHub Actions 성공으로 간주하지 않는다. 개인 통합의 최종 commit 재검증·dev Draft는 다음 제출 단계이며 실제 동시 요청 검증은 **필수 후속 개발**이다.
+정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit의 clean 재실행·실제 Actions 성공과 개인 통합 병합은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 기록했다. PR 2 CI는 PR의 checkout merge SHA를 검사한 결과이며 이후 개인 통합 merge SHA를 다시 실행한 결과로 바꾸어 기록하지 않는다. 실제 동시성과 Dashboard 소비 검증은 PR 3A·3B의 계획 범위다.
+
+## 9. PR 3A에서 PR 3B로 넘기는 절차 — 구현 예정
+
+지금 실행 가능한 명령은 2절의 기존 Gate다. PR 3A의 bundle exporter와 PR 3B의 consumer 명령은 아직 없으며, 문서에 없는 옵션을 추측해 실행하지 않는다. 구현 PR에서 실제 실행 파일·인수·종료 코드·필수 환경을 이 절에 추가한다.
+
+### Decision 개발자: PR 3A
+
+1. PR 2가 반영된 개인 통합 SHA를 확인하고 3A 작업 branch를 만든다. 기존 Gate를 실행해 기반 상태를 확인한다.
+2. [RCG-10~12](verification-spec.md#pr-3a-실제-db-동시성-검증-계획)의 실제 경합을 구현한다. 요청별 PID·단계·대기·commit/rollback·최종 DB 증거를 확인한다.
+3. 정상·retry·baseline·동시 요청의 원본 status/body를 consumer bundle로 기록하고 manifest·hash·누락 제어 검사를 연결한다. 기존 fixed/latest 결과와 섞지 않는다.
+4. clean한 제출 SHA에서 로컬·CI를 실행하고 결과·소요 시간·정리를 기록한다. 아직 실패 중인 bundle은 진단용이라고 표시한다.
+5. Dashboard에 전달할 자료는 producer SHA·source digest, Contract SHA, bundle/response hash, 생성 명령, Gate result·JSON/JUnit, CI 실행 링크다. 고정 baseline expected는 함께 참조하되 재생성하지 않는다.
+
+### Dashboard 개발자: PR 3B
+
+1. Dashboard의 실제 base·checkout SHA와 lock을 기록하고, Decision producer SHA를 3A의 검증 revision에 고정한다. 파일이 오래됐으면 branch 이름만 보고 최신으로 간주하지 않는다.
+2. 로컬에서는 3A의 검토된 bundle 경로를 입력받는다. CI에서는 고정 Decision SHA를 별도 임시 checkout하고 같은 Gate 명령으로 bundle을 생성한다. cross-repository artifact 다운로드 권한을 암묵적으로 요구하지 않는다.
+3. bundle의 schema·lane·case·source revision·파일 hash·Gate 결과를 먼저 검증한다. 재생성 실행은 새로운 run ID·bundle hash를 가질 수 있으므로 그 실행을 새 소비 결과에 연결한다. 과거 실행 hash와 같아야 한다고 가정하지 않는다.
+4. 실제 client·공유 변환·launch를 [RCC-01~06](verification-spec.md#pr-3b-dashboard-consumer-검증-계획)으로 검사한다. replay 서버는 원본 응답을 제공하고 downstream operation 대역은 호출 인자를 기록한다. 배포 Dashboard에 요청하거나 실제 발송하지 않는다.
+5. 소비 결과에는 Dashboard SHA·dirty/source digest·Node lock, 입력 producer/bundle hash, case별 결과·거절 층·호출 기록, JSON/JUnit, cleanup과 CI 링크를 남긴다.
+6. fixed는 필수, latest는 별도 경고로 기록한다. fixed producer/bundle이 없거나 검증되지 않으면 consumer의 성공만으로 전체 PASS를 만들지 않는다.
+
+### 리뷰어: 같은 revision 조합인지 확인
+
+[근거 대장 E-16](evidence-log.md#e-16-pr-3-milestone-결정과-증거-대장)의 한 행이 아래 연결을 모두 가리켜야 한다.
+
+`Decision checkout/source digest → Contract/DDL → Gate run/bundle hash → Dashboard checkout/source digest → consumer result`
+
+PR head와 CI checkout merge SHA, baseline producer와 현재 candidate, fixed와 latest를 각각 구분한다. 3A와 3B의 독립 PASS만 있고 입력 hash가 연결되지 않으면 milestone 완료가 아니다. CI artifact 보존 기간이 끝나기 전에 합성 데이터·민감정보 여부를 검토한 증거를 보존하거나 같은 revision에서 재실행하고 새 근거를 기록한다. 영구 artifact 저장소·업로드 정책은 임의로 추가하지 않는다.
+
+### 실패 조사와 재실행
+
+| 실패 위치 | 조사할 내용 | 다음 행동 |
+|---|---|---|
+| 경합 준비/관찰 | 실제 connection 분리, barrier 순서, blocker PID, timeout | harness 문제를 분리하고 INCOMPLETE 유지; sleep 연장만으로 통과시키지 않음 |
+| DB/응답 불일치 | commit/rollback 시점, 원본 응답, 독립 DB 조회 | 서비스 결함이면 별도 수정 범위로 중단·보고 |
+| bundle 입력 | producer/Contract SHA, hash, lane, 필수 case | 맞는 실행을 재생성/전달; latest나 이전 성공으로 대체 금지 |
+| client | 실제 HTTP 오류·schema 거절 | 원본 body와 API 계약 확인 |
+| 변환/launch | 공유 함수 사용, scope·ID, operation 인자·호출 순서 | 동작 변경이 필요하면 별도 수정 범위; 테스트 기대값 임의 보정 금지 |
+| 공통 runner/cleanup | 누락 결과·남은 자기 자원·worker | 필수 INCOMPLETE; 원인 해결 후 해당 조합 재검증 |
+
+생산 코드·DDL·lock이 바뀌면 3A 생산과 연결된 3B 소비를 다시 검증한다. Dashboard만 바뀌면 유효성이 확인된 동일 producer bundle을 소비하는 3B를 다시 검증한다. 어느 경우든 과거 결과를 덮어쓰지 않고 새 revision 조합으로 기록한다.

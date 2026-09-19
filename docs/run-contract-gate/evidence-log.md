@@ -3,8 +3,8 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 0·PR 1 개인 통합 병합 완료 · PR 2 workflow·로컬 검증 완료, Actions 실행 대기 |
-| 기준 revision | PR 2 기반 fe7e8e67f58b51dc03779929f7040eea4bc744e1 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
+| 상태 | PR 0·1·2 개인 통합 병합 완료 · PR 2 CI PASS · PR 3A/3B 계획 확정, 미구현 |
+| 기준 revision | 문서 기반 14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
 | 마지막 확인 | 2026-09-19 KST |
 
 ## 기록 규칙
@@ -300,3 +300,68 @@ workflow는 개인 통합·dev 대상 PR과 수동 실행을 선언하며, `ubun
 로컬 검증 도구·추출한 step은 `/private/tmp/rcg-pr2-validation-20260919/`, 실제 Gate JSON/JUnit은 `/private/tmp/rcg-pr2-local-20260919/`에 있다. 임시 도구와 raw artifact는 커밋하지 않는다. 문서에는 사람이 검토한 결과만 기록한다. 이 34초는 캐시가 있는 단일 로컬 실행이며 GitHub runner 성능 수치가 아니다.
 
 제출 commit에서 clean 재실행 후 그 SHA와 결과를 PR 본문에 기록한다. 실제 GitHub-hosted runner의 실행·익명 Contract 취득·artifact 업로드는 PR 생성 후 확인한다. 실패 경로의 실제 GitHub artifact 업로드, 수동 dispatch, 장기 CI 안정성, 통합 최종 commit, dev Draft는 이 로컬 검증으로 완료 처리하지 않는다. PR 2는 생성까지만 승인됐으며 merge하지 않는다.
+
+## E-15: PR 2 CI 성공과 개인 통합 병합
+
+E-14는 PR 생성 전 정적·로컬 검증 기록으로 보존한다. 이후 [PR #396](https://github.com/krafton-jungle-project-4team/loop-ad_decision/pull/396)을 생성했고 아래 결과를 확인했다.
+
+| 구분 | 확인한 revision·결과 |
+|---|---|
+| 제출 head | `0908bb7bec2dc62b3376f3a72c99829d6178f387` |
+| clean 로컬 | 동일 head / dirty=false, fixed 17·latest 17·controls 30 passed, exit 0·cleanup 성공, Gate 31초 |
+| 로컬 artifact | `/private/tmp/rcg-pr2-clean-20260919/` |
+| PR CI | [실행 35428223300](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35428223300), Fixed contract (required) SUCCESS |
+| CI 실제 checkout | `a50132a86dad9496d1d9dca1672485f6f5c48793` (`refs/pull/396/merge`), dirty=false |
+| CI base / head | `fe7e8e67f58b51dc03779929f7040eea4bc744e1` / `0908bb7bec2dc62b3376f3a72c99829d6178f387` |
+| CI 검증 | linux/arm64, fixed 17·latest 17·controls 30 passed, errors/failures/skipped 0, Gate 65초·job 72초 |
+| Contract | fixed/latest 모두 `0ec2cef0290f4659ad21ccc1dd2a20df2801ff50`, 각각 실행 |
+| source digest | `e632a860ae5f70c13f4a9c945ace0b636bf3f345edd390cff6bb827b37176803`, 로컬·CI 일치 |
+| required artifact | [10580205704](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35428223300/artifacts/10580205704), JSON/JUnit·CI context·exit 확인 |
+| latest artifact | [10580185759](https://github.com/krafton-jungle-project-4team/loop-ad_decision/actions/runs/35428223300/artifacts/10580185759), 별도 JSON/JUnit 확인 |
+| artifact 다운로드 검증 | `/private/tmp/rcg-pr2-ci-35428223300/`; provenance와 실제 checkout·Gate 입력 일치, artifacts_ok/controls_ok/cleanup_ok=true |
+| 개인 통합 병합 | 2026-09-19 07:07:11 UTC, GitHub 조회로 MERGED 확인. merge SHA `14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e` |
+
+PR 2 작업에서는 PR 생성·CI 확인까지만 수행했다. 이 문서화 단계에서 이미 병합된 원격 상태를 조회했다. 위 CI checkout SHA와 이후 개인 통합 merge SHA는 다르며, 개인 통합 SHA를 새로 실행했다고 주장하지 않는다. artifact의 14일 보존 설정은 영구 보관이 아니다. 실패 경로의 실제 GitHub 업로드·수동 dispatch·장기 안정성·동시성·Dashboard 검증은 이 PASS의 의미에 포함하지 않는다.
+
+## E-16: PR 3 milestone 결정과 증거 대장
+
+2026-09-19 사용자가 저장소별 PR 3A/3B를 하나의 PR 3 milestone으로 묶는 문서화를 요청했다. 명칭은 논리 작업 이름이며 원격 GitHub PR/Milestone을 생성한 사실을 뜻하지 않는다.
+
+### 확정한 역할과 조사 근거
+
+- PR 3A / Decision: 실제 DB 동시성 검증과 Gate 결과·응답 artifact 생산.
+- PR 3B / Dashboard: 실제 client·실제 공유 변환·실제 launch flow의 소비 검증.
+- 실제 downstream 처리·브라우저 전체 E2E와 구분하고, producer/consumer revision·Contract·bundle hash를 하나의 조합으로 기록한다.
+- 문서 기반은 PR 2 통합 `14e54cda5c4e92cf835a6ddffc5c20bac0d4ea1e`; 로컬 branch는 `docs/run-contract-gate-pr3-milestone`이다.
+- Dashboard 코드는 로컬 `40af537b0e48a26f738f9cbf4dfc5fbcf2055d62`에서 읽었다. client의 fetch/schema, hook 안의 run 변환, launch의 scope 검사·operation 호출을 확인했다. 이는 Dashboard 배포 또는 원격 최신 확인이 아니다.
+- 이번 변경은 Decision의 기존 문서 7개에 한정한다. PR 3 runtime·테스트·CI·bundle은 미구현이며 Dashboard 저장소는 변경하지 않았다.
+
+### Revision 조합 대장
+
+구현 후 아래 표를 실행 조합별로 복제해 채운다. 실제 값이 없으면 `미실행`을 유지한다. 예시 hash·가상 PR 번호를 실제 근거처럼 넣지 않는다.
+
+| 필드 | 현재 값 |
+|---|---|
+| milestone 상태 | 계획 확정 / 3A pending / 3B pending |
+| PR 3A URL·merge 상태 | 미생성 |
+| PR 3B URL·merge 상태 | 미생성 |
+| Decision 제출 head / 실제 checkout / source digest / dirty | 미실행 |
+| Dashboard 제출 head / 실제 checkout / source digest / dirty | 미실행 |
+| baseline producer / fixture hash | 기존 fixture 사용 예정; 해당 실행 검증 미실행 |
+| fixed Contract SHA / DDL hash | 기존 고정 SHA 유지 계획; PR 3 실행 미실행 |
+| latest Contract SHA / DDL hash | 실행 시 한 번 해석·고정; 미실행 |
+| runner image / Python lock / Node lock / architecture | 미실행 |
+| 3A Gate run ID / JSON·JUnit / 경합 증거 | 미실행 |
+| fixed bundle manifest·response hash / 3B 입력 hash 대조 | 미실행 |
+| latest bundle manifest·response hash / 3B 입력 hash 대조 | 미실행 |
+| 3B consumer run ID / JSON·JUnit / operation 호출 근거 | 미실행 |
+| 각 fixed verdict / latest 경고와 이유 / 공통 cleanup | 미실행 |
+| 로컬 명령·소요 시간 / 3A·3B CI URL | 미실행 |
+| 보관 경로·artifact 링크·보존 만료 / 재현 방법 | 미실행 |
+| reviewer의 조합 일치 확인 / 남은 범위 | 미실행 |
+
+3A CI와 3B CI 안에서 재생성한 producer 실행은 run ID가 달라도 된다. 사용한 Decision source·Contract·환경을 대조하고 **3B가 실제 소비한 그 실행의 bundle hash**를 연결한다. 다른 실행의 hash를 대신 붙이지 않는다. Dashboard 변경 후 과거 소비 결과를 재사용하거나 Decision 최신 branch를 묵시적으로 선택하지 않는다.
+
+최종 완료는 [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)의 체크리스트와 [검증 명세](verification-spec.md#pr-3-검증-경계--계획-아직-실행하지-않음)를 따른다. 실행 결과가 생기면 이 대장에 추가하고, 과거 E-09~15의 실패·성공 범위를 소급해서 바꾸지 않는다.
+
+문서 검수: 변경 파일은 기존 문서 7개뿐임을 확인했다. 상대 파일 링크 98개·문서 anchor 37개, code fence 및 세로 Mermaid 3개의 기본 구조, diff whitespace를 검사했다. 영향 분류기는 문서 속 ID/DTO/DB 용어로 T0 신호를 냈지만 실행 코드 diff는 없다. 이 검수는 PR 3 테스트·CI 성공의 근거가 아니며 런타임 테스트는 실행하지 않았다.
