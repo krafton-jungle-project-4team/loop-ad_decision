@@ -3,13 +3,13 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 채용 담당자, 백엔드 면접관, 프로젝트 리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 0~3 Decision·Dashboard 구현/병합 완료 · 최신 dev 로컬 통합 완료 · 통합 최종 SHA 재검증 대기 |
+| 기준 revision | 최신 로컬 merge `004e3e7` (`dd55b38` + `61f7e03`); 직전 검증 producer `9ace3b6` / Dashboard `adb7d29` / baseline `e1de8b2` / Contract `0ec2cef` |
+| 마지막 확인 | 2026-09-22 KST |
 
 ## 한 문장 설명
 
-LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은 고객군 요청을 안전하게 재사용하고 실패 시 부분 데이터를 남기지 않는지, 로컬에서 반복 확인하는 검증 도구를 구현했다. 같은 명령의 PR CI workflow도 구현했고 정적·로컬 검증을 마쳤다. 실제 Actions에서도 고정·최신 검사와 분리 artifact 보관을 확인했다. PR 3A에서 실제 DB 경합·원본 응답 bundle까지 구현하고 로컬 검증했다. Dashboard 소비 경계는 PR 3B 후속 계획이다.
+LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은 고객군 요청을 안전하게 재사용하고 실패 시 부분 데이터를 남기지 않는지 반복 확인하는 검증 도구를 구현했다. 같은 명령의 PR CI, 실제 DB 경합·원본 응답 bundle, Dashboard의 실제 client→공유 변환→launch 소비 검증까지 구현·병합했다. 직전 고정 revision 조합은 검증을 마쳤고, 최신 dev 로컬 통합 후보는 최종 SHA 재검증을 남겨 두었다.
 
 초기 RCG-07에서 응답 전송 뒤 commit이 실패하는 결함을 재현했다. 별도 서비스 PR #394로 수정·개인 통합 병합한 뒤 고정·최신 lane 각각 17개, 제어 30개가 통과했다. 고정 baseline row 복원·재사용과 단일 실행 명령도 검증했다. 아래 수치는 커밋 전 로컬 후보의 결과다. 제출 commit의 clean 로컬·CI 근거는 E-15에 별도로 기록했다. 운영 효과는 측정하지 않았다.
 
@@ -32,7 +32,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 | 로컬 Gate 구현 | RCG-01~09, 제어 판정·cleanup, baseline fixture·provenance | E-12: fixed/latest 각 17 passed, controls 30 passed |
 | 선행 서비스 수정 | 응답 전에 commit·close, commit 실패 회귀 검사 | PR #394, E-10/E-11 |
 | CI 연결 구현 | 동일 명령·종료 코드 전달, latest 경고, 분리 artifact | E-14/E-15: 정적·로컬·실제 CI 검증 |
-| PR 3A 구현 / 3B 계획 | 실제 동시성 4개·원본 응답 bundle·무결성 제어, 후속 consumer 대장 | E-17: 로컬 각 21개·CTRL 54개, timeout/중단 정리 확인; 3B 미실행 |
+| PR 3A / 3B 구현 | 실제 동시성 4개·원본 응답 bundle·무결성 제어와 실제 Dashboard consumer 검증 | E-17: producer fixed/latest 각 21개·CTRL 54개, consumer 각 34개·CTRL 23개; Decision·Dashboard 병합 완료 |
 
 ## 선택한 설계와 이유
 
@@ -49,7 +49,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 
 | JD 관심사 | 이 과제의 증거 | 표현의 경계 |
 |---|---|---|
-| 안전한 개발 환경·자동화 도구 | 실제 DB 검증과 단일 명령·JSON/JUnit·실패/정리 제어 | 기존 로컬·CI 및 artifact 확인; PR 3A 로컬 PASS·3B 계획 |
+| 안전한 개발 환경·자동화 도구 | 실제 DB 검증과 단일 명령·JSON/JUnit·실패/정리 제어 | producer·consumer 로컬/CI artifact 확인; 최신 통합 SHA 재검증은 별도 |
 | 배포·모니터링·장애 대응 | 배포 전 계약 검증과 실패 원인 분리 | 운영 모니터링·실제 장애 대응 경험으로 바꾸지 않음 |
 | 기존 동작 분석·호환성 검증 | 기존 테스트 분석, baseline row와 후보 reader | 전체 legacy migration 수행 주장 제외 |
 | AI 코딩 도구 활용 | AI 변경을 사람의 명세와 deterministic assertion으로 검증하는 절차 | 도구를 만들기 전 생산성 향상 수치 주장 제외 |
@@ -81,7 +81,7 @@ LoopAd Decision의 run 생성 코드가 실제 PostgreSQL 계약에서도 같은
 - 실제 FastAPI·PostgreSQL 경계를 검증하는 Gate를 구현해 고정·최신 계약 각각 17개 DB 시나리오와 30개 제어 검사를 통과하고, commit 실패 후 HTTP 성공 응답이 전송되는 문제를 별도 서비스 PR로 수정.
 - 고정 baseline의 생성 전후 행과 expected 응답을 보존하고, canonical lifecycle 제약을 유지한 복원·후보 reader 재사용으로 한 baseline의 호환성을 검증.
 
-PR 2 CI 한 실행의 결과는 확보했다. 장기 안정성·생산성 향상률·운영 개선 수치는 확보하지 않았다. PR 3A의 동시성과 bundle은 로컬 구현·검증 성과로 설명할 수 있다. 3A의 제출/CI revision·결과는 PR 본문에서 별도로 확인한다. Dashboard 소비·운영 개선 수치는 주장하지 않는다.
+PR 2 CI와 PR 3 producer·consumer CI 결과를 확보했다. PR 3A의 동시성과 bundle, PR 3B의 실제 Dashboard client→공유 변환→launch 연결은 E-17의 명시적 revision 조합에 한해 설명할 수 있다. 장기 안정성·생산성 향상률·실제 downstream 실행·배포·운영 개선 수치는 주장하지 않는다. 최신 dev 통합 후보의 결과도 재실행 전에는 직전 PASS로 대신하지 않는다.
 
 ### 구현 완료 후에만 사용할 문장 틀
 
@@ -92,9 +92,9 @@ PR 2 CI 한 실행의 결과는 확보했다. 장기 안정성·생산성 향상
 
 PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답 12개, 실제 timeout/SIGTERM에서 INCOMPLETE와 소유 자원 정리를 확인했다. 이는 E-17의 해당 revision·환경에 한정하며 두 lane이 같은 Contract SHA를 가리킨 실행이라는 점도 함께 설명한다.
 
-## 30초 설명 — 기존 로컬·CI와 PR 3A 로컬 검증 완료
+## 30초 설명 — producer·consumer 경계 검증 완료
 
-“광고 실험을 시작하는 API에서 같은 요청을 다시 보내도 실험이 중복되지 않고, 실패하면 데이터가 반쯤 남지 않아야 합니다. 기존 테스트가 실제 DB의 commit까지 확인하는지 조사했고, 그 경계를 반복 검증하는 도구를 설계했습니다. 실제 DB 검증을 시작하자 commit이 실패해도 HTTP 성공 응답이 먼저 나가는 문제가 재현됐습니다. 실패를 보존하고 별도 서비스 PR로 수정했습니다. 이후 기존 행 호환성까지 포함한 Gate를 로컬과 CI에서 검증했습니다. 이어서 실제 DB lock 경합과 rollback을 검증하고 원본 응답 bundle까지 만들었습니다. 다음 단계는 이 bundle을 Dashboard의 실제 소비 코드에 연결하고 두 revision의 결과를 함께 확인하는 것입니다.”
+“광고 실험을 시작하는 API에서 같은 요청을 다시 보내도 실험이 중복되지 않고, 실패하면 데이터가 반쯤 남지 않아야 합니다. 기존 테스트가 실제 DB의 commit까지 확인하는지 조사했고, 그 경계를 반복 검증하는 도구를 설계했습니다. 실제 DB 검증을 시작하자 commit이 실패해도 HTTP 성공 응답이 먼저 나가는 문제가 재현돼 별도 서비스 PR로 수정했습니다. 이후 기존 행 호환성, 실제 DB lock 경합과 rollback, 원본 응답 bundle을 검증했고, Dashboard의 실제 client·공유 변환·launch가 그 bundle을 소비하는 경계까지 CI로 연결했습니다. 최신 dev 통합 후보는 같은 검증을 최종 SHA에서 다시 실행한 뒤 제출 여부를 판단합니다.”
 
 ## 3분 기술 설명의 순서
 
@@ -103,7 +103,7 @@ PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답
 3. **설계:** 실제 dependency commit 후 독립 connection으로 확인하며 baseline fixture를 보존하는 이유를 말한다.
 4. **실패 가능성:** 중간 쓰기 실패, 지연 제약 실패, 누락된 case의 잘못된 PASS를 예로 든다.
 5. **Trade-off:** DB 컨테이너만 쓰는 방식보다 재현성 비용을 수용했고, 최신 DDL은 배포를 흔드는 필수 기준으로 쓰지 않았다고 설명한다.
-6. **결과와 한계:** E-12 미커밋 후보, E-15 clean head·CI checkout의 차이를 밝힌다. E-17의 실제 동시 경합 결과를 제시하고 운영 pool·부하·Dashboard 소비·운영 효과의 미검증 범위를 덧붙인다.
+6. **결과와 한계:** E-12 미커밋 후보, E-15 clean head·CI checkout의 차이를 밝힌다. E-17의 실제 동시 경합과 Dashboard consumer 결과를 제시하고 운영 pool·부하·실제 downstream·배포·운영 효과의 미검증 범위를 덧붙인다.
 
 ## 3분 데모 순서
 
@@ -115,7 +115,7 @@ PR 3A 추가 근거: fixed/latest 각 21개·제어 54개, lane별 원본 응답
 | 2:10~2:40 | fixed/latest JSON·JUnit 또는 CI 결과 | 기준과 경고의 분리 |
 | 2:40~3:00 | 미검증 범위와 필수 후속 | 보장의 한계를 정확히 설명 |
 
-실행이 3분보다 길면 실제 사전 실행 artifact를 제시하고 “사전 실행 결과”라고 표시한다. 녹화·저장된 결과를 즉석 실시간 실행처럼 보여주지 않는다. 현재 로컬 Gate와 저장된 JSON/JUnit을 시연할 수 있다. CI는 E-15의 실제 실행과 artifact를 제시할 수 있다. PR 3A의 경합 timeline·원본 응답 bundle은 E-17의 로컬·CI artifact로 시연할 수 있다. PR 3B consumer 데모는 아직 없다.
+실행이 3분보다 길면 실제 사전 실행 artifact를 제시하고 “사전 실행 결과”라고 표시한다. 녹화·저장된 결과를 즉석 실시간 실행처럼 보여주지 않는다. 현재 로컬 Gate와 저장된 JSON/JUnit을 시연할 수 있다. CI는 E-15의 실제 실행과 artifact를 제시할 수 있다. PR 3A의 경합 timeline·원본 응답 bundle과 PR 3B consumer 결과는 E-17의 로컬·CI artifact로 시연할 수 있다.
 
 ## 예상 면접 질문과 답변 방향
 

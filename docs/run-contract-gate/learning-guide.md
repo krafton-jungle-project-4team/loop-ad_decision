@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 설계를 이해하고 자신의 말로 설명하려는 개발자 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 0~3 구현·통합 완료 · 최신 dev 로컬 통합 완료 · 최종 SHA Gate/consumer 재검증 대기 |
+| 기준 revision | dev `dd55b38` + integration `61f7e03` → 로컬 merge `004e3e7` / 기존 검증 producer `9ace3b6` / baseline `e1de8b2` / Contract `0ec2cef` |
+| 마지막 확인 | 2026-09-22 KST |
 
 한 번에 전체 service 파일을 읽지 않는다. 각 단원의 작은 조각을 읽고 입력·출력·부작용을 세 문장으로 설명한다. 해설을 읽기 전에 질문에 답한다. 아래 일반 실패 상황은 설명을 위한 가정이다. 다만 2026-09-19 RCG-07에서 HTTP 200 이후 commit 실패가 실제로 재현됐으며, 운영 사고라는 의미는 아니다.
 

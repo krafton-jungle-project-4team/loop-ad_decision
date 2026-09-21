@@ -3,10 +3,10 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현 개발자·에이전트, 리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
-| Merge-safety verdict | **incomplete evidence** — PR 3A 로컬·CI PASS; Dashboard 소비·배포 여정은 미검증 |
+| 상태 | PR 0~3 Decision·Dashboard 구현/병합 완료 · 최신 dev 로컬 통합 완료 · 통합 최종 SHA Gate/consumer 재검증 대기 |
+| 기준 revision | origin/dev `dd55b38` + origin/integration/run-contract-gate `61f7e03` → 로컬 merge `004e3e7`; 직전 검증 producer `9ace3b6`; baseline `e1de8b2`; Contract `0ec2cef` |
+| 마지막 확인 | 2026-09-22 KST |
+| Merge-safety verdict | 직전 PR 3 조합은 producer·consumer 검증 완료. 최신 dev 통합 후보는 최종 SHA Gate/consumer 재검증 전이며 dev PR·CI 판단은 후속 범위 |
 
 ## 1. 결정 요약
 
@@ -14,7 +14,7 @@
 
 PR 0 #394는 응답 전 commit을 보장하는 서비스 수정, PR 1 #395는 실제 DB 로컬 Gate, PR 2 #396은 같은 명령의 CI 연결로 개인 통합에 병합됐다. PR 2 제출 SHA의 로컬·CI 결과와 병합 revision은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 구분해 기록한다.
 
-2026-09-19 사용자는 후속을 **PR 3A — Decision 동시성·artifact**, **PR 3B — Dashboard 실제 consumer 검증**으로 나누고 두 저장소의 revision·결과를 **PR 3 milestone**으로 묶기로 결정했다. 문서 PR #397이 `6de82a3`으로 통합된 뒤 `feat/run-contract-gate-concurrency`에서 PR 3A를 구현했다. PR 3A의 commit·push·PR 생성은 승인됐고 merge는 제외한다. 3B는 이번 구현 범위 밖이다. 구현자가 따라야 할 범위·선행 관계는 이 문서 21절, 합격 기준은 검증 명세의 PR 3 절이 기준이다.
+2026-09-19 후속을 **PR 3A — Decision 동시성·artifact**, **PR 3B — Dashboard 실제 consumer 검증**으로 나누고 두 저장소의 revision·결과를 **PR 3 milestone**으로 묶었다. Decision #397~#399와 Dashboard #246·#247이 병합됐고, 직전 고정 조합은 producer fixed/latest 각 21개·제어 54개와 consumer fixed/latest 각 34개·제어 23개를 통과했다. 2026-09-22에는 최신 `origin/dev@dd55b38`을 `origin/integration/run-contract-gate@61f7e03`에 로컬 병합해 `004e3e7` 후보를 만들었다. 이 최종 후보의 Gate·consumer 재실행과 dev PR·CI 판단은 별도 후속으로 남긴다. 구현 범위·선행 관계는 이 문서 21절, 합격 기준은 검증 명세의 PR 3 절이 기준이다.
 
 ## 2. 해결하려는 실제 문제와 코드 근거
 
@@ -63,11 +63,11 @@ PR 1·2 완료 범위: 명시적 analysis_id·generation_id·segment_ids의 일�
 
 PR 3A 구현 범위: 같은 전용 DB의 복수 실제 connection에서 요청을 경합시키고 commit·rollback·재조회를 확인한다. Dashboard가 소비할 실제 요청/응답과 DB 근거를 provenance가 있는 artifact로 내보낸다.
 
-PR 3B 계획 범위: 실제 Dashboard client·응답 변환·launch flow에 PR 3A 응답을 연결하고 다음 operation에 전달되는 run/experiment ID, scope, 호출 순서와 오류 차단을 검사한다. 응답 변환 추출이 필요하면 Dashboard 내 동작 보존 refactor까지 포함한다.
+PR 3B 구현 범위: 실제 Dashboard client·응답 변환·launch flow에 PR 3A 응답을 연결하고 다음 operation에 전달되는 run/experiment ID, scope, 호출 순서와 오류 차단을 검사한다. 응답 변환은 Dashboard에서 동작 보존 순수 함수로 추출했다.
 
 공통 비범위: 브라우저 전체 E2E, 배포 서버·ALB 검증, 실제 assignment 처리·start 상태 전이·발송, next-loop activation, ClickHouse·외부 AI, 분석/콘텐츠 생성 전체 파이프라인, 전체 migration·legacy 호환, 운영 데이터, 배포/branch protection 변경. PR 3B의 operation 호출 기록은 downstream 처리 성공의 증거가 아니다.
 
-동시성과 producer bundle은 **3A 로컬 검증 완료**, consumer는 **3B pending**이다. 기존 순차 테스트나 PR 2 CI 성공으로 PR 3 전체를 완료 처리하지 않는다.
+직전 고정 revision 조합의 동시성·producer bundle과 Dashboard consumer 검증은 완료됐다. 다만 최신 dev 로컬 병합 후보 `004e3e7`은 아직 같은 Gate·consumer 조합을 재실행하지 않았으므로, 과거 PASS를 최종 통합 SHA의 결과로 재사용하지 않는다.
 
 ## 7. Producer → row → consumer → Dashboard action
 
@@ -168,7 +168,7 @@ PR 2 변경: .github/workflows/run-contract-gate.yml. PR 3은 21절의 소유 �
 - 현재 문서 worktree: /Users/ran/loop-ad/loop-ad_decision-run-contract-gate.
 - 최종 Draft의 base: dev. main은 대상이 아니다.
 
-PR 0·1·2와 milestone 문서 #397은 개인 통합에 병합됐다. PR 3A branch는 `6de82a36ddc1cf51c88a431d65e84f873ea8f472`에서 분기했으며 Dashboard 파일은 변경하지 않는다. PR 3A를 구현·검증해 개인 통합 대상 PR로 제출하고 merge는 수행하지 않는다. PR 3B는 후속 작업이다. 원래 main 작업 공간의 변경·untracked 파일은 옮기지 않는다.
+PR 0~3 Decision 변경은 개인 통합에 병합됐고 Dashboard #246·#247도 main에 병합됐다. 이후 최신 dev를 별도 worktree의 개인 통합 branch에 로컬 병합했다. 원래 main 작업 공간의 변경·untracked 파일은 옮기지 않으며, `004e3e7`의 재검증과 dev 제출은 별도 후속으로 수행한다.
 
 실제 원격 쓰기 전 repository·branch·commit 범위·diff/stat·정확한 파일을 검토하고 해당 작업 승인을 받는다. AGENTS.md, agent/, .codex/, .env, 출력물·캐시·개인 기록은 포함하지 않는다. 광범위한 git add를 사용하지 않는다.
 
@@ -246,7 +246,7 @@ PR 1·2 완료 조건(이 목록 통과만으로 PR 3 milestone이 완료되지�
 
 ## 20. 구현 중 이해해야 할 핵심 개념
 
-[학습 안내](learning-guide.md)의 1~6단원은 기존 Gate, 7~9단원은 PR 3A 구현·3B 계획을 따른다. 설명할 수 있어야 할 차이는 fake/실DB, 멱등성/동시성, statement/commit, scope/ID/binding, baseline fixture/현재 writer, 필수 판정/최신 경고, PR check/배포 차단이다.
+[학습 안내](learning-guide.md)의 1~6단원은 기존 Gate, 7~9단원은 PR 3A·3B 검증 경계를 따른다. 설명할 수 있어야 할 차이는 fake/실DB, 멱등성/동시성, statement/commit, scope/ID/binding, baseline fixture/현재 writer, 필수 판정/최신 경고, PR check/배포 차단이다.
 
 이 설계는 운영 경험을 새로 만드는 기능이 아니다. 실제 코드·DB 경계를 검증하고 재현 가능한 증거를 쌓는 개발 안전성 과제다.
 
@@ -287,19 +287,21 @@ Dashboard 최신 branch까지 추가하는 조합 검사는 PR 3 범위 밖이�
 
 - [x] 3A 기존·새 필수 case가 모두 실행되고, 실제 DB 경합·commit/rollback·정리 증거가 있다. 로컬 E-17 기준.
 - [x] 3A artifact가 실제 응답과 DB 검증을 같은 실행으로 연결하며 누락·손상·hash 불일치 탐지 제어 검사가 있다. 로컬 E-17 기준.
-- [ ] 3B의 실제 client → 공유 변환 → 실제 launch 연결 검사가 정상·retry·baseline·오류 입력을 다룬다.
-- [ ] 각각의 clean revision·CI 결과·Contract SHA·lock/image·bundle hash·소비 결과가 같은 조합으로 연결된다.
-- [ ] latest 경고가 있으면 원인과 영향이 기록돼 있고 필수 통과로 합산되지 않는다.
-- [ ] 각 PR의 merge 상태와 실제 검증 SHA를 구분한다. 통합 후 SHA가 바뀌면 실제 tree·source digest를 대조하고 통합 결과를 재검증한다.
-- [ ] 개발자 실행 안내·근거 대장·학습/포트폴리오의 완료 표현이 실제 결과와 일치한다.
+- [x] 3B의 실제 client → 공유 변환 → 실제 launch 연결 검사가 정상·retry·baseline·오류 입력을 다룬다. Dashboard #246·#247 및 E-17 기준.
+- [x] 직전 검증 조합의 clean revision·CI 결과·Contract SHA·bundle hash·소비 결과가 연결된다.
+- [x] 직전 검증 조합에서 latest lane을 필수 판정과 분리해 기록했다.
+- [x] Decision·Dashboard PR의 merge 상태와 실제 검증 SHA를 구분해 기록했다.
+- [x] 개발자 실행 안내·근거 대장·학습/포트폴리오의 완료 표현을 직전 검증 조합에 맞췄다.
+- [ ] 최신 dev 통합 후보 `004e3e7`에서 Gate와 Dashboard consumer를 같은 revision 조합으로 재검증한다.
+- [ ] 최종 dev PR을 만들 경우 해당 checkout의 CI와 artifact를 별도 근거로 연결한다.
 
-3A만 통과하면 milestone은 `3A verified / 3B pending`이다. 3B가 무관한 fixture로 통과하거나 revision 연결이 없으면 `incomplete evidence`다. 두 PR의 fixed 검증과 연결 근거가 갖춰져야 `PR 3 verified`로 기록한다. merge 여부는 별도 필드이며 verified를 merge 승인으로 해석하지 않는다.
+직전 고정 조합은 두 PR의 fixed 검증과 revision 연결을 갖춰 `PR 3 verified`로 기록한다. merge 여부와 검증 여부는 별도 필드이며 verified를 dev merge 승인으로 해석하지 않는다. 최신 dev 통합으로 SHA가 바뀐 현재 후보는 재검증 전 상태로 별도 관리한다.
 
 ### Cross-repository 안전성 판정
 
 | 항목 | 계획 단계의 결론 |
 |---|---|
-| Verdict | 3A local verified / 3B pending — 전체 milestone은 incomplete evidence |
+| Verdict | 직전 producer `9ace3b6` + Dashboard `adb7d29` 조합은 verified; 최신 dev 통합 후보 `004e3e7`은 재검증 대기 |
 | Affected Dashboard journey | run 생성 응답 수신 → 변환 → launch의 다음 operation 인자 확인; 실제 downstream 실행은 제외 |
 | Contract impact | 기존 run DTO·identity·DDL은 유지. 새 계약은 테스트용 producer bundle뿐이며 v1과 hash로 관리 |
 | Existing-data compatibility | 고정 baseline row → 후보 Decision 재사용 응답 → 후보 Dashboard client/변환/launch |

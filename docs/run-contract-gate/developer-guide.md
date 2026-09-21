@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | Decision 변경을 검증하는 개발자·리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 0~3 구현·통합 완료 · 최신 dev 로컬 통합 완료 · 최종 SHA Gate/consumer 재검증 대기 |
+| 기준 revision | dev `dd55b38` + integration `61f7e03` → 로컬 merge `004e3e7` / 기존 검증 producer `9ace3b6` / baseline `e1de8b2` / Contract `0ec2cef` |
+| 마지막 확인 | 2026-09-22 KST |
 
 ## 1. 준비할 환경
 
@@ -131,11 +131,11 @@ GitHub-hosted `ubuntu-24.04-arm`에서 로컬과 같은 `./scripts/run-contract-
 
 JSON·JUnit과 CI 실행 메타데이터만 명시한 경로로 업로드하며 전체 작업 디렉터리·환경변수·원문 로그는 업로드하지 않는다. 준비 실패로 생성되지 않은 JUnit을 만들어내지 않는다. 일반 실패에서도 생성된 결과의 업로드를 시도하지만 runner 강제 종료·job timeout·GitHub artifact 서비스 장애까지 보관을 보장하지는 않는다. artifact 업로드 자체의 실패는 check 실패다.
 
-정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit의 clean 재실행·실제 Actions 성공과 개인 통합 병합은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 기록했다. PR 2 CI는 PR의 checkout merge SHA를 검사한 결과이며 이후 개인 통합 merge SHA를 다시 실행한 결과로 바꾸어 기록하지 않는다. 실제 동시성과 응답 bundle은 3A로 구현했다. Dashboard 소비 검증은 3B 계획 범위다.
+정적·로컬 검증은 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증), 제출 commit의 clean 재실행·실제 Actions 성공과 개인 통합 병합은 [E-15](evidence-log.md#e-15-pr-2-ci-성공과-개인-통합-병합)에 기록했다. PR 2 CI는 PR의 checkout merge SHA를 검사한 결과이며 이후 개인 통합 merge SHA를 다시 실행한 결과로 바꾸어 기록하지 않는다. 실제 동시성과 응답 bundle은 3A, Dashboard 소비 검증은 3B로 구현·검증했으며 연결 revision과 결과는 E-17에 기록했다.
 
 ## 9. PR 3A에서 PR 3B로 넘기는 절차
 
-2절의 같은 Gate 명령이 동시성 검사와 lane별 consumer bundle 생성까지 수행한다. 추가 dependency·환경변수·production flag는 없다. 3B의 실제 consumer 명령은 아직 구현하지 않았다.
+2절의 같은 Gate 명령이 동시성 검사와 lane별 consumer bundle 생성까지 수행한다. 추가 dependency·환경변수·production flag는 없다. 3B consumer 명령은 Dashboard 저장소의 `scripts/run-consumer-gate.sh`로 구현됐으며, 이 Decision 저장소의 명령으로 오인하지 않는다.
 
 ### Decision 개발자: PR 3A
 

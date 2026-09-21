@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 구현자, 리뷰어, 포트폴리오 작성자 |
-| 상태 | PR 3A merged (`9ace3b6`) · Dashboard #246/#247 merged · PR 3 milestone 구현·consumer artifact 검증 완료 · Decision 문서 PR #399 OPEN |
-| 기준 revision | Decision producer `9ace3b6` → Dashboard fix merge `7d4a8a2` → 3B head `a813993` / CI checkout `a6c868d` / main merge `adb7d29`; 전체 SHA·hash는 E-17 마지막 실행 조합 참조 |
-| 마지막 확인 | 2026-09-20 KST |
+| 상태 | Decision #394~#399 통합 병합 · Dashboard #246/#247 main 병합 · 최신 dev 로컬 통합 완료 · 최종 SHA 재검증 대기 |
+| 기준 revision | 최신 로컬 merge `004e3e7` (`origin/dev@dd55b38` + `origin/integration/run-contract-gate@61f7e03`); 직전 검증 producer `9ace3b6` → Dashboard main `adb7d29`; 상세 SHA·hash는 E-17 참조 |
+| 마지막 확인 | 2026-09-22 KST |
 
 ## 기록 규칙
 
@@ -362,7 +362,7 @@ PR 2 작업에서는 PR 생성·CI 확인까지만 수행했다. 이 문서화 �
 
 3A CI와 3B CI 안에서 재생성한 producer 실행은 run ID가 달라도 된다. 사용한 Decision source·Contract·환경을 대조하고 **3B가 실제 소비한 그 실행의 bundle hash**를 연결한다. 다른 실행의 hash를 대신 붙이지 않는다. Dashboard 변경 후 과거 소비 결과를 재사용하거나 Decision 최신 branch를 묵시적으로 선택하지 않는다.
 
-최종 완료는 [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)의 체크리스트와 [검증 명세](verification-spec.md#pr-3-검증-경계--3a-구현-3b-계획)를 따른다. 실행 결과가 생기면 이 대장에 추가하고, 과거 E-09~15의 실패·성공 범위를 소급해서 바꾸지 않는다.
+최종 완료는 [계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)의 체크리스트와 [검증 명세](verification-spec.md#pr-3-검증-경계--3a3b-구현)를 따른다. 실행 결과가 생기면 이 대장에 추가하고, 과거 E-09~15의 실패·성공 범위를 소급해서 바꾸지 않는다.
 
 문서 검수: 변경 파일은 기존 문서 7개뿐임을 확인했다. 상대 파일 링크 98개·문서 anchor 37개, code fence 및 세로 Mermaid 3개의 기본 구조, diff whitespace를 검사했다. 영향 분류기는 문서 속 ID/DTO/DB 용어로 T0 신호를 냈지만 실행 코드 diff는 없다. 이 검수는 PR 3 테스트·CI 성공의 근거가 아니며 런타임 테스트는 실행하지 않았다.
 
@@ -573,3 +573,19 @@ Dashboard의 실제 client → 추출된 공유 변환 → 실제 `launchPromoti
 최종 Dashboard head `a813993`과 main merge `adb7d29`의 tree diff가 비어 있음을 확인했다. 병합 commit의 별도 detached checkout에서 최종 CI artifact를 내려받아 `python3 tools/run-consumer-gate/verify.py /private/tmp/rcc-ci-35451441072 --producer-checkout /private/tmp/rcg-decision-producer-9ace3b6`를 실행했다. 164개 파일 inventory/hash, fixed/latest bundle provenance, JSON/JUnit, controls가 VERIFIED였고 artifact의 모든 소스 파일 hash가 병합 tree와 일치했다. main merge SHA 자체에서 CI를 새로 실행했다고 표시하지 않는다.
 
 **구현 완료 판단:** 합의한 PR 0~3 범위의 Decision actual DB/transaction·동시성·고정 기존 row 호환·bundle 및 Dashboard actual client→공유 변환→actual launch 검증은 완료됐다. 기존 downstream 대역·browser/배포 비범위는 그대로다. 통합 브랜치 대상 #399는 근거 문서만 추가하며 새 런타임 의존성이나 구현 변경이 없다. 배포 여정 전체에 대한 merge-safety verdict는 여전히 `incomplete evidence`다. 실제 assignment/start/dispatch·배포 smoke를 실행한 근거가 없기 때문이다. 이 한계는 구현 미완료나 문서 PR 제출 차단으로 해석하지 않으며, dev merge·배포 승인을 대신하지 않는다. `AGENTS.md`, `agent/`, 원본 stop evidence·개인 로컬 변경은 제출에서 제외한다.
+
+## E-18: 최신 dev의 개인 통합 브랜치 로컬 병합 (2026-09-22 KST)
+
+최신 원격 상태를 확인한 뒤 별도 worktree의 `integration/run-contract-gate`를 `origin/integration/run-contract-gate@61f7e03`으로 fast-forward하고, `origin/dev@dd55b38`을 로컬 merge했다. 결과 merge commit은 `004e3e7`이며 충돌은 없었다. 기존 main 작업 공간과 그 untracked 파일은 변경하지 않았다.
+
+| 항목 | 실제 확인 값 |
+| --- | --- |
+| 통합 입력 | `origin/integration/run-contract-gate@61f7e03` + `origin/dev@dd55b38` |
+| 로컬 결과 | `integration/run-contract-gate@004e3e7` |
+| 충돌 | 없음; `.gitignore`, `pyproject.toml`은 자동 병합 |
+| 보존 확인 | Gate 문서 추적 예외와 ANN artifact ignore 규칙이 함께 남음; `fastapi>=0.121.0`과 `matplotlib>=3.8.0`이 함께 남음 |
+| 원격 쓰기 | push·PR 생성·merge 없음 |
+| 이번 범위 | 로컬 dev 통합과 Run Contract Gate 문서의 현재 상태 정리 |
+| 미실행 | `004e3e7` 기준 전체 Gate, Dashboard consumer, dev PR CI |
+
+직전 producer `9ace3b6`과 Dashboard main `adb7d29`의 PASS는 E-17의 고정 revision 조합에 대한 근거다. 이를 `004e3e7`의 실행 결과로 재사용하지 않는다. 최신 통합 후보의 Gate·consumer 재실행, artifact 연결, dev PR/CI 판단은 사용자가 분리한 후속 계획에서 수행한다. `AGENTS.md`와 `agent/`는 로컬 전용 컨텍스트로 계속 제외한다.

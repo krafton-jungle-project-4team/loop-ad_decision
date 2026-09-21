@@ -3,9 +3,9 @@
 | 항목 | 내용 |
 |---|---|
 | 대상 독자 | 테스트 구현자, 리뷰어 |
-| 상태 | PR 0·1·2·milestone 문서 통합 완료 · PR 3A clean 로컬·CI PASS · PR #398 OPEN · PR 3B pending |
-| 기준 revision | PR 3A base 6de82a36ddc1cf51c88a431d65e84f873ea8f472 / baseline e1de8b2 / Contract 0ec2cef0290f4659ad21ccc1dd2a20df2801ff50 |
-| 마지막 확인 | 2026-09-19 KST |
+| 상태 | PR 0~3 구현·통합 완료 · 최신 dev 로컬 통합 완료 · 최종 SHA Gate/consumer 재검증 대기 |
+| 기준 revision | dev `dd55b38` + integration `61f7e03` → 로컬 merge `004e3e7` / 기존 검증 producer `9ace3b6` / baseline `e1de8b2` / Contract `0ec2cef` |
+| 마지막 확인 | 2026-09-22 KST |
 
 ## 실행 경계와 공통 fixture
 
@@ -98,9 +98,9 @@ JUnit은 fixed/latest를 구분해 저장하고 latest assertion을 전체 필�
 
 ## 제외한 보장과 다음 단계
 
-PR 1·2 성공에는 실제 concurrent request와 Dashboard 변환·launch 검증이 포함되지 않는다. 3A는 새 경합 case로 검증했고, Dashboard 변환·launch는 3B 계획이다. 실제 Decision/Dashboard 서버를 함께 띄운 live HTTP 여정·브라우저 전체 실행·assignment 처리·운영 DB·전체 migration·모든 dependency/architecture 조합은 PR 3에서도 보장하지 않는다.
+PR 1·2 성공 자체에는 실제 concurrent request와 Dashboard 변환·launch 검증이 포함되지 않는다. 이후 3A는 새 경합 case, 3B는 실제 Dashboard client·공유 변환·launch 소비 case로 별도 검증했다. 실제 Decision/Dashboard 서버를 함께 띄운 live HTTP 여정·브라우저 전체 실행·assignment 처리·운영 DB·전체 migration·모든 dependency/architecture 조합은 PR 3에서도 보장하지 않는다.
 
-**필수 후속 동시성 검증:** 최소 두 실제 DB connection과 동시 요청으로 같은 scope를 경합시켜 승자·패자 응답의 identity, row 수, lock·commit·rollback을 확인한다. PR 3A의 RCG-10~12로 수행하며 fake race 분기 테스트나 RCG-02로 대체하지 않는다.
+**필수 동시성 검증 기준:** 최소 두 실제 DB connection과 동시 요청으로 같은 scope를 경합시켜 승자·패자 응답의 identity, row 수, lock·commit·rollback을 확인한다. PR 3A의 RCG-10~12로 수행하며 fake race 분기 테스트나 RCG-02로 대체하지 않는다.
 
 ## 2026-09-19 실제 확인 상태
 
@@ -110,9 +110,9 @@ PR 1·2 성공에는 실제 concurrent request와 Dashboard 변환·launch 검�
 
 PR 2는 위 판정 규칙을 바꾸지 않고 Gate 종료 코드를 필수 check에 전달한다. latest 경고 표시와 JSON/JUnit 보관은 [개발자 안내 8절](developer-guide.md#8-pr-2-ci와-최종-제출), 정적·로컬 근거는 [E-14](evidence-log.md#e-14-pr-2-ci-구현과-로컬-검증)를 따른다.
 
-## PR 3 검증 경계 — 3A 구현, 3B 계획
+## PR 3 검증 경계 — 3A·3B 구현
 
-PR 3A와 PR 3B의 소유·순서는 [개발 계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)이 기준이다. RCG-10~12는 구현됐고 RCC-01~06은 3B 예약 ID다. 기존 RCG-01~09와 CTRL-01~05의 의미를 바꾸지 않는다. 3A의 실제 매개변수 case는 [manifest](../../tools/run_contract_gate/manifest.json)와 [control manifest](../../tools/run_contract_gate/control-manifest.json)에 모두 열거했다.
+PR 3A와 PR 3B의 소유·순서는 [개발 계획 21절](implementation-plan.md#21-pr-3-milestone-실행-계약)이 기준이다. RCG-10~12와 Dashboard RCC-01~06을 구현했다. 기존 RCG-01~09와 CTRL-01~05의 의미를 바꾸지 않는다. 3A의 실제 매개변수 case는 [manifest](../../tools/run_contract_gate/manifest.json)와 [control manifest](../../tools/run_contract_gate/control-manifest.json)에 모두 열거했다. 3B 상세 구현·artifact는 Dashboard 저장소와 [E-17](evidence-log.md#e-17-pr-3a-구현과-실제-경합bundle-검증)이 소유한다.
 
 ### PR 3A 실제 DB 동시성 검증
 
