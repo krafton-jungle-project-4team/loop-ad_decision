@@ -5,6 +5,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from typing import Any
+from urllib.parse import urlsplit
 
 import boto3
 
@@ -17,7 +18,7 @@ from app.generation.errors import (
     RetryableGenerationError,
 )
 from app.generation.schemas import ContentChannel
-from app.logging import log
+from app.logging import duration_ms, log, now_ms
 
 
 BRAND_CONTEXT_POINTER_SCHEMA_VERSION = "loopad.brand-context-pointer.v1"
@@ -26,9 +27,13 @@ MAX_POINTER_BYTES = 16_384
 MAX_MANIFEST_BYTES = 2_000_000
 MAX_GUIDE_BYTES = 256_000
 MAX_BRAND_KIT_BYTES = 256_000
+MAX_CATALOG_BYTES = 512_000
 MAX_ASSET_VALIDATION_BYTES = 20_000_000
+PROMOTION_PRICE_CATALOG_SCHEMA_VERSION = "stayloop.promotion-price-catalog.v1"
 
 _PROJECT_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_OFFER_SET_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
+_DEAL_CODE_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$")
 _SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _HEX_COLOUR_PATTERN = re.compile(r"#[0-9a-fA-F]{6}\b")
 _MARKDOWN_BULLET_PATTERN = re.compile(r"^\s*[-*]\s+(.+?)\s*$")
@@ -48,6 +53,7 @@ class S3BrandContextLoader:
         self._base_prefix = _normalised_prefix(base_prefix)
         self._s3_client = s3_client
         self._manifest_cache: dict[tuple[str, str, str], Mapping[str, Any]] = {}
+        self._offer_catalog_cache: dict[tuple[str, ...], Mapping[str, Any]] = {}
 
     def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot | None:
         project_id = _validated_project_id(project_id)
@@ -112,6 +118,75 @@ class S3BrandContextLoader:
             },
         )
         return snapshot
+
+    def load_offer_catalog(
+        self,
+        *,
+        project_id: str,
+        snapshot: BrandContextSnapshot,
+        offer_set_id: str | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Load verified promotion facts and public asset paths for email cards."""
+
+        project_id = _validated_project_id(project_id)
+        selected_offer_set_id = (
+            _validated_offer_set_id(offer_set_id)
+            if offer_set_id is not None
+            else None
+        )
+        manifest = self._load_manifest(
+            project_id=project_id,
+            context_version=snapshot.context_version,
+            manifest_key=snapshot.manifest_key,
+            expected_sha256=snapshot.manifest_sha256,
+        )
+        catalog_entry, offer_set_entry = _resolve_offer_catalog_reference(
+            manifest,
+            offer_set_id=selected_offer_set_id,
+        )
+        if catalog_entry is None:
+            return None
+        catalog_id = _required_text(
+            catalog_entry.get("catalog_id"),
+            "catalog.catalog_id",
+        )
+        catalog_version = _required_text(
+            catalog_entry.get("version"),
+            "catalog.version",
+        )
+        catalog_sha256 = _required_sha256(
+            catalog_entry.get("sha256"),
+            "catalog.sha256",
+        )
+        cache_key = (
+            project_id,
+            snapshot.context_version,
+            snapshot.manifest_sha256,
+            selected_offer_set_id or "__legacy__",
+            catalog_id,
+            catalog_version,
+            catalog_sha256,
+        )
+        cached = self._offer_catalog_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        catalog_bytes = self._read_verified_reference(
+            catalog_entry,
+            project_id=project_id,
+            max_bytes=MAX_CATALOG_BYTES,
+            label=f"catalog {catalog_id}",
+        )
+        catalog = _json_object(catalog_bytes, label=f"catalog {catalog_id}")
+        normalized = _normalise_offer_catalog(
+            catalog,
+            catalog_entry=catalog_entry,
+            manifest=manifest,
+            project_id=project_id,
+            selected_offer_set_id=selected_offer_set_id,
+            offer_set_entry=offer_set_entry,
+        )
+        self._offer_catalog_cache[cache_key] = normalized
+        return normalized
 
     def load_documents(
         self,
@@ -350,66 +425,122 @@ class S3BrandContextLoader:
         optional: bool = False,
         expected_content_type: str | None = None,
     ) -> bytes | None:
+        started_at = now_ms()
+        provider_context = {
+            "endpoint": "get_object",
+            "objectKey": key,
+            "provider": "aws_s3",
+        }
+        log.info("provider_request_prepared", provider_context)
         try:
             response = self._client().get_object(Bucket=self._bucket_name, Key=key)
         except Exception as exc:
             if optional and _is_s3_not_found(exc):
+                log.info(
+                    "provider_request_completed",
+                    {
+                        **provider_context,
+                        "durationMs": duration_ms(started_at),
+                        "outcome": "not_found",
+                    },
+                )
                 return None
             if _is_s3_not_found(exc):
-                raise PermanentGenerationError(
+                error = PermanentGenerationError(
                     code="brand_context_object_missing",
                     safe_message="A required brand context object was not found.",
-                ) from exc
-            raise RetryableGenerationError(
-                code="brand_context_read_failed",
-                safe_message="Brand context storage could not be read temporarily.",
-            ) from exc
-        if not isinstance(response, Mapping):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
+                )
+            else:
+                error = RetryableGenerationError(
+                    code="brand_context_read_failed",
+                    safe_message="Brand context storage could not be read temporarily.",
+                )
+            log.warn(
+                "provider_request_failed",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": error,
+                },
             )
-        if expected_content_type is not None and not _content_types_match(
-            response.get("ContentType"),
-            expected_content_type,
-        ):
-            raise PermanentGenerationError(
-                code="brand_context_object_content_type_mismatch",
-                safe_message=(
-                    "A brand context object content type did not match its manifest."
-                ),
-            )
-        body = response.get("Body")
-        reader = getattr(body, "read", None)
-        if not callable(reader):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
-            )
+            raise error from exc
+
         try:
-            data = reader(max_bytes + 1)
-        except Exception as exc:
-            raise RetryableGenerationError(
-                code="brand_context_read_failed",
-                safe_message="Brand context storage could not be read temporarily.",
-            ) from exc
-        finally:
-            closer = getattr(body, "close", None)
-            if callable(closer):
-                try:
-                    closer()
-                except Exception:
-                    pass
-        if not isinstance(data, bytes):
-            raise PermanentGenerationError(
-                code="brand_context_object_invalid",
-                safe_message="A brand context object response was invalid.",
+            if not isinstance(response, Mapping):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            if expected_content_type is not None and not _content_types_match(
+                response.get("ContentType"),
+                expected_content_type,
+            ):
+                raise PermanentGenerationError(
+                    code="brand_context_object_content_type_mismatch",
+                    safe_message=(
+                        "A brand context object content type did not match its manifest."
+                    ),
+                )
+            body = response.get("Body")
+            reader = getattr(body, "read", None)
+            if not callable(reader):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            try:
+                data = reader(max_bytes + 1)
+            except Exception as exc:
+                raise RetryableGenerationError(
+                    code="brand_context_read_failed",
+                    safe_message="Brand context storage could not be read temporarily.",
+                ) from exc
+            finally:
+                closer = getattr(body, "close", None)
+                if callable(closer):
+                    try:
+                        closer()
+                    except Exception:
+                        pass
+            if not isinstance(data, bytes):
+                raise PermanentGenerationError(
+                    code="brand_context_object_invalid",
+                    safe_message="A brand context object response was invalid.",
+                )
+            if len(data) > max_bytes:
+                raise PermanentGenerationError(
+                    code="brand_context_object_too_large",
+                    safe_message="A brand context object exceeded its size limit.",
+                )
+        except RetryableGenerationError as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": exc,
+                },
             )
-        if len(data) > max_bytes:
-            raise PermanentGenerationError(
-                code="brand_context_object_too_large",
-                safe_message="A brand context object exceeded its size limit.",
+            raise
+        except PermanentGenerationError as exc:
+            log.warn(
+                "provider_response_invalid",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": exc,
+                },
             )
+            raise
+
+        log.info(
+            "provider_request_completed",
+            {
+                **provider_context,
+                "durationMs": duration_ms(started_at),
+                "responseBytes": len(data),
+            },
+        )
         return data
 
     def _client(self) -> Any:
@@ -461,6 +592,13 @@ def _validated_project_id(value: str) -> str:
     if not _PROJECT_ID_PATTERN.fullmatch(project_id):
         raise ValueError("brand context project_id is invalid")
     return project_id
+
+
+def _validated_offer_set_id(value: object) -> str:
+    offer_set_id = str(value or "").strip()
+    if not _OFFER_SET_ID_PATTERN.fullmatch(offer_set_id):
+        raise ValueError("brand context offer_set_id is invalid")
+    return offer_set_id
 
 
 def _json_object(value: bytes, *, label: str) -> Mapping[str, Any]:
@@ -603,6 +741,542 @@ def _manifest_catalog_version(
         if str(item.get("version") or "").strip()
     }
     return next(iter(versions)) if len(versions) == 1 else fallback
+
+
+def _select_offer_catalog(
+    catalogs: Sequence[Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    eligible = [
+        catalog
+        for catalog in catalogs
+        if bool(catalog.get("required"))
+        and (
+            not _string_list(catalog.get("applies_to"))
+            or ContentChannel.EMAIL.value
+            in _string_list(catalog.get("applies_to"))
+        )
+    ]
+    if not eligible:
+        return None
+    return min(eligible, key=lambda item: str(item.get("catalog_id") or ""))
+
+
+def _resolve_offer_catalog_reference(
+    manifest: Mapping[str, Any],
+    *,
+    offer_set_id: str | None,
+) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+    catalogs = _mapping_list(manifest, "catalogs")
+    if offer_set_id is None:
+        return _select_offer_catalog(catalogs), None
+
+    offer_sets = _offer_set_entries(manifest)
+    matching_offer_sets = [
+        item
+        for item in offer_sets
+        if _required_manifest_offer_set_id(item) == offer_set_id
+    ]
+    if len(matching_offer_sets) > 1:
+        _raise_manifest_invalid()
+    if matching_offer_sets:
+        offer_set = matching_offer_sets[0]
+        catalog_id = _required_text(
+            offer_set.get("catalog_id"),
+            "offer_set.catalog_id",
+        )
+        catalog_version = _required_text(
+            offer_set.get("catalog_version"),
+            "offer_set.catalog_version",
+        )
+        matching_catalogs = [
+            item
+            for item in catalogs
+            if str(item.get("catalog_id") or "").strip() == catalog_id
+            and str(item.get("version") or "").strip() == catalog_version
+        ]
+        if len(matching_catalogs) != 1:
+            _raise_manifest_invalid()
+        catalog_entry = matching_catalogs[0]
+        reference_offer_set_id = _optional_offer_set_id(
+            catalog_entry.get("offer_set_id"),
+            label="catalog reference offer_set_id",
+        )
+        if (
+            reference_offer_set_id is not None
+            and reference_offer_set_id != offer_set_id
+        ):
+            _raise_contract_mismatch("promotion offer set catalog reference")
+        return catalog_entry, offer_set
+
+    matching_catalogs = [
+        item
+        for item in catalogs
+        if _optional_offer_set_id(
+            item.get("offer_set_id"),
+            label="catalog reference offer_set_id",
+        )
+        == offer_set_id
+    ]
+    if len(matching_catalogs) > 1:
+        _raise_manifest_invalid()
+    if matching_catalogs:
+        return matching_catalogs[0], None
+    raise PermanentGenerationError(
+        code="brand_context_offer_set_unknown",
+        safe_message="The requested promotion offer set was unavailable.",
+    )
+
+
+def _offer_set_entries(manifest: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    raw = manifest.get("offer_sets", [])
+    if isinstance(raw, Mapping):
+        entries: list[Mapping[str, Any]] = []
+        for raw_offer_set_id, raw_entry in raw.items():
+            if not isinstance(raw_entry, Mapping):
+                _raise_manifest_invalid()
+            offer_set_id = _validated_manifest_offer_set_id(raw_offer_set_id)
+            embedded_offer_set_id = _optional_offer_set_id(
+                raw_entry.get("offer_set_id"),
+                label="offer_set.offer_set_id",
+            )
+            if (
+                embedded_offer_set_id is not None
+                and embedded_offer_set_id != offer_set_id
+            ):
+                _raise_contract_mismatch("promotion offer set")
+            entries.append({**raw_entry, "offer_set_id": offer_set_id})
+        _reject_duplicate_offer_set_ids(entries)
+        return entries
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        _raise_manifest_invalid()
+    if not all(isinstance(item, Mapping) for item in raw):
+        _raise_manifest_invalid()
+    entries = list(raw)
+    _reject_duplicate_offer_set_ids(entries)
+    return entries
+
+
+def _reject_duplicate_offer_set_ids(
+    offer_sets: Sequence[Mapping[str, Any]],
+) -> None:
+    seen: set[str] = set()
+    for offer_set in offer_sets:
+        offer_set_id = _required_manifest_offer_set_id(offer_set)
+        if offer_set_id in seen:
+            _raise_manifest_invalid()
+        seen.add(offer_set_id)
+
+
+def _required_manifest_offer_set_id(value: Mapping[str, Any]) -> str:
+    return _validated_manifest_offer_set_id(
+        _required_text(value.get("offer_set_id"), "offer_set.offer_set_id")
+    )
+
+
+def _validated_manifest_offer_set_id(value: object) -> str:
+    try:
+        return _validated_offer_set_id(value)
+    except ValueError as exc:
+        raise PermanentGenerationError(
+            code="brand_context_manifest_invalid",
+            safe_message="The brand context manifest was invalid.",
+        ) from exc
+
+
+def _optional_offer_set_id(value: object, *, label: str) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return _validated_offer_set_id(value)
+    except ValueError as exc:
+        raise PermanentGenerationError(
+            code="brand_context_manifest_invalid",
+            safe_message=f"The {label} was invalid.",
+        ) from exc
+
+
+def _raise_manifest_invalid() -> None:
+    raise PermanentGenerationError(
+        code="brand_context_manifest_invalid",
+        safe_message="The brand context manifest was invalid.",
+    )
+
+
+def _raise_contract_mismatch(label: str) -> None:
+    raise PermanentGenerationError(
+        code="brand_context_contract_mismatch",
+        safe_message=f"The {label} did not match the expected contract.",
+    )
+
+
+def _normalise_offer_catalog(
+    catalog: Mapping[str, Any],
+    *,
+    catalog_entry: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    project_id: str,
+    selected_offer_set_id: str | None,
+    offer_set_entry: Mapping[str, Any] | None,
+) -> Mapping[str, Any]:
+    _require_schema(
+        catalog,
+        PROMOTION_PRICE_CATALOG_SCHEMA_VERSION,
+        label="promotion price catalog",
+    )
+    _require_equal(
+        catalog,
+        "project_id",
+        project_id,
+        label="promotion price catalog",
+    )
+    catalog_id = _required_text(catalog.get("catalog_id"), "catalog.catalog_id")
+    _require_equal(
+        catalog_entry,
+        "catalog_id",
+        catalog_id,
+        label="promotion price catalog reference",
+    )
+    catalog_version = _required_text(
+        catalog.get("catalog_version"),
+        "catalog.catalog_version",
+    )
+    _require_equal(
+        catalog_entry,
+        "version",
+        catalog_version,
+        label="promotion price catalog reference",
+    )
+    normalized_offer_set_id = _normalised_catalog_offer_set_id(
+        catalog=catalog,
+        catalog_entry=catalog_entry,
+        offer_set_entry=offer_set_entry,
+        selected_offer_set_id=selected_offer_set_id,
+    )
+    landing_url = _normalised_catalog_https_url(
+        catalog=catalog,
+        catalog_entry=catalog_entry,
+        offer_set_entry=offer_set_entry,
+        field_name="landing_url",
+    )
+    deal_code = _normalised_catalog_deal_code(
+        catalog=catalog,
+        catalog_entry=catalog_entry,
+        offer_set_entry=offer_set_entry,
+    )
+    currency = _required_text(catalog.get("currency"), "catalog.currency")
+    hotels = _mapping_list(catalog, "hotels")
+    if not hotels or len(hotels) > 20:
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="The promotion price catalog was invalid.",
+        )
+    assets = _mapping_list(manifest, "assets")
+    normalized_hotels: list[dict[str, Any]] = []
+    seen_hotel_ids: set[str] = set()
+    for hotel in hotels:
+        hotel_id = _required_text(hotel.get("hotel_id"), "catalog.hotel_id")
+        if hotel_id in seen_hotel_ids:
+            raise PermanentGenerationError(
+                code="brand_context_catalog_invalid",
+                safe_message="The promotion price catalog was invalid.",
+            )
+        seen_hotel_ids.add(hotel_id)
+        destination_id = _required_text(
+            hotel.get("destination_id"),
+            "catalog.destination_id",
+        )
+        asset = _select_offer_asset(
+            assets,
+            hotel_id=hotel_id,
+            destination_id=destination_id,
+        )
+        if asset is None:
+            raise PermanentGenerationError(
+                code="brand_context_offer_asset_missing",
+                safe_message="A promotion hotel image was unavailable.",
+            )
+        normalized_hotel = {
+            "offer_id": hotel_id,
+            "hotel_name": _required_text(
+                hotel.get("hotel_name"),
+                "catalog.hotel_name",
+            ),
+            "destination_id": destination_id,
+            "currency": _required_text(
+                hotel.get("currency"),
+                "catalog.hotel.currency",
+            ),
+            "sale_price_per_night": _catalog_nonnegative_int(
+                hotel.get("sale_price_per_night"),
+                "catalog.sale_price_per_night",
+            ),
+            "original_price_per_night": _catalog_optional_nonnegative_int(
+                hotel.get("original_price_per_night"),
+                "catalog.original_price_per_night",
+            ),
+            "promotion_price_per_night": _catalog_optional_nonnegative_int(
+                hotel.get("promotion_price_per_night"),
+                "catalog.promotion_price_per_night",
+            ),
+            "discount_rate_percent": _catalog_optional_nonnegative_int(
+                hotel.get("discount_rate_percent"),
+                "catalog.discount_rate_percent",
+            ),
+            "additional_discount_rate_percent": (
+                _catalog_optional_nonnegative_int(
+                    hotel.get("additional_discount_rate_percent"),
+                    "catalog.additional_discount_rate_percent",
+                )
+            ),
+            "image_path": _validated_frontend_path(asset.get("frontend_path")),
+            "asset_id": _required_text(asset.get("asset_id"), "asset.asset_id"),
+        }
+        _validate_catalog_price_order(normalized_hotel)
+        destination_url = _optional_https_url(
+            hotel.get("destination_url"),
+            field_name="catalog.destination_url",
+        )
+        if destination_url is not None:
+            normalized_hotel["destination_url"] = destination_url
+        normalized_hotels.append(normalized_hotel)
+    normalized_catalog: dict[str, Any] = {
+        "schema_version": PROMOTION_PRICE_CATALOG_SCHEMA_VERSION,
+        "catalog_id": catalog_id,
+        "catalog_version": catalog_version,
+        "promotion_label": _required_text(
+            catalog.get("promotion_label"),
+            "catalog.promotion_label",
+        ),
+        "currency": currency,
+        "price_basis": _required_text(
+            catalog.get("price_basis"),
+            "catalog.price_basis",
+        ),
+        "hotels": normalized_hotels,
+    }
+    if selected_offer_set_id is not None:
+        normalized_catalog["catalog_sha256"] = _required_sha256(
+            catalog_entry.get("sha256"),
+            "catalog.sha256",
+        )
+    if normalized_offer_set_id is not None:
+        normalized_catalog["offer_set_id"] = normalized_offer_set_id
+    if landing_url is not None:
+        normalized_catalog["landing_url"] = landing_url
+    if deal_code is not None:
+        normalized_catalog["deal_code"] = deal_code
+    return normalized_catalog
+
+
+def _validate_catalog_price_order(hotel: Mapping[str, Any]) -> None:
+    sale_price = int(hotel["sale_price_per_night"])
+    promotion_price = hotel.get("promotion_price_per_night")
+    original_price = hotel.get("original_price_per_night")
+    if promotion_price is not None and int(promotion_price) < sale_price:
+        _raise_invalid_catalog_price_order()
+    comparison_price = (
+        int(promotion_price) if promotion_price is not None else sale_price
+    )
+    if original_price is not None and int(original_price) < comparison_price:
+        _raise_invalid_catalog_price_order()
+
+
+def _raise_invalid_catalog_price_order() -> None:
+    raise PermanentGenerationError(
+        code="brand_context_catalog_invalid",
+        safe_message="The promotion price catalog was invalid.",
+    )
+
+
+def _normalised_catalog_offer_set_id(
+    *,
+    catalog: Mapping[str, Any],
+    catalog_entry: Mapping[str, Any],
+    offer_set_entry: Mapping[str, Any] | None,
+    selected_offer_set_id: str | None,
+) -> str | None:
+    candidates = [selected_offer_set_id]
+    if offer_set_entry is not None:
+        candidates.append(
+            _optional_offer_set_id(
+                offer_set_entry.get("offer_set_id"),
+                label="offer_set.offer_set_id",
+            )
+        )
+    candidates.extend(
+        [
+            _optional_offer_set_id(
+                catalog_entry.get("offer_set_id"),
+                label="catalog reference offer_set_id",
+            ),
+            _optional_catalog_offer_set_id(catalog.get("offer_set_id")),
+        ]
+    )
+    values = {item for item in candidates if item is not None}
+    if len(values) > 1:
+        _raise_contract_mismatch("promotion offer set identity")
+    return next(iter(values)) if values else None
+
+
+def _optional_catalog_offer_set_id(value: object) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return _validated_offer_set_id(value)
+    except ValueError as exc:
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="The promotion price catalog was invalid.",
+        ) from exc
+
+
+def _normalised_catalog_https_url(
+    *,
+    catalog: Mapping[str, Any],
+    catalog_entry: Mapping[str, Any],
+    offer_set_entry: Mapping[str, Any] | None,
+    field_name: str,
+) -> str | None:
+    sources: list[tuple[object, str]] = [
+        (catalog.get(field_name), f"catalog.{field_name}"),
+        (catalog_entry.get(field_name), f"catalog reference {field_name}"),
+    ]
+    if offer_set_entry is not None:
+        sources.append(
+            (offer_set_entry.get(field_name), f"offer_set.{field_name}")
+        )
+    values = {
+        normalized
+        for raw, label in sources
+        if (normalized := _optional_https_url(raw, field_name=label)) is not None
+    }
+    if len(values) > 1:
+        _raise_contract_mismatch(f"promotion offer set {field_name}")
+    return next(iter(values)) if values else None
+
+
+def _normalised_catalog_deal_code(
+    *,
+    catalog: Mapping[str, Any],
+    catalog_entry: Mapping[str, Any],
+    offer_set_entry: Mapping[str, Any] | None,
+) -> str | None:
+    sources: list[object] = [
+        catalog.get("deal_code"),
+        catalog_entry.get("deal_code"),
+    ]
+    if offer_set_entry is not None:
+        sources.append(offer_set_entry.get("deal_code"))
+    values = {
+        normalized
+        for raw in sources
+        if (normalized := _optional_deal_code(raw)) is not None
+    }
+    if len(values) > 1:
+        _raise_contract_mismatch("promotion offer set deal_code")
+    return next(iter(values)) if values else None
+
+
+def _optional_deal_code(value: object) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    deal_code = str(value).strip()
+    if not _DEAL_CODE_PATTERN.fullmatch(deal_code):
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="The promotion price catalog deal code was invalid.",
+        )
+    return deal_code
+
+
+def _optional_https_url(value: object, *, field_name: str) -> str | None:
+    if value is None or not str(value).strip():
+        return None
+    url = str(value).strip()
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError as exc:
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message=f"The promotion price {field_name} was invalid.",
+        ) from exc
+    if (
+        parsed.scheme.casefold() != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+        or any(character.isspace() for character in url)
+        or port is not None and not 1 <= port <= 65535
+    ):
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message=f"The promotion price {field_name} was invalid.",
+        )
+    return url
+
+
+def _select_offer_asset(
+    assets: Sequence[Mapping[str, Any]],
+    *,
+    hotel_id: str,
+    destination_id: str,
+) -> Mapping[str, Any] | None:
+    candidates: list[tuple[int, str, Mapping[str, Any]]] = []
+    for asset in assets:
+        if not _asset_is_eligible(asset) or not str(
+            asset.get("frontend_path") or ""
+        ).strip():
+            continue
+        entity_refs = _mapping_list(asset, "entity_refs")
+        hotel_refs = [
+            ref
+            for ref in entity_refs
+            if str(ref.get("type") or "") == "hotel"
+            and str(ref.get("id") or "") == hotel_id
+        ]
+        destination_match = any(
+            str(ref.get("type") or "") == "destination"
+            and str(ref.get("id") or "") == destination_id
+            for ref in entity_refs
+        )
+        if hotel_refs:
+            primary = any(str(ref.get("usage") or "") == "primary" for ref in hotel_refs)
+            priority = 0 if primary else 1
+        elif destination_match and str(asset.get("role") or "") in {"hero", "hotel"}:
+            priority = 2
+        else:
+            continue
+        candidates.append(
+            (priority, str(asset.get("asset_id") or ""), asset)
+        )
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: (item[0], item[1]))[2]
+
+
+def _validated_frontend_path(value: object) -> str:
+    path = _required_text(value, "asset.frontend_path")
+    if not path.startswith("/") or path.startswith("//") or ".." in path.split("/"):
+        raise PermanentGenerationError(
+            code="brand_context_catalog_invalid",
+            safe_message="A promotion image path was invalid.",
+        )
+    return path
+
+
+def _catalog_nonnegative_int(value: object, field_name: str) -> int:
+    return _required_nonnegative_int(value, field_name)
+
+
+def _catalog_optional_nonnegative_int(
+    value: object,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    return _required_nonnegative_int(value, field_name)
 
 
 def _brand_kit_rules(value: Mapping[str, Any]) -> dict[str, Any]:

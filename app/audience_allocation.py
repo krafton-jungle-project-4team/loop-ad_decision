@@ -15,6 +15,7 @@ from app.audience_exclusions import (
     PromotionAudienceExclusionContext,
     PromotionAudienceExclusionReader,
     SegmentAudienceExclusionError,
+    promotion_target_is_active_sql,
 )
 from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 
@@ -22,6 +23,7 @@ from app.analysis.segment_suggester import DEFAULT_MAX_SUGGESTED_SEGMENTS
 ALLOCATION_POLICY_VERSION = "hotel_segment_allocation.v1"
 ALLOCATION_PREVIEW_VERSION = "audience_allocation_preview.v1"
 ALLOCATION_POLICY_PRIORITY = {
+    "custom_structured": -1,
     "target_destination_affinity": 0,
     "funnel_recovery": 1,
     "benefit_value_seeker": 2,
@@ -1053,7 +1055,7 @@ class PostgresAudienceAllocationRepository:
                         PARTITION BY member.user_id
                         ORDER BY source.priority ASC,
                                  (member.behavior_fit_score - source.score_threshold)
-                                    / source.semantic_margin DESC,
+                                    / source.semantic_margin DESC NULLS LAST,
                                  source.segment_id ASC
                     ) AS winner_rank
                 FROM audience_allocation_sources AS source
@@ -1062,10 +1064,16 @@ class PostgresAudienceAllocationRepository:
                 WHERE NOT EXISTS (
                     SELECT 1
                     FROM {POSTGRES_EXCLUSION_RELATION} AS excluded
+                    JOIN promotion_target_segments AS target
+                      ON target.analysis_id = excluded.target_analysis_id
+                     AND target.segment_id = excluded.segment_id
+                     AND target.allocation_plan_id = excluded.allocation_plan_id
+                     AND target.audience_snapshot_id = excluded.final_snapshot_id
                     WHERE excluded.project_id = %s
                       AND excluded.promotion_id = %s
                       AND excluded.user_id = member.user_id
                       AND excluded.state IN ('reserved', 'consumed')
+                      AND {promotion_target_is_active_sql("target")}
                 )
             )
             SELECT *
@@ -1358,6 +1366,21 @@ class PostgresAudienceAllocationRepository:
                         consumed_at = NULL,
                         released_at = NULL
                     WHERE {POSTGRES_EXCLUSION_RELATION}.state = 'released'
+                       OR EXISTS (
+                            SELECT 1
+                            FROM promotion_target_segments AS stale_target
+                            WHERE stale_target.analysis_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.target_analysis_id
+                              AND stale_target.segment_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.segment_id
+                              AND stale_target.allocation_plan_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.allocation_plan_id
+                              AND stale_target.audience_snapshot_id =
+                                      {POSTGRES_EXCLUSION_RELATION}.final_snapshot_id
+                              AND NOT (
+                                  {promotion_target_is_active_sql("stale_target")}
+                              )
+                       )
                     RETURNING user_id
                 )
                 SELECT count(*) AS reserved_count

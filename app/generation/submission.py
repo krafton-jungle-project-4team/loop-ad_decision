@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Any, Protocol
 
 from app.generation.brand_context import (
@@ -14,6 +14,7 @@ from app.generation.brand_context import (
 from app.generation.prompt_builder import (
     GenerationInputBuilder,
     GenerationPromptInput,
+    PromotionOfferLink,
     PromotionPromptInput,
     TargetSegmentPromptInput,
 )
@@ -27,7 +28,12 @@ from app.generation.schemas import (
     GenerationRequest,
     GenerationStatus,
 )
-from app.logging import log
+from app.logging import duration_ms, log, log_context_scope, now_ms
+from app.promotion_offers.service import (
+    canonical_offer_destination_url,
+    canonical_promotion_landing_url,
+    validated_storefront_url,
+)
 
 
 GENERATION_REQUEST_SCHEMA_VERSION = "generation.request.v1"
@@ -60,6 +66,15 @@ class GenerationSubmissionInputReader(Protocol):
 
 class BrandContextSnapshotReader(Protocol):
     def resolve_snapshot(self, *, project_id: str) -> BrandContextSnapshot | None:
+        ...
+
+    def load_offer_catalog(
+        self,
+        *,
+        project_id: str,
+        snapshot: BrandContextSnapshot,
+        offer_set_id: str | None = None,
+    ) -> Mapping[str, Any] | None:
         ...
 
 
@@ -114,14 +129,43 @@ class GenerationSubmissionService:
         self._model_version = model_version
         self._coordinator = coordinator
 
+    @log_context_scope
     def submit(
         self,
         request: GenerationRequest,
         *,
         idempotency_key: str,
     ) -> GenerationAcceptedResponse:
-        key = normalize_idempotency_key(idempotency_key)
+        started_at = now_ms()
+        log.assign_context(
+            {
+                "analysisId": request.analysis_id,
+                "campaignId": request.campaign_id,
+                "offerSetId": request.offer_set_id,
+                "projectId": request.project_id,
+                "promotionId": request.promotion_id,
+            }
+        )
+        log.info(
+            "started",
+            {
+                "contentOptionCount": request.content_option_count,
+                "hasOperatorInstruction": bool(request.operator_instruction),
+            },
+        )
+        try:
+            key = normalize_idempotency_key(idempotency_key)
+        except ValueError as exc:
+            log.warn(
+                "generation_request_invalid",
+                {"err": exc, "reason": "idempotency_key_invalid"},
+            )
+            raise
         if self._coordinator is not None and not self._coordinator.accepting:
+            log.warn(
+                "generation_submission_unavailable",
+                {"reason": "worker_shutting_down"},
+            )
             raise GenerationSubmissionUnavailable(
                 "generation worker is shutting down"
             )
@@ -133,15 +177,43 @@ class GenerationSubmissionService:
             if self._brand_context_repository is not None
             else None
         )
-        promotion = self._generation_input_reader.get_promotion_input(request)
+        try:
+            promotion = self._generation_input_reader.get_promotion_input(request)
+        except ValueError as exc:
+            log.warn(
+                "generation_promotion_input_invalid",
+                {"err": exc},
+            )
+            raise GenerationInputUnavailable(
+                f"promotion input is invalid: {exc}"
+            ) from exc
         if promotion is None:
+            log.warn("generation_promotion_input_not_found")
             raise GenerationInputUnavailable(
                 "promotion input was not found for generation"
+            )
+        offer_catalog = _submission_offer_catalog(
+            repository=self._brand_context_repository,
+            project_id=request.project_id,
+            request=request,
+            promotion=promotion,
+            snapshot=brand_context,
+        )
+        promotion = promotion_with_selected_offer_catalog(
+            request=request,
+            promotion=promotion,
+            catalog=offer_catalog,
+        )
+        if offer_catalog is not None and promotion.offer_links:
+            validate_submission_offer_links(
+                offer_links=promotion.offer_links,
+                catalog=offer_catalog,
             )
         target_segments = self._generation_input_reader.list_target_segment_inputs(
             request
         )
         if not target_segments:
+            log.warn("generation_target_segments_empty")
             raise GenerationInputUnavailable(
                 "confirmed promotion_target_segments are required for generation"
             )
@@ -150,6 +222,7 @@ class GenerationSubmissionService:
             promotion=promotion,
             target_segments=target_segments,
             brand_context=brand_context,
+            offer_catalog=offer_catalog,
             model_version=self._model_version,
         )
         fingerprint = generation_request_fingerprint(snapshot)
@@ -185,12 +258,14 @@ class GenerationSubmissionService:
                 persisted.get("request_fingerprint") or ""
             )
             if persisted_fingerprint != fingerprint:
+                log.warn("generation_idempotency_conflict")
                 raise GenerationIdempotencyConflict(
                     "idempotency key was already used for a different generation request"
                 )
             self._connection.commit()
         except GenerationIdempotencyMismatch as exc:
             self._connection.rollback()
+            log.warn("generation_idempotency_conflict", {"err": exc})
             raise GenerationIdempotencyConflict(
                 "idempotency key was already used for a different generation request"
             ) from exc
@@ -215,12 +290,20 @@ class GenerationSubmissionService:
             promotion_id=str(persisted["promotion_id"]),
             status=status,
         )
+        log.assign_context({"generationId": response.generation_id})
         log.info(
             "generation_request_accepted",
             {
-                "generationId": response.generation_id,
                 "status": response.status.value,
                 "created": created,
+            },
+        )
+        log.info(
+            "completed",
+            {
+                "created": created,
+                "durationMs": duration_ms(started_at),
+                "status": response.status.value,
             },
         )
         return response
@@ -245,6 +328,7 @@ def build_generation_input_snapshot(
     promotion: PromotionPromptInput,
     target_segments: Sequence[TargetSegmentPromptInput],
     brand_context: BrandContextSnapshot | None = None,
+    offer_catalog: Mapping[str, Any] | None = None,
     model_version: str = "generation-default",
 ) -> dict[str, Any]:
     GenerationInputBuilder().build(
@@ -252,6 +336,7 @@ def build_generation_input_snapshot(
         promotion=promotion,
         target_segments=target_segments,
         brand_context=brand_context,
+        offer_catalog=offer_catalog,
     )
     targets = sorted(target_segments, key=lambda item: item.segment_id)
     if len({target.segment_id for target in targets}) != len(targets):
@@ -281,6 +366,26 @@ def build_generation_input_snapshot(
     }
     if brand_context is not None:
         snapshot["brand_context"] = brand_context.to_snapshot()
+    if offer_catalog is not None:
+        snapshot["offer_catalog"] = dict(offer_catalog)
+    if request.offer_set_id is not None:
+        selection: dict[str, Any] = {
+            "offer_set_id": request.offer_set_id,
+            "expected_catalog_id": request.expected_catalog_id,
+            "expected_catalog_version": request.expected_catalog_version,
+        }
+        if offer_catalog is not None:
+            selection.update(
+                {
+                    "catalog_id": offer_catalog.get("catalog_id"),
+                    "catalog_version": offer_catalog.get("catalog_version"),
+                    "catalog_sha256": offer_catalog.get("catalog_sha256"),
+                    "landing_url": offer_catalog.get("landing_url"),
+                }
+            )
+        snapshot["offer_selection"] = {
+            key: item for key, item in selection.items() if item is not None
+        }
     return snapshot
 
 
@@ -317,11 +422,29 @@ def prompt_inputs_from_snapshot(
 ) -> list[GenerationPromptInput]:
     if value.get("schema_version") != GENERATION_REQUEST_SCHEMA_VERSION:
         raise GenerationSnapshotError("unsupported generation input schema_version")
+    raw_offer_selection = value.get("offer_selection")
+    if raw_offer_selection is not None and not isinstance(
+        raw_offer_selection,
+        Mapping,
+    ):
+        raise GenerationSnapshotError("offer_selection must be an object")
+    offer_selection = (
+        raw_offer_selection
+        if isinstance(raw_offer_selection, Mapping)
+        else {}
+    )
     request = GenerationRequest(
         project_id=_required_text(value, "project_id"),
         campaign_id=_required_text(value, "campaign_id"),
         promotion_id=_required_text(value, "promotion_id"),
         analysis_id=_required_text(value, "analysis_id"),
+        offer_set_id=_optional_text(offer_selection.get("offer_set_id")),
+        expected_catalog_id=_optional_text(
+            offer_selection.get("expected_catalog_id")
+        ),
+        expected_catalog_version=_optional_text(
+            offer_selection.get("expected_catalog_version")
+        ),
         content_option_count=_required_positive_int(value, "content_option_count"),
         operator_instruction=_optional_text(value.get("operator_instruction")),
     )
@@ -338,6 +461,7 @@ def prompt_inputs_from_snapshot(
         landing_url=_optional_text(promotion_value.get("landing_url")),
         offer_type=_optional_text(promotion_value.get("offer_type")),
         landing_type=_optional_text(promotion_value.get("landing_type")),
+        offer_links=_offer_links_from_snapshot(promotion_value.get("offer_links")),
     )
     raw_targets = value.get("target_segments")
     if not isinstance(raw_targets, list) or not raw_targets:
@@ -359,18 +483,296 @@ def prompt_inputs_from_snapshot(
         )
     except ValueError as exc:
         raise GenerationSnapshotError(str(exc)) from exc
+    offer_catalog_value = value.get("offer_catalog")
+    if offer_catalog_value is not None and not isinstance(
+        offer_catalog_value,
+        Mapping,
+    ):
+        raise GenerationSnapshotError("offer_catalog must be an object")
+    if request.offer_set_id is not None:
+        if not isinstance(offer_catalog_value, Mapping):
+            raise GenerationSnapshotError(
+                "offer_selection requires a snapshotted offer_catalog"
+            )
+        _validate_snapshot_offer_selection(
+            selection=offer_selection,
+            catalog=offer_catalog_value,
+        )
     return GenerationInputBuilder().build(
         request=request,
         promotion=promotion,
         target_segments=targets,
         brand_context=brand_context,
+        offer_catalog=(
+            dict(offer_catalog_value)
+            if isinstance(offer_catalog_value, Mapping)
+            else None
+        ),
     )
+
+
+def _validate_snapshot_offer_selection(
+    *,
+    selection: Mapping[str, Any],
+    catalog: Mapping[str, Any],
+) -> None:
+    for field_name in (
+        "offer_set_id",
+        "catalog_id",
+        "catalog_version",
+        "catalog_sha256",
+    ):
+        selected_value = _optional_text(selection.get(field_name))
+        catalog_value = _optional_text(catalog.get(field_name))
+        if selected_value is None or selected_value != catalog_value:
+            raise GenerationSnapshotError(
+                f"offer_selection {field_name} does not match offer_catalog"
+            )
 
 
 def _promotion_snapshot(value: PromotionPromptInput) -> dict[str, Any]:
     snapshot = asdict(value)
     snapshot["channel"] = value.channel.value
     return snapshot
+
+
+def _submission_offer_catalog(
+    *,
+    repository: BrandContextSnapshotReader | None,
+    project_id: str,
+    request: GenerationRequest,
+    promotion: PromotionPromptInput,
+    snapshot: BrandContextSnapshot | None,
+) -> Mapping[str, Any] | None:
+    if not promotion.offer_links and request.offer_set_id is None:
+        # Dashboard enforces at least one selection for the new catalog flow.
+        # Keep pre-catalog email promotions generatable during the migration.
+        return None
+    if promotion.channel != ContentChannel.EMAIL:
+        raise GenerationInputUnavailable(
+            "promotion offer_links are supported only for email generation"
+        )
+    destination_urls = [link.destination_url for link in promotion.offer_links]
+    if len(destination_urls) != len(set(destination_urls)):
+        raise GenerationInputUnavailable(
+            "promotion offer_links must not contain duplicate destination_url"
+        )
+    if repository is None or snapshot is None:
+        raise GenerationInputUnavailable(
+            "brand context is required for promotion offer_links"
+        )
+    load_offer_catalog = getattr(repository, "load_offer_catalog", None)
+    if not callable(load_offer_catalog):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog loader is unavailable"
+        )
+    if request.offer_set_id is None:
+        catalog = load_offer_catalog(project_id=project_id, snapshot=snapshot)
+    else:
+        catalog = load_offer_catalog(
+            project_id=project_id,
+            snapshot=snapshot,
+            offer_set_id=request.offer_set_id,
+        )
+    if not isinstance(catalog, Mapping):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog is unavailable"
+        )
+    validate_selected_offer_catalog(request=request, catalog=catalog)
+    return dict(catalog)
+
+
+def validate_selected_offer_catalog(
+    *,
+    request: GenerationRequest,
+    catalog: Mapping[str, Any],
+) -> None:
+    catalog_id = _optional_text(catalog.get("catalog_id"))
+    catalog_version = _optional_text(catalog.get("catalog_version"))
+    if (
+        request.expected_catalog_id is not None
+        and catalog_id != request.expected_catalog_id
+    ):
+        raise GenerationInputUnavailable(
+            "selected offer catalog_id does not match expected_catalog_id"
+        )
+    if (
+        request.expected_catalog_version is not None
+        and catalog_version != request.expected_catalog_version
+    ):
+        raise GenerationInputUnavailable(
+            "selected offer catalog_version does not match expected_catalog_version"
+        )
+    selected_offer_set_id = _optional_text(catalog.get("offer_set_id"))
+    if (
+        request.offer_set_id is not None
+        and selected_offer_set_id != request.offer_set_id
+    ):
+        raise GenerationInputUnavailable(
+            "selected offer catalog does not match offer_set_id"
+        )
+
+
+def promotion_with_selected_offer_catalog(
+    *,
+    request: GenerationRequest,
+    promotion: PromotionPromptInput,
+    catalog: Mapping[str, Any] | None,
+) -> PromotionPromptInput:
+    if request.offer_set_id is None or catalog is None:
+        return promotion
+    raw_hotels = catalog.get("hotels")
+    if not isinstance(raw_hotels, Sequence) or isinstance(
+        raw_hotels,
+        (str, bytes),
+    ):
+        raise GenerationInputUnavailable(
+            "selected offer catalog hotels are unavailable"
+        )
+    deal_code = _optional_text(catalog.get("deal_code"))
+    catalog_links: dict[str, PromotionOfferLink] = {}
+    catalog_order: list[str] = []
+    for raw_hotel in raw_hotels:
+        if not isinstance(raw_hotel, Mapping):
+            continue
+        offer_id = _optional_text(raw_hotel.get("offer_id"))
+        if offer_id is None:
+            continue
+        destination_url = _optional_text(raw_hotel.get("destination_url"))
+        expected_destination_url = canonical_offer_destination_url(
+            offer_id,
+            deal_code=deal_code,
+        )
+        if destination_url is None:
+            destination_url = expected_destination_url
+        else:
+            try:
+                destination_url = validated_storefront_url(destination_url)
+            except ValueError as exc:
+                raise GenerationInputUnavailable(
+                    "selected offer destination_url is invalid"
+                ) from exc
+            if destination_url != expected_destination_url:
+                raise GenerationInputUnavailable(
+                    "selected offer destination_url does not match its price tier"
+                )
+        catalog_links[offer_id] = PromotionOfferLink(
+            offer_id=offer_id,
+            destination_url=destination_url,
+        )
+        catalog_order.append(offer_id)
+    if not catalog_links:
+        raise GenerationInputUnavailable(
+            "selected offer catalog contains no usable hotels"
+        )
+
+    landing_url = _optional_text(catalog.get("landing_url"))
+    if landing_url is None:
+        landing_url = canonical_promotion_landing_url(deal_code)
+    else:
+        try:
+            landing_url = validated_storefront_url(landing_url)
+        except ValueError as exc:
+            raise GenerationInputUnavailable(
+                "selected offer landing_url is invalid"
+            ) from exc
+        if deal_code is not None and landing_url != canonical_promotion_landing_url(
+            deal_code
+        ):
+            raise GenerationInputUnavailable(
+                "selected offer landing_url does not match its price tier"
+            )
+    return replace(
+        promotion,
+        landing_url=landing_url,
+        # An explicit offer set is the immutable source of truth. Legacy
+        # promotion metadata may still contain a partial V2 selection and must
+        # not silently narrow the V3 last-call set.
+        offer_links=tuple(catalog_links[offer_id] for offer_id in catalog_order),
+    )
+
+
+def validate_submission_offer_links(
+    *,
+    offer_links: Sequence[PromotionOfferLink],
+    catalog: Mapping[str, Any],
+) -> None:
+    raw_hotels = catalog.get("hotels")
+    if not isinstance(raw_hotels, Sequence) or isinstance(
+        raw_hotels,
+        (str, bytes),
+    ):
+        raise GenerationInputUnavailable(
+            "brand context offer catalog hotels are unavailable"
+        )
+
+    hotels_by_offer_id = {
+        offer_id.strip(): hotel
+        for hotel in raw_hotels
+        if isinstance(hotel, Mapping)
+        and isinstance((offer_id := hotel.get("offer_id")), str)
+        and offer_id.strip()
+    }
+    available_offer_ids = set(hotels_by_offer_id)
+    missing_offer_ids = sorted(
+        link.offer_id
+        for link in offer_links
+        if link.offer_id not in available_offer_ids
+    )
+    if missing_offer_ids:
+        raise GenerationInputUnavailable(
+            "promotion offer_id is not available in the current brand context "
+            f"offer catalog: {', '.join(missing_offer_ids)}"
+        )
+
+    for link in offer_links:
+        catalog_hotel = hotels_by_offer_id[link.offer_id]
+        expected_url = canonical_offer_destination_url(
+            link.offer_id,
+            deal_code=_optional_text(catalog.get("deal_code")),
+        )
+        canonical_url = _optional_text(catalog_hotel.get("destination_url"))
+        if canonical_url is None:
+            canonical_url = expected_url
+        else:
+            try:
+                canonical_url = validated_storefront_url(canonical_url)
+            except ValueError as exc:
+                raise GenerationInputUnavailable(
+                    "promotion offer destination_url must use the storefront"
+                ) from exc
+            if canonical_url != expected_url:
+                raise GenerationInputUnavailable(
+                    "promotion offer destination_url must match its price tier"
+                )
+        if link.destination_url != canonical_url:
+            raise GenerationInputUnavailable(
+                "promotion offer destination_url must match the canonical URL "
+                f"for offer_id {link.offer_id}"
+            )
+
+
+def _offer_links_from_snapshot(value: object) -> tuple[PromotionOfferLink, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise GenerationSnapshotError("promotion.offer_links must be an array")
+    links: list[PromotionOfferLink] = []
+    try:
+        for raw_link in value:
+            if not isinstance(raw_link, Mapping):
+                raise GenerationSnapshotError(
+                    "promotion.offer_links entries must be objects"
+                )
+            links.append(
+                PromotionOfferLink(
+                    offer_id=_required_text(raw_link, "offer_id"),
+                    destination_url=_required_text(raw_link, "destination_url"),
+                )
+            )
+    except ValueError as exc:
+        raise GenerationSnapshotError(str(exc)) from exc
+    return tuple(links)
 
 
 def _target_segment_snapshot(value: TargetSegmentPromptInput) -> dict[str, Any]:

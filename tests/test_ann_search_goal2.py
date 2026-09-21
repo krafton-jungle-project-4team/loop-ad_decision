@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from offline_evaluation.ann_search_goal2 import (
-    GOAL1_ROOT,
+    SCALE_COHORT_SIZES,
     build_execution_manifest,
     build_policy_coverage_audit,
     build_tuning_cells,
@@ -18,6 +21,43 @@ from scripts.run_ann_scale_goal2 import (
     _final_scale_rows,
     _validate_raw_block,
 )
+
+
+@pytest.fixture
+def goal1_root(tmp_path: Path) -> Path:
+    """Synthetic planning inputs; no private measurements or user data required."""
+    def write(relative: str, payload: object) -> None:
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    scenarios = [
+        {"scenario_id": f"synthetic-{index}", "candidate_type": "intent_matched",
+         "scenario_set": "tuning" if index < 19 else "confirmation"}
+        for index in range(22)
+    ]
+    write("phase2/selected-scenario-manifest.json", {"scenarios": scenarios})
+    write("phase2/scenario-pairs.json", {"pairs": [{
+        "validated": True, "candidate_type": "intent_matched",
+        "tuning_scenario_id": "synthetic-0",
+        "confirmation_scenario_id": "synthetic-19",
+    }]})
+    write("goal2-tuning-inputs.json", {"cells": [
+        {"corpus_user_count": SCALE_COHORT_SIZES[index % 6],
+         "scenario_id": f"synthetic-{index}", "candidate_type": "intent_matched",
+         "requested_k": 500 * (k + 1)}
+        for index in range(19)
+        for k in range(6 if index < 9 else 5)
+    ]})
+    for size in SCALE_COHORT_SIZES:
+        for scenario in scenarios:
+            write(f"phase4/cohort-{size}/ground-truth/{scenario['scenario_id']}.summary.json", {
+                "scenario_id": scenario["scenario_id"], "corpus_user_count": size,
+                "hard_match_user_count": size // 10,
+                "estimated_member_count": size // 100,
+            })
+        write(f"phase5/cohort-{size}/screening-result.json", {"summaries": []})
+    return tmp_path
 
 
 def test_goal2_grid_is_the_preregistered_24_settings() -> None:
@@ -36,9 +76,9 @@ def test_goal2_grid_is_the_preregistered_24_settings() -> None:
     }
 
 
-def test_goal2_execution_manifest_freezes_exact_expected_volume() -> None:
-    cells = build_tuning_cells(GOAL1_ROOT)
-    manifest = build_execution_manifest(GOAL1_ROOT)
+def test_goal2_execution_manifest_freezes_exact_expected_volume(goal1_root: Path) -> None:
+    cells = build_tuning_cells(goal1_root)
+    manifest = build_execution_manifest(goal1_root)
 
     assert len(cells) == 2_496
     assert len({item.identity for item in cells}) == 2_496
@@ -52,10 +92,12 @@ def test_goal2_execution_manifest_freezes_exact_expected_volume() -> None:
     assert manifest["expected_measured_observation_count"] == 25_530
 
 
-def test_goal2_policy_coverage_is_not_identifiable_without_five_types() -> None:
-    audit = build_policy_coverage_audit(GOAL1_ROOT)
+def test_goal2_policy_coverage_is_not_identifiable_without_five_types(goal1_root: Path) -> None:
+    audit = build_policy_coverage_audit(goal1_root)
 
     assert audit["bucket_count"] > 0
+    assert any(item["tuning_confirmation_pair_exists"] for item in audit["buckets"])
+    assert any(item["ann_screening_survivor_exists"] for item in audit["buckets"])
     assert audit["five_candidate_type_coverage_bucket_count"] == 0
     assert audit["policy_rule_possible_bucket_count"] == 0
     assert audit["product_confirmation_branch_enabled"] is False

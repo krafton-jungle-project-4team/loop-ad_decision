@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Mapping, Sequence
 
 from app.analysis.behavior_manifest import behavior_manifest_hash
@@ -19,6 +20,121 @@ LEGACY_AUDIENCE_CONTRACT = "legacy"
 SEGMENT_AUDIENCE_CONTRACT = "segment_audience.v1"
 SEGMENT_AUDIENCE_SCHEMA_VERSION = "hotel_behavior.v2"
 SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION = "segment_behavior_query.v2"
+CUSTOM_STRUCTURED_TEMPLATE_ID = "custom_structured_condition"
+CUSTOM_STRUCTURED_TEMPLATE_VERSION = 1
+CUSTOM_STRUCTURED_CANDIDATE_TYPE = "custom_structured"
+CUSTOM_STRUCTURED_WINDOW_DAYS = 30
+CUSTOM_STRUCTURED_MIN_WINDOW_DAYS = 1
+CUSTOM_STRUCTURED_MAX_WINDOW_DAYS = 365
+CUSTOM_STRUCTURED_PARAMETER_POLICY_ID = "custom_structured_parameters.v1"
+CUSTOM_STRUCTURED_SELECTION_POLICY_ID = "exact_predicate_membership.v1"
+CUSTOM_STRUCTURED_ANCHOR_POLICY_ID = "structured_conditions_no_anchor.v1"
+CUSTOM_STRUCTURED_CONDITION_KEY = "structured_conditions"
+CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION = 2
+CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID = "custom_structured_parameters.v2"
+CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID = "source_refinement_exact_membership.v1"
+CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID = (
+    "source_membership_with_optional_structured_conditions.v1"
+)
+CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY = "source_audience_membership"
+
+
+def custom_structured_template_hash(
+    *,
+    template_version: int,
+    window_days: int,
+) -> str:
+    if (
+        not isinstance(window_days, int)
+        or isinstance(window_days, bool)
+        or not CUSTOM_STRUCTURED_MIN_WINDOW_DAYS
+        <= window_days
+        <= CUSTOM_STRUCTURED_MAX_WINDOW_DAYS
+    ):
+        raise ValueError("custom structured window must be between 1 and 365 days")
+    if template_version == CUSTOM_STRUCTURED_TEMPLATE_VERSION:
+        semantics = {
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "conditions": "allowlisted_event_property_count_conjunction",
+            "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+            "selection": "exact_predicate_membership_vector_tiebreak_only",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+            "window_days": window_days,
+        }
+    elif template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
+        semantics = {
+            "base_membership": "canonical_source_suggestion_user_ids",
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "conditions": "optional_allowlisted_event_property_count_conjunction",
+            "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
+            "selection": "source_membership_with_optional_exact_predicate_membership",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+            "window_days": window_days,
+        }
+    else:
+        raise ValueError("unsupported custom structured template version")
+    return hashlib.sha256(
+        json.dumps(semantics, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+CUSTOM_STRUCTURED_TEMPLATE_HASH = custom_structured_template_hash(
+    template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+    window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
+)
+CUSTOM_SOURCE_REFINEMENT_TEMPLATE_HASH = custom_structured_template_hash(
+    template_version=CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+    window_days=CUSTOM_STRUCTURED_WINDOW_DAYS,
+)
+
+CUSTOM_STRUCTURED_EVENT_NAMES = frozenset(
+    {
+        "page_view",
+        "hotel_search",
+        "hotel_click",
+        "hotel_detail_view",
+        "promotion_impression",
+        "promotion_click",
+        "campaign_redirect_click",
+        "campaign_landing",
+        "booking_start",
+        "booking_complete",
+        "booking_cancel",
+    }
+)
+CUSTOM_STRUCTURED_PROPERTY_KEYS = frozenset(
+    {
+        "deal",
+        "free_cancellation",
+        "breakfast_included",
+        "age_group",
+        "gender",
+        "region",
+        "preferred_category",
+        "user_segment",
+        "adult_count",
+        "child_count",
+        "rooms",
+        "hotel_id",
+        "hotel_name",
+        "hotel_city",
+        "hotel_country",
+        "hotel_market",
+        "hotel_cluster",
+        "hotel_star_rating",
+        "hotel_guest_rating",
+        "price",
+        "property_type",
+        "room_type",
+        "revenue",
+    }
+)
+CUSTOM_STRUCTURED_PROPERTY_OPERATORS = frozenset(
+    {"equals", "in", "contains", "exists", "gte", "lte"}
+)
+SCORE_THRESHOLD_QUANTUM = Decimal("0.000001")
 _QUERY_COMPILER_SEMANTICS = {
     "version": SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
     "schema_version": SEGMENT_AUDIENCE_SCHEMA_VERSION,
@@ -35,6 +151,14 @@ SEGMENT_AUDIENCE_QUERY_COMPILER_HASH = hashlib.sha256(
         separators=(",", ":"),
     ).encode("utf-8")
 ).hexdigest()
+
+
+def contract_score_threshold(value: float | Decimal) -> Decimal:
+    """Normalize to the NUMERIC(10, 6) precision in the data contract."""
+    return Decimal(str(value)).quantize(
+        SCORE_THRESHOLD_QUANTUM,
+        rounding=ROUND_HALF_UP,
+    )
 
 
 class SegmentAudienceContractError(RuntimeError):
@@ -71,14 +195,39 @@ class SegmentAudienceSpec:
     semantic_anchor_policy_id: str
     observation_window_days: int
     spec_hash: str
+    custom_conditions: tuple[Mapping[str, Any], ...] = ()
+    base_user_ids: tuple[str, ...] = ()
+
+    @property
+    def is_custom_structured(self) -> bool:
+        return self.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+
+    @property
+    def is_source_refinement(self) -> bool:
+        return bool(self.base_user_ids)
 
     @property
     def predicate_parameters(self) -> Mapping[str, Sequence[str] | Sequence[int]]:
-        return {
+        parameters: dict[str, Sequence[str] | Sequence[int]] = {
             "destinations": self.destination_ids,
             "season_months": self.season_months,
             "benefit_keys": self.benefit_keys,
         }
+        if self.is_custom_structured:
+            parameters["structured_conditions_json"] = (
+                json.dumps(
+                    list(self.custom_conditions),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            )
+            parameters["observation_window_days"] = (
+                self.observation_window_days,
+            )
+        if self.is_source_refinement:
+            parameters["base_user_ids"] = self.base_user_ids
+        return parameters
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +289,12 @@ def _parse_spec(
             f"segment audience schema must be {SEGMENT_AUDIENCE_SCHEMA_VERSION}",
         )
     template_id = _required_text(raw_spec, "template_id", segment_id)
+    if template_id == CUSTOM_STRUCTURED_TEMPLATE_ID:
+        return _parse_custom_structured_spec(
+            segment_id=segment_id,
+            schema_version=schema_version,
+            raw_spec=raw_spec,
+        )
     try:
         template = require_registered_template(template_id)
     except ValueError as exc:
@@ -329,6 +484,425 @@ def _parse_spec(
         semantic_anchor_policy_id=semantic_anchor_policy_id,
         observation_window_days=observation_window_days,
         spec_hash=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+    )
+
+
+def _parse_custom_structured_spec(
+    *,
+    segment_id: str,
+    schema_version: str,
+    raw_spec: Mapping[str, Any],
+) -> SegmentAudienceSpec:
+    raw_parameters = raw_spec.get("parameters")
+    if not isinstance(raw_parameters, Mapping):
+        raise _error(
+            "segment_audience_parameters_invalid",
+            segment_id,
+            "custom structured parameters must be an object",
+        )
+    lookback_days = raw_parameters.get("lookback_days")
+    if (
+        not isinstance(lookback_days, int)
+        or isinstance(lookback_days, bool)
+        or not CUSTOM_STRUCTURED_MIN_WINDOW_DAYS
+        <= lookback_days
+        <= CUSTOM_STRUCTURED_MAX_WINDOW_DAYS
+    ):
+        raise _error(
+            "segment_audience_window_invalid",
+            segment_id,
+            "custom structured lookback_days must be between 1 and 365",
+        )
+    template_version = raw_spec.get("template_version")
+    if template_version == CUSTOM_STRUCTURED_TEMPLATE_VERSION:
+        expected_static = {
+            "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+            "template_semantic_hash": custom_structured_template_hash(
+                template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+                window_days=lookback_days,
+            ),
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+            "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+            "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+            "observation_window_days": lookback_days,
+        }
+        is_source_refinement = False
+    elif template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION:
+        expected_static = {
+            "template_version": CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+            "template_semantic_hash": custom_structured_template_hash(
+                template_version=CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+                window_days=lookback_days,
+            ),
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "parameter_policy_id": CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
+            "semantic_selection_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
+            ),
+            "semantic_anchor_policy_id": CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
+            "observation_window_days": lookback_days,
+        }
+        is_source_refinement = True
+    else:
+        raise _error(
+            "segment_audience_template_binding_mismatch",
+            segment_id,
+            "template_version does not match a supported custom structured template",
+        )
+    for field_name, expected in expected_static.items():
+        if raw_spec.get(field_name) != expected:
+            raise _error(
+                "segment_audience_template_binding_mismatch",
+                segment_id,
+                f"{field_name} does not match the custom structured template",
+            )
+
+    custom_conditions = _canonical_custom_conditions(
+        raw_parameters.get("conditions"),
+        segment_id=segment_id,
+        allow_empty=is_source_refinement,
+    )
+    base_user_ids = (
+        _canonical_source_user_ids(
+            raw_parameters.get("base_user_ids"),
+            segment_id=segment_id,
+        )
+        if template_version == CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+        else ()
+    )
+    expected_keys = (
+        (CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,)
+        + ((CUSTOM_STRUCTURED_CONDITION_KEY,) if custom_conditions else ())
+        if is_source_refinement
+        else (CUSTOM_STRUCTURED_CONDITION_KEY,)
+    )
+    condition_keys = _required_text_tuple(raw_spec, "condition_keys", segment_id)
+    hard_predicate_keys = _required_text_tuple(
+        raw_spec,
+        "hard_predicate_keys",
+        segment_id,
+    )
+    if condition_keys != expected_keys or hard_predicate_keys != expected_keys:
+        raise _error(
+            "segment_audience_template_binding_mismatch",
+            segment_id,
+            "custom structured predicates do not match the template version",
+        )
+    query_signal_keys = _custom_query_signal_keys(custom_conditions)
+    raw_query_signal_keys = _required_text_tuple(
+        raw_spec,
+        "query_signal_keys",
+        segment_id,
+    )
+    if raw_query_signal_keys != query_signal_keys:
+        raise _error(
+            "segment_audience_template_binding_mismatch",
+            segment_id,
+            "query_signal_keys do not match the structured conditions",
+        )
+
+    destination_ids = tuple(
+        sorted(
+            {
+                str(condition["destination"]).strip().lower()
+                for condition in custom_conditions
+                if condition.get("destination")
+            }
+        )
+    )
+    season_months = tuple(
+        sorted(
+            {
+                int(month)
+                for condition in custom_conditions
+                for month in condition.get("checkin_months", ())
+            }
+        )
+    )
+    canonical = {
+        "schema_version": schema_version,
+        "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+        **expected_static,
+        "condition_keys": list(condition_keys),
+        "query_signal_keys": list(query_signal_keys),
+        "hard_predicate_keys": list(hard_predicate_keys),
+        "parameters": {
+            "lookback_days": lookback_days,
+            "conditions": list(custom_conditions),
+            **(
+                {"base_user_ids": list(base_user_ids)}
+                if base_user_ids
+                else {}
+            ),
+        },
+    }
+    serialized = json.dumps(
+        canonical,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return SegmentAudienceSpec(
+        segment_id=segment_id,
+        schema_version=schema_version,
+        template_id=CUSTOM_STRUCTURED_TEMPLATE_ID,
+        template_version=int(template_version),
+        template_semantic_hash=str(expected_static["template_semantic_hash"]),
+        candidate_type=CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+        condition_keys=condition_keys,
+        query_signal_keys=query_signal_keys,
+        hard_predicate_keys=hard_predicate_keys,
+        destination_ids=destination_ids,
+        season_months=season_months,
+        benefit_keys=(),
+        parameter_policy_id=str(expected_static["parameter_policy_id"]),
+        semantic_selection_policy_id=str(
+            expected_static["semantic_selection_policy_id"]
+        ),
+        semantic_anchor_policy_id=str(expected_static["semantic_anchor_policy_id"]),
+        observation_window_days=lookback_days,
+        spec_hash=hashlib.sha256(serialized.encode("utf-8")).hexdigest(),
+        custom_conditions=custom_conditions,
+        base_user_ids=base_user_ids,
+    )
+
+
+def _canonical_source_user_ids(
+    value: Any,
+    *,
+    segment_id: str,
+) -> tuple[str, ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not 1 <= len(value) <= 5_000
+    ):
+        raise _error(
+            "segment_audience_parameters_invalid",
+            segment_id,
+            "source refinement requires between 1 and 5000 base_user_ids",
+        )
+    user_ids = tuple(sorted({str(item).strip() for item in value if str(item).strip()}))
+    if not user_ids or len(user_ids) != len(value) or tuple(value) != user_ids:
+        raise _error(
+            "segment_audience_parameters_not_canonical",
+            segment_id,
+            "base_user_ids must be non-empty, unique, and canonically sorted",
+        )
+    return user_ids
+
+
+def _canonical_custom_conditions(
+    value: Any,
+    *,
+    segment_id: str,
+    allow_empty: bool = False,
+) -> tuple[Mapping[str, Any], ...]:
+    minimum_items = 0 if allow_empty else 1
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or not minimum_items <= len(value) <= 8
+    ):
+        raise _error(
+            "segment_audience_parameters_invalid",
+            segment_id,
+            "custom structured conditions must contain between "
+            f"{minimum_items} and 8 items",
+        )
+    conditions: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise _custom_condition_error(segment_id, index, "must be an object")
+        event_name = item.get("event_name")
+        if event_name not in CUSTOM_STRUCTURED_EVENT_NAMES:
+            raise _custom_condition_error(segment_id, index, "uses an unsupported event")
+        label = item.get("label")
+        if not isinstance(label, str) or not 1 <= len(label.strip()) <= 120:
+            raise _custom_condition_error(segment_id, index, "has an invalid label")
+        minimum_count = item.get("minimum_count")
+        maximum_count = item.get("maximum_count")
+        if (
+            not isinstance(minimum_count, int)
+            or isinstance(minimum_count, bool)
+            or not 0 <= minimum_count <= 10_000
+        ):
+            raise _custom_condition_error(segment_id, index, "has an invalid minimum_count")
+        if maximum_count is not None and (
+            not isinstance(maximum_count, int)
+            or isinstance(maximum_count, bool)
+            or not minimum_count <= maximum_count <= 10_000
+        ):
+            raise _custom_condition_error(segment_id, index, "has an invalid maximum_count")
+        destination = item.get("destination")
+        if destination is not None and (
+            not isinstance(destination, str)
+            or not 1 <= len(destination.strip()) <= 120
+        ):
+            raise _custom_condition_error(segment_id, index, "has an invalid destination")
+        months = item.get("checkin_months", ())
+        if (
+            not isinstance(months, Sequence)
+            or isinstance(months, (str, bytes))
+            or len(months) > 12
+            or any(
+                not isinstance(month, int)
+                or isinstance(month, bool)
+                or not 1 <= month <= 12
+                for month in months
+            )
+        ):
+            raise _custom_condition_error(segment_id, index, "has invalid checkin_months")
+        filters = _canonical_custom_property_filters(
+            item.get("property_filters", ()),
+            segment_id=segment_id,
+            condition_index=index,
+        )
+        conditions.append(
+            {
+                "label": label.strip(),
+                "event_name": str(event_name),
+                "minimum_count": minimum_count,
+                "maximum_count": maximum_count,
+                "destination": destination.strip() if destination else None,
+                "checkin_months": sorted(set(int(month) for month in months)),
+                "property_filters": list(filters),
+            }
+        )
+    return tuple(conditions)
+
+
+def _canonical_custom_property_filters(
+    value: Any,
+    *,
+    segment_id: str,
+    condition_index: int,
+) -> tuple[Mapping[str, str], ...]:
+    if (
+        not isinstance(value, Sequence)
+        or isinstance(value, (str, bytes))
+        or len(value) > 8
+    ):
+        raise _custom_condition_error(
+            segment_id,
+            condition_index,
+            "has invalid property_filters",
+        )
+    filters: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise _custom_condition_error(
+                segment_id,
+                condition_index,
+                "has an invalid property filter",
+            )
+        key = item.get("key")
+        operator = item.get("operator")
+        raw_value = item.get("value")
+        if key not in CUSTOM_STRUCTURED_PROPERTY_KEYS:
+            raise _custom_condition_error(
+                segment_id,
+                condition_index,
+                "uses an unsupported property",
+            )
+        if operator not in CUSTOM_STRUCTURED_PROPERTY_OPERATORS:
+            raise _custom_condition_error(
+                segment_id,
+                condition_index,
+                "uses an unsupported property operator",
+            )
+        if not isinstance(raw_value, str) or not 1 <= len(raw_value.strip()) <= 200:
+            raise _custom_condition_error(
+                segment_id,
+                condition_index,
+                "has an invalid property value",
+            )
+        canonical_value = raw_value.strip()
+        if operator in {"gte", "lte"}:
+            try:
+                float(canonical_value)
+            except ValueError as exc:
+                raise _custom_condition_error(
+                    segment_id,
+                    condition_index,
+                    "requires a numeric property value",
+                ) from exc
+        if operator == "in":
+            alternatives = _canonical_property_filter_values(canonical_value)
+            if len(alternatives) < 2:
+                raise _custom_condition_error(
+                    segment_id,
+                    condition_index,
+                    "requires at least two property alternatives",
+                )
+            canonical_value = ",".join(alternatives)
+        filters.append(
+            {
+                "key": str(key),
+                "operator": str(operator),
+                "value": canonical_value,
+            }
+        )
+    return tuple(filters)
+
+
+def _canonical_property_filter_values(value: str) -> tuple[str, ...]:
+    normalized = value.replace("，", ",").replace("/", ",").replace("·", ",")
+    normalized = normalized.replace("또는", ",").replace("혹은", ",")
+    values = {
+        item.strip().casefold()
+        for item in normalized.split(",")
+        if item.strip()
+    }
+    return tuple(sorted(values))
+
+
+def _custom_query_signal_keys(
+    conditions: Sequence[Mapping[str, Any]],
+) -> tuple[str, ...]:
+    event_signals = {
+        "hotel_search": "hotel_search_intensity",
+        "hotel_click": "hotel_click_intensity",
+        "hotel_detail_view": "hotel_detail_view_intensity",
+        "promotion_impression": "promotion_impression_intensity",
+        "promotion_click": "promotion_click_intensity",
+        "campaign_redirect_click": "campaign_redirect_intensity",
+        "campaign_landing": "campaign_landing_intensity",
+        "booking_start": "booking_start_intensity",
+    }
+    signals = {
+        event_signals[str(condition["event_name"])]
+        for condition in conditions
+        if int(condition["minimum_count"]) > 0
+        and str(condition["event_name"]) in event_signals
+    }
+    has_booking_start = any(
+        condition["event_name"] == "booking_start"
+        and int(condition["minimum_count"]) > 0
+        for condition in conditions
+    )
+    has_no_booking_complete = any(
+        condition["event_name"] == "booking_complete"
+        and condition.get("maximum_count") == 0
+        for condition in conditions
+    )
+    if has_booking_start and has_no_booking_complete:
+        signals.add("booking_start_without_complete")
+    if not signals:
+        signals.add("hotel_consideration_intensity")
+    return tuple(sorted(signals))
+
+
+def _custom_condition_error(
+    segment_id: str,
+    index: int,
+    reason: str,
+) -> SegmentAudienceContractError:
+    return _error(
+        "segment_audience_parameters_invalid",
+        segment_id,
+        f"custom condition {index + 1} {reason}",
     )
 
 

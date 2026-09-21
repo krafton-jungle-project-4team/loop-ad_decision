@@ -24,26 +24,38 @@ class _Result:
 
 
 class _Postgres:
-    def __init__(self, row=None) -> None:
+    def __init__(self, row=None, rows=()) -> None:
         self.row = row
+        self.rows = list(rows)
         self.calls = []
 
     def fetchone(self, query, params=()):
         self.calls.append((query, params))
         return self.row
 
+    def fetchall(self, query, params=()):
+        self.calls.append((query, params))
+        return list(self.rows)
+
     def execute(self, query, params=()):
         self.calls.append((query, params))
 
 
 class _ClickHouse:
-    def __init__(self, rows=()) -> None:
+    def __init__(self, rows=(), *, fail_member_insert=False) -> None:
         self.rows = tuple(rows)
         self.calls = []
+        self.inserts = []
+        self.fail_member_insert = fail_member_insert
 
     def query(self, query, parameters=None):
         self.calls.append((query, parameters or {}))
         return _Result(self.rows)
+
+    def insert(self, table, data, column_names):
+        if self.fail_member_insert and table == "promotion_audience_exclusion_projection":
+            raise RuntimeError("member projection failed")
+        self.inserts.append((table, list(data), tuple(column_names)))
 
 
 class _ExclusionReader:
@@ -67,6 +79,7 @@ def test_exclusion_context_requires_clickhouse_revision_at_least_postgres() -> N
         [
             {
                 "applied_revision": 4,
+                "active_user_count": 37,
             }
         ]
     )
@@ -86,31 +99,90 @@ def test_exclusion_context_requires_clickhouse_revision_at_least_postgres() -> N
     assert context.projection_revision == context.revision
 
 
-def test_stale_clickhouse_projection_fails_without_empty_fallback() -> None:
-    repository = PromotionAudienceExclusionRepository(
-        postgres=_Postgres(
+def test_stale_clickhouse_projection_is_repaired_before_use() -> None:
+    now = datetime(2026, 7, 18, tzinfo=UTC)
+    postgres = _Postgres(
+        {
+            "revision": 2,
+            "excluded_user_count": 2,
+        },
+        rows=[
             {
+                "user_id": "user_a",
+                "state": "consumed",
                 "revision": 2,
-                "excluded_user_count": 3,
-            }
-        ),
-        clickhouse=_ClickHouse(
-            [
-                {
-                    "applied_revision": 1,
-                }
-            ]
-        ),
+                "updated_at": now,
+            },
+            {
+                "user_id": "user_b",
+                "state": "reserved",
+                "revision": 1,
+                "updated_at": now,
+            },
+            {
+                "user_id": "user_c",
+                "state": "released",
+                "revision": 2,
+                "updated_at": now,
+            },
+        ],
+    )
+    clickhouse = _ClickHouse(
+        [{"applied_revision": 1, "active_user_count": 1}]
+    )
+    repository = PromotionAudienceExclusionRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
     )
 
-    with pytest.raises(SegmentAudienceExclusionError) as error:
+    context = repository.load_active_exclusion_context(
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+    )
+
+    assert context.projection_revision == 2
+    assert [insert[0] for insert in clickhouse.inserts] == [
+        "promotion_audience_exclusion_projection",
+        "promotion_audience_exclusion_projection_status",
+    ]
+    assert clickhouse.inserts[0][1] == [
+        ("project", "campaign", "promotion", "user_a", "consumed", 2, now),
+        ("project", "campaign", "promotion", "user_b", "reserved", 1, now),
+        ("project", "campaign", "promotion", "user_c", "released", 2, now),
+    ]
+    assert clickhouse.inserts[1][1][0][:3] == ("project", "promotion", 2)
+
+
+def test_projection_checkpoint_is_not_advanced_when_member_write_fails() -> None:
+    now = datetime(2026, 7, 18, tzinfo=UTC)
+    clickhouse = _ClickHouse(
+        [{"applied_revision": 1, "active_user_count": 0}],
+        fail_member_insert=True,
+    )
+    repository = PromotionAudienceExclusionRepository(
+        postgres=_Postgres(
+            {"revision": 2, "excluded_user_count": 1},
+            rows=[
+                {
+                    "user_id": "user_a",
+                    "state": "reserved",
+                    "revision": 2,
+                    "updated_at": now,
+                }
+            ],
+        ),
+        clickhouse=clickhouse,
+    )
+
+    with pytest.raises(RuntimeError, match="member projection failed"):
         repository.load_active_exclusion_context(
             project_id="project",
             campaign_id="campaign",
             promotion_id="promotion",
         )
 
-    assert error.value.code == "segment_audience_exclusion_projection_not_ready"
+    assert clickhouse.inserts == []
 
 
 def test_vector_population_count_anti_joins_same_promotion_exclusions() -> None:
@@ -154,6 +226,9 @@ def test_vector_population_count_anti_joins_same_promotion_exclusions() -> None:
     assert "promotion_audience_exclusion_members" in query
     assert "NOT EXISTS" in query
     assert "reserved" in query and "consumed" in query
+    assert "target.status <> 'stopped'" in query
+    assert "promotion_run_target_bindings" in query
+    assert "active_run.status NOT IN" in query
     assert params == ("project", "hotel_behavior.v2", "promotion")
     assert result.corpus_user_count == 63
     assert result.exclusion_context == context
@@ -173,6 +248,87 @@ def test_empty_exclusion_context_uses_zero_revisions() -> None:
 
     assert context.revision == 0
     assert context.projection_revision == 0
+
+
+def test_projection_treats_stopped_targets_as_released() -> None:
+    now = datetime(2026, 7, 22, tzinfo=UTC)
+    postgres = _Postgres(
+        {"revision": 3, "excluded_user_count": 0},
+        rows=[
+            {
+                "user_id": "reusable_user",
+                "state": "released",
+                "revision": 3,
+                "updated_at": now,
+            }
+        ],
+    )
+    clickhouse = _ClickHouse(
+        [{"applied_revision": 2, "active_user_count": 1}]
+    )
+    repository = PromotionAudienceExclusionRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
+    )
+
+    repository.load_active_exclusion_context(
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+    )
+
+    projection_query, projection_params = postgres.calls[1]
+    assert "WHEN NOT (" in projection_query
+    assert "target.status <> 'stopped'" in projection_query
+    assert projection_params == (3, "project", "promotion")
+    assert clickhouse.inserts[0][1] == [
+        ("project", "campaign", "promotion", "reusable_user", "released", 3, now)
+    ]
+
+
+def test_projection_releases_terminal_run_members_without_revision_change() -> None:
+    now = datetime(2026, 7, 24, tzinfo=UTC)
+    postgres = _Postgres(
+        {"revision": 4, "excluded_user_count": 0},
+        rows=[
+            {
+                "user_id": "completed_run_user",
+                "state": "released",
+                "revision": 4,
+                "updated_at": now,
+            }
+        ],
+    )
+    clickhouse = _ClickHouse(
+        [{"applied_revision": 4, "active_user_count": 1}]
+    )
+    repository = PromotionAudienceExclusionRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
+    )
+
+    repository.load_active_exclusion_context(
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+    )
+
+    projection_query, _ = postgres.calls[1]
+    assert "promotion_run_target_bindings" in projection_query
+    assert "active_run.status NOT IN" in projection_query
+    assert "'goal_met'" in projection_query
+    assert "'goal_not_met'" in projection_query
+    assert clickhouse.inserts[0][1] == [
+        (
+            "project",
+            "campaign",
+            "promotion",
+            "completed_run_user",
+            "released",
+            4,
+            now,
+        )
+    ]
 
 
 def test_clickhouse_hard_predicate_uses_revisioned_anti_join() -> None:

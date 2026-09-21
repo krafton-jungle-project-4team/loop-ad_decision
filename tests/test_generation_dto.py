@@ -23,6 +23,36 @@ def test_generation_request_accepts_valid_payload() -> None:
     assert request.content_option_count == 3
 
 
+def test_generation_request_accepts_versioned_offer_set_selection() -> None:
+    request = GenerationRequest(
+        project_id="demo_project",
+        campaign_id="camp_demo_summer",
+        promotion_id="promo_demo_summer",
+        analysis_id="analysis_demo_summer",
+        offer_set_id="summer-lastcall",
+        expected_catalog_id="black-friday-hotels-lastcall",
+        expected_catalog_version="v3",
+        content_option_count=3,
+    )
+
+    assert request.offer_set_id == "summer-lastcall"
+    assert request.expected_catalog_id == "black-friday-hotels-lastcall"
+    assert request.expected_catalog_version == "v3"
+
+
+def test_generation_request_requires_complete_expected_catalog_identity() -> None:
+    with pytest.raises(ValidationError):
+        GenerationRequest(
+            project_id="demo_project",
+            campaign_id="camp_demo_summer",
+            promotion_id="promo_demo_summer",
+            analysis_id="analysis_demo_summer",
+            offer_set_id="summer-lastcall",
+            expected_catalog_id="black-friday-hotels-lastcall",
+            content_option_count=3,
+        )
+
+
 def test_generation_request_rejects_non_positive_option_count() -> None:
     with pytest.raises(ValidationError):
         GenerationRequest(

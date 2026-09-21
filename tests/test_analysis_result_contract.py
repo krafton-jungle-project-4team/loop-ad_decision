@@ -504,6 +504,7 @@ def test_analysis_service_persists_dashboard_db_contract() -> None:
         "available_segment_definitions",
         "focus_segment_ids",
         "operator_instruction",
+        "segment_instruction",
     }
     assert saved_analysis.input_snapshot_json["focus_segment_ids"] is None
     assert saved_analysis.input_snapshot_json["promotion"] == {

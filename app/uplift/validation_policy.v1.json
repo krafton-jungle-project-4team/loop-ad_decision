@@ -1,0 +1,14 @@
+{
+  "validation_policy_version": "uplift-validation.v1",
+  "policy_status": "provisional_safety_guard",
+  "minimum_completed_experiments": 20,
+  "minimum_treatment_observations": 1000,
+  "minimum_control_observations": 1000,
+  "minimum_positive_outcomes_per_arm": 30,
+  "required_metrics": {
+    "qini_above_zero": true,
+    "auuc_above_baseline": true
+  },
+  "requires_manual_approval": true,
+  "statistical_power_derived": false
+}

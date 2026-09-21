@@ -34,7 +34,8 @@ class AnalysisRequest(BaseModel):
     project_id: str
     campaign_id: str
     promotion_id: str
-    operator_instruction: str | None = None
+    operator_instruction: str | None = Field(default=None, max_length=2_000)
+    segment_instruction: str | None = Field(default=None, max_length=2_000)
 
 
 class SegmentAnalysisRequest(AnalysisRequest):

@@ -13,7 +13,9 @@ from psycopg.types.json import Jsonb
 from app.decision.repositories import (
     AdExperimentRepository,
     AdExperimentWrite,
+    BookingIntentCohortRecord,
     ContentCandidateRepository,
+    EvaluationFunnelRecord,
     EvaluationMetricRepository,
     GenerationRunRepository,
     NextLoopPreparationConflictError,
@@ -391,6 +393,46 @@ def test_target_segment_repository_lists_all_approved_records_when_ids_omitted()
     assert "target.status = 'approved'" in sql
     assert "target.segment_id = any" not in sql
     assert call.params == ("analysis_banner_001",)
+
+
+def test_target_segment_repository_transitions_only_expected_status() -> None:
+    db = FakePostgresExecutor(fetchone_result={"status": "approved"})
+    repo = PromotionTargetSegmentRepository(db)
+
+    transitioned = repo.transition_status(
+        analysis_id="analysis_banner_001",
+        segment_id="seg_family_trip",
+        expected_status="planned",
+        next_status="approved",
+    )
+
+    assert transitioned is True
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert call.operation == "fetchone"
+    assert "update promotion_target_segments" in sql
+    assert "and status = %s" in sql
+    assert "returning status" in sql
+    assert call.params == (
+        "approved",
+        "analysis_banner_001",
+        "seg_family_trip",
+        "planned",
+    )
+
+
+def test_target_segment_repository_reports_failed_status_transition() -> None:
+    db = FakePostgresExecutor(fetchone_result=None)
+    repo = PromotionTargetSegmentRepository(db)
+
+    transitioned = repo.transition_status(
+        analysis_id="analysis_banner_001",
+        segment_id="seg_family_trip",
+        expected_status="planned",
+        next_status="approved",
+    )
+
+    assert transitioned is False
 
 
 def test_content_candidate_repository_lists_approved_or_active_with_segment_keys() -> None:
@@ -1179,6 +1221,7 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
     assert "fallback" in sql
     assert "fallback_reason" in sql
     assert "assignment_source" in sql
+    assert "segment_assignment_execution_id" in sql
     assert "assignment_status" not in sql
     assert "on conflict (promotion_run_id, user_id) do nothing" in sql
     assert "returning user_id, segment_id, fallback" in sql
@@ -1200,6 +1243,7 @@ def test_user_segment_assignment_repository_bulk_inserts_official_columns_only()
         [AssignmentSource.FALLBACK.value, AssignmentSource.DECISION_BATCH.value],
         [assigned_at, assigned_at],
         [None, expires_at],
+        [None, None],
     )
 
 
@@ -1269,6 +1313,48 @@ def test_user_segment_assignment_repository_lists_existing_user_ids() -> None:
     assert call.params == (
         "prun_banner_001_loop_1",
         ["user_001", "user_002"],
+    )
+
+
+def test_user_segment_assignment_repository_lists_source_page() -> None:
+    db = FakePostgresExecutor(
+        fetchall_result=[
+            {
+                "user_id": "user_002",
+                "segment_id": "seg_family_trip",
+                "ad_experiment_id": "adexp_family_trip_001",
+                "similarity_score": Decimal("0.812345"),
+            }
+        ]
+    )
+    repo = UserSegmentAssignmentRepository(db)
+
+    records = repo.list_source_page(
+        promotion_run_id="prun_banner_001_loop_1",
+        ad_experiment_ids=["adexp_family_trip_001"],
+        after_user_id="user_001",
+        limit=100,
+    )
+
+    assert len(records) == 1
+    assert records[0].user_id == "user_002"
+    assert records[0].segment_id == "seg_family_trip"
+    assert records[0].ad_experiment_id == "adexp_family_trip_001"
+    assert records[0].similarity_score == Decimal("0.812345")
+    call = db.calls[0]
+    sql = compact_sql(call.query)
+    assert "from user_segment_assignments" in sql
+    assert "promotion_run_id = %s" in sql
+    assert "ad_experiment_id = any(%s)" in sql
+    assert "user_id > %s" in sql
+    assert "order by user_id asc" in sql
+    assert "limit %s" in sql
+    assert call.params == (
+        "prun_banner_001_loop_1",
+        ["adexp_family_trip_001"],
+        "user_001",
+        "user_001",
+        100,
     )
 
 
@@ -2080,8 +2166,55 @@ def test_evaluation_metric_repository_counts_inflow_rate_events() -> None:
     }
 
 
+@pytest.mark.parametrize(
+    ("goal_metric", "expected_table", "expected_event"),
+    [
+        (
+            GoalMetric.INFLOW_RATE.value,
+            "promotion_touch_events",
+            "campaign_landing",
+        ),
+        (
+            GoalMetric.BOOKING_CONVERSION_RATE.value,
+            "booking_outcome_events",
+            "booking_complete",
+        ),
+    ],
+)
+def test_evaluation_metric_repository_lists_successful_user_ids(
+    goal_metric: str,
+    expected_table: str,
+    expected_event: str,
+) -> None:
+    cutoff = datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
+    client = FakeClickHouseClient(rows=[("user_001",), ("user_002",)])
+    repo = EvaluationMetricRepository(client)
+
+    successful = repo.list_successful_user_ids(
+        ad_experiment_record(goal_metric=goal_metric),
+        user_ids=["user_001", "user_002", "user_003"],
+        evaluation_cutoff_at=cutoff,
+    )
+
+    assert successful == {"user_001", "user_002"}
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert f"from {expected_table}" in sql
+    assert "select distinct user_id" in sql
+    assert "user_id in {user_ids:array(string)}" in sql
+    assert "notempty(user_id)" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+        "success_event": expected_event,
+        "evaluation_cutoff_at": cutoff,
+        "user_ids": ["user_001", "user_002", "user_003"],
+    }
+
+
 def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_keys() -> None:
-    client = FakeClickHouseClient(rows=[(0, 10)])
+    client = FakeClickHouseClient(rows=[(0, 10, 10, 8, 7, 4, 0, 0)])
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
@@ -2091,17 +2224,26 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
 
     assert counts.numerator_count == 0
     assert counts.denominator_count == 10
+    assert counts.funnel == EvaluationFunnelRecord(
+        response_count=10,
+        hotel_search_count=8,
+        hotel_detail_view_count=7,
+        booking_start_count=4,
+        booking_complete_count=0,
+        fixture_response_count=0,
+    )
     call = client.calls[0]
     sql = compact_sql(call.query)
     assert "from booking_outcome_events" in sql
     assert "from promotion_touch_events" in sql
+    assert "from raw_events" in sql
     assert "booking_complete" in sql
     assert "denominator_event_name:string" in sql
-    assert "promotion_run_id is not null" in sql
-    assert "ad_experiment_id is not null" in sql
+    assert "validation_status = 'valid'" in sql
+    assert "countif(hotel_search_or_later_at >= response_at)" in sql
     assert sql.count(
         "event_time <= {evaluation_cutoff_at:datetime64(3, 'utc')}"
-    ) == 2
+    ) == 3
     assert call.params == {
         "project_id": "hotel-client-a",
         "promotion_run_id": "prun_banner_001_loop_1",
@@ -2114,7 +2256,7 @@ def test_evaluation_metric_repository_counts_booking_conversion_with_nullable_ke
 
 
 def test_evaluation_metric_repository_counts_email_booking_conversion_from_landings() -> None:
-    client = FakeClickHouseClient(rows=[(1, 2)])
+    client = FakeClickHouseClient(rows=[(1, 2, 2, 2, 2, 1, 1, 2)])
     repo = EvaluationMetricRepository(client)
 
     counts = repo.count_booking_conversion_rate(
@@ -2127,8 +2269,83 @@ def test_evaluation_metric_repository_counts_email_booking_conversion_from_landi
 
     assert counts.numerator_count == 1
     assert counts.denominator_count == 2
+    assert counts.funnel is not None
+    assert counts.funnel.fixture_response_count == 2
     call = client.calls[0]
     assert call.params["denominator_event_name"] == "campaign_landing"
+
+
+def test_evaluation_metric_repository_analyzes_pre_experiment_booking_intent() -> None:
+    cutoff = datetime(2026, 7, 10, 12, 34, 56, 567000, tzinfo=UTC)
+    client = FakeClickHouseClient(
+        rows=[
+            (
+                216,
+                130,
+                16,
+                350,
+                9,
+                40,
+                24,
+                Decimal("720000"),
+                Decimal("510000"),
+                103,
+                82,
+                21,
+                Decimal("238000"),
+                Decimal("184000"),
+            )
+        ]
+    )
+    repo = EvaluationMetricRepository(client)
+
+    cohorts = repo.analyze_booking_intent_cohorts(
+        ad_experiment_record(
+            goal_metric=GoalMetric.BOOKING_CONVERSION_RATE.value,
+            channel=Channel.EMAIL.value,
+        ),
+        destination_ids=("jeju", "okinawa"),
+        evaluation_cutoff_at=cutoff,
+        lookback_days=30,
+    )
+
+    assert cohorts == BookingIntentCohortRecord(
+        ad_click_count=216,
+        repeat_view_user_count=130,
+        repeat_view_booking_count=16,
+        comparison_user_count=350,
+        comparison_booking_count=9,
+        booking_abandon_user_count=40,
+        booking_complete_user_count=24,
+        booking_abandon_median_revenue=Decimal("720000"),
+        booking_complete_median_revenue=Decimal("510000"),
+        high_price_booking_start_user_count=103,
+        high_price_booking_abandon_user_count=82,
+        high_price_booking_complete_user_count=21,
+        booking_abandon_median_nightly_price=Decimal("238000"),
+        booking_complete_median_nightly_price=Decimal("184000"),
+    )
+    call = client.calls[0]
+    sql = compact_sql(call.query)
+    assert "pre_experiment_behavior" in sql
+    assert "events.event_time < responses.response_at" in sql
+    assert "tointervalday({lookback_days:uint16})" in sql
+    assert "in {destination_ids:array(string)}" in sql
+    assert "quantileexactif(0.5)" in sql
+    assert "booking_start_prices" in sql
+    assert "jsonextractstring(price_events.properties_json, 'price')" in sql
+    assert "nightly_price > {high_price_threshold:float64}" in sql
+    assert call.params == {
+        "project_id": "hotel-client-a",
+        "promotion_run_id": "prun_banner_001_loop_1",
+        "ad_experiment_id": "adexp_family_trip_001",
+        "denominator_event_name": "campaign_landing",
+        "click_event_name": "campaign_redirect_click",
+        "destination_ids": ["jeju", "okinawa"],
+        "evaluation_cutoff_at": cutoff,
+        "lookback_days": 30,
+        "high_price_threshold": 200000.0,
+    }
 
 
 def test_promotion_evaluation_status_enum_does_not_emit_goal_near() -> None:

@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+from decimal import Decimal
+from datetime import UTC, datetime
+
 import pytest
 
+from app.decision import audience_snapshots
 from app.decision.audience_snapshots import (
     AudienceSnapshotContractError,
     AudienceSnapshotRepository,
@@ -68,6 +72,12 @@ def _complete_binding_row():
         "plan_status": "locked",
         "snapshot_status": "completed",
         "vector_version": "hotel_behavior.v2",
+        "vector_generation_id": "generation_a",
+        "source_cutoff": datetime(2026, 7, 1, tzinfo=UTC),
+        "generation_window_end": datetime(2026, 7, 1, tzinfo=UTC),
+        "generation_source_revision_cutoff": datetime(
+            2026, 7, 1, tzinfo=UTC
+        ),
         "final_user_count": 2,
         "audience_status": "insufficient_sample",
         "snapshot_kind": "final",
@@ -136,6 +146,11 @@ def test_run_member_reader_reads_final_binding_without_search_or_winner() -> Non
                 "segment_id": "seg_a",
                 "behavior_fit_score": "0.81",
             },
+            {
+                "user_id": "user_2",
+                "segment_id": "seg_a",
+                "behavior_fit_score": None,
+            },
         )
     )
     repository = AudienceSnapshotRepository(db)
@@ -147,8 +162,12 @@ def test_run_member_reader_reads_final_binding_without_search_or_winner() -> Non
         limit=100,
     )
 
-    assert [(member.user_id, member.segment_id) for member in members] == [
-        ("user_1", "seg_a")
+    assert [
+        (member.user_id, member.segment_id, member.behavior_fit_score)
+        for member in members
+    ] == [
+        ("user_1", "seg_a", Decimal("0.81")),
+        ("user_2", "seg_a", None),
     ]
     query = db.executed[0][0]
     assert "promotion_run_target_bindings" in query
@@ -186,6 +205,65 @@ def test_run_binding_allows_one_card_from_a_multi_target_allocation_plan() -> No
         "segment_audience_allocation_plan_segments" in query
         for query, _params in db.executed
     )
+
+
+def test_run_binding_logs_the_failed_exclusion_invariant(monkeypatch) -> None:
+    warnings = []
+
+    class _Log:
+        def warn(self, event, payload):
+            warnings.append((event, payload))
+
+    invalid_target = {
+        **_target_binding_row(),
+        "reservation_count": 1,
+        "every_member_reserved": False,
+    }
+    db = _Db(fetchone_rows=(invalid_target,))
+    monkeypatch.setattr(audience_snapshots, "log", _Log())
+    repository = AudienceSnapshotRepository(db)
+
+    with pytest.raises(
+        AudienceSnapshotContractError,
+        match="segment_audience_exclusion_binding_invalid: seg_a",
+    ):
+        repository.bind_run_targets(
+            promotion_run_id="run",
+            project_id="project",
+            campaign_id="campaign",
+            promotion_id="promotion",
+            bindings=(
+                RunAudienceTargetBindingWrite(
+                    target_analysis_id="confirmation_a",
+                    segment_id="seg_a",
+                    allocation_plan_id="plan_a",
+                    final_snapshot_id="final_a",
+                ),
+            ),
+        )
+
+    assert warnings == [
+        (
+            "segment_audience_exclusion_binding_invalid",
+            {
+                "segmentId": "seg_a",
+                "failedChecks": [
+                    "reservation_count",
+                    "every_member_reserved",
+                ],
+                "planStatus": "finalized",
+                "snapshotStatus": "completed",
+                "snapshotKind": "final",
+                "audienceReservationState": "reserved",
+                "hasSourceSnapshot": True,
+                "allocationPlanMatches": True,
+                "finalUserCount": 2,
+                "actualMemberCount": 2,
+                "reservationCount": 1,
+                "everyMemberReserved": False,
+            },
+        )
+    ]
 
 
 def test_run_binding_reports_target_already_bound_to_another_run() -> None:

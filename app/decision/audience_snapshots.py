@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -9,11 +10,13 @@ from app.audience_contract import (
     SEGMENT_AUDIENCE_CONTRACT,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
+    contract_score_threshold,
 )
 from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
     semantic_query_vector_hash,
 )
+from app.logging import log
 
 
 class PostgresExecutor(Protocol):
@@ -43,7 +46,19 @@ class PostgresExecutor(Protocol):
 class AudienceSnapshotMember:
     user_id: str
     segment_id: str
-    behavior_fit_score: Decimal
+    behavior_fit_score: Decimal | None
+
+
+@dataclass(frozen=True, slots=True)
+class AudienceSnapshotBinding:
+    segment_id: str
+    audience_snapshot_id: str
+    vector_generation_id: str
+    vector_version: str
+    source_cutoff: datetime
+    generation_window_end: datetime
+    generation_source_revision_cutoff: datetime
+    member_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +68,7 @@ class AudienceSnapshotSet:
     vector_version: str
     member_count: int
     snapshot_ids: tuple[str, ...] = ()
+    bindings: tuple[AudienceSnapshotBinding, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -331,22 +347,49 @@ class AudienceSnapshotRepository:
         row: Mapping[str, Any],
         binding: RunAudienceTargetBindingWrite,
     ) -> None:
-        if (
-            str(row["plan_status"]) not in {"finalized", "locked"}
-            or str(row["snapshot_status"]) != "completed"
-            or str(row["snapshot_kind"]) != "final"
-            or not row["source_snapshot_id"]
-            or str(row["snapshot_allocation_plan_id"])
-            != binding.allocation_plan_id
-            or int(row["final_user_count"]) <= 0
-            or int(row["actual_member_count"]) != int(row["final_user_count"])
-            or int(row["reservation_count"]) != int(row["final_user_count"])
-            or not bool(row["every_member_reserved"])
-        ):
-            raise AudienceSnapshotContractError(
-                "segment_audience_exclusion_binding_invalid: "
-                + binding.segment_id
-            )
+        final_user_count = int(row["final_user_count"])
+        actual_member_count = int(row["actual_member_count"])
+        reservation_count = int(row["reservation_count"])
+        checks = {
+            "plan_status": str(row["plan_status"]) in {"finalized", "locked"},
+            "snapshot_status": str(row["snapshot_status"]) == "completed",
+            "snapshot_kind": str(row["snapshot_kind"]) == "final",
+            "source_snapshot": bool(row["source_snapshot_id"]),
+            "allocation_plan": (
+                str(row["snapshot_allocation_plan_id"])
+                == binding.allocation_plan_id
+            ),
+            "final_user_count": final_user_count > 0,
+            "actual_member_count": actual_member_count == final_user_count,
+            "reservation_count": reservation_count == final_user_count,
+            "every_member_reserved": bool(row["every_member_reserved"]),
+        }
+        failed_checks = [name for name, passed in checks.items() if not passed]
+        if not failed_checks:
+            return
+
+        log.warn(
+            "segment_audience_exclusion_binding_invalid",
+            {
+                "segmentId": binding.segment_id,
+                "failedChecks": failed_checks,
+                "planStatus": str(row["plan_status"]),
+                "snapshotStatus": str(row["snapshot_status"]),
+                "snapshotKind": str(row["snapshot_kind"]),
+                "audienceReservationState": str(
+                    row["audience_reservation_state"]
+                ),
+                "hasSourceSnapshot": bool(row["source_snapshot_id"]),
+                "allocationPlanMatches": checks["allocation_plan"],
+                "finalUserCount": final_user_count,
+                "actualMemberCount": actual_member_count,
+                "reservationCount": reservation_count,
+                "everyMemberReserved": bool(row["every_member_reserved"]),
+            },
+        )
+        raise AudienceSnapshotContractError(
+            "segment_audience_exclusion_binding_invalid: " + binding.segment_id
+        )
 
     def _advance_exclusion_revision(self, promotion_id: str) -> int:
         row = self._db.fetchone(
@@ -722,12 +765,17 @@ class AudienceSnapshotRepository:
                 plan.status AS plan_status,
                 snapshot.status AS snapshot_status,
                 snapshot.vector_version,
+                snapshot.vector_generation_id,
+                snapshot.source_cutoff,
                 snapshot.final_user_count,
                 snapshot.audience_status,
                 snapshot.snapshot_kind,
                 snapshot.source_snapshot_id,
                 snapshot.allocation_plan_id AS snapshot_allocation_plan_id,
                 target.audience_reservation_state,
+                generation.window_end AS generation_window_end,
+                generation.source_revision_cutoff
+                    AS generation_source_revision_cutoff,
                 (SELECT count(*)
                  FROM segment_audience_members AS member
                  WHERE member.snapshot_id = binding.final_snapshot_id)
@@ -765,6 +813,8 @@ class AudienceSnapshotRepository:
              AND target.segment_id = binding.segment_id
              AND target.allocation_plan_id = binding.allocation_plan_id
              AND target.audience_snapshot_id = binding.final_snapshot_id
+            JOIN user_behavior_vector_search_generations AS generation
+              ON generation.vector_generation_id = snapshot.vector_generation_id
             WHERE binding.promotion_run_id = %s
             ORDER BY binding.segment_id ASC
             """,
@@ -825,6 +875,21 @@ class AudienceSnapshotRepository:
             snapshot_ids=tuple(
                 str(row["final_snapshot_id"]) for row in rows
             ),
+            bindings=tuple(
+                AudienceSnapshotBinding(
+                    segment_id=str(row["segment_id"]),
+                    audience_snapshot_id=str(row["final_snapshot_id"]),
+                    vector_generation_id=str(row["vector_generation_id"]),
+                    vector_version=str(row["vector_version"]),
+                    source_cutoff=row["source_cutoff"],
+                    generation_window_end=row["generation_window_end"],
+                    generation_source_revision_cutoff=(
+                        row["generation_source_revision_cutoff"]
+                    ),
+                    member_count=int(row["final_user_count"]),
+                )
+                for row in rows
+            ),
         )
 
     def consume_run_members(
@@ -875,7 +940,11 @@ class AudienceSnapshotRepository:
             AudienceSnapshotMember(
                 user_id=str(row["user_id"]),
                 segment_id=str(row["segment_id"]),
-                behavior_fit_score=Decimal(str(row["behavior_fit_score"])),
+                behavior_fit_score=(
+                    Decimal(str(row["behavior_fit_score"]))
+                    if row["behavior_fit_score"] is not None
+                    else None
+                ),
             )
             for row in rows
         ]
@@ -899,7 +968,7 @@ def _snapshot_row_matches_compiled(
         semantic_query_vector_hash(compiled),
         compiled.query_compiler_version,
         compiled.query_compiler_hash,
-        Decimal(str(compiled.score_threshold)),
+        contract_score_threshold(compiled.score_threshold),
         compiled.template_id,
         compiled.template_version,
         compiled.template_semantic_hash,

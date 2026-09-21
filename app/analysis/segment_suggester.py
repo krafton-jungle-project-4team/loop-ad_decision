@@ -9,8 +9,11 @@ from typing import Protocol, Sequence
 from urllib.parse import parse_qs, urlparse
 
 from app.analysis.audience_selection import AudienceSelectionPolicyProtocol
+from app.analysis.audience_search_repository import AudienceSearchContext
+from app.analysis.behavior_vector_schema import HOTEL_BEHAVIOR_VECTOR_VERSION
 from app.analysis.repositories import (
     PromotionRecord,
+    RawEventSignalGenerationScope,
     RawEventUserSignalRecord,
     SegmentDefinitionRecord,
     UserBehaviorVectorRecord,
@@ -23,6 +26,7 @@ from app.analysis.raw_event_segments import (
     season_months_from_intent,
 )
 from app.analysis.segment_performance import SegmentPerformancePredictor
+from app.analysis.segment_property_conditions import SegmentPropertyCondition
 from app.analysis.vector_service import DEFAULT_VECTOR_VERSION, VECTOR_DIM
 from app.logging import log, log_context_scope, now_ms, duration_ms
 
@@ -217,8 +221,22 @@ class RawEventUserSignalSampler(Protocol):
         vector_version: str = DEFAULT_VECTOR_VERSION,
         destination_terms: Sequence[str] = (),
         season_months: Sequence[int] = (),
+        segment_property_conditions: Sequence[SegmentPropertyCondition] = (),
         limit: int = DEFAULT_VECTOR_POOL_LIMIT,
+        generation_scope: RawEventSignalGenerationScope | None = None,
     ) -> list[RawEventUserSignalRecord]:
+        ...
+
+
+class AudienceSearchContextProvider(Protocol):
+    def get_context(
+        self,
+        *,
+        project_id: str,
+        vector_version: str,
+        campaign_id: str | None = None,
+        promotion_id: str | None = None,
+    ) -> AudienceSearchContext:
         ...
 
 
@@ -258,6 +276,7 @@ class VectorClusterSegmentSuggester:
         *,
         user_behavior_vector_repository: UserBehaviorVectorSampler,
         raw_event_signal_repository: RawEventUserSignalSampler | None = None,
+        audience_context_provider: AudienceSearchContextProvider | None = None,
         promotion_intent_extractor: PromotionIntentExtractor | None = None,
         performance_predictor: SegmentPerformancePredictor | None = None,
         audience_selection_policy: AudienceSelectionPolicyProtocol | None = None,
@@ -266,6 +285,7 @@ class VectorClusterSegmentSuggester:
         max_suggested_segments: int = DEFAULT_MAX_SUGGESTED_SEGMENTS,
         min_cluster_size: int = DEFAULT_MIN_CLUSTER_SIZE,
         vector_version: str = DEFAULT_VECTOR_VERSION,
+        audience_vector_version: str = HOTEL_BEHAVIOR_VECTOR_VERSION,
     ) -> None:
         if vector_pool_limit <= 0:
             raise ValueError("vector_pool_limit must be positive")
@@ -282,6 +302,7 @@ class VectorClusterSegmentSuggester:
 
         self._user_behavior_vector_repository = user_behavior_vector_repository
         self._raw_event_signal_repository = raw_event_signal_repository
+        self._audience_context_provider = audience_context_provider
         self._promotion_intent_extractor = promotion_intent_extractor
         self._performance_predictor = performance_predictor
         self._audience_selection_policy = audience_selection_policy
@@ -290,9 +311,15 @@ class VectorClusterSegmentSuggester:
         self._max_suggested_segments = max_suggested_segments
         self._min_cluster_size = min_cluster_size
         self._vector_version = vector_version
+        self._audience_vector_version = audience_vector_version
 
     @log_context_scope
-    def suggest_segments(self, *, promotion: PromotionRecord) -> list[SegmentDefinitionRecord]:
+    def suggest_segments(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segment_instruction: str | None = None,
+    ) -> list[SegmentDefinitionRecord]:
         started_at = now_ms()
         log.assign_context(
             {
@@ -301,9 +328,17 @@ class VectorClusterSegmentSuggester:
                 "promotionId": promotion.promotion_id,
             }
         )
-        log.info("started", {"promotion": promotion})
-        sample_seed = _promotion_sample_seed(promotion)
-        raw_event_segments = self._suggest_raw_event_segments(promotion=promotion)
+        log.info(
+            "started",
+            {
+                "hasSegmentInstruction": bool(segment_instruction),
+                "segmentInstructionLength": len(segment_instruction or ""),
+            },
+        )
+        raw_event_segments = self._suggest_raw_event_segments(
+            promotion=promotion,
+            segment_instruction=segment_instruction,
+        )
         if raw_event_segments:
             response = raw_event_segments[: self._max_suggested_segments]
             log.info(
@@ -315,32 +350,168 @@ class VectorClusterSegmentSuggester:
             )
             log.info(
                 "completed",
-                {"response": response, "durationMs": duration_ms(started_at)},
+                {
+                    "suggestedSegmentCount": len(response),
+                    "segmentIds": [segment.segment_id for segment in response],
+                    "durationMs": duration_ms(started_at),
+                },
             )
             return response
 
+        log.info(
+            "dynamic_audience_candidates_empty",
+            {
+                "segmentInstructionLength": len(segment_instruction or ""),
+                "legacyVectorCardFallback": "disabled",
+            },
+        )
+        log.info(
+            "completed",
+            {
+                "suggestedSegmentCount": 0,
+                "segmentIds": [],
+                "durationMs": duration_ms(started_at),
+            },
+        )
+        return []
+
+    def _suggest_raw_event_segments(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segment_instruction: str | None = None,
+    ) -> list[SegmentDefinitionRecord]:
+        if (
+            self._raw_event_signal_repository is None
+            or self._promotion_intent_extractor is None
+        ):
+            return []
+        try:
+            intent = self._promotion_intent_extractor.extract(
+                promotion,
+                segment_instruction=segment_instruction,
+            )
+            compilation = compile_raw_event_intent(intent)
+            generation_scope = self._generation_scope(promotion)
+            signal_query = {
+                "project_id": promotion.project_id,
+                "vector_version": self._vector_version,
+                "destination_terms": destination_terms_from_intent(intent),
+                "season_months": season_months_from_intent(intent),
+                "segment_property_conditions": intent.segment_property_conditions,
+                "limit": self._vector_pool_limit,
+            }
+            if generation_scope is None:
+                profiles = (
+                    self._raw_event_signal_repository.list_raw_event_user_signals(
+                        **signal_query,
+                    )
+                )
+            else:
+                profiles = (
+                    self._raw_event_signal_repository.list_raw_event_user_signals(
+                        **signal_query,
+                        generation_scope=generation_scope,
+                    )
+                )
+            log.info(
+                "raw_event_vector_window_signals_loaded",
+                {
+                    "userSignalCount": len(profiles),
+                    "vectorVersion": (
+                        generation_scope.vector_version
+                        if generation_scope is not None
+                        else self._vector_version
+                    ),
+                    "vectorGenerationId": (
+                        generation_scope.vector_generation_id
+                        if generation_scope is not None
+                        else None
+                    ),
+                    "generationScoped": generation_scope is not None,
+                    "generationCorpusUserCount": (
+                        generation_scope.corpus_user_count
+                        if generation_scope is not None
+                        else None
+                    ),
+                    "exclusionRevision": (
+                        generation_scope.exclusion_context.revision
+                        if generation_scope is not None
+                        and generation_scope.exclusion_context is not None
+                        else None
+                    ),
+                    "intentSource": intent.source,
+                    "destinationCount": len(intent.destinations),
+                    "seasonCount": len(intent.season),
+                    "desiredBehaviorCount": len(intent.desired_behaviors),
+                    "excludedBehaviors": list(intent.excluded_behaviors),
+                    "segmentPropertyConditionCount": len(
+                        intent.segment_property_conditions
+                    ),
+                    "requestedCandidateTypes": list(intent.requested_candidate_types),
+                    "compiledConditionCount": len(compilation.compiled_conditions),
+                    "unsupportedConditionCount": len(
+                        compilation.unsupported_conditions
+                    ),
+                },
+            )
+            return generate_raw_event_segment_definitions(
+                promotion=promotion,
+                intent=intent,
+                compilation=compilation,
+                profiles=profiles[: self._vector_sample_limit],
+                max_suggested_segments=self._max_suggested_segments,
+                min_sample_size=self._min_cluster_size,
+                performance_predictor=self._performance_predictor,
+                audience_selection_policy=self._audience_selection_policy,
+            )
+        except Exception as exc:
+            log.error(
+                "raw_event_intent_segments_failed",
+                {
+                    "err": exc,
+                },
+            )
+            raise
+
+    def _generation_scope(
+        self,
+        promotion: PromotionRecord,
+    ) -> RawEventSignalGenerationScope | None:
+        if self._audience_context_provider is None:
+            return None
+        context = self._audience_context_provider.get_context(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            vector_version=self._audience_vector_version,
+        )
+        return RawEventSignalGenerationScope(
+            vector_generation_id=context.vector_generation_id,
+            vector_version=self._audience_vector_version,
+            window_start=context.window_start,
+            window_end=context.source_cutoff,
+            source_revision_cutoff=context.source_revision_cutoff,
+            corpus_user_count=context.corpus_user_count,
+            exclusion_context=context.exclusion_context,
+        )
+
+    def _suggest_legacy_vector_segments_for_diagnostics(
+        self,
+        *,
+        promotion: PromotionRecord,
+    ) -> list[SegmentDefinitionRecord]:
+        """Keep the former cluster output available to offline diagnostics only."""
+
+        sample_seed = _promotion_sample_seed(promotion)
         user_vectors = self._load_user_vectors(promotion, sample_seed)
         if len(user_vectors) < self._min_cluster_size:
-            log.warn("user_vector_sample_insufficient", {"userVectorCount": len(user_vectors), "minClusterSize": self._min_cluster_size})
-            log.info(
-                "completed",
-                {"response": raw_event_segments, "durationMs": duration_ms(started_at)},
-            )
-            return raw_event_segments
-
+            return []
         cluster_count = min(
             self._max_suggested_segments,
             max(1, len(user_vectors) // self._min_cluster_size),
         )
         clusters = _cluster_user_vectors(user_vectors, cluster_count)
-        if not clusters:
-            log.warn("vector_clusters_empty", {"userVectorCount": len(user_vectors)})
-            log.info(
-                "completed",
-                {"response": raw_event_segments, "durationMs": duration_ms(started_at)},
-            )
-            return raw_event_segments
-
         total_eligible_user_count = len(user_vectors)
         promotion_intent = _promotion_intent(promotion)
         scored_clusters = _score_clusters(
@@ -348,7 +519,7 @@ class VectorClusterSegmentSuggester:
             promotion_intent=promotion_intent,
             total_eligible_user_count=total_eligible_user_count,
         )
-        response = [
+        return [
             _segment_definition_from_cluster(
                 promotion=promotion,
                 scored_cluster=scored_cluster,
@@ -372,65 +543,6 @@ class VectorClusterSegmentSuggester:
             )
             if len(scored_cluster.cluster.users) >= self._min_cluster_size
         ][: self._max_suggested_segments]
-        log.info(
-            "vector_clusters_created",
-            {
-                "clusterCount": len(clusters),
-                "suggestedSegmentCount": len(response),
-                "totalEligibleUserCount": total_eligible_user_count,
-                "promotionVectorBasis": promotion_intent.basis,
-            },
-        )
-        log.info("completed", {"response": response, "durationMs": duration_ms(started_at)})
-        return response
-
-    def _suggest_raw_event_segments(
-        self,
-        *,
-        promotion: PromotionRecord,
-    ) -> list[SegmentDefinitionRecord]:
-        if (
-            self._raw_event_signal_repository is None
-            or self._promotion_intent_extractor is None
-        ):
-            return []
-        try:
-            intent = self._promotion_intent_extractor.extract(promotion)
-            compilation = compile_raw_event_intent(intent)
-            profiles = self._raw_event_signal_repository.list_raw_event_user_signals(
-                project_id=promotion.project_id,
-                vector_version=self._vector_version,
-                destination_terms=destination_terms_from_intent(intent),
-                season_months=season_months_from_intent(intent),
-                limit=self._vector_pool_limit,
-            )
-            log.info(
-                "raw_event_vector_window_signals_loaded",
-                {
-                    "userSignalCount": len(profiles),
-                    "vectorVersion": self._vector_version,
-                    "intent": intent.to_json(),
-                    "compiledConditionCount": len(compilation.compiled_conditions),
-                },
-            )
-            return generate_raw_event_segment_definitions(
-                promotion=promotion,
-                intent=intent,
-                compilation=compilation,
-                profiles=profiles[: self._vector_sample_limit],
-                max_suggested_segments=self._max_suggested_segments,
-                min_sample_size=self._min_cluster_size,
-                performance_predictor=self._performance_predictor,
-                audience_selection_policy=self._audience_selection_policy,
-            )
-        except Exception as exc:
-            log.warn(
-                "raw_event_intent_segments_failed",
-                {
-                    "err": exc,
-                },
-            )
-            return []
 
     def _load_user_vectors(
         self,

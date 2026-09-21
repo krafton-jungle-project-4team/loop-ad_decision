@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import UTC, datetime
 from decimal import Decimal
 
 import pytest
@@ -19,10 +21,13 @@ from app.decision.matcher import (
 )
 from app.decision.repositories import (
     AdExperimentRecord,
+    PromotionAnalysisRecord,
+    PromotionEvaluationRecord,
     PromotionRunRecord,
     SegmentVectorRecord,
     UserBehaviorVectorRecord,
     UserSegmentAssignmentInsertRecord,
+    UserSegmentAssignmentSourceRecord,
     UserSegmentAssignmentWrite,
 )
 from app.decision.schemas import (
@@ -137,6 +142,160 @@ def test_assignment_service_requires_snapshot_repository_at_construction() -> No
             user_segment_assignment_repository=repos.assignments,
             reranker=SegmentCandidateReranker(),
         )
+
+
+def test_next_loop_reassigns_only_source_users_without_success_events() -> None:
+    source_run = replace(
+        promotion_run_record(),
+        promotion_run_id="run_source",
+        analysis_id="analysis_source",
+        generation_id="generation_source",
+        loop_count=1,
+    )
+    target_run = replace(
+        promotion_run_record(),
+        promotion_run_id="run_target",
+        analysis_id="analysis_target",
+        generation_id="generation_target",
+        loop_count=2,
+    )
+    source_experiment = replace(
+        ad_experiment_record("seg_family_trip"),
+        ad_experiment_id="experiment_source",
+        promotion_run_id=source_run.promotion_run_id,
+        analysis_id=source_run.analysis_id,
+        generation_id=source_run.generation_id,
+        loop_count=1,
+    )
+    target_experiment = replace(
+        ad_experiment_record("seg_family_trip"),
+        ad_experiment_id="experiment_target",
+        promotion_run_id=target_run.promotion_run_id,
+        analysis_id=target_run.analysis_id,
+        generation_id=target_run.generation_id,
+        content_id="content_retry",
+        content_option_id="option_retry",
+        loop_count=2,
+    )
+    assignments = FakeRetryUserSegmentAssignmentRepository(
+        source_assignments=[
+            UserSegmentAssignmentSourceRecord(
+                user_id="user_failed_a",
+                segment_id="seg_family_trip",
+                ad_experiment_id=source_experiment.ad_experiment_id,
+                similarity_score=Decimal("0.810000"),
+            ),
+            UserSegmentAssignmentSourceRecord(
+                user_id="user_succeeded",
+                segment_id="seg_family_trip",
+                ad_experiment_id=source_experiment.ad_experiment_id,
+                similarity_score=Decimal("0.920000"),
+            ),
+            UserSegmentAssignmentSourceRecord(
+                user_id="user_failed_b",
+                segment_id="seg_family_trip",
+                ad_experiment_id=source_experiment.ad_experiment_id,
+                similarity_score=None,
+            ),
+        ]
+    )
+    metric_repository = FakeRetryMetricRepository(
+        successful_user_ids={"user_succeeded"}
+    )
+    service = SegmentAssignmentService(
+        promotion_run_repository=FakeRetryPromotionRunRepository(
+            [source_run, target_run]
+        ),
+        ad_experiment_repository=FakeRetryAdExperimentRepository(
+            {
+                source_run.promotion_run_id: [source_experiment],
+                target_run.promotion_run_id: [target_experiment],
+            }
+        ),
+        segment_vector_repository=FakeSegmentVectorRepository([], None, None),
+        user_behavior_vector_repository=FakeUserBehaviorVectorRepository([]),
+        user_segment_assignment_repository=assignments,
+        reranker=SegmentCandidateReranker(),
+        audience_snapshot_repository=FakeLegacyAudienceSnapshotRepository(),
+        promotion_analysis_repository=FakeRetryPromotionAnalysisRepository(
+            PromotionAnalysisRecord(
+                analysis_id=target_run.analysis_id,
+                project_id=target_run.project_id,
+                campaign_id=target_run.campaign_id,
+                promotion_id=target_run.promotion_id,
+                focus_segment_ids_json=["seg_family_trip"],
+                operator_instruction=None,
+                input_snapshot_json={
+                    "next_loop": {
+                        "source_promotion_run_id": source_run.promotion_run_id,
+                        "source_failed_ad_experiment_ids": [
+                            source_experiment.ad_experiment_id
+                        ],
+                    }
+                },
+                profile_summary_json={},
+                output_json={},
+                status="completed",
+            )
+        ),
+        promotion_evaluation_repository=FakeRetryPromotionEvaluationRepository(
+            [
+                PromotionEvaluationRecord(
+                    evaluation_id="evaluation_source",
+                    project_id=source_run.project_id,
+                    campaign_id=source_run.campaign_id,
+                    promotion_id=source_run.promotion_id,
+                    promotion_run_id=source_run.promotion_run_id,
+                    ad_experiment_id=source_experiment.ad_experiment_id,
+                    segment_id=source_experiment.segment_id,
+                    content_id=source_experiment.content_id,
+                    content_option_id=source_experiment.content_option_id,
+                    metric=source_experiment.goal_metric,
+                    target_value=Decimal("0.030000"),
+                    actual_value=Decimal("0.010000"),
+                    numerator_count=1,
+                    denominator_count=3,
+                    sample_size=3,
+                    basis="all_segments",
+                    status="goal_not_met",
+                    feedback=None,
+                    next_loop_required=True,
+                    result_json={
+                        "evaluation_cutoff_at": "2026-07-18T12:34:56.789Z"
+                    },
+                )
+            ]
+        ),
+        evaluation_metric_repository=metric_repository,
+    )
+
+    response = service.build_assignments(
+        promotion_run_id=target_run.promotion_run_id,
+        request=SegmentAssignmentBuildRequest(),
+    )
+
+    assert response.processed_user_count == 3
+    assert response.assignment_count == 2
+    assert response.segment_assignment_counts == {"seg_family_trip": 2}
+    assert response.assignment_mode == "analysis_snapshot"
+    assert response.input_stability == "snapshotted"
+    assert {assignment.user_id for assignment in assignments.inserted} == {
+        "user_failed_a",
+        "user_failed_b",
+    }
+    assert all(
+        assignment.promotion_run_id == target_run.promotion_run_id
+        and assignment.ad_experiment_id == target_experiment.ad_experiment_id
+        and assignment.content_id == target_experiment.content_id
+        for assignment in assignments.inserted
+    )
+    assert metric_repository.calls == [
+        (
+            source_experiment.ad_experiment_id,
+            ("user_failed_a", "user_failed_b", "user_succeeded"),
+            datetime(2026, 7, 18, 12, 34, 56, 789000, tzinfo=UTC),
+        )
+    ]
 
 
 def test_assignment_service_leaves_below_threshold_user_unassigned_without_fallback() -> None:
@@ -1113,6 +1272,102 @@ class FakeUserSegmentAssignmentRepository:
             )
             for assignment in inserted
         ]
+
+
+class FakeRetryPromotionRunRepository:
+    def __init__(self, runs: list[PromotionRunRecord]) -> None:
+        self.runs = {run.promotion_run_id: run for run in runs}
+
+    def get_by_id(self, promotion_run_id: str) -> PromotionRunRecord | None:
+        return self.runs.get(promotion_run_id)
+
+
+class FakeRetryAdExperimentRepository:
+    def __init__(
+        self,
+        experiments_by_run: dict[str, list[AdExperimentRecord]],
+    ) -> None:
+        self.experiments_by_run = experiments_by_run
+
+    def list_by_run(self, promotion_run_id: str) -> list[AdExperimentRecord]:
+        return self.experiments_by_run.get(promotion_run_id, [])
+
+
+class FakeRetryPromotionAnalysisRepository:
+    def __init__(self, analysis: PromotionAnalysisRecord) -> None:
+        self.analysis = analysis
+
+    def get_by_id(self, analysis_id: str) -> PromotionAnalysisRecord | None:
+        return self.analysis if self.analysis.analysis_id == analysis_id else None
+
+
+class FakeRetryPromotionEvaluationRepository:
+    def __init__(self, evaluations: list[PromotionEvaluationRecord]) -> None:
+        self.evaluations = evaluations
+
+    def list_latest_by_run_ad_experiments(
+        self,
+        promotion_run_id: str,
+    ) -> list[PromotionEvaluationRecord]:
+        return [
+            evaluation
+            for evaluation in self.evaluations
+            if evaluation.promotion_run_id == promotion_run_id
+        ]
+
+
+class FakeRetryMetricRepository:
+    def __init__(self, *, successful_user_ids: set[str]) -> None:
+        self.successful_user_ids = successful_user_ids
+        self.calls: list[tuple[str, tuple[str, ...], datetime]] = []
+
+    def list_successful_user_ids(
+        self,
+        experiment: AdExperimentRecord,
+        *,
+        user_ids: list[str],
+        evaluation_cutoff_at: datetime,
+    ) -> set[str]:
+        self.calls.append(
+            (
+                experiment.ad_experiment_id,
+                tuple(user_ids),
+                evaluation_cutoff_at,
+            )
+        )
+        return self.successful_user_ids.intersection(user_ids)
+
+
+class FakeRetryUserSegmentAssignmentRepository(
+    FakeUserSegmentAssignmentRepository
+):
+    def __init__(
+        self,
+        *,
+        source_assignments: list[UserSegmentAssignmentSourceRecord],
+    ) -> None:
+        super().__init__(set(), set())
+        self.source_assignments = sorted(
+            source_assignments,
+            key=lambda assignment: assignment.user_id,
+        )
+
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: list[str] | tuple[str, ...],
+        after_user_id: str | None,
+        limit: int,
+    ) -> list[UserSegmentAssignmentSourceRecord]:
+        del promotion_run_id
+        records = [
+            assignment
+            for assignment in self.source_assignments
+            if assignment.ad_experiment_id in ad_experiment_ids
+            and (after_user_id is None or assignment.user_id > after_user_id)
+        ]
+        return records[:limit]
 
 
 class FakeRepositoryBundle:

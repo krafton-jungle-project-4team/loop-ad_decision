@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import timedelta
 from typing import Any, Mapping, Protocol, Sequence
 
 from app.audience_contract import (
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
     SegmentAudienceContractError,
     SegmentAudienceSpec,
     SegmentDefinitionAudienceAdapter,
@@ -36,6 +38,7 @@ from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
     SegmentVectorBuildResult,
 )
+from app.logging import log
 
 
 BUNDLED_AUDIENCE_CALIBRATION_PATH = BUNDLED_SEMANTIC_SELECTION_PATH
@@ -68,6 +71,14 @@ class AudienceV2Preparation:
     allocation_plan_id: str | None = None
     promotion_exclusion_revision: int | None = None
     excluded_user_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class AudienceV2MatchPreview:
+    vector_generation_id: str
+    vector_version: str
+    total_eligible_user_count: int
+    matching_user_count: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +219,59 @@ class AudienceV2Coordinator:
             for item in compiled
         }
 
+    def preview_many(
+        self,
+        *,
+        promotion: PromotionRecord,
+        segments: Sequence[SegmentDefinitionRecord],
+    ) -> Mapping[str, AudienceV2MatchPreview]:
+        """Count executable audience matches without writing vectors or snapshots."""
+        if not segments:
+            return {}
+        contexts: dict[str, AudienceSearchContext] = {}
+        compiled: list[_CompiledAudience] = []
+        for segment in segments:
+            audience_spec, spec = self._compile_segment(segment)
+            context = contexts.get(spec.vector_version)
+            if context is None:
+                context = self._active_context(
+                    project_id=promotion.project_id,
+                    campaign_id=promotion.campaign_id,
+                    promotion_id=promotion.promotion_id,
+                    segment_id=segment.segment_id,
+                    vector_version=spec.vector_version,
+                )
+                contexts[spec.vector_version] = context
+            self._validate_context(
+                segment_id=segment.segment_id,
+                spec=spec,
+                context=context,
+                observation_window_days=audience_spec.observation_window_days,
+            )
+            compiled.append(
+                _CompiledAudience(
+                    segment=segment,
+                    spec=spec,
+                    observation_window_days=audience_spec.observation_window_days,
+                    context=context,
+                    segment_vector_id="",
+                )
+            )
+
+        hard_match_counts = self._count_hard_matches_by_scope(
+            project_id=promotion.project_id,
+            compiled=compiled,
+        )
+        return {
+            item.segment.segment_id: AudienceV2MatchPreview(
+                vector_generation_id=item.context.vector_generation_id,
+                vector_version=item.spec.vector_version,
+                total_eligible_user_count=item.context.corpus_user_count,
+                matching_user_count=hard_match_counts[item.segment.segment_id],
+            )
+            for item in compiled
+        }
+
     def _compile_segment(
         self,
         segment: SegmentDefinitionRecord,
@@ -223,6 +287,20 @@ class AudienceV2Coordinator:
                 reason="AudienceV2Coordinator requires segment_audience.v1",
             )
         audience_spec = resolution.spec
+        if audience_spec.is_custom_structured:
+            try:
+                return (
+                    audience_spec,
+                    self._schema.compile_custom_segment_audience(
+                        spec=audience_spec,
+                    ),
+                )
+            except ValueError as exc:
+                raise SegmentAudienceContractError(
+                    code="segment_audience_manifest_mismatch",
+                    segment_id=segment.segment_id,
+                    reason=str(exc),
+                ) from exc
         calibration = self._calibration_provider.require(
             segment_id=segment.segment_id,
             spec=audience_spec,
@@ -281,7 +359,12 @@ class AudienceV2Coordinator:
         window_days = int(
             (context.source_cutoff - context.window_start).total_seconds() / 86400
         )
-        if window_days != observation_window_days:
+        window_matches = (
+            observation_window_days <= window_days
+            if spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+            else observation_window_days == window_days
+        )
+        if not window_matches:
             raise SegmentAudienceContractError(
                 code="segment_audience_generation_incompatible",
                 segment_id=segment_id,
@@ -347,7 +430,8 @@ class AudienceV2Coordinator:
                         project_id=project_id,
                         vector_version=item.spec.vector_version,
                         source_revision_cutoff=context.source_revision_cutoff,
-                        window_start=context.window_start,
+                        window_start=self._observation_window_start(item),
+                        vector_window_start=context.window_start,
                         window_end=context.source_cutoff,
                         hard_predicate_keys=item.spec.hard_predicate_keys,
                         predicate_parameters=item.spec.predicate_parameters,
@@ -374,7 +458,8 @@ class AudienceV2Coordinator:
                 vector_version=spec.vector_version,
                 source_revision_cutoff=context.source_revision_cutoff,
                 source_cutoff=context.source_cutoff,
-                window_start=context.window_start,
+                window_start=self._observation_window_start(item),
+                vector_window_start=context.window_start,
                 query_vector=spec.query_vector,
                 score_threshold=spec.score_threshold,
                 hard_predicate_keys=spec.hard_predicate_keys,
@@ -391,6 +476,32 @@ class AudienceV2Coordinator:
             hard_match_user_count=hard_match_count,
             estimated_score_pass_rate=estimated_score_pass_rate,
         )
+        log.info(
+            "segment_audience_materialized",
+            {
+                "projectId": promotion.project_id,
+                "promotionId": promotion.promotion_id,
+                "segmentId": segment.segment_id,
+                "templateId": spec.template_id,
+                "vectorGenerationId": context.vector_generation_id,
+                "vectorPopulationCount": context.corpus_user_count,
+                "preliminaryHardMatchCount": hard_match_count,
+                "materializedMemberCount": search_result.final_user_count,
+                "selectionMethod": search_result.method.value,
+            },
+        )
+        # Final members have passed both the hard predicates and score threshold.
+        # Treat them as an authoritative lower bound when the aggregate pre-count
+        # lags behind the materialized search population.
+        behavior_match_count = max(
+            hard_match_count,
+            search_result.final_user_count,
+        )
+        if behavior_match_count != search_result.hard_match_user_count:
+            search_result = replace(
+                search_result,
+                hard_match_user_count=behavior_match_count,
+            )
         snapshot_id = self._snapshot_repository.save_completed(
             AudienceSnapshotWrite(
                 analysis_id=analysis_id,
@@ -401,7 +512,7 @@ class AudienceV2Coordinator:
                 segment_vector_id=item.segment_vector_id,
                 vector_generation_id=context.vector_generation_id,
                 source_cutoff=context.source_cutoff,
-                window_start=context.window_start,
+                window_start=self._observation_window_start(item),
                 window_end=context.source_cutoff,
                 spec=spec,
                 search_result=search_result,
@@ -416,8 +527,8 @@ class AudienceV2Coordinator:
             segment_vector_id=item.segment_vector_id,
             vector_generation_id=context.vector_generation_id,
             vector_version=spec.vector_version,
-            total_eligible_user_count=context.corpus_user_count,
-            matching_user_count=hard_match_count,
+            total_eligible_user_count=search_result.corpus_user_count,
+            matching_user_count=behavior_match_count,
             selected_user_count=final_user_count,
             selection_method=search_result.method.value,
             estimated_recall=audit.estimated_recall if audit else 1.0,
@@ -438,6 +549,13 @@ class AudienceV2Coordinator:
                 else 0
             ),
         )
+
+    @staticmethod
+    def _observation_window_start(item: _CompiledAudience):
+        requested_start = item.context.source_cutoff - timedelta(
+            days=item.observation_window_days
+        )
+        return max(item.context.window_start, requested_start)
 
 
 def load_bundled_candidate_calibrations(

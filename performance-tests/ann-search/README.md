@@ -16,6 +16,12 @@ policy or a deployable common runtime setting.
 
 ## Validate
 
+Install development dependencies before running the experiment tests:
+
+```bash
+python -m pip install -e '.[dev]'
+```
+
 Validate the committed checkpoint:
 
 ```bash
@@ -39,6 +45,12 @@ pytest -q \
   tests/test_ann_search_goal3.py \
   tests/test_ann_search_checkpoint_evidence.py
 ```
+
+The source-archive test skips when no local source archive is installed. A
+partial archive or a hash mismatch fails. Goal 2 planning tests use synthetic
+fixtures and do not require the original measurements.
+
+See [merge readiness](merge-readiness.md) for the dev synchronization checks.
 
 ## Current decision
 

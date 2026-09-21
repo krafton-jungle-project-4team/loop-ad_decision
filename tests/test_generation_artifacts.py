@@ -13,6 +13,7 @@ from app.generation.artifacts import (
     CREATIVE_SOURCE_META_NAME,
     StaticCreativeArtifactPublisher,
     content_values_from_rendered_html,
+    creative_contract_sha256,
     html_artifact_key,
     image_artifact_key,
     image_prompt_sha256,
@@ -159,6 +160,7 @@ def test_rendered_html_recovers_exact_canonical_source(
         "landing_url_sha256": hashlib.sha256(
             str(values.get("landing_url")).encode("utf-8")
         ).hexdigest(),
+        "creative_contract_sha256": creative_contract_sha256(values),
         "renderer_version": renderer_metadata(channel)["version"],
         "template_version": renderer_metadata(channel)["template_version"],
     }
@@ -218,6 +220,7 @@ def test_rendered_html_source_keeps_private_values_out_and_reads_v1() -> None:
     assert landing_url not in serialized_payload
 
     payload["schema_version"] = "creative.source.v1"
+    payload.pop("creative_contract_sha256")
     payload.pop("renderer_version")
     payload.pop("template_version")
     legacy_encoded = base64.urlsafe_b64encode(
@@ -241,6 +244,55 @@ def test_rendered_html_source_keeps_private_values_out_and_reads_v1() -> None:
 
     assert recovered["renderer_version"] == "generation.renderer.v1"
     assert recovered["template_version"] == "banner.overlay.v1"
+    assert recovered["creative_contract_sha256"] is None
+
+
+def test_rendered_html_source_reads_previous_v2_schema() -> None:
+    rendered = render_banner_html(
+        {
+            "title": "제주 숙박 특가",
+            "body": "객실을 확인하세요.",
+            "cta": "숙소 보기",
+            "image_prompt": "coastal hotel, no visible text",
+            "image_url": IMAGE_URL,
+            "landing_url": "https://demo-stay.example.com/summer",
+        }
+    )
+    match = re.search(
+        rf'<meta name="{re.escape(CREATIVE_SOURCE_META_NAME)}" content="([^"]+)">',
+        rendered,
+    )
+    assert match is not None
+    encoded = match.group(1)
+    payload = json.loads(
+        base64.urlsafe_b64decode(
+            f"{encoded}{'=' * (-len(encoded) % 4)}"
+        ).decode("utf-8")
+    )
+    payload["schema_version"] = "creative.source.v2"
+    payload.pop("creative_contract_sha256")
+    previous_encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    previous_rendered = (
+        rendered[: match.start(1)]
+        + previous_encoded
+        + rendered[match.end(1) :]
+    )
+
+    recovered = content_values_from_rendered_html(
+        channel=ContentChannel.ONSITE_BANNER,
+        html_body=previous_rendered,
+    )
+
+    assert recovered["renderer_version"] == "generation.renderer.v1"
+    assert recovered["template_version"] == "banner.overlay.v1"
+    assert recovered["creative_contract_sha256"] is None
 
 
 def test_hierarchical_artifact_keys_and_public_url_strip_root_prefix() -> None:

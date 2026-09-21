@@ -5,8 +5,10 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 import hashlib
 import json
+from typing import Mapping, Sequence
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.analysis.audience_search import (
     AudienceSearchResult,
@@ -20,6 +22,7 @@ from app.analysis.audience_snapshot_repository import (
     AudienceSnapshotRepository as AnalysisAudienceSnapshotRepository,
     AudienceSnapshotWrite,
     _input_fingerprint,
+    _spec_fingerprint,
 )
 from app.analysis.behavior_vector_schema import (
     CandidateCalibration,
@@ -33,6 +36,7 @@ from app.analysis.behavior_manifest import (
     BehaviorManifestError,
     behavior_manifest_hash,
     clickhouse_canonical_destination_sql,
+    executable_destination_id,
     load_behavior_manifest,
     order_vector_terms_by_manifest,
 )
@@ -61,6 +65,7 @@ from app.analysis.audience_search_repository import (
     PgClickHouseAudienceVectorSearchRepository,
     _hard_predicate_batch_query,
     _hard_predicate_query,
+    _structured_query_parameters,
 )
 from app.analysis.raw_event_segments import PromotionIntent
 from app.analysis.repositories import (
@@ -69,12 +74,27 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
 )
 from app.audience_contract import (
+    CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+    CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID,
+    CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION,
+    CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+    CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+    CUSTOM_STRUCTURED_CONDITION_KEY,
+    CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+    CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+    CUSTOM_STRUCTURED_WINDOW_DAYS,
     SEGMENT_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_QUERY_COMPILER_HASH,
     SEGMENT_AUDIENCE_QUERY_COMPILER_VERSION,
     SEGMENT_AUDIENCE_SCHEMA_VERSION,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
+    contract_score_threshold,
+    custom_structured_template_hash,
 )
 from app.audience_exclusions import PromotionAudienceExclusionContext
 from app.analysis.vector_service import SegmentVectorBuildResult
@@ -95,9 +115,11 @@ from app.decision.repositories import (
 from app.decision.schemas import AssignmentSource, SegmentAssignmentBuildRequest
 from app.internal.user_behavior_vector_search_sync import (
     SearchVectorRevision,
+    UserBehaviorVectorSearchSyncRepository,
     UserBehaviorVectorSearchSyncService,
     VectorSearchGeneration,
     VectorSyncCursor,
+    _validate_revision,
 )
 
 
@@ -132,10 +154,16 @@ def test_manifest_fixes_all_dimensions_and_destination_alias_sql() -> None:
     assert behavior_manifest_hash() == HOTEL_BEHAVIOR_MANIFEST_HASH
     assert canonical_destination(" 제주도 ") == "jeju"
     assert signed_hash_coordinate("제주도") == signed_hash_coordinate("jeju")
+    assert canonical_destination(" 오키나와 ") == "okinawa"
+    assert signed_hash_coordinate("오키나와") == signed_hash_coordinate("okinawa")
+    assert executable_destination_id("8250") == "8250"
+    assert executable_destination_id("발리") is None
     sql = clickhouse_canonical_destination_sql("destination_value")
     assert "multiIf(" in sql
     assert "'제주도'" in sql
     assert "'jeju'" in sql
+    assert "'오키나와'" in sql
+    assert "'okinawa'" in sql
 
     names = [str(item["name"]) for item in manifest["dimensions"]]
     ordered = order_vector_terms_by_manifest({name: name for name in names})
@@ -158,6 +186,16 @@ def test_hard_match_population_is_frozen_by_vector_revision_cutoff() -> None:
     assert "vector_version = {vector_version:String}" in sql
     assert "received_at <=" in sql
     assert "raw_event_received_cutoff" in sql
+    normalized_sql = " ".join(sql.split())
+    assert (
+        "parseDateTime64BestEffort( {source_revision_cutoff:String}, 6, 'UTC' )"
+        in normalized_sql
+    )
+    assert (
+        "parseDateTime64BestEffort( {raw_event_received_cutoff:String}, 6, 'UTC' )"
+        in normalized_sql
+    )
+    assert "parseDateTimeBestEffort({source_revision_cutoff:String})" not in sql
 
 
 def test_predicate_chunk_size_must_be_positive() -> None:
@@ -167,6 +205,40 @@ def test_predicate_chunk_size_must_be_positive() -> None:
             clickhouse=_UnusedRepository(),
             predicate_chunk_size=0,
         )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 10_000])
+def test_cohort_hard_match_count_is_invariant_to_chunk_size(chunk_size: int) -> None:
+    calls: list[list[str]] = []
+    cutoff = "2026-07-01T00:00:00Z"
+
+    class GenerationDb:
+        def fetchone(self, query, params):
+            assert params == ("project", "v2", cutoff, "generation")
+            return {"window_start": "2026-06-01T00:00:00Z",
+                    "source_revision_cutoff": cutoff}
+
+    class PredicateDb:
+        def query(self, query, *, parameters):
+            ids = parameters["user_ids"]
+            calls.append(ids)
+            assert parameters["project_id"] == "project"
+            assert parameters["raw_event_received_cutoff"] == cutoff
+            return _RawExactQueryResult([uid for uid in ids if uid in {"u0", "u2", "u4"}])
+
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=GenerationDb(), clickhouse=PredicateDb(),
+        predicate_chunk_size=chunk_size,
+    )
+    cohort = ["u0", "u1", "u2", "u3", "u4"]
+    result = repository.count_hard_matches_for_user_ids(
+        project_id="project", vector_generation_id="generation", vector_version="v2",
+        source_cutoff=cutoff, hard_predicate_keys=("hotel_product_interest",),
+        predicate_parameters={}, user_ids=cohort,
+    )
+    assert result == 3
+    assert [uid for batch in calls for uid in batch] == cohort
+    assert all(len(batch) <= chunk_size for batch in calls)
 
 
 def test_hard_match_rate_sample_uses_stable_salted_order() -> None:
@@ -193,8 +265,255 @@ def test_three_same_scope_predicates_share_one_batch_aggregate() -> None:
     )
     assert query.count("FROM raw_events") == 1
     assert query.count("FROM per_user") == 1
+    assert "parseDateTime64BestEffort" in query
+    assert "parseDateTimeBestEffort(\n                            {source_revision_cutoff:String}" not in query
     assert all(f"AS match_{index}" in query for index in range(3))
     assert len(parameters) == 9
+
+
+def test_custom_structured_segment_compiles_exact_conditions_without_semantic_filter() -> None:
+    conditions = [
+        {
+            "event_name": "hotel_detail_view",
+            "label": "제주 호텔 상세 조회",
+            "minimum_count": 1,
+            "maximum_count": None,
+            "destination": "jeju",
+            "checkin_months": [],
+            "property_filters": [],
+        },
+        {
+            "event_name": "booking_start",
+            "label": "제주 예약 시작",
+            "minimum_count": 1,
+            "maximum_count": None,
+            "destination": "jeju",
+            "checkin_months": [],
+            "property_filters": [],
+        },
+        {
+            "event_name": "booking_complete",
+            "label": "예약 완료 없음",
+            "minimum_count": 0,
+            "maximum_count": 0,
+            "destination": None,
+            "checkin_months": [],
+            "property_filters": [],
+        },
+    ]
+    rule_json = _custom_structured_rule(
+        conditions=conditions,
+        query_signal_keys=(
+            "booking_start_intensity",
+            "booking_start_without_complete",
+            "hotel_detail_view_intensity",
+        ),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="custom_segment",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.is_custom_structured
+    assert resolution.spec.destination_ids == ("jeju",)
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    assert compiled.hard_predicate_keys == (CUSTOM_STRUCTURED_CONDITION_KEY,)
+    assert compiled.score_threshold == -1.0
+    assert compiled.semantic_margin == 2.0
+    assert compiled.semantic_selection_status == "exact_structured_conditions"
+
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    # The zero-upper-bound condition emits one count expression for each bound.
+    assert sql.count("countIf(") == 4
+    assert "custom_0_destination_terms" in sql
+    assert "custom_1_destination_terms" in sql
+    assert "custom_2_maximum_count" in sql
+
+
+def test_custom_structured_segment_compiles_multiple_age_groups_as_one_filter() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "page_view",
+                "label": "20~30대",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [
+                    {
+                        "key": "age_group",
+                        "operator": "in",
+                        "value": "30대, 20대",
+                    }
+                ],
+            }
+        ],
+        query_signal_keys=("hotel_consideration_intensity",),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="twenties_and_thirties",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.custom_conditions[0]["property_filters"] == [
+        {"key": "age_group", "operator": "in", "value": "20대,30대"}
+    ]
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    parameters = _structured_query_parameters(compiled.predicate_parameters)
+    assert "has({custom_0_property_0:Array(String)}, lowerUTF8(" in sql
+    assert parameters["custom_0_property_0"] == ["20대", "30대"]
+
+
+def test_custom_structured_segment_preserves_seven_day_observation_window() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "booking_start",
+                "label": "고가 숙소 예약 시작",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [
+                    {"key": "price", "operator": "gte", "value": "200001"}
+                ],
+            }
+        ],
+        query_signal_keys=("booking_start_intensity",),
+        lookback_days=7,
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="recent_high_price_booking_start",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.observation_window_days == 7
+    assert resolution.spec.predicate_parameters["observation_window_days"] == (7,)
+    assert resolution.spec.template_semantic_hash == custom_structured_template_hash(
+        template_version=CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+        window_days=7,
+    )
+
+
+def test_source_refinement_intersects_structured_conditions_with_source_users() -> None:
+    conditions = [
+        {
+            "event_name": "hotel_detail_view",
+            "label": "호텔 상세 조회 2회 이상",
+            "minimum_count": 2,
+            "maximum_count": None,
+            "destination": None,
+            "checkin_months": [],
+            "property_filters": [],
+        }
+    ]
+    rule_json = _custom_structured_rule(
+        conditions=conditions,
+        query_signal_keys=("hotel_detail_view_intensity",),
+        base_user_ids=("user_001", "user_002"),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="source_refinement",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.base_user_ids == ("user_001", "user_002")
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    assert compiled.hard_predicate_keys == (
+        CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+        CUSTOM_STRUCTURED_CONDITION_KEY,
+    )
+    assert compiled.semantic_selection_status == "exact_source_refinement"
+    assert compiled.predicate_parameters["base_user_ids"] == (
+        "user_001",
+        "user_002",
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        filter_user_ids=False,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    assert "user_id IN {base_user_ids:Array(String)}" in sql
+
+
+def test_source_membership_can_reuse_the_exact_ai_audience_without_extra_conditions() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[],
+        query_signal_keys=("hotel_consideration_intensity",),
+        base_user_ids=("user_001", "user_002"),
+    )
+
+    resolution = SegmentDefinitionAudienceAdapter().resolve(
+        segment_id="source_membership",
+        rule_json=rule_json,
+    )
+
+    assert resolution.spec is not None
+    assert resolution.spec.custom_conditions == ()
+    compiled = HotelBookingBehaviorSchemaV2().compile_custom_segment_audience(
+        spec=resolution.spec
+    )
+    assert compiled.hard_predicate_keys == (
+        CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+    )
+    sql = _hard_predicate_query(
+        compiled.hard_predicate_keys,
+        filter_user_ids=False,
+        predicate_parameters=compiled.predicate_parameters,
+    )
+    assert "user_id IN {base_user_ids:Array(String)}" in sql
+    assert "HAVING 1" in sql
+
+
+def test_custom_structured_segment_rejects_unsupported_event() -> None:
+    rule_json = _custom_structured_rule(
+        conditions=[
+            {
+                "event_name": "arbitrary_sql_event",
+                "label": "허용되지 않은 이벤트",
+                "minimum_count": 1,
+                "maximum_count": None,
+                "destination": None,
+                "checkin_months": [],
+                "property_filters": [],
+            }
+        ],
+        query_signal_keys=("hotel_consideration_intensity",),
+    )
+
+    with pytest.raises(SegmentAudienceContractError) as error:
+        SegmentDefinitionAudienceAdapter().resolve(
+            segment_id="invalid_custom_segment",
+            rule_json=rule_json,
+        )
+
+    assert error.value.code == "segment_audience_parameters_invalid"
 
 
 def test_batch_and_individual_destination_exploration_share_canonical_values() -> None:
@@ -396,6 +715,14 @@ def test_registered_template_parameters_canonicalize_before_hash_and_query() -> 
     assert first_compiled.query_vector == second_compiled.query_vector
 
 
+def test_registered_template_rejects_unregistered_benefit_key() -> None:
+    with pytest.raises(ValueError, match="unregistered benefit key"):
+        RegisteredSegmentAudienceBinder().bind(
+            candidate_type="benefit_value_seeker",
+            benefit_keys=("review_based_recommendation",),
+        )
+
+
 def test_query_compiler_hash_is_not_coupled_to_unrelated_template_registry(
 ) -> None:
     compiler_semantics = {
@@ -456,6 +783,113 @@ def test_coordinator_batches_three_segments_once() -> None:
     assert search.batch_call_count == 1
     assert search.individual_call_count == 0
     assert len(snapshots.writes) == 3
+
+
+def test_coordinator_previews_hard_matches_without_writing_audience_state() -> None:
+    search = _BatchCoordinatorSearchRepository(hard_match_count=7)
+    snapshots = _BatchSnapshotWriter()
+    vectors = _BatchSegmentVectorPreparer()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=vectors,
+        calibration_provider=_TestCalibrationProvider(),
+    )
+
+    previews = coordinator.preview_many(
+        promotion=_analysis_promotion(),
+        segments=tuple(_v2_segment(f"segment_{index}") for index in range(3)),
+    )
+
+    assert set(previews) == {"segment_0", "segment_1", "segment_2"}
+    assert {preview.matching_user_count for preview in previews.values()} == {7}
+    assert {preview.total_eligible_user_count for preview in previews.values()} == {
+        100
+    }
+    assert search.batch_call_count == 1
+    assert snapshots.writes == []
+    assert vectors.requests == []
+
+
+def test_coordinator_uses_final_members_as_behavior_match_lower_bound() -> None:
+    search = _BatchCoordinatorSearchRepository(
+        hard_match_count=0,
+        materialized_member_count=2,
+    )
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+        calibration_provider=_TestCalibrationProvider(),
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis",
+        promotion=_analysis_promotion(),
+        segments=(_v2_segment("segment"),),
+    )["segment"]
+
+    assert prepared.matching_user_count == 2
+    assert prepared.selected_user_count == 2
+    assert snapshots.writes[0].search_result.hard_match_user_count == 2
+
+
+def test_custom_segment_snapshot_uses_raw_exact_members_without_vector_overlap() -> None:
+    search = _RawExactBatchCoordinatorSearchRepository(member_count=103)
+    snapshots = _BatchSnapshotWriter()
+    coordinator = AudienceV2Coordinator(
+        search_repository=search,
+        snapshot_repository=snapshots,
+        segment_vector_service=_BatchSegmentVectorPreparer(),
+    )
+    segment = replace(
+        _v2_segment("seg_custom_chatkit"),
+        source="custom_chatkit",
+        rule_json=_custom_structured_rule(
+            conditions=[
+                {
+                    "event_name": "booking_start",
+                    "label": "20만원 초과 숙소 예약 시작",
+                    "minimum_count": 1,
+                    "maximum_count": None,
+                    "destination": "jeju,okinawa",
+                    "checkin_months": [],
+                    "property_filters": [
+                        {"key": "price", "operator": "gte", "value": "200001"},
+                    ],
+                },
+                {
+                    "event_name": "booking_complete",
+                    "label": "예약 완료 없음",
+                    "minimum_count": 0,
+                    "maximum_count": 0,
+                    "destination": None,
+                    "checkin_months": [],
+                    "property_filters": [],
+                },
+            ],
+            query_signal_keys=(
+                "booking_start_intensity",
+                "booking_start_without_complete",
+            ),
+            lookback_days=7,
+        ),
+    )
+
+    prepared = coordinator.prepare_many(
+        analysis_id="analysis",
+        promotion=_analysis_promotion(),
+        segments=(segment,),
+    )[segment.segment_id]
+
+    assert search.raw_exact_call_count == 1
+    assert prepared.total_eligible_user_count == 103
+    assert prepared.matching_user_count == 103
+    assert prepared.selected_user_count == 103
+    assert snapshots.writes[0].search_result.members_relation == (
+        "audience_exact_members"
+    )
 
 
 def test_six_registered_templates_build_expected_exact_snapshot_members() -> None:
@@ -762,6 +1196,142 @@ def test_materialized_ann_uses_server_side_relation_and_returns_only_count() -> 
     )
 
 
+def test_materialized_exact_members_use_postgres_array_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    postgres = _SearchSqlPostgres(
+        fetchall_results=[
+            [
+                {
+                    "user_id": "user_1",
+                    "behavior_fit_score": 0.9,
+                    "retrieval_rank": 1,
+                },
+                {
+                    "user_id": "user_2",
+                    "behavior_fit_score": 0.8,
+                    "retrieval_rank": 2,
+                },
+            ]
+        ]
+    )
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=_UnusedRepository(),
+    )
+    monkeypatch.setattr(
+        repository,
+        "_filter_hard_predicates",
+        lambda **kwargs: list(kwargs["candidates"]),
+    )
+
+    repository._materialize_hard_filtered_relation(
+        project_id="project",
+        vector_generation_id="uvgen_frozen",
+        vector_version="hotel_behavior.v2",
+        source_cutoff=datetime(2026, 7, 16, tzinfo=UTC),
+        hard_predicate_keys=("promotion_response",),
+        predicate_parameters={},
+        candidate_relation="audience_exact_candidates",
+        member_relation="audience_exact_members",
+        score_threshold=None,
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(" in query
+    )
+    assert params == (["user_1", "user_2"], [0.9, 0.8], [1, 2])
+
+
+def test_raw_exact_members_materialize_clickhouse_users_without_vector_gate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user_ids = [f"user_{index:03d}" for index in range(103)]
+    clickhouse = _RawExactClickHouse(user_ids)
+    postgres = _SearchSqlPostgres()
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=clickhouse,
+    )
+    monkeypatch.setattr(
+        repository,
+        "_generation_window",
+        lambda **_kwargs: (
+            datetime(2026, 6, 24, tzinfo=UTC),
+            datetime(2026, 7, 24, tzinfo=UTC),
+        ),
+    )
+    predicate_parameters = {
+        "observation_window_days": (7,),
+        "structured_conditions_json": (
+            json.dumps(
+                [
+                    {
+                        "event_name": "booking_start",
+                        "label": "20만원 초과 숙소 예약 시작",
+                        "minimum_count": 1,
+                        "maximum_count": None,
+                        "destination": "jeju,okinawa",
+                        "checkin_months": [],
+                        "property_filters": [
+                            {
+                                "key": "price",
+                                "operator": "gte",
+                                "value": "200001",
+                            }
+                        ],
+                    }
+                ],
+                ensure_ascii=False,
+            ),
+        ),
+    }
+
+    count = repository.materialize_raw_exact_members(
+        project_id="project",
+        vector_generation_id="uvgen_without_overlap",
+        vector_version="hotel_behavior.v2",
+        source_cutoff=datetime(2026, 7, 24, tzinfo=UTC),
+        hard_predicate_keys=(CUSTOM_STRUCTURED_CONDITION_KEY,),
+        predicate_parameters=predicate_parameters,
+    )
+
+    assert count == 103
+    assert "user_behavior_vector_revisions" not in clickhouse.query_text
+    assert "user_ids" not in clickhouse.parameters
+    assert clickhouse.parameters["custom_0_property_0"] == 200001.0
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(" in query
+    )
+    assert params[0] == user_ids
+    assert params[1] == [1.0] * 103
+    assert params[2] == list(range(1, 104))
+
+
+def test_temp_user_ids_use_postgres_array_parameters() -> None:
+    postgres = _SearchSqlPostgres()
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=postgres,
+        clickhouse=_UnusedRepository(),
+    )
+
+    repository._replace_temp_user_ids(
+        table_name="audience_ann_candidates",
+        user_ids=("user_1", "user_2"),
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in postgres.executed
+        if "FROM unnest(%s::text[])" in query
+    )
+    assert params == (["user_1", "user_2"],)
+
+
 def test_large_search_falls_back_to_exact_when_recall_gate_fails() -> None:
     repository = _SearchRepository(always_miss=True)
     service = CandidateAudienceSearchService(
@@ -910,6 +1480,128 @@ def test_snapshot_bulk_copies_materialized_members_without_python_list() -> None
     assert "calibration_hash" in snapshot_insert[0]
 
 
+def test_snapshot_explicit_members_use_postgres_array_parameters() -> None:
+    db = _SnapshotWriteDb(actual_member_count=2)
+    repository = AnalysisAudienceSnapshotRepository(db)
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    spec = HotelBookingBehaviorSchemaV2().compile_candidate(
+        candidate_type="promotion_responsive",
+        intent=_intent(),
+        calibration=CandidateCalibration(0.5, "test.v1"),
+    )
+
+    snapshot_id = repository.save_completed(
+        AudienceSnapshotWrite(
+            analysis_id="analysis",
+            project_id="project",
+            campaign_id="campaign",
+            promotion_id="promotion",
+            segment_id="segment",
+            segment_vector_id="segment_vector",
+            vector_generation_id="uvgen_test",
+            source_cutoff=now,
+            window_start=now - timedelta(days=90),
+            window_end=now,
+            spec=spec,
+            search_result=AudienceSearchResult(
+                method=AudienceSearchMethod.EXACT,
+                members=(
+                    SearchCandidate("user_1", 0.9, 1),
+                    SearchCandidate("user_2", 0.8, 2),
+                ),
+                corpus_user_count=2,
+                hard_match_user_count=2,
+                requested_k=2,
+                recall_audit=None,
+                policy_version="audience_search.v2",
+            ),
+            min_sample_size=1,
+        )
+    )
+
+    _query, params = next(
+        (query, params)
+        for query, params in db.executed
+        if "FROM unnest(" in query
+    )
+    assert params == (
+        [snapshot_id, snapshot_id],
+        ["user_1", "user_2"],
+        [Decimal("0.9"), Decimal("0.8")],
+        ["exact", "exact"],
+        [1, 2],
+    )
+    assert all(isinstance(value, list) for value in params)
+
+
+def test_snapshot_binding_uses_contract_score_threshold_precision() -> None:
+    segment = _v2_segment("segment", candidate_type="benefit_value_seeker")
+    compiled = compile_registered_segment_audience(
+        segment_id=segment.segment_id,
+        rule_json=segment.rule_json,
+    )
+    stored_score_threshold = Decimal(str(compiled.score_threshold)).quantize(
+        Decimal("0.000001")
+    )
+    assert stored_score_threshold != Decimal(str(compiled.score_threshold))
+    now = datetime(2026, 7, 16, tzinfo=UTC)
+    repository = AnalysisAudienceSnapshotRepository(
+        _SnapshotBindingDb(
+            {
+                "snapshot_id": "snapshot",
+                "segment_vector_id": "segment-vector",
+                "vector_generation_id": "generation",
+                "source_cutoff": now,
+                "window_start": now - timedelta(days=90),
+                "window_end": now,
+                "eligible_user_count": 100,
+                "behavior_match_count": 20,
+                "final_user_count": 10,
+                "selection_method": "exact",
+                "estimated_recall": Decimal("1"),
+                "recall_lower_bound": Decimal("1"),
+                "recall_target": Decimal("1"),
+                "meets_min_sample_size": True,
+                "snapshot_status": "completed",
+                "project_id": "project",
+                "campaign_id": "campaign",
+                "promotion_id": "promotion",
+                "segment_id": segment.segment_id,
+                "schema_version": compiled.schema_version,
+                "vector_version": compiled.vector_version,
+                "manifest_hash": compiled.manifest_hash,
+                "calibration_version": compiled.calibration_version,
+                "calibration_hash": compiled.calibration_hash,
+                "audience_resolution_contract": (
+                    compiled.audience_resolution_contract
+                ),
+                "segment_audience_spec_hash": compiled.segment_audience_spec_hash,
+                "query_vector_hash": semantic_query_vector_hash(compiled),
+                "query_compiler_version": compiled.query_compiler_version,
+                "query_compiler_hash": compiled.query_compiler_hash,
+                "score_threshold": stored_score_threshold,
+                "metadata_json": {
+                    "spec_fingerprint": _spec_fingerprint(compiled),
+                },
+                "generation_status": "activated",
+                "generation_is_active": True,
+                "actual_member_count": 10,
+            }
+        )
+    )
+
+    bound = repository.require_binding(
+        snapshot_id="snapshot",
+        project_id="project",
+        campaign_id="campaign",
+        promotion_id="promotion",
+        segment_id=segment.segment_id,
+        spec=compiled,
+    )
+
+    assert bound.snapshot_id == "snapshot"
+
+
 def test_source_snapshot_fingerprint_changes_with_promotion_exclusion_revision() -> None:
     now = datetime(2026, 7, 17, tzinfo=UTC)
     spec = HotelBookingBehaviorSchemaV2().compile_candidate(
@@ -995,42 +1687,52 @@ def test_assignment_reuses_preallocated_run_target_snapshots_without_winner_sear
     assert response.matching_mode == "analysis_snapshot_reuse"
     assert response.assignment_mode == "analysis_snapshot"
     assert response.input_stability == "snapshotted"
-    assert response.assignment_count == 2
+    assert response.assignment_count == 3
     assert {row.user_id: row.segment_id for row in assignments.rows} == {
         "user_1": "seg_b",
         "user_2": "seg_a",
+        "user_3": "seg_b",
+    }
+    assert {
+        row.user_id: row.similarity_score for row in assignments.rows
+    } == {
+        "user_1": Decimal("0.900000"),
+        "user_2": Decimal("0.000000"),
+        "user_3": None,
     }
     assert all(
         row.assignment_source == AssignmentSource.ANALYSIS_SNAPSHOT.value
         for row in assignments.rows
     )
     assert snapshots.consume_calls == 1
-
-
 def test_vector_search_sync_is_incremental_and_advances_complete_cutoff() -> None:
     repository = _SyncRepository()
-    first = UserBehaviorVectorSearchSyncService(repository).sync(
-        project_id="project",
-        vector_version="hotel_behavior.v2",
-        vector_generation_id="uvgen_test",
-        batch_size=1,
-        max_batches=1,
-    )
+    with capture_logs() as logs:
+        first = UserBehaviorVectorSearchSyncService(repository).sync(
+            project_id="project",
+            vector_version="hotel_behavior.v2",
+            vector_generation_id="uvgen_test",
+            batch_size=1,
+            max_batches=1,
+        )
+        result = UserBehaviorVectorSearchSyncService(repository).sync(
+            project_id="project",
+            vector_version="hotel_behavior.v2",
+            vector_generation_id="uvgen_test",
+            batch_size=1,
+            max_batches=2,
+        )
     assert first.status == "in_progress"
     assert first.synced_user_count == 1
-
-    result = UserBehaviorVectorSearchSyncService(repository).sync(
-        project_id="project",
-        vector_version="hotel_behavior.v2",
-        vector_generation_id="uvgen_test",
-        batch_size=1,
-        max_batches=2,
-    )
     assert result.status == "activated"
     assert result.synced_vector_count == 2
     assert result.source_cutoff == repository.generation.window_end
     assert [row.user_id for row in repository.upserted] == ["user_1", "user_2"]
     assert result.active_generation_id == "uvgen_test"
+    completed = [record for record in logs if record["event"] == "completed"][-1]
+    assert completed["status"] == "activated"
+    assert completed["processedBatchCount"] == 1
+    assert "user_2" not in str(logs)
 
 
 def test_failed_vector_generation_preserves_previous_active_generation() -> None:
@@ -1048,6 +1750,64 @@ def test_failed_vector_generation_preserves_previous_active_generation() -> None
 
     assert result.status == "failed"
     assert result.active_generation_id == "uvgen_previous"
+
+
+def test_vector_revision_window_compares_at_clickhouse_utc_millisecond_precision(
+) -> None:
+    repository = _SyncRepository()
+    generation = replace(
+        repository.generation,
+        window_start=repository.generation.window_start.replace(microsecond=123_456),
+        window_end=repository.generation.window_end.replace(microsecond=654_321),
+    )
+    revision = replace(
+        repository.revisions[0],
+        window_start=generation.window_start.replace(
+            tzinfo=None,
+            microsecond=123_000,
+        ),
+        window_end=generation.window_end.replace(
+            tzinfo=None,
+            microsecond=654_000,
+        ),
+    )
+
+    _validate_revision(revision, generation)
+
+    with pytest.raises(
+        ValueError,
+        match="search vector revision does not belong to generation",
+    ):
+        _validate_revision(
+            replace(
+                revision,
+                window_end=revision.window_end + timedelta(milliseconds=1),
+            ),
+            generation,
+        )
+
+
+def test_vector_revision_bulk_upsert_uses_postgres_array_parameters() -> None:
+    class RecordingPostgres:
+        params: tuple[object, ...] | None = None
+
+        def execute(self, _query: str, params: tuple[object, ...] = ()) -> None:
+            self.params = params
+
+    source = _SyncRepository()
+    postgres = RecordingPostgres()
+    repository = UserBehaviorVectorSearchSyncRepository(
+        clickhouse=object(),
+        postgres=postgres,
+    )
+
+    repository.bulk_upsert_revisions(
+        generation=source.generation,
+        revisions=source.revisions,
+    )
+
+    assert postgres.params is not None
+    assert all(isinstance(value, list) for value in postgres.params[5:])
 
 
 def test_assignment_snapshot_contract_accepts_superseded_consistent_generation() -> None:
@@ -1176,6 +1936,75 @@ def _analysis_promotion() -> AnalysisPromotionRecord:
     )
 
 
+def _custom_structured_rule(
+    *,
+    conditions: Sequence[Mapping[str, object]],
+    query_signal_keys: Sequence[str],
+    base_user_ids: Sequence[str] = (),
+    lookback_days: int = CUSTOM_STRUCTURED_WINDOW_DAYS,
+) -> dict[str, object]:
+    is_source_refinement = bool(base_user_ids)
+    condition_keys = (
+        [
+            CUSTOM_SOURCE_MEMBERSHIP_CONDITION_KEY,
+            *([CUSTOM_STRUCTURED_CONDITION_KEY] if conditions else []),
+        ]
+        if is_source_refinement
+        else [CUSTOM_STRUCTURED_CONDITION_KEY]
+    )
+    return {
+        "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
+        "segment_audience_spec": {
+            "schema_version": "hotel_behavior.v2",
+            "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+            "template_version": (
+                CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_TEMPLATE_VERSION
+            ),
+            "template_semantic_hash": (
+                custom_structured_template_hash(
+                    template_version=(
+                        CUSTOM_SOURCE_REFINEMENT_TEMPLATE_VERSION
+                        if is_source_refinement
+                        else CUSTOM_STRUCTURED_TEMPLATE_VERSION
+                    ),
+                    window_days=lookback_days,
+                )
+            ),
+            "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+            "condition_keys": condition_keys,
+            "query_signal_keys": list(query_signal_keys),
+            "hard_predicate_keys": condition_keys,
+            "parameters": {
+                "lookback_days": lookback_days,
+                "conditions": list(conditions),
+                **(
+                    {"base_user_ids": list(base_user_ids)}
+                    if is_source_refinement
+                    else {}
+                ),
+            },
+            "parameter_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_PARAMETER_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_PARAMETER_POLICY_ID
+            ),
+            "semantic_selection_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_SELECTION_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_SELECTION_POLICY_ID
+            ),
+            "semantic_anchor_policy_id": (
+                CUSTOM_SOURCE_REFINEMENT_ANCHOR_POLICY_ID
+                if is_source_refinement
+                else CUSTOM_STRUCTURED_ANCHOR_POLICY_ID
+            ),
+            "observation_window_days": lookback_days,
+        },
+    }
+
+
 def _v2_segment(
     segment_id: str,
     *,
@@ -1217,9 +2046,16 @@ class _TestCalibrationProvider:
 
 
 class _BatchCoordinatorSearchRepository:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        hard_match_count: int = 10,
+        materialized_member_count: int = 2,
+    ) -> None:
         self.batch_call_count = 0
         self.individual_call_count = 0
+        self.hard_match_count = hard_match_count
+        self.materialized_member_count = materialized_member_count
         now = datetime(2026, 7, 16, tzinfo=UTC)
         self.context = AudienceSearchContext(
             vector_generation_id="uvgen_active",
@@ -1235,17 +2071,35 @@ class _BatchCoordinatorSearchRepository:
 
     def count_hard_matches_batch(self, *, requests, **_kwargs: object):
         self.batch_call_count += 1
-        return {request.segment_id: 10 for request in requests}
+        return {
+            request.segment_id: self.hard_match_count for request in requests
+        }
 
     def count_hard_matches(self, **_kwargs: object) -> int:
         self.individual_call_count += 1
-        return 10
+        return self.hard_match_count
 
     def estimate_score_pass_rate(self, **_kwargs: object) -> float:
         return 0.5
 
     def materialize_exact_members(self, **_kwargs: object) -> int:
-        return 2
+        return self.materialized_member_count
+
+
+class _RawExactBatchCoordinatorSearchRepository(
+    _BatchCoordinatorSearchRepository
+):
+    def __init__(self, *, member_count: int) -> None:
+        super().__init__(hard_match_count=0, materialized_member_count=0)
+        self.member_count = member_count
+        self.raw_exact_call_count = 0
+
+    def materialize_raw_exact_members(self, **_kwargs: object) -> int:
+        self.raw_exact_call_count += 1
+        return self.member_count
+
+    def materialize_exact_members(self, **_kwargs: object) -> int:
+        raise AssertionError("custom conditions must not use vector candidates")
 
 
 class _SemanticCorpusSearchRepository:
@@ -1341,7 +2195,11 @@ class _SemanticCorpusSearchRepository:
 
 
 class _BatchSegmentVectorPreparer:
+    def __init__(self) -> None:
+        self.requests = []
+
     def prepare_segment_vector(self, request) -> SegmentVectorBuildResult:
+        self.requests.append(request)
         return SegmentVectorBuildResult(
             segment_id=request.segment_id,
             segment_vector_id=f"vector_{request.segment_id}",
@@ -1418,16 +2276,21 @@ class _MaterializedSearchRepository:
 
 
 class _SearchSqlPostgres:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        fetchall_results: list[list[dict[str, object]]] | None = None,
+    ) -> None:
         self.executed: list[tuple[str, object]] = []
         self.fetchall_calls: list[tuple[str, tuple[object, ...]]] = []
+        self._fetchall_results = list(fetchall_results or [])
 
     def execute(self, query: str, params: object = ()) -> None:
         self.executed.append((query, params))
 
     def fetchall(self, query: str, params: tuple[object, ...]):
         self.fetchall_calls.append((query, params))
-        return []
+        return self._fetchall_results.pop(0) if self._fetchall_results else []
 
     def fetchone(self, query: str, _params: object = ()):
         if "SELECT count(*) AS row_count" in query:
@@ -1435,17 +2298,49 @@ class _SearchSqlPostgres:
         return None
 
 
+class _RawExactQueryResult:
+    def __init__(self, user_ids: Sequence[str]) -> None:
+        self._user_ids = user_ids
+
+    def named_results(self):
+        return ({"user_id": user_id} for user_id in self._user_ids)
+
+
+class _RawExactClickHouse:
+    def __init__(self, user_ids: Sequence[str]) -> None:
+        self.user_ids = user_ids
+        self.query_text = ""
+        self.parameters: Mapping[str, object] = {}
+
+    def query(self, query: str, *, parameters: Mapping[str, object]):
+        self.query_text = query
+        self.parameters = parameters
+        return _RawExactQueryResult(self.user_ids)
+
+
 class _SnapshotWriteDb:
-    def __init__(self) -> None:
+    def __init__(self, *, actual_member_count: int = 800) -> None:
+        self.actual_member_count = actual_member_count
         self.executed: list[tuple[str, tuple[object, ...]]] = []
 
     def fetchone(self, query: str, _params: object = ()):
         if "SELECT count(*) AS actual_member_count" in query:
-            return {"actual_member_count": 800}
+            return {"actual_member_count": self.actual_member_count}
         return None
 
     def execute(self, query: str, params: object = ()) -> None:
         self.executed.append((query, tuple(params)))
+
+
+class _SnapshotBindingDb:
+    def __init__(self, row: dict[str, object]) -> None:
+        self.row = row
+
+    def fetchone(self, _query: str, _params: object = ()) -> dict[str, object]:
+        return self.row
+
+    def execute(self, _query: str, _params: object = ()) -> None:
+        raise AssertionError("snapshot binding validation must be read-only")
 
 
 class _RunReader:
@@ -1487,7 +2382,8 @@ class _SnapshotReader:
         # Final allocation snapshots are already mutually exclusive.
         return [
             AudienceSnapshotMember("user_1", "seg_b", Decimal("0.9")),
-            AudienceSnapshotMember("user_2", "seg_a", Decimal("0.8")),
+            AudienceSnapshotMember("user_2", "seg_a", Decimal("-0.25")),
+            AudienceSnapshotMember("user_3", "seg_b", None),
         ]
 
 
@@ -1638,7 +2534,7 @@ def _snapshot_contract_row(
         "query_vector_hash": semantic_query_vector_hash(compiled),
         "query_compiler_version": compiled.query_compiler_version,
         "query_compiler_hash": compiled.query_compiler_hash,
-        "score_threshold": Decimal(str(compiled.score_threshold)),
+        "score_threshold": contract_score_threshold(compiled.score_threshold),
         "matcher_version": "exact_cosine_rerank.v2",
         "search_policy_version": "audience_search.v2",
         "metadata_json": {

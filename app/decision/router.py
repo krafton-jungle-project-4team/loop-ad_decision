@@ -20,7 +20,10 @@ from app.audience_allocation import (
     AudienceAllocationService,
     PostgresAudienceAllocationRepository,
 )
-from app.audience_exclusions import PromotionAudienceExclusionRepository
+from app.audience_exclusions import (
+    PromotionAudienceExclusionRepository,
+    SegmentAudienceExclusionError,
+)
 from app.analysis.repositories import (
     HotelProfileRepository as AnalysisHotelProfileRepository,
     PromotionAnalysisRepository as AnalysisPromotionAnalysisRepository,
@@ -54,6 +57,14 @@ from app.decision.evaluation_service import (
     PromotionRunEvaluationNotFoundError,
     PromotionRunEvaluationService,
     PromotionRunEvaluationValidationError,
+)
+from app.decision.experiment_assignment_repository import (
+    ExperimentAssignmentRepository,
+)
+from app.decision.experiment_design import (
+    ExperimentDesignConflictError,
+    ExperimentDesignValidationError,
+    RandomizedHoldoutConfigurationError,
 )
 from app.decision.matcher import SegmentCandidateReranker
 from app.decision.next_loop_service import (
@@ -215,6 +226,15 @@ def get_segment_assignment_service(
             ),
             reranker=SegmentCandidateReranker(),
             audience_snapshot_repository=AudienceSnapshotRepository(executor),
+            promotion_analysis_repository=PromotionAnalysisRepository(executor),
+            promotion_evaluation_repository=PromotionEvaluationRepository(executor),
+            evaluation_metric_repository=EvaluationMetricRepository(
+                clickhouse_client
+            ),
+            experiment_assignment_repository=ExperimentAssignmentRepository(
+                executor
+            ),
+            randomization_salt=settings.segment_holdout_randomization_salt,
         )
         connection.commit()
     except Exception:
@@ -309,15 +329,17 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_vector_repository=analysis_segment_vector_repository,
             user_behavior_vector_repository=analysis_user_behavior_vector_repository,
         )
+        analysis_exclusion_repository = PromotionAudienceExclusionRepository(
+            postgres=analysis_executor,
+            clickhouse=clickhouse_client,
+        )
+        audience_search_repository = PgClickHouseAudienceVectorSearchRepository(
+            postgres=analysis_executor,
+            clickhouse=clickhouse_client,
+            exclusion_repository=analysis_exclusion_repository,
+        )
         audience_v2_coordinator = AudienceV2Coordinator(
-            search_repository=PgClickHouseAudienceVectorSearchRepository(
-                postgres=analysis_executor,
-                clickhouse=clickhouse_client,
-                exclusion_repository=PromotionAudienceExclusionRepository(
-                    postgres=analysis_executor,
-                    clickhouse=clickhouse_client,
-                ),
-            ),
+            search_repository=audience_search_repository,
             snapshot_repository=AnalysisAudienceSnapshotRepository(
                 analysis_executor
             ),
@@ -336,6 +358,7 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             segment_suggester=VectorClusterSegmentSuggester(
                 user_behavior_vector_repository=analysis_user_behavior_vector_repository,
                 raw_event_signal_repository=analysis_user_behavior_vector_repository,
+                audience_context_provider=audience_search_repository,
                 promotion_intent_extractor=build_promotion_intent_extractor(settings),
                 vector_version=DEFAULT_VECTOR_VERSION,
             ),
@@ -344,11 +367,11 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
             audience_allocation_service=AudienceAllocationService(
                 PostgresAudienceAllocationRepository(
                     postgres=analysis_executor,
-                    exclusion_reader=PromotionAudienceExclusionRepository(
-                        postgres=analysis_executor,
-                        clickhouse=clickhouse_client,
-                    ),
+                    exclusion_reader=analysis_exclusion_repository,
                 )
+            ),
+            next_loop_source_assignment_reader=UserSegmentAssignmentRepository(
+                executor
             ),
         )
         content_generator = None
@@ -495,6 +518,21 @@ async def build_segment_assignments(
             status_code=status.HTTP_409_CONFLICT,
             detail=exc.to_detail(),
         ) from exc
+    except ExperimentDesignConflictError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except RandomizedHoldoutConfigurationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
+    except ExperimentDesignValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": exc.code, "message": str(exc)},
+        ) from exc
     except SegmentAssignmentValidationError as exc:
         raise HTTPException(
             status_code=422,
@@ -575,6 +613,16 @@ async def create_next_loop(
         raise HTTPException(
             status_code=422,
             detail="segment vector data unavailable",
+        ) from exc
+    except SegmentAudienceExclusionError as exc:
+        status_code = (
+            status.HTTP_422_UNPROCESSABLE_CONTENT
+            if exc.code == "segment_audience_exclusion_contract_missing"
+            else status.HTTP_409_CONFLICT
+        )
+        raise HTTPException(
+            status_code=status_code,
+            detail=exc.to_detail(),
         ) from exc
     except NextLoopConflictError as exc:
         raise HTTPException(

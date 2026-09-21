@@ -39,7 +39,7 @@ BUNDLED_SEMANTIC_SELECTION_PATH = (
     / "hotel_behavior_v2_segment_audience_templates_v1.json"
 )
 BUNDLED_SEMANTIC_SELECTION_SHA256 = (
-    "ccc9d1c61419b8910ed3588ee5973cad8ab19e3af399f6b45f4d55c86d5421cf"
+    "65060ff8aff2565fd5c2942ad0f9a6fa92104ad4a6f4ac0bcba7ba9658578e7c"
 )
 
 
@@ -252,6 +252,17 @@ def compile_registered_segment_audience(
             "registered audience compiler requires segment_audience.v1",
         )
     behavior_schema = schema or HotelBookingBehaviorSchemaV2()
+    if resolution.spec.is_custom_structured:
+        try:
+            return behavior_schema.compile_custom_segment_audience(
+                spec=resolution.spec,
+            )
+        except ValueError as exc:
+            raise _contract_error(
+                "segment_audience_manifest_mismatch",
+                segment_id,
+                str(exc),
+            ) from exc
     calibration = (provider or _DEFAULT_SEMANTIC_SELECTION_PROVIDER).require(
         segment_id=segment_id,
         spec=resolution.spec,

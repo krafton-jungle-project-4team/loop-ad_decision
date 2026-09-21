@@ -23,6 +23,11 @@ from app.generation.coordinator import GenerationCoordinator
 from app.generation.worker import GenerationJobProcessor
 from app.internal.router import router as internal_batch_router
 from app.logging import configure_logging, request_logging_middleware
+from app.promotion_offers.router import router as promotion_offer_router
+from app.uplift.router import router as uplift_router
+
+
+MANUAL_NEXT_LOOP_ENABLED_ENVS = frozenset({"dev", "local"})
 
 
 def create_app(*, settings: Settings | None = None) -> FastAPI:
@@ -55,6 +60,7 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.manual_next_loop_enabled = _manual_next_loop_enabled(settings)
     app.state.generation_coordinator = None
     if settings is not None:
         configure_logging(settings)
@@ -88,6 +94,8 @@ def create_app(*, settings: Settings | None = None) -> FastAPI:
     app.include_router(promotion_run_router)
     app.include_router(ad_experiment_router)
     app.include_router(internal_batch_router)
+    app.include_router(uplift_router)
+    app.include_router(promotion_offer_router)
     return app
 
 
@@ -96,7 +104,12 @@ def _get_or_load_settings(app: Any) -> Settings:
     if settings is None:
         settings = load_settings()
         app.state.settings = settings
+        app.state.manual_next_loop_enabled = _manual_next_loop_enabled(settings)
     return settings
+
+
+def _manual_next_loop_enabled(settings: Settings | None) -> bool:
+    return settings is not None and settings.env in MANUAL_NEXT_LOOP_ENABLED_ENVS
 
 
 app = create_app() 

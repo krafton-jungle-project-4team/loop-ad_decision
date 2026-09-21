@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Mapping, Protocol, Sequence
 
 from psycopg import errors
@@ -8,10 +9,61 @@ from psycopg import errors
 
 POSTGRES_EXCLUSION_RELATION = "promotion_audience_exclusion_members"
 CLICKHOUSE_EXCLUSION_RELATION = "promotion_audience_exclusion_active"
+CLICKHOUSE_EXCLUSION_PROJECTION_RELATION = (
+    "promotion_audience_exclusion_projection"
+)
 EXCLUSION_REVISION_RELATION = "promotion_audience_exclusion_state"
 CLICKHOUSE_PROJECTION_REVISION_RELATION = (
     "promotion_audience_exclusion_projection_status"
 )
+TERMINAL_PROMOTION_RUN_STATUSES_SQL = """(
+    'goal_met',
+    'goal_not_met',
+    'partial_goal_met',
+    'insufficient_data',
+    'stopped'
+)"""
+
+
+def promotion_target_is_active_sql(target_alias: str = "target") -> str:
+    """Return the shared reservation rule for a promotion target.
+
+    An unbound confirmation is still active. Once it is bound to a run, the
+    reservation remains active only while the run is non-terminal.
+    """
+
+    return f"""
+        {target_alias}.status <> 'stopped'
+        AND (
+            NOT EXISTS (
+                SELECT 1
+                FROM promotion_run_target_bindings AS target_binding
+                WHERE target_binding.target_analysis_id =
+                          {target_alias}.analysis_id
+                  AND target_binding.segment_id = {target_alias}.segment_id
+                  AND target_binding.allocation_plan_id =
+                          {target_alias}.allocation_plan_id
+                  AND target_binding.final_snapshot_id =
+                          {target_alias}.audience_snapshot_id
+            )
+            OR EXISTS (
+                SELECT 1
+                FROM promotion_run_target_bindings AS active_binding
+                JOIN promotion_runs AS active_run
+                  ON active_run.promotion_run_id =
+                     active_binding.promotion_run_id
+                WHERE active_binding.target_analysis_id =
+                          {target_alias}.analysis_id
+                  AND active_binding.segment_id = {target_alias}.segment_id
+                  AND active_binding.allocation_plan_id =
+                          {target_alias}.allocation_plan_id
+                  AND active_binding.final_snapshot_id =
+                          {target_alias}.audience_snapshot_id
+                  AND active_run.status NOT IN
+                      {TERMINAL_PROMOTION_RUN_STATUSES_SQL}
+            )
+        )
+    """
 
 
 class SegmentAudienceExclusionError(RuntimeError):
@@ -71,12 +123,27 @@ class PostgresExecutor(Protocol):
     ) -> Mapping[str, Any] | None:
         ...
 
+    def fetchall(
+        self,
+        query: str,
+        params: Sequence[Any] | Mapping[str, Any] = (),
+    ) -> list[Mapping[str, Any]]:
+        ...
+
 
 class ClickHouseClient(Protocol):
     def query(
         self,
         query: str,
         parameters: Mapping[str, Any] | None = None,
+    ) -> Any:
+        ...
+
+    def insert(
+        self,
+        table: str,
+        data: Sequence[Sequence[Any]],
+        column_names: Sequence[str],
     ) -> Any:
         ...
 
@@ -123,9 +190,15 @@ class PromotionAudienceExclusionRepository:
                     (
                         SELECT count(*)
                         FROM {POSTGRES_EXCLUSION_RELATION} AS member
+                        JOIN promotion_target_segments AS target
+                          ON target.analysis_id = member.target_analysis_id
+                         AND target.segment_id = member.segment_id
+                         AND target.allocation_plan_id = member.allocation_plan_id
+                         AND target.audience_snapshot_id = member.final_snapshot_id
                         WHERE member.project_id = %s
                           AND member.promotion_id = state.promotion_id
                           AND member.state IN ('reserved', 'consumed')
+                          AND {promotion_target_is_active_sql("target")}
                     ) AS excluded_user_count
                 FROM {EXCLUSION_REVISION_RELATION} AS state
                 WHERE state.promotion_id = %s
@@ -143,10 +216,21 @@ class PromotionAudienceExclusionRepository:
         excluded_user_count = (
             int(row["excluded_user_count"]) if row is not None else 0
         )
-        projection = self._load_projection_revision(
+        projection, projected_active_user_count = self._load_projection_state(
             project_id=project_id,
             promotion_id=promotion_id,
         )
+        if projection < revision or (
+            projected_active_user_count is not None
+            and projected_active_user_count != excluded_user_count
+        ):
+            projection = self._synchronize_projection(
+                project_id=project_id,
+                campaign_id=campaign_id,
+                promotion_id=promotion_id,
+                revision=revision,
+                excluded_user_count=excluded_user_count,
+            )
         context = PromotionAudienceExclusionContext(
             project_id=project_id,
             campaign_id=campaign_id,
@@ -158,16 +242,117 @@ class PromotionAudienceExclusionRepository:
         context.require_projection_ready()
         return context
 
-    def _load_projection_revision(
+    def _synchronize_projection(
+        self,
+        *,
+        project_id: str,
+        campaign_id: str,
+        promotion_id: str,
+        revision: int,
+        excluded_user_count: int,
+    ) -> int:
+        members = self._postgres.fetchall(
+            f"""
+            SELECT
+                member.user_id,
+                CASE
+                    WHEN NOT ({promotion_target_is_active_sql("target")})
+                        THEN 'released'
+                    ELSE member.state
+                END AS state,
+                CASE
+                    WHEN NOT ({promotion_target_is_active_sql("target")})
+                        THEN %s
+                    ELSE member.revision
+                END AS revision,
+                coalesce(
+                    member.released_at,
+                    member.consumed_at,
+                    member.reserved_at
+                ) AS updated_at
+            FROM {POSTGRES_EXCLUSION_RELATION} AS member
+            JOIN promotion_target_segments AS target
+              ON target.analysis_id = member.target_analysis_id
+             AND target.segment_id = member.segment_id
+             AND target.allocation_plan_id = member.allocation_plan_id
+             AND target.audience_snapshot_id = member.final_snapshot_id
+            WHERE member.project_id = %s
+              AND member.promotion_id = %s
+            ORDER BY member.user_id ASC
+            """,
+            (revision, project_id, promotion_id),
+        )
+        active_member_count = sum(
+            1
+            for member in members
+            if str(member["state"]) in {"reserved", "consumed"}
+        )
+        if active_member_count != excluded_user_count or (revision > 0 and not members):
+            raise SegmentAudienceExclusionError(
+                code="segment_audience_exclusion_projection_not_ready",
+                promotion_id=promotion_id,
+                reason=(
+                    "PostgreSQL exclusion members do not match the current "
+                    "exclusion revision"
+                ),
+            )
+
+        if members:
+            self._clickhouse.insert(
+                table=CLICKHOUSE_EXCLUSION_PROJECTION_RELATION,
+                data=[
+                    (
+                        project_id,
+                        campaign_id,
+                        promotion_id,
+                        str(member["user_id"]),
+                        str(member["state"]),
+                        int(member["revision"]),
+                        member["updated_at"],
+                    )
+                    for member in members
+                ],
+                column_names=(
+                    "project_id",
+                    "campaign_id",
+                    "promotion_id",
+                    "user_id",
+                    "state",
+                    "exclusion_revision",
+                    "updated_at",
+                ),
+            )
+
+        self._clickhouse.insert(
+            table=CLICKHOUSE_PROJECTION_REVISION_RELATION,
+            data=[(project_id, promotion_id, revision, datetime.now(UTC))],
+            column_names=(
+                "project_id",
+                "promotion_id",
+                "applied_revision",
+                "applied_at",
+            ),
+        )
+        return revision
+
+    def _load_projection_state(
         self,
         *,
         project_id: str,
         promotion_id: str,
-    ) -> int:
+    ) -> tuple[int, int | None]:
         try:
             result = self._clickhouse.query(
                 f"""
-                SELECT applied_revision
+                SELECT
+                    applied_revision,
+                    (
+                        SELECT count()
+                        FROM {CLICKHOUSE_EXCLUSION_RELATION}
+                        WHERE project_id = {{project_id:String}}
+                          AND promotion_id = {{promotion_id:String}}
+                          AND state IN ('reserved', 'consumed')
+                    ) AS active_user_count
                 FROM {CLICKHOUSE_PROJECTION_REVISION_RELATION}
                 WHERE project_id = {{project_id:String}}
                   AND promotion_id = {{promotion_id:String}}
@@ -196,11 +381,16 @@ class PromotionAudienceExclusionRepository:
             else list(result.result_rows)
         )
         if not rows:
-            return 0
+            return 0, None
         row = rows[0]
         if isinstance(row, Mapping):
-            return int(row["applied_revision"])
-        return int(row[0])
+            active_user_count = row.get("active_user_count")
+            return int(row["applied_revision"]), (
+                int(active_user_count)
+                if active_user_count is not None
+                else None
+            )
+        return int(row[0]), (int(row[1]) if len(row) > 1 else None)
 
 
 def _is_missing_clickhouse_contract(exc: Exception) -> bool:

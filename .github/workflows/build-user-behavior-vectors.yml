@@ -10,11 +10,11 @@ on:
       vector_version:
         description: "Vector version written to ClickHouse"
         required: true
-        default: "v1"
+        default: "hotel_behavior.v2"
       window_days:
         description: "Source event lookback window in days"
         required: true
-        default: "90"
+        default: "30"
   schedule:
     - cron: "0 * * * *"
 
@@ -30,8 +30,8 @@ jobs:
           DECISION_API_URL: https://decision.api.dev.loop-ad.org
           LOOPAD_INTERNAL_API_KEY: ${{ secrets.LOOPAD_INTERNAL_API_KEY }}
           PROJECT_ID: ${{ inputs.project_id || 'demo_project' }}
-          VECTOR_VERSION: ${{ inputs.vector_version || 'v1' }}
-          WINDOW_DAYS: ${{ inputs.window_days || '90' }}
+          VECTOR_VERSION: ${{ inputs.vector_version || 'hotel_behavior.v2' }}
+          WINDOW_DAYS: ${{ inputs.window_days || '30' }}
         run: |
           test -n "$DECISION_API_URL"
           test -n "$LOOPAD_INTERNAL_API_KEY"
@@ -44,8 +44,26 @@ jobs:
               vector_version: $vector_version,
               window_days: $window_days
             }')"
-          curl --fail-with-body --show-error --silent --max-time 900 \
+          build_response="$(curl --fail-with-body --show-error --silent --max-time 900 \
             -X POST "$DECISION_API_URL/internal/decision/v1/batches/user-behavior-vectors/build" \
             -H "Content-Type: application/json" \
             -H "X-Loop-Ad-Internal-Key: $LOOPAD_INTERNAL_API_KEY" \
-            -d "$payload"
+            -d "$payload")"
+          vector_generation_id="$(printf '%s' "$build_response" | jq -er '.vector_generation_id')"
+          sync_payload="$(jq -n \
+            --arg project_id "$PROJECT_ID" \
+            --arg vector_version "$VECTOR_VERSION" \
+            --arg vector_generation_id "$vector_generation_id" \
+            '{
+              project_id: $project_id,
+              vector_version: $vector_version,
+              vector_generation_id: $vector_generation_id,
+              batch_size: 5000,
+              max_batches: 100
+            }')"
+          sync_response="$(curl --fail-with-body --show-error --silent --max-time 900 \
+            -X POST "$DECISION_API_URL/internal/decision/v1/batches/user-behavior-vector-search/sync" \
+            -H "Content-Type: application/json" \
+            -H "X-Loop-Ad-Internal-Key: $LOOPAD_INTERNAL_API_KEY" \
+            -d "$sync_payload")"
+          printf '%s' "$sync_response" | jq -e '.status == "activated"'

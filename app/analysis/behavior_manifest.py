@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from functools import lru_cache
 from pathlib import Path
 from types import MappingProxyType
@@ -47,15 +48,53 @@ def canonical_destination_id(value: str) -> str:
 
 
 @lru_cache(maxsize=1)
-def destination_alias_lookup() -> Mapping[str, str]:
-    aliases: dict[str, str] = {}
+def canonical_destination_id_patterns() -> tuple[re.Pattern[str], ...]:
+    return tuple(
+        re.compile(str(value))
+        for value in load_behavior_manifest()[
+            "canonical_destination_id_patterns"
+        ]
+    )
+
+
+def executable_destination_id(value: str) -> str | None:
+    canonical_id = canonical_destination_id(value)
+    if not canonical_id:
+        return None
+    if canonical_id in destination_alias_groups() or any(
+        pattern.fullmatch(canonical_id)
+        for pattern in canonical_destination_id_patterns()
+    ):
+        return canonical_id
+    return None
+
+
+@lru_cache(maxsize=1)
+def destination_alias_groups() -> Mapping[str, tuple[str, ...]]:
+    groups: dict[str, tuple[str, ...]] = {}
     manifest = load_behavior_manifest()
     for canonical, values in manifest["destination_aliases"].items():
         canonical_id = _normalize_text(str(canonical))
         if not canonical_id:
             raise BehaviorManifestError("canonical destination id must not be empty")
-        for value in (canonical, *values):
-            alias = _normalize_text(str(value))
+        aliases = tuple(
+            dict.fromkeys(
+                alias
+                for value in (canonical, *values)
+                if (alias := _normalize_text(str(value)))
+            )
+        )
+        if not aliases:
+            raise BehaviorManifestError("destination aliases must not be empty")
+        groups[canonical_id] = aliases
+    return MappingProxyType(groups)
+
+
+@lru_cache(maxsize=1)
+def destination_alias_lookup() -> Mapping[str, str]:
+    aliases: dict[str, str] = {}
+    for canonical_id, values in destination_alias_groups().items():
+        for alias in values:
             previous = aliases.setdefault(alias, canonical_id)
             if previous != canonical_id:
                 raise BehaviorManifestError(
@@ -143,6 +182,15 @@ def manifest_season_query_indices() -> Mapping[str, int]:
             str(season): indices[str(name)]
             for season, name in manifest["season_query_dimensions"].items()
         }
+    )
+
+
+def manifest_intent_benefit_keys() -> tuple[str, ...]:
+    return tuple(
+        str(benefit).strip().casefold()
+        for benefit in load_behavior_manifest()[
+            "intent_benefit_query_dimensions"
+        ]
     )
 
 

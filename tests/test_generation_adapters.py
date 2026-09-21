@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -21,6 +22,7 @@ from app.generation.adapters import (
 )
 from app.generation.artifacts import (
     ArtifactIdentity,
+    CREATIVE_SOURCE_META_NAME,
     S3CreativeArtifactPublisher,
     StoredAsset,
     image_prompt_sha256,
@@ -55,6 +57,35 @@ PROMOTION_LANDING_URL = "https://demo-stay.example.com/summer"
 LLM_LANDING_URL = "https://yourhotelbookinglink.com/generated-by-model"
 OPENAI_FIXTURE_KEY = "fixture-openai-key"
 GEMINI_FIXTURE_KEY = "fixture-gemini-key"
+
+
+def _with_v2_creative_source(html_body: str) -> str:
+    match = re.search(
+        rf'<meta name="{re.escape(CREATIVE_SOURCE_META_NAME)}" content="([^"]+)">',
+        html_body,
+    )
+    assert match is not None
+    encoded = match.group(1)
+    payload = json.loads(
+        base64.urlsafe_b64decode(
+            f"{encoded}{'=' * (-len(encoded) % 4)}"
+        ).decode("utf-8")
+    )
+    payload["schema_version"] = "creative.source.v2"
+    payload.pop("creative_contract_sha256")
+    previous_encoded = base64.urlsafe_b64encode(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return (
+        html_body[: match.start(1)]
+        + previous_encoded
+        + html_body[match.end(1) :]
+    )
 
 
 def provider_key_kwargs(value: str) -> dict[str, str]:
@@ -102,6 +133,8 @@ def test_external_content_generator_stores_banner_image_url() -> None:
         "Property-agnostic hotel booking advertisement image."
     )
     assert "no visible text" in content.image_prompt
+    assert "do not render a color palette" in content.image_prompt
+    assert "adult travelers aged 20 to 39" in content.image_prompt
     assert content.landing_url == PROMOTION_LANDING_URL
     assert content.image_url == IMAGE_URL
     assert image_client.prompts == [content.image_prompt]
@@ -360,6 +393,8 @@ def test_external_content_generator_creates_images_for_email_contract() -> None:
     assert content.image_prompt is not None
     assert content.image_url == IMAGE_URL
     assert image_client.prompts == [content.image_prompt]
+    assert "do not render a color palette" in image_client.prompts[0]
+    assert "adult travelers aged 20 to 39" in image_client.prompts[0]
     assert asset_storage.saved == [
         (
             "content_email_repeat_hotel_001",
@@ -790,6 +825,79 @@ def test_s3_asset_storage_reuses_same_source_across_renderer_changes() -> None:
         "version": "generation.renderer.old",
         "template_version": "banner.overlay.old",
     }
+    assert len(s3_client.put_objects) == 1
+
+
+def test_s3_asset_storage_rejects_changed_creative_contract() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+    values = {
+        "title": "호텔 특가",
+        "body": "객실을 확인하세요.",
+        "cta": "호텔 보기",
+        "image_prompt": "hotel image, no visible text",
+        "image_url": IMAGE_URL,
+        "variant_type": "editorial",
+        "link_targets": [
+            {"placeholder": "{{redirect_url}}", "target_type": "promotion"}
+        ],
+    }
+    storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=render_banner_html(values),
+    )
+
+    with pytest.raises(RetryableGenerationError) as exc_info:
+        storage.store_html(
+            identity=artifact_identity(),
+            creative_format=CreativeFormat.BANNER_HTML,
+            html_body=render_banner_html(
+                {
+                    **values,
+                    "variant_type": "comparison",
+                }
+            ),
+        )
+
+    assert exc_info.value.code == "artifact_hash_conflict"
+    assert len(s3_client.put_objects) == 1
+
+
+def test_s3_asset_storage_reuses_v2_source_for_empty_creative_contract() -> None:
+    s3_client = FakeS3Client()
+    storage = S3AssetStorage(
+        bucket_name="loop-ad-dev-data-storage",
+        base_prefix="genai/",
+        public_base_url=PUBLIC_BASE_URL,
+        s3_client=s3_client,
+    )
+    values = {
+        "title": "호텔 특가",
+        "body": "객실을 확인하세요.",
+        "cta": "호텔 보기",
+        "image_prompt": "hotel image, no visible text",
+        "image_url": IMAGE_URL,
+    }
+    v2_html = _with_v2_creative_source(render_banner_html(values))
+    first = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=v2_html,
+    )
+
+    reused = storage.store_html(
+        identity=artifact_identity(),
+        creative_format=CreativeFormat.BANNER_HTML,
+        html_body=render_banner_html(values),
+    )
+
+    assert reused == first
     assert len(s3_client.put_objects) == 1
 
 

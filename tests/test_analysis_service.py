@@ -1,15 +1,29 @@
 from __future__ import annotations
 
 import re
+import threading
 from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any, Mapping, Sequence
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.audience_allocation import (
     ConfirmationAllocationResult,
     FinalAudienceAllocation,
+)
+from app.audience_contract import (
+    CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+    CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+    CUSTOM_STRUCTURED_CONDITION_KEY,
+    CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+    CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_HASH,
+    CUSTOM_STRUCTURED_TEMPLATE_ID,
+    CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+    CUSTOM_STRUCTURED_WINDOW_DAYS,
+    SEGMENT_AUDIENCE_CONTRACT,
 )
 
 from app.analysis.repositories import (
@@ -22,18 +36,21 @@ from app.analysis.repositories import (
     SegmentDefinitionRecord,
     SegmentSuggestionAudienceBindingRecord,
 )
-from app.analysis.audience_v2 import AudienceV2Preparation
+from app.analysis.audience_v2 import AudienceV2MatchPreview, AudienceV2Preparation
 from app.analysis.audience_snapshot_repository import AudienceSnapshotBindingError
 from app.analysis.segment_audience_templates import (
     RegisteredSegmentAudienceBinder,
 )
+from app.analysis.report_generator import SegmentSuggestionReportInput
 from app.analysis.schemas import AnalysisRequest, SegmentAnalysisRequest
 from app.analysis.service import (
     NextLoopFocusAnalysisRequest,
     PromotionAnalysisService,
     PromotionNotFoundError,
     SegmentSelectionError,
+    _analysis_id,
     _bounded_next_loop_lineage_id,
+    _display_copy_from_report,
 )
 from app.analysis.vector_service import (
     SegmentVectorBuildRequest,
@@ -176,8 +193,13 @@ class FakePromotionAnalysisRepository:
         self.saved.segment_suggestions = list(suggestions)
         self.events.append("segment_suggestions")
 
-    def get_latest_audience_bindings(self, **_kwargs: object):
-        return list(self.bindings)
+    def get_latest_audience_bindings(self, **kwargs: object):
+        segment_ids = set(kwargs.get("segment_ids", ()))
+        return [
+            binding
+            for binding in self.bindings
+            if not segment_ids or binding.segment_id in segment_ids
+        ]
 
 
 class FakeAudienceV2Coordinator:
@@ -224,6 +246,7 @@ class FakePreparingAudienceV2Coordinator:
         self.selected_user_count = selected_user_count
         self.meets_min_sample_size = meets_min_sample_size
         self.counts_by_segment = counts_by_segment or {}
+        self.preview_many_calls: list[dict[str, object]] = []
         self.prepare_many_calls: list[dict[str, object]] = []
 
     def prepare(self, **kwargs: object) -> AudienceV2Preparation:
@@ -280,6 +303,29 @@ class FakePreparingAudienceV2Coordinator:
                 meets_min_sample_size=meets_minimum,
             )
         return preparations
+
+    def preview_many(self, **kwargs: object):
+        self.preview_many_calls.append(dict(kwargs))
+        previews: dict[str, AudienceV2MatchPreview] = {}
+        for segment in kwargs["segments"]:
+            eligible, matching, _selected, _meets_minimum = (
+                self.counts_by_segment.get(
+                    segment.segment_id,
+                    (
+                        self.total_eligible_user_count,
+                        self.matching_user_count,
+                        self.selected_user_count,
+                        self.meets_min_sample_size,
+                    ),
+                )
+            )
+            previews[segment.segment_id] = AudienceV2MatchPreview(
+                vector_generation_id="generation_active",
+                vector_version="hotel_behavior.v2",
+                total_eligible_user_count=eligible,
+                matching_user_count=matching,
+            )
+        return previews
 
 
 class FakeAudienceAllocationService:
@@ -380,18 +426,88 @@ class FakeSegmentVectorService:
         )
 
 
+@dataclass(frozen=True)
+class FakeSourceAssignment:
+    user_id: str
+    segment_id: str
+    ad_experiment_id: str
+
+
+class FakeNextLoopSourceAssignmentReader:
+    def __init__(self, assignments: Sequence[FakeSourceAssignment]) -> None:
+        self.assignments = sorted(assignments, key=lambda item: item.user_id)
+        self.calls: list[dict[str, Any]] = []
+
+    def list_source_page(
+        self,
+        *,
+        promotion_run_id: str,
+        ad_experiment_ids: Sequence[str],
+        after_user_id: str | None,
+        limit: int,
+    ) -> list[FakeSourceAssignment]:
+        self.calls.append(
+            {
+                "promotion_run_id": promotion_run_id,
+                "ad_experiment_ids": list(ad_experiment_ids),
+                "after_user_id": after_user_id,
+                "limit": limit,
+            }
+        )
+        return [
+            assignment
+            for assignment in self.assignments
+            if assignment.ad_experiment_id in ad_experiment_ids
+            and (after_user_id is None or assignment.user_id > after_user_id)
+        ][:limit]
+
+
 class FakeSegmentSuggester:
     def __init__(self, segments: list[SegmentDefinitionRecord]) -> None:
         self.segments = segments
-        self.calls: list[PromotionRecord] = []
+        self.calls: list[tuple[PromotionRecord, str | None]] = []
 
     def suggest_segments(
         self,
         *,
         promotion: PromotionRecord,
+        segment_instruction: str | None = None,
     ) -> list[SegmentDefinitionRecord]:
-        self.calls.append(promotion)
+        self.calls.append((promotion, segment_instruction))
         return self.segments
+
+
+class ConcurrentSegmentReportGenerator:
+    def __init__(self, expected_calls: int) -> None:
+        self.barrier = threading.Barrier(expected_calls)
+        self.calls: list[str] = []
+
+    def generate_report(
+        self,
+        report_input: SegmentSuggestionReportInput,
+    ) -> dict[str, Any]:
+        self.barrier.wait(timeout=2)
+        segment_id = report_input.segment.segment_id
+        self.calls.append(segment_id)
+        return {"source": "test", "title": segment_id}
+
+
+def test_report_enrichment_preserves_strategy_specific_card_title() -> None:
+    display_copy = {
+        "title": "예약 직전 이탈 고객",
+        "reason": "예약 단계에서 이탈한 고객입니다.",
+    }
+
+    enriched = _display_copy_from_report(
+        display_copy=display_copy,
+        report={
+            "title": "예약을 시작한 고객",
+            "why_recommended": ["예약을 완료하도록 다시 안내하기 적합합니다."],
+        },
+    )
+
+    assert enriched["title"] == "예약 직전 이탈 고객"
+    assert enriched["reason"] == "예약을 완료하도록 다시 안내하기 적합합니다."
 
 
 def promotion_record(
@@ -462,12 +578,14 @@ def analysis_request(
     *,
     promotion_id: str,
     operator_instruction: str | None = None,
+    segment_instruction: str | None = None,
 ) -> AnalysisRequest:
     return AnalysisRequest(
         project_id="hotel-client-a",
         campaign_id="camp_summer_2026",
         promotion_id=promotion_id,
         operator_instruction=operator_instruction,
+        segment_instruction=segment_instruction,
     )
 
 
@@ -480,9 +598,13 @@ def build_service(
     booking_training_records: list[BookingTrainingRecord] | None = None,
     segment_vector_service: FakeSegmentVectorService | None = None,
     segment_suggester: FakeSegmentSuggester | None = None,
+    segment_report_generator: ConcurrentSegmentReportGenerator | None = None,
     audience_v2_coordinator: FakeAudienceV2Coordinator | None = None,
     audience_bindings: Sequence[SegmentSuggestionAudienceBindingRecord] = (),
     audience_allocation_service: FakeAudienceAllocationService | None = None,
+    next_loop_source_assignment_reader: (
+        FakeNextLoopSourceAssignmentReader | None
+    ) = None,
     configured_candidate_limit: int = 3,
 ) -> tuple[
     PromotionAnalysisService,
@@ -502,10 +624,14 @@ def build_service(
         promotion_analysis_repository=analysis_repository,
         segment_vector_service=segment_vector_service or FakeSegmentVectorService(),
         segment_suggester=segment_suggester,
+        segment_report_generator=segment_report_generator,
         audience_v2_coordinator=audience_v2_coordinator,
         audience_allocation_service=(
             audience_allocation_service
             or FakeAudienceAllocationService(audience_bindings)
+        ),
+        next_loop_source_assignment_reader=(
+            next_loop_source_assignment_reader
         ),
         max_default_target_segments=configured_candidate_limit,
     )
@@ -611,6 +737,16 @@ def test_service_creates_new_analysis_id_for_repeated_ai_recommendations() -> No
     assert {
         suggestion.analysis_id for suggestion in second.segment_suggestions
     } == {second.analysis.analysis_id}
+
+
+def test_initial_analysis_id_fits_contract_for_max_length_promotion_id() -> None:
+    analysis_id = _analysis_id(
+        promotion_id="p" * 100,
+        next_loop_context=None,
+    )
+
+    assert len(analysis_id) == 100
+    assert re.fullmatch(r"analysis_p{78}_run_[0-9a-f]{8}", analysis_id)
 
 
 def test_service_prioritizes_related_custom_segment_for_onsite_banner() -> None:
@@ -881,12 +1017,14 @@ def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
         audience_v2_coordinator=coordinator,
     )
 
-    result = service.recommend_segments(
-        analysis_request(promotion_id=promotion.promotion_id)
-    )
+    with capture_logs() as logs:
+        result = service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
 
     assert len(coordinator.prepare_many_calls) == 1
-    assert len(result.segment_suggestions) == 3
+    assert len(coordinator.preview_many_calls) == 1
+    assert len(result.segment_suggestions) == 2
     for suggestion in result.segment_suggestions:
         eligible, matching, selected, _meets_minimum = expected[
             suggestion.segment_id
@@ -906,12 +1044,84 @@ def test_v2_recommendation_projects_each_snapshot_to_its_own_card() -> None:
     assert targets["seg_ai_second"].data_evidence_json["audience_status"] == (
         "insufficient_sample"
     )
-    assert targets["seg_ai_third"].data_evidence_json["audience_status"] == (
-        "no_eligible_audience"
+    assert "seg_ai_third" not in targets
+    preflight = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_preflight_completed"
+    )
+    assert preflight["candidateCount"] == 3
+    assert preflight["targetableCandidateCount"] == 2
+    assert preflight["emptyCandidateCount"] == 1
+    excluded = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_candidate_empty"
+    )
+    assert excluded["segmentId"] == "seg_ai_third"
+    assert excluded["candidateGenerationUserCount"] == 40
+    assert excluded["matchingUserCount"] == 0
+    prepared = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_snapshots_prepared"
+    )
+    assert prepared["audienceCount"] == 2
+    assert {audience["segmentId"] for audience in prepared["audiences"]} == {
+        "seg_ai_first",
+        "seg_ai_second",
+    }
+
+
+def test_v2_recommendation_uses_current_audience_when_stored_sample_is_zero() -> None:
+    promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
+    segment = _v2_ai_segment(
+        promotion=promotion,
+        segment_id="seg_ai_stale_zero",
+        sample_size=0,
+        raw_audience={
+            "total_eligible_user_count": 0,
+            "matching_user_count": 0,
+            "selected_user_count": 0,
+        },
+    )
+    coordinator = FakePreparingAudienceV2Coordinator(
+        total_eligible_user_count=100,
+        matching_user_count=20,
+        selected_user_count=10,
+    )
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[segment],
+        segment_suggester=FakeSegmentSuggester([]),
+        audience_v2_coordinator=coordinator,
     )
 
+    with capture_logs() as logs:
+        result = service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
 
-def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> None:
+    assert segment_ids(result.target_segments) == [segment.segment_id]
+    assert result.target_segments[0].estimated_size == 10
+    preflight = next(
+        record
+        for record in logs
+        if record["event"] == "segment_audience_preflight_completed"
+    )
+    assert preflight["targetableCandidateCount"] == 1
+    assert preflight["audiences"] == [
+        {
+            "segmentId": segment.segment_id,
+            "candidateGenerationUserCount": 0,
+            "totalEligibleUserCount": 100,
+            "matchingUserCount": 20,
+            "vectorGenerationId": "generation_active",
+        }
+    ]
+
+
+def test_v2_recommendation_rejects_when_all_executable_audiences_are_empty() -> None:
     promotion = promotion_record(channel="onsite_banner", min_sample_size=20)
     segment = _v2_ai_segment(
         promotion=promotion,
@@ -923,30 +1133,26 @@ def test_v2_recommendation_keeps_zero_audience_without_legacy_card_values() -> N
             "selected_user_count": 40,
         },
     )
-    coordinator = FakePreparingAudienceV2Coordinator(selected_user_count=0)
-    service, _, _ = build_service(
+    coordinator = FakePreparingAudienceV2Coordinator(
+        matching_user_count=0,
+        selected_user_count=0,
+    )
+    service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=[],
         segment_suggester=FakeSegmentSuggester([segment]),
         audience_v2_coordinator=coordinator,
     )
 
-    result = service.recommend_segments(
-        analysis_request(promotion_id=promotion.promotion_id)
-    )
+    with pytest.raises(SegmentSelectionError, match="no active segment candidates"):
+        service.recommend_segments(
+            analysis_request(promotion_id=promotion.promotion_id)
+        )
 
-    target = result.target_segments[0]
-    assert target.estimated_size == 0
-    assert target.data_evidence_json["sample_size"] == 0
-    assert target.data_evidence_json["sample_ratio"] == 0.0
-    assert target.data_evidence_json["targetable"] is False
-    assert target.data_evidence_json["audience_status"] == "no_eligible_audience"
-    audience = result.segment_suggestions[0].metadata_json["display_copy"][
-        "audience"
-    ]
-    assert audience["selected_user_count"] == 0
-    assert audience["selected_user_ratio"] == 0.0
-    assert audience["selection_ratio_within_matching"] == 0.0
+    assert len(coordinator.preview_many_calls) == 1
+    assert coordinator.prepare_many_calls == []
+    assert analysis_repository.saved.analysis is None
+    assert analysis_repository.saved.segment_suggestions is None
 
 
 def test_legacy_recommendation_preserves_existing_card_audience() -> None:
@@ -1145,7 +1351,72 @@ def test_v2_confirmation_rejects_missing_recommendation_snapshot() -> None:
     assert coordinator.prepare_many_calls == 0
 
 
-def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None:
+def test_v2_confirmation_prepares_custom_snapshot_and_allocates_with_ai_candidate() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    ai_segment = _v2_ai_segment(
+        promotion=promotion,
+        segment_id="seg_ai_confirmed",
+        sample_size=20,
+        raw_audience={},
+    )
+    custom_segment = _v2_custom_segment(
+        promotion=promotion,
+        segment_id="seg_custom_confirmed",
+    )
+    source_analysis_id = "recommendation_analysis_mixed"
+    bindings = (
+        SegmentSuggestionAudienceBindingRecord(
+            suggestion_id="suggestion_ai",
+            analysis_id=source_analysis_id,
+            segment_id=ai_segment.segment_id,
+            audience_snapshot_id="snapshot_ai",
+        ),
+        SegmentSuggestionAudienceBindingRecord(
+            suggestion_id="internal_custom",
+            analysis_id=source_analysis_id,
+            segment_id=custom_segment.segment_id,
+            audience_snapshot_id="snapshot_custom",
+        ),
+    )
+    coordinator = FakePreparingAudienceV2Coordinator()
+    allocation_service = FakeAudienceAllocationService(bindings)
+    service, analysis_repository, _ = build_service(
+        promotion=promotion,
+        segments=[ai_segment, custom_segment],
+        audience_v2_coordinator=coordinator,
+        audience_bindings=bindings,
+        audience_allocation_service=allocation_service,
+    )
+
+    result = service.analyze_segments(
+        SegmentAnalysisRequest(
+            project_id=promotion.project_id,
+            campaign_id=promotion.campaign_id,
+            promotion_id=promotion.promotion_id,
+            segment_ids=[ai_segment.segment_id, custom_segment.segment_id],
+        )
+    )
+
+    assert len(coordinator.prepare_many_calls) == 1
+    prepare_call = coordinator.prepare_many_calls[0]
+    assert prepare_call["analysis_id"] == source_analysis_id
+    assert [segment.segment_id for segment in prepare_call["segments"]] == [
+        custom_segment.segment_id
+    ]
+    assert len(allocation_service.confirm_calls) == 1
+    assert allocation_service.confirm_calls[0]["source_analysis_id"] == source_analysis_id
+    assert set(allocation_service.confirm_calls[0]["segment_ids"]) == {
+        ai_segment.segment_id,
+        custom_segment.segment_id,
+    }
+    assert {target.audience_snapshot_id for target in result.target_segments} == {
+        "final_snapshot_ai",
+        "final_snapshot_custom",
+    }
+    assert analysis_repository.saved.target_segments == result.target_segments
+
+
+def test_v2_next_loop_uses_failed_source_assignments_without_reallocation() -> None:
     promotion = promotion_record(channel="onsite_banner")
     segment_id = "seg_ai_next_loop_funnel"
     segment = _v2_ai_segment(
@@ -1154,13 +1425,49 @@ def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None
         sample_size=25,
         raw_audience={},
     )
+    segment = replace(
+        segment,
+        rule_json={
+            key: value
+            for key, value in segment.rule_json.items()
+            if key != "candidate_user_ids"
+        },
+    )
     coordinator = FakePreparingAudienceV2Coordinator()
     allocation_service = FakeAudienceAllocationService()
+    vector_service = FakeSegmentVectorService()
+    source_assignments = [
+        FakeSourceAssignment(
+            user_id=f"user_{index:04d}",
+            segment_id=segment_id,
+            ad_experiment_id="adexp_failed",
+        )
+        for index in range(1001)
+    ]
+    source_assignments.extend(
+        [
+            FakeSourceAssignment(
+                user_id="user_other_segment",
+                segment_id="seg_other",
+                ad_experiment_id="adexp_failed",
+            ),
+            FakeSourceAssignment(
+                user_id="user_other_experiment",
+                segment_id=segment_id,
+                ad_experiment_id="adexp_success",
+            ),
+        ]
+    )
+    source_assignment_reader = FakeNextLoopSourceAssignmentReader(
+        source_assignments
+    )
     service, analysis_repository, _ = build_service(
         promotion=promotion,
         segments=[segment],
+        segment_vector_service=vector_service,
         audience_v2_coordinator=coordinator,
         audience_allocation_service=allocation_service,
+        next_loop_source_assignment_reader=source_assignment_reader,
     )
 
     result = service.analyze_focus(
@@ -1177,10 +1484,25 @@ def test_v2_next_loop_creates_final_allocation_and_reservation_binding() -> None
     )
 
     target = result.target_segments[0]
-    assert target.audience_snapshot_id == f"final_snapshot_{segment_id}"
-    assert target.allocation_plan_id == "allocation_test"
-    assert allocation_service.confirm_calls[0]["source_analysis_id"] == (
-        result.analysis.analysis_id
+    assert target.audience_snapshot_id is None
+    assert target.allocation_plan_id is None
+    assert target.rule_json["audience_resolution_contract"] == "legacy"
+    assert target.rule_json["next_loop_audience_source"] == (
+        "failed_source_assignments"
+    )
+    assert allocation_service.confirm_calls == []
+    assert coordinator.prepare_many_calls == []
+    assert len(source_assignment_reader.calls) == 2
+    assert source_assignment_reader.calls[0] == {
+        "promotion_run_id": "run_previous",
+        "ad_experiment_ids": ["adexp_failed"],
+        "after_user_id": None,
+        "limit": 1000,
+    }
+    assert source_assignment_reader.calls[1]["after_user_id"] == "user_0999"
+    assert len(vector_service.calls) == 1
+    assert vector_service.calls[0].candidate_user_ids == tuple(
+        f"user_{index:04d}" for index in range(1001)
     )
     assert analysis_repository.saved.target_segments == result.target_segments
 
@@ -1218,6 +1540,65 @@ def _v2_ai_segment(
                 "audience": dict(raw_audience),
             },
         },
+    )
+
+
+def _v2_custom_segment(
+    *,
+    promotion: PromotionRecord,
+    segment_id: str,
+) -> SegmentDefinitionRecord:
+    conditions = [
+        {
+            "event_name": "booking_start",
+            "label": "예약 시작",
+            "minimum_count": 1,
+            "maximum_count": None,
+            "destination": "jeju",
+            "checkin_months": [],
+            "property_filters": [],
+        },
+        {
+            "event_name": "booking_complete",
+            "label": "예약 완료 없음",
+            "minimum_count": 0,
+            "maximum_count": 0,
+            "destination": None,
+            "checkin_months": [],
+            "property_filters": [],
+        },
+    ]
+    return replace(
+        segment_record(
+            segment_id,
+            source="custom_chatkit",
+            rule_json={
+                "audience_resolution_contract": SEGMENT_AUDIENCE_CONTRACT,
+                "segment_audience_spec": {
+                    "schema_version": "hotel_behavior.v2",
+                    "template_id": CUSTOM_STRUCTURED_TEMPLATE_ID,
+                    "template_version": CUSTOM_STRUCTURED_TEMPLATE_VERSION,
+                    "template_semantic_hash": CUSTOM_STRUCTURED_TEMPLATE_HASH,
+                    "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
+                    "condition_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+                    "query_signal_keys": [
+                        "booking_start_intensity",
+                        "booking_start_without_complete",
+                    ],
+                    "hard_predicate_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
+                    "parameters": {
+                        "lookback_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+                        "conditions": conditions,
+                    },
+                    "parameter_policy_id": CUSTOM_STRUCTURED_PARAMETER_POLICY_ID,
+                    "semantic_selection_policy_id": CUSTOM_STRUCTURED_SELECTION_POLICY_ID,
+                    "semantic_anchor_policy_id": CUSTOM_STRUCTURED_ANCHOR_POLICY_ID,
+                    "observation_window_days": CUSTOM_STRUCTURED_WINDOW_DAYS,
+                },
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
     )
 
 
@@ -1421,7 +1802,7 @@ def test_service_prioritizes_ai_suggested_cluster_segments() -> None:
     ]
     assert segment_ids(result.target_segments) == expected_segment_ids
     assert segment_definition_repository.saved_ai_suggested == [ai_segment]
-    assert suggester.calls == [promotion]
+    assert suggester.calls == [(promotion, None)]
     assert analysis_repository.events == ["analysis", "segment_suggestions"]
     assert result.analysis.output_json == {
         "selected_segment_ids": expected_segment_ids,
@@ -1530,9 +1911,17 @@ def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist(
             "recommendation_score": 0.8,
         },
     )
+    stored_custom_segment = _v2_custom_segment(
+        promotion=promotion,
+        segment_id="seg_custom_stored_zero",
+    )
     service, _, segment_definition_repository = build_service(
         promotion=promotion,
-        segments=[stale_ai_segment, *default_segments()],
+        segments=[
+            stale_ai_segment,
+            stored_custom_segment,
+            *default_segments(),
+        ],
         segment_suggester=FakeSegmentSuggester([fresh_ai_segment]),
     )
 
@@ -1544,11 +1933,182 @@ def test_service_ignores_stale_ai_suggested_segments_when_new_suggestions_exist(
     assert fresh_ai_segment.segment_id in selected_segment_ids
     assert stale_ai_segment.segment_id not in selected_segment_ids
     assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
-    assert all(
-        segment["segment_id"] != stale_ai_segment.segment_id
+    available_segment_ids = {
+        segment["segment_id"]
         for segment in result.analysis.input_snapshot_json[
             "available_segment_definitions"
         ]
+    }
+    assert fresh_ai_segment.segment_id in available_segment_ids
+    assert stale_ai_segment.segment_id not in available_segment_ids
+    assert stored_custom_segment.segment_id not in available_segment_ids
+    assert {
+        segment.segment_id for segment in default_segments()
+    }.issubset(available_segment_ids)
+
+
+def test_service_scopes_conversational_recommendation_to_fresh_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    instruction = "최근 제주 숙소를 반복 탐색한 고객을 찾아줘"
+    stale_ai_segment = replace(
+        segment_record(
+            "seg_ai_stale",
+            source="ai_suggested",
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["old_user_001"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    fresh_ai_segment = replace(
+        segment_record(
+            "seg_ai_jeju_repeat",
+            source="ai_suggested",
+            sample_size=120,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["jeju_user_001", "jeju_user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+        profile_json={
+            "primary_segment": "seg_ai_jeju_repeat",
+            "source": "raw_event_intent",
+            "recommendation_score": 0.81,
+        },
+    )
+    segment_suggester = FakeSegmentSuggester([fresh_ai_segment])
+    service, _, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=[stale_ai_segment, *default_segments()],
+        segment_suggester=segment_suggester,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            segment_instruction=instruction,
+        ),
+    )
+
+    assert segment_suggester.calls == [(promotion, instruction)]
+    assert segment_ids(result.target_segments) == [fresh_ai_segment.segment_id]
+    assert suggestion_segment_ids(result.segment_suggestions) == [
+        fresh_ai_segment.segment_id
+    ]
+    assert segment_definition_repository.saved_ai_suggested == [fresh_ai_segment]
+
+
+def test_service_does_not_replace_empty_conversational_result_with_defaults() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    segment_suggester = FakeSegmentSuggester([])
+    service, analysis_repository, segment_definition_repository = build_service(
+        promotion=promotion,
+        segments=default_segments(),
+        segment_suggester=segment_suggester,
+    )
+
+    with pytest.raises(
+        SegmentSelectionError,
+        match="no segment candidates matched segment instruction",
+    ):
+        service.recommend_segments(
+            analysis_request(
+                promotion_id=promotion.promotion_id,
+                segment_instruction="최근 부산에서 반려동물 동반 객실을 본 고객",
+            ),
+        )
+
+    assert analysis_repository.events == []
+    assert segment_definition_repository.saved_ai_suggested == []
+
+
+def test_service_builds_ai_reports_concurrently_without_mixing_segments() -> None:
+    promotion = promotion_record(channel="onsite_banner")
+    first_segment = replace(
+        segment_record(
+            "seg_ai_first",
+            source="ai_suggested",
+            sample_size=200,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_001", "user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    second_segment = replace(
+        segment_record(
+            "seg_ai_second",
+            source="ai_suggested",
+            sample_size=100,
+            rule_json={
+                "source": "user_vector_clustering",
+                "candidate_user_ids": ["user_003", "user_004"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    report_generator = ConcurrentSegmentReportGenerator(expected_calls=2)
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[first_segment, second_segment],
+        segment_report_generator=report_generator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(promotion_id=promotion.promotion_id),
+    )
+
+    assert len(report_generator.calls) == 2
+    assert set(report_generator.calls) == {
+        first_segment.segment_id,
+        second_segment.segment_id,
+    }
+    assert [
+        suggestion.metadata_json["ai_report"]["title"]
+        for suggestion in result.segment_suggestions
+    ] == [suggestion.segment_id for suggestion in result.segment_suggestions]
+
+
+def test_conversational_recommendation_skips_additional_openai_report_calls() -> None:
+    promotion = promotion_record(channel="email")
+    suggested_segment = replace(
+        segment_record(
+            "seg_ai_conversation_destination",
+            source="ai_suggested",
+            sample_size=80,
+            rule_json={
+                "source": "raw_event_intent",
+                "candidate_user_ids": ["user_001", "user_002"],
+            },
+        ),
+        campaign_id=promotion.campaign_id,
+        promotion_id=promotion.promotion_id,
+    )
+    report_generator = ConcurrentSegmentReportGenerator(expected_calls=1)
+    service, _, _ = build_service(
+        promotion=promotion,
+        segments=[],
+        segment_suggester=FakeSegmentSuggester([suggested_segment]),
+        segment_report_generator=report_generator,
+    )
+
+    result = service.recommend_segments(
+        analysis_request(
+            promotion_id=promotion.promotion_id,
+            segment_instruction="최근 제주 숙소를 반복 검색한 고객",
+        ),
+    )
+
+    assert report_generator.calls == []
+    assert result.segment_suggestions[0].metadata_json["ai_report"]["source"] == (
+        "deterministic"
     )
 
 
@@ -1983,7 +2543,7 @@ def test_service_falls_back_to_default_segments_when_no_ai_suggestions_exist() -
         "seg_repeat_hotel_no_booking",
     ]
     assert segment_definition_repository.saved_ai_suggested == []
-    assert suggester.calls == [promotion]
+    assert suggester.calls == [(promotion, None)]
 
 
 def test_service_skips_zero_size_default_segments() -> None:

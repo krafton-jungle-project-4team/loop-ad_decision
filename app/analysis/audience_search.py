@@ -6,6 +6,7 @@ from enum import StrEnum
 from statistics import NormalDist
 from typing import Mapping, Protocol, Sequence
 
+from app.audience_contract import CUSTOM_STRUCTURED_TEMPLATE_ID
 from app.analysis.behavior_vector_schema import CandidateBehaviorSpec
 
 
@@ -92,6 +93,7 @@ class AudienceVectorSearchRepository(Protocol):
         source_cutoff: str,
         query_vector: Sequence[float],
         score_threshold: float,
+        apply_score_threshold: bool,
         hard_predicate_keys: Sequence[str],
         predicate_parameters: Mapping[str, Sequence[str] | Sequence[int]],
     ) -> list[SearchCandidate]:
@@ -169,6 +171,17 @@ class CandidateAudienceSearchService:
             raise ValueError("hard match count must not exceed corpus count")
         if not 0.0 <= estimated_score_pass_rate <= 1.0:
             raise ValueError("estimated score pass rate must be between 0 and 1")
+
+        if spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID:
+            return self._exact(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                source_cutoff=source_cutoff,
+                spec=spec,
+                corpus_user_count=corpus_user_count,
+                hard_match_user_count=hard_match_user_count,
+                method=AudienceSearchMethod.EXACT,
+            )
 
         if corpus_user_count <= self._policy.exact_user_limit:
             return self._exact(
@@ -446,6 +459,36 @@ class CandidateAudienceSearchService:
         hard_match_user_count: int,
         method: AudienceSearchMethod,
     ) -> AudienceSearchResult:
+        apply_score_threshold = spec.template_id != CUSTOM_STRUCTURED_TEMPLATE_ID
+        materialize_raw_exact = getattr(
+            self._repository,
+            "materialize_raw_exact_members",
+            None,
+        )
+        if (
+            spec.template_id == CUSTOM_STRUCTURED_TEMPLATE_ID
+            and callable(materialize_raw_exact)
+        ):
+            member_count = materialize_raw_exact(
+                project_id=project_id,
+                vector_generation_id=vector_generation_id,
+                vector_version=spec.vector_version,
+                source_cutoff=source_cutoff,
+                hard_predicate_keys=spec.hard_predicate_keys,
+                predicate_parameters=spec.predicate_parameters,
+            )
+            effective_corpus_count = max(corpus_user_count, member_count)
+            return AudienceSearchResult(
+                method=method,
+                members=(),
+                corpus_user_count=effective_corpus_count,
+                hard_match_user_count=member_count,
+                requested_k=member_count,
+                recall_audit=None,
+                policy_version=self._policy.version,
+                materialized_member_count=member_count,
+                members_relation="audience_exact_members",
+            )
         materialize_exact = getattr(
             self._repository,
             "materialize_exact_members",
@@ -459,6 +502,7 @@ class CandidateAudienceSearchService:
                 source_cutoff=source_cutoff,
                 query_vector=spec.query_vector,
                 score_threshold=spec.score_threshold,
+                apply_score_threshold=apply_score_threshold,
                 hard_predicate_keys=spec.hard_predicate_keys,
                 predicate_parameters=spec.predicate_parameters,
             )
@@ -480,6 +524,7 @@ class CandidateAudienceSearchService:
             source_cutoff=source_cutoff,
             query_vector=spec.query_vector,
             score_threshold=spec.score_threshold,
+            apply_score_threshold=apply_score_threshold,
             hard_predicate_keys=spec.hard_predicate_keys,
             predicate_parameters=spec.predicate_parameters,
         )

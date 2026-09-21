@@ -151,6 +151,12 @@ def source_request_fingerprint(
     if option_index < 1:
         raise ValueError("source manifest option_index must be positive")
     request = prompt_input.request.model_dump(mode="json")
+    if prompt_input.request.offer_set_id is None:
+        # Keep legacy source fingerprints byte-for-byte stable after adding the
+        # optional offer-set selection contract.
+        request.pop("offer_set_id", None)
+        request.pop("expected_catalog_id", None)
+        request.pop("expected_catalog_version", None)
     segment_ids = request.get("segment_ids")
     if isinstance(segment_ids, list):
         request["segment_ids"] = sorted(str(value) for value in segment_ids)
@@ -181,6 +187,29 @@ def source_request_fingerprint(
     }
     if prompt_input.brand_context is not None:
         payload["brand_context"] = prompt_input.brand_context.to_snapshot()
+    if prompt_input.request.offer_set_id is not None:
+        offer_catalog = prompt_input.offer_catalog
+        if not isinstance(offer_catalog, Mapping):
+            raise ValueError(
+                "source manifest offer_set_id requires a snapshotted offer catalog"
+            )
+        catalog_sha256 = _optional_canonical_text(
+            offer_catalog.get("catalog_sha256")
+        )
+        if catalog_sha256 is None:
+            catalog_sha256 = hashlib.sha256(
+                _canonical_json_bytes(offer_catalog)
+            ).hexdigest()
+        payload["offer_selection"] = {
+            "offer_set_id": prompt_input.request.offer_set_id,
+            "catalog_id": _required_canonical_text(
+                offer_catalog.get("catalog_id")
+            ),
+            "catalog_version": _required_canonical_text(
+                offer_catalog.get("catalog_version")
+            ),
+            "catalog_sha256": catalog_sha256,
+        }
     return hashlib.sha256(_canonical_json_bytes(payload)).hexdigest()
 
 

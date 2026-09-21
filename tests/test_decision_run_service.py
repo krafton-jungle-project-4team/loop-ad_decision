@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import replace
 from datetime import UTC, datetime
 from decimal import Decimal
+from uuid import UUID
 
 import pytest
 
+from app.audience_contract import contract_score_threshold
 from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
     semantic_query_vector_hash,
@@ -88,6 +90,16 @@ def test_run_service_uses_latest_completed_analysis_and_generation() -> None:
         "analysis_id": "analysis_banner_001",
         "generation_id": "generation_banner_001",
         "loop_count": 1,
+        "outcome_spec": {
+            "outcome_metric": "booking_conversion_rate",
+            "outcome_event_name": "booking_complete",
+            "outcome_filter": {"destination_ids": []},
+            "outcome_definition_version": "booking-outcome.v1",
+            "uplift_training_eligible": True,
+        },
+        "outcome_spec_hash": (
+            "02d72a181ba9e6c82a0a905444116440f3d7aa4b5b6cfcf27a9d0fc205df711d"
+        ),
     }
     assert repos.runs.inserted[0].segment_scope_json == ("seg_family_trip",)
     assert repos.runs.inserted[0].segment_scope_fingerprint == (
@@ -123,6 +135,39 @@ def test_run_service_uses_target_contract_and_ignores_analysis_audience_mode() -
     )
 
     assert "audience_scope" not in repos.runs.inserted[0].goal_snapshot_json
+
+
+def test_v2_run_accepts_data_contract_score_threshold_precision() -> None:
+    rule_json = segment_audience_rule_json(candidate_type="benefit_value_seeker")
+    target = target_segment_record(
+        audience_snapshot_id="snapshot_family",
+        rule_json=rule_json,
+    )
+    compiled = compile_registered_segment_audience(
+        segment_id=target.segment_id,
+        rule_json=rule_json,
+    )
+
+    assert target.audience_score_threshold == contract_score_threshold(
+        compiled.score_threshold
+    )
+    assert target.audience_score_threshold != Decimal(
+        str(compiled.score_threshold)
+    )
+
+    service, repos = make_service(target_segments=[target])
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id="analysis_banner_001",
+            generation_id="generation_banner_001",
+            segment_ids=["seg_family_trip"],
+        ),
+    )
+
+    assert response.segment_ids == ["seg_family_trip"]
+    assert len(repos.runs.inserted) == 1
 
 
 def test_v2_run_requires_explicit_card_source_without_breaking_legacy_fallback() -> None:
@@ -263,6 +308,53 @@ def test_v2_run_uses_only_the_selected_card_source_and_snapshot() -> None:
     assert [(item.segment_id, item.final_snapshot_id) for item in bindings] == [
         ("seg_a", "final_a")
     ]
+
+
+def test_v2_run_normalizes_postgres_uuid_allocation_plan_id() -> None:
+    analysis = analysis_record(analysis_id="analysis_confirm_a")
+    generation = generation_record(
+        analysis_id=analysis.analysis_id,
+        generation_id="generation_a",
+        target_segment_ids=["seg_a"],
+    )
+    plan_id = UUID("c15768c1-544c-4d7f-bae5-835a17fc6359")
+    target = replace(
+        target_segment_record(
+            analysis_id=analysis.analysis_id,
+            segment_id="seg_a",
+            audience_snapshot_id="final_a",
+            rule_json=segment_audience_rule_json(),
+        ),
+        allocation_plan_id=plan_id,
+    )
+    service, repos = make_service(
+        analysis=analysis,
+        latest_analysis=analysis,
+        generation=generation,
+        latest_generation=generation,
+        target_segments=[target],
+        candidates=[
+            content_candidate_record(
+                analysis_id=analysis.analysis_id,
+                generation_id=generation.generation_id,
+                segment_id="seg_a",
+                content_id="content_a",
+                content_option_id="option_a",
+            )
+        ],
+    )
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=RunCreateRequest(
+            analysis_id=analysis.analysis_id,
+            generation_id=generation.generation_id,
+            segment_ids=["seg_a"],
+        ),
+    )
+
+    binding = repos.run_audience_bindings.bindings[response.promotion_run_id][0]
+    assert binding.allocation_plan_id == str(plan_id)
 
 
 def test_run_service_rejects_invalid_v2_snapshot_before_writes() -> None:
@@ -1160,12 +1252,12 @@ def make_preparation_activation_service(
                 target_segment_record(
                     analysis_id="analysis_banner_loop_2",
                     segment_id="seg_family_trip",
-                    status="approved",
+                    status="planned",
                 ),
                 target_segment_record(
                     analysis_id="analysis_banner_loop_2",
                     segment_id="seg_mobile_user",
-                    status="approved",
+                    status="planned",
                 ),
             ]
         ),
@@ -1209,6 +1301,68 @@ def test_v2_preparation_activation_binds_final_snapshots_before_activation() -> 
     }
     assert repos.preparations.record is not None
     assert repos.preparations.record.status == "activated"
+    assert repos.target_segments.status_updates == []
+
+
+def test_preparation_activation_approves_planned_target_segments() -> None:
+    service, repos = make_preparation_activation_service()
+
+    response = service.create_run(
+        promotion_id="promo_banner_001",
+        request=activation_request(),
+    )
+
+    assert response.segment_ids == ["seg_family_trip", "seg_mobile_user"]
+    assert repos.target_segments.status_updates == [
+        ("analysis_banner_loop_2", "seg_family_trip", "approved"),
+        ("analysis_banner_loop_2", "seg_mobile_user", "approved"),
+    ]
+    assert {segment.status for segment in repos.target_segments.segments} == {
+        "approved"
+    }
+
+
+def test_preparation_activation_rejects_non_approvable_target_segment() -> None:
+    targets = [
+        target_segment_record(
+            analysis_id="analysis_banner_loop_2",
+            segment_id="seg_family_trip",
+            status="rejected",
+        ),
+        target_segment_record(
+            analysis_id="analysis_banner_loop_2",
+            segment_id="seg_mobile_user",
+            status="planned",
+        ),
+    ]
+    service, repos = make_preparation_activation_service(target_segments=targets)
+
+    with pytest.raises(RunValidationError, match="segment_ids"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.target_segments.status_updates == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
+
+
+def test_preparation_activation_rejects_concurrent_target_status_change() -> None:
+    service, repos = make_preparation_activation_service()
+    repos.target_segments.transition_status = (  # type: ignore[method-assign]
+        lambda **_kwargs: False
+    )
+
+    with pytest.raises(RunConflictError, match="status changed"):
+        service.create_run(
+            promotion_id="promo_banner_001",
+            request=activation_request(),
+        )
+
+    assert repos.target_segments.status_updates == []
+    assert repos.runs.inserted == []
+    assert repos.ad_experiments.inserted_batches == []
 
 
 def test_preparation_activation_is_disabled_by_default_without_writes() -> None:
@@ -1355,6 +1509,7 @@ def test_preparation_activation_rejects_invalid_generation_candidate_scope(
     assert repos.runs.inserted == []
     assert repos.ad_experiments.inserted_batches == []
     assert repos.preparations.activated_calls == []
+    assert repos.target_segments.status_updates == []
 
 
 @pytest.mark.parametrize(
@@ -1886,6 +2041,7 @@ class FakePromotionTargetSegmentRepository:
         self.segments = segments
         self.calls: list[str] = []
         self.approved_calls: list[tuple[str, list[str] | None]] = []
+        self.status_updates: list[tuple[str, str, str]] = []
 
     def list_for_analysis(
         self,
@@ -1917,6 +2073,37 @@ class FakePromotionTargetSegmentRepository:
             and segment.segment_id in requested_ids
             and segment.status == "approved"
         ]
+
+    def transition_status(
+        self,
+        *,
+        analysis_id: str,
+        segment_id: str,
+        expected_status: str,
+        next_status: str,
+    ) -> bool:
+        matching_segment = next(
+            (
+                segment
+                for segment in self.segments
+                if segment.analysis_id == analysis_id
+                and segment.segment_id == segment_id
+                and segment.status == expected_status
+            ),
+            None,
+        )
+        if matching_segment is None:
+            return False
+        self.status_updates.append((analysis_id, segment_id, next_status))
+        self.segments = [
+            replace(segment, status=next_status)
+            if segment.analysis_id == analysis_id
+            and segment.segment_id == segment_id
+            else segment
+            for segment in self.segments
+        ]
+        return True
+
 
 class FakeContentCandidateRepository:
     def __init__(self, candidates: list[ContentCandidateRecord]) -> None:
@@ -2436,7 +2623,9 @@ def target_segment_record(
             compiled.query_compiler_hash if compiled else None
         ),
         audience_score_threshold=(
-            Decimal(str(compiled.score_threshold)) if compiled else None
+            contract_score_threshold(compiled.score_threshold)
+            if compiled
+            else None
         ),
         audience_metadata_json=(
             _audience_metadata(compiled) if compiled else None
@@ -2444,13 +2633,14 @@ def target_segment_record(
     )
 
 
-def segment_audience_rule_json() -> dict[str, object]:
+def segment_audience_rule_json(
+    *,
+    candidate_type: str = "intent_matched",
+) -> dict[str, object]:
     return {
         "audience_resolution_contract": "segment_audience.v1",
         "segment_audience_spec": dict(
-            RegisteredSegmentAudienceBinder().bind(
-                candidate_type="intent_matched"
-            )
+            RegisteredSegmentAudienceBinder().bind(candidate_type=candidate_type)
         ),
     }
 

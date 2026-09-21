@@ -14,6 +14,7 @@ from app.audience_contract import (
     SEGMENT_AUDIENCE_CONTRACT,
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
+    contract_score_threshold,
 )
 from app.analysis.semantic_selection import (
     compile_registered_segment_audience,
@@ -50,6 +51,7 @@ from app.decision.audience_snapshots import (
     RunAudienceTargetBindingWrite,
 )
 from app.decision.matcher import FALLBACK_SEGMENT_ID
+from app.decision.outcome_spec import build_frozen_outcome_spec
 from app.decision.schemas import (
     AdExperimentCreateResponse,
     AdExperimentStatus,
@@ -276,6 +278,7 @@ class PromotionRunService:
             loop_count=loop_count,
             segment_ids=segment_ids,
             segment_scope_fingerprint=segment_scope_fingerprint,
+            target_segments=target_segments,
         )
         ad_experiments = self._build_ad_experiments(
             promotion=promotion,
@@ -551,6 +554,7 @@ class PromotionRunService:
             analysis,
             promotion,
             segment_ids=expected_segment_ids,
+            allow_planned=True,
         )
         audience_contract = _require_uniform_target_audience_contract(
             target_segments
@@ -577,6 +581,12 @@ class PromotionRunService:
             preparation=preparation,
             source_run=source_run,
             promotion=promotion,
+        )
+        self._approve_planned_target_segments(target_segments)
+        target_segments = self._load_target_segments(
+            analysis,
+            promotion,
+            segment_ids=expected_segment_ids,
         )
 
         promotion_run_id = build_promotion_run_id(
@@ -622,6 +632,7 @@ class PromotionRunService:
             loop_count=request.loop_count,
             segment_ids=expected_segment_ids,
             segment_scope_fingerprint=segment_scope_fingerprint,
+            target_segments=target_segments,
         )
         ad_experiments = self._build_ad_experiments(
             promotion=promotion,
@@ -1070,13 +1081,31 @@ class PromotionRunService:
         *,
         segment_ids: Sequence[str] | None,
         explicit_source: bool = False,
+        allow_planned: bool = False,
     ) -> list[PromotionTargetSegmentRecord]:
-        target_segments = (
-            self._promotion_target_segment_repository.list_approved_for_analysis(
-                analysis.analysis_id,
-                segment_ids,
+        if allow_planned:
+            requested_segment_ids = set(segment_ids or ())
+            analysis_target_segments = (
+                self._promotion_target_segment_repository.list_for_analysis(
+                    analysis.analysis_id
+                )
             )
-        )
+            target_segments = [
+                segment
+                for segment in analysis_target_segments
+                if segment.status in {"approved", "planned"}
+                and (
+                    segment_ids is None
+                    or segment.segment_id in requested_segment_ids
+                )
+            ]
+        else:
+            target_segments = (
+                self._promotion_target_segment_repository.list_approved_for_analysis(
+                    analysis.analysis_id,
+                    segment_ids,
+                )
+            )
         target_segments = [
             segment
             for segment in target_segments
@@ -1129,6 +1158,24 @@ class PromotionRunService:
                 "segment_ids must match approved promotion_target_segments"
             )
         return target_segments
+
+    def _approve_planned_target_segments(
+        self,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
+    ) -> None:
+        for segment in target_segments:
+            if segment.status != "planned":
+                continue
+            transitioned = self._promotion_target_segment_repository.transition_status(
+                analysis_id=segment.analysis_id,
+                segment_id=segment.segment_id,
+                expected_status="planned",
+                next_status="approved",
+            )
+            if not transitioned:
+                raise RunConflictError(
+                    "next-loop target segment status changed during activation"
+                )
 
     def _validate_generation_segment_snapshot(
         self,
@@ -1243,6 +1290,7 @@ class PromotionRunService:
         loop_count: int,
         segment_ids: Sequence[str],
         segment_scope_fingerprint: str,
+        target_segments: Sequence[PromotionTargetSegmentRecord],
     ) -> PromotionRunWrite:
         segment_scope_json = tuple(
             sorted(
@@ -1275,6 +1323,7 @@ class PromotionRunService:
                 analysis=analysis,
                 generation=generation,
                 loop_count=loop_count,
+                target_segments=target_segments,
             ),
             segment_scope_json=segment_scope_json,
             segment_scope_fingerprint=segment_scope_fingerprint,
@@ -1354,7 +1403,7 @@ class PromotionRunService:
                 RunAudienceTargetBindingWrite(
                     target_analysis_id=target.analysis_id,
                     segment_id=target.segment_id,
-                    allocation_plan_id=target.allocation_plan_id,
+                    allocation_plan_id=str(target.allocation_plan_id),
                     final_snapshot_id=target.audience_snapshot_id,
                 )
             )
@@ -1550,7 +1599,12 @@ def _build_goal_snapshot(
     analysis: PromotionAnalysisRecord,
     generation: GenerationRunRecord,
     loop_count: int,
+    target_segments: Sequence[PromotionTargetSegmentRecord],
 ) -> dict[str, Any]:
+    outcome_spec, frozen_outcome_spec_hash = build_frozen_outcome_spec(
+        goal_metric=promotion.goal_metric,
+        target_segment_rules=[target.rule_json for target in target_segments],
+    )
     snapshot: dict[str, Any] = {
         "source": "promotions",
         "promotion_id": promotion.promotion_id,
@@ -1563,6 +1617,8 @@ def _build_goal_snapshot(
         "analysis_id": analysis.analysis_id,
         "generation_id": generation.generation_id,
         "loop_count": loop_count,
+        "outcome_spec": outcome_spec,
+        "outcome_spec_hash": frozen_outcome_spec_hash,
     }
     return snapshot
 
@@ -1690,7 +1746,7 @@ def _target_snapshot_matches_compiled(
         semantic_query_vector_hash(compiled),
         compiled.query_compiler_version,
         compiled.query_compiler_hash,
-        Decimal(str(compiled.score_threshold)),
+        contract_score_threshold(compiled.score_threshold),
         compiled.template_id,
         compiled.template_version,
         compiled.template_semantic_hash,

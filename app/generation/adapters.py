@@ -22,6 +22,7 @@ from app.generation.artifacts import (
     S3CreativeArtifactPublisher,
     StoredAsset,
     content_values_from_rendered_html,
+    creative_contract_sha256,
     creative_format_for_channel,
     html_artifact_key,
     image_artifact_key,
@@ -50,7 +51,7 @@ from app.generation.source_manifest import (
 from app.logging import log, duration_ms
 
 
-EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v3"
+EXTERNAL_CONTENT_GENERATOR_VERSION = "dec-c6.external.v4"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 MAX_HTML_ARTIFACT_BYTES = 1_000_000
 MAX_CONCURRENT_GEMINI_IMAGE_REQUESTS = 3
@@ -740,6 +741,14 @@ class S3AssetStorage:
             )
         except (ArtifactRenderError, UnicodeDecodeError, ValueError):
             return None
+        if (
+            existing_values.get("creative_contract_sha256") is None
+            and current_values.get("creative_contract_sha256")
+            == creative_contract_sha256({})
+        ):
+            existing_values["creative_contract_sha256"] = current_values[
+                "creative_contract_sha256"
+            ]
         semantic_fields = set(existing_values) - {
             "renderer_version",
             "template_version",

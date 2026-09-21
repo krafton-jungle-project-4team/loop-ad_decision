@@ -195,6 +195,28 @@ def test_generation_api_calls_generation_service() -> None:
     assert fake_service.idempotency_keys == ["generation-api-call-001"]
 
 
+def test_generation_api_passes_offer_set_selection_to_service() -> None:
+    fake_service = FakeGenerationSubmissionService()
+    client = make_generation_client(fake_service)
+
+    response = client.post(
+        "/decision/v1/promotions/promo_banner_001/generation",
+        json={
+            **generation_payload(),
+            "offer_set_id": "summer-lastcall",
+            "expected_catalog_id": "black-friday-hotels-lastcall",
+            "expected_catalog_version": "v3",
+        },
+        headers={"Idempotency-Key": "generation-offer-set-001"},
+    )
+
+    assert response.status_code == 202
+    request = fake_service.requests[0]
+    assert request.offer_set_id == "summer-lastcall"
+    assert request.expected_catalog_id == "black-friday-hotels-lastcall"
+    assert request.expected_catalog_version == "v3"
+
+
 @pytest.mark.parametrize(
     "segment_ids",
     [[], ["seg_family_trip", "seg_family_trip"], ["   "]],

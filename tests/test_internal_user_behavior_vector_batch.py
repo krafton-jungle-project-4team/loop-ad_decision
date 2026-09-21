@@ -88,13 +88,22 @@ def compact_sql(query: str) -> str:
 
 
 def test_hotel_behavior_v2_sql_uses_shared_sha256_destination_space() -> None:
-    sql = compact_sql(_build_hotel_behavior_v2_insert_sql())
+    query = _build_hotel_behavior_v2_insert_sql()
+    sql = compact_sql(query)
     assert "sha256" in sql
+    assert "sha256(canonical_destination) as destination_hash" in sql
     assert "destination_bucket_15" in sql
     assert "booking_start_count > booking_complete_count" in sql
     assert "raw_vector_values" in sql
     assert "sqrt(arraysum(value -> value * value, raw_vector_values))" in sql
     assert "value / vector_norm" in sql
+
+
+def test_hotel_behavior_v2_sql_stays_below_clickhouse_query_size_limit() -> None:
+    query = _build_hotel_behavior_v2_insert_sql()
+
+    assert query.count("multiIf(") == 1
+    assert len(query.encode("utf-8")) < 256 * 1024
 
 
 def test_python_anchor_vectorizer_and_clickhouse_sql_share_formula_golden() -> None:

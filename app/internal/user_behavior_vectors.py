@@ -434,19 +434,19 @@ def _build_hotel_behavior_v2_insert_sql() -> str:
         )
     """.strip()
     destination_value = clickhouse_canonical_destination_sql(destination_source)
-    destination_hash = f"SHA256({destination_value})"
+    destination_hash = "SHA256(canonical_destination)"
     destination_bucket = (
         "modulo(reinterpretAsUInt64(reverse(substring("
-        f"{destination_hash}, 1, 8))), 16)"
+        "destination_hash, 1, 8))), 16)"
     )
     destination_sign = (
         "if(bitAnd(reinterpretAsUInt8(substring("
-        f"{destination_hash}, 9, 1)), 1) = 0, 1.0, -1.0)"
+        "destination_hash, 9, 1)), 1) = 0, 1.0, -1.0)"
     )
     destination_terms = [
         "sumIf("
-        f"{destination_sign}, {destination_value} != '' "
-        f"AND {destination_bucket} = {index}) AS destination_bucket_{index}"
+        "destination_sign, canonical_destination != '' "
+        f"AND destination_bucket = {index}) AS destination_bucket_{index}"
         for index in range(16)
     ]
     aggregates = [
@@ -472,7 +472,7 @@ def _build_hotel_behavior_v2_insert_sql() -> str:
         "countIf(toFloat64OrZero(JSONExtractString(properties_json, 'price')) >= 300000) AS premium_price_count",
         "countIf(toUInt8OrZero(JSONExtractString(properties_json, 'free_cancellation')) = 1) AS free_cancellation_count",
         "countIf(toUInt8OrZero(JSONExtractString(properties_json, 'breakfast_included')) = 1) AS breakfast_count",
-        f"uniqExactIf({destination_value}, {destination_value} != '') AS destination_count",
+        "uniqExactIf(canonical_destination, canonical_destination != '') AS destination_count",
         "countIf(parseDateTimeBestEffortOrNull(JSONExtractString(properties_json, 'checkin_date')) IS NOT NULL) AS checkin_date_count",
         "countIf(toMonth(parseDateTimeBestEffortOrNull(JSONExtractString(properties_json, 'checkin_date'))) IN (3,4,5)) AS spring_count",
         "countIf(toMonth(parseDateTimeBestEffortOrNull(JSONExtractString(properties_json, 'checkin_date'))) IN (6,7,8)) AS summer_count",
@@ -659,11 +659,38 @@ def _build_hotel_behavior_v2_insert_sql() -> str:
                         count() AS event_count,
                         toDateTime64(parseDateTimeBestEffort({{window_end:String}}), 3, 'UTC') AS window_end_value,
                         {aggregate_sql}
-                    FROM raw_events
-                    WHERE project_id = {{project_id:String}}
-                      AND validation_status = 'valid'
-                      AND event_time >= toDateTime64(parseDateTimeBestEffort({{window_start:String}}), 3, 'UTC')
-                      AND event_time < toDateTime64(parseDateTimeBestEffort({{window_end:String}}), 3, 'UTC')
+                    FROM (
+                        SELECT
+                            user_id,
+                            event_name,
+                            event_time,
+                            properties_json,
+                            canonical_destination,
+                            {destination_bucket} AS destination_bucket,
+                            {destination_sign} AS destination_sign
+                        FROM (
+                            SELECT
+                                user_id,
+                                event_name,
+                                event_time,
+                                properties_json,
+                                canonical_destination,
+                                {destination_hash} AS destination_hash
+                            FROM (
+                                SELECT
+                                    user_id,
+                                    event_name,
+                                    event_time,
+                                    properties_json,
+                                    {destination_value} AS canonical_destination
+                                FROM raw_events
+                                WHERE project_id = {{project_id:String}}
+                                  AND validation_status = 'valid'
+                                  AND event_time >= toDateTime64(parseDateTimeBestEffort({{window_start:String}}), 3, 'UTC')
+                                  AND event_time < toDateTime64(parseDateTimeBestEffort({{window_end:String}}), 3, 'UTC')
+                            )
+                        )
+                    )
                     GROUP BY user_id
                 )
                 WHERE event_count > 0

@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any
 
 import pytest
+from structlog.testing import capture_logs
 
 from app.generation.artifacts import ArtifactIdentity
 from app.generation.brand_context import (
@@ -341,11 +342,12 @@ def test_embedding_client_uses_contract_model_and_dimensions() -> None:
         )
         return {"data": [{"embedding": [0.001] * 1024}]}
 
-    result = OpenAIEmbeddingClient(
-        api_key="test-key",
-        timeout_seconds=7,
-        transport=transport,
-    ).embed("brand query")
+    with capture_logs() as logs:
+        result = OpenAIEmbeddingClient(
+            api_key="test-key",
+            timeout_seconds=7,
+            transport=transport,
+        ).embed("brand query")
 
     assert len(result) == 1024
     assert captured["payload"] == {
@@ -355,6 +357,12 @@ def test_embedding_client_uses_contract_model_and_dimensions() -> None:
         "encoding_format": "float",
     }
     assert captured["timeout_seconds"] == 7
+    assert [
+        record["event"]
+        for record in logs
+        if str(record["event"]).startswith("provider_request_")
+    ] == ["provider_request_prepared", "provider_request_completed"]
+    assert "test-key" not in str(logs)
 
 
 def test_brand_snapshot_roundtrip_is_immutable_generation_input() -> None:

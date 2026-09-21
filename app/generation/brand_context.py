@@ -542,40 +542,58 @@ class OpenAIEmbeddingClient:
             "encoding_format": "float",
         }
         started_at = now_ms()
+        provider_context = {
+            "provider": "openai",
+            "endpoint": self._endpoint,
+            "model": BRAND_CONTEXT_EMBEDDING_MODEL,
+            "purpose": "brand_context_retrieval",
+        }
         log.info(
             "provider_request_prepared",
-            {
-                "provider": "openai",
-                "endpoint": self._endpoint,
-                "model": BRAND_CONTEXT_EMBEDDING_MODEL,
-                "purpose": "brand_context_retrieval",
-            },
+            {**provider_context, "inputLength": len(text)},
         )
-        response = self._transport(
-            self._endpoint,
-            {
-                "Authorization": f"Bearer {self._api_key}",
-                "Content-Type": "application/json",
-            },
-            payload,
-            self._timeout_seconds,
-        )
+        try:
+            response = self._transport(
+                self._endpoint,
+                {
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                payload,
+                self._timeout_seconds,
+            )
+        except Exception as exc:
+            log.warn(
+                "provider_request_failed",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": exc,
+                },
+            )
+            raise
         try:
             data = response["data"]
             embedding = data[0]["embedding"]
-        except (KeyError, IndexError, TypeError) as exc:
-            raise PermanentGenerationError(
+            vector = _validated_embedding(embedding)
+        except (KeyError, IndexError, TypeError, ValueError) as exc:
+            error = PermanentGenerationError(
                 code="brand_embedding_response_invalid",
                 safe_message="The brand retrieval embedding response was invalid.",
-            ) from exc
-        vector = _validated_embedding(embedding)
+            )
+            log.warn(
+                "provider_response_invalid",
+                {
+                    **provider_context,
+                    "durationMs": duration_ms(started_at),
+                    "err": error,
+                },
+            )
+            raise error from exc
         log.info(
             "provider_request_completed",
             {
-                "provider": "openai",
-                "endpoint": self._endpoint,
-                "model": BRAND_CONTEXT_EMBEDDING_MODEL,
-                "purpose": "brand_context_retrieval",
+                **provider_context,
                 "durationMs": duration_ms(started_at),
             },
         )
