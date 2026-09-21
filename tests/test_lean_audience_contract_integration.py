@@ -5,6 +5,7 @@ import json
 import uuid
 
 import psycopg
+import pytest
 from psycopg.types.json import Jsonb
 
 from app.analysis.repositories import PsycopgPostgresExecutor
@@ -34,8 +35,13 @@ class _InitialExclusionReader:
         )
 
 
+@pytest.mark.parametrize(
+    "prechange_selection_method",
+    ("transition", "exact_fallback"),
+)
 def test_lean_contract_allocation_and_run_binding_lifecycle(
     loopad_test_postgres_dsn: str,
+    prechange_selection_method: str,
 ) -> None:
     suffix = uuid.uuid4().hex[:12]
     project_id = f"project_lean_{suffix}"
@@ -113,7 +119,7 @@ def test_lean_contract_allocation_and_run_binding_lifecycle(
                 source_revision_cutoff, expected_user_count,
                 synced_user_count, status, is_active, activated_at
             ) VALUES (
-                %s, %s, 'v2', 'manifest-lean-v2',
+                %s, %s, 'v2', repeat('a', 64),
                 now() - interval '30 days', now(), now(), 2, 2,
                 'activated', true, now()
             )
@@ -156,13 +162,13 @@ def test_lean_contract_allocation_and_run_binding_lifecycle(
                 metadata_json, snapshot_kind
             ) VALUES (
                 %s, %s, %s, %s, %s, %s, %s, %s,
-                'hotel_behavior.v2', 'v2', 'manifest-lean-v2',
-                'segment_audience.v1', 'spec-hash', 'query-hash',
-                'compiler-v1', 'compiler-hash', 'matcher-v1', 'search-v1',
-                'selection-v1', 'selection-hash', 0.65,
+                'hotel_behavior.v2', 'v2', repeat('a', 64),
+                'segment_audience.v1', repeat('b', 64), repeat('c', 64),
+                'compiler-v1', repeat('d', 64), 'matcher-v1', 'search-v1',
+                'selection-v1', repeat('e', 64), 0.65,
                 now(), now() - interval '30 days', now(),
-                2, 2, 2, 1, 'targetable', 'exact',
-                1.0, 1.0, 0.95, 'source-fingerprint', true, 'completed',
+                2, 2, 2, 1, 'targetable', %s,
+                1.0, 1.0, 0.95, repeat('f', 64), true, 'completed',
                 %s, 'source'
             )
             """,
@@ -175,6 +181,7 @@ def test_lean_contract_allocation_and_run_binding_lifecycle(
                 segment_id,
                 segment_vector_id,
                 vector_generation_id,
+                prechange_selection_method,
                 {
                     "candidate_type": "promotion_responsive",
                     "semantic_margin": "0.10",

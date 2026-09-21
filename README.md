@@ -1,149 +1,277 @@
-# Loop-Ad Decision API
+# loop-ad Decision API
 
-Loop-Ad Decision API is a lifecycle write API service for analysis, generation,
-promotion run creation, segment assignment, evaluation, and next-loop
-orchestration.
+> 고객군 분석부터 콘텐츠 생성, 실험 배정, 성과 평가, 다음 실험까지 연결하는 AI 마케팅 의사결정 서비스
 
-The service is not a Dashboard API, ChatKit API, or advertisement-serving
-Decision hot path. Dashboard-owned systems handle segment query preview,
-ChatKit flows, banner resolve, redirect handling, dispatch, public read APIs,
-and any public recommendation-style API surface.
+`loop-ad Decision`은 숙박 탐색, 클릭, 예약 데이터를 바탕으로 고객군을 분석하고 콘텐츠를 생성하는 AI 마케팅 의사결정 서비스입니다. 실험 배정과 성과 평가는 API와 배치 작업으로 처리합니다. 의사결정 결과를 미리 계산해 저장하므로 광고 노출 시점에는 Decision API를 호출하지 않고 Dashboard가 저장된 결과를 조회합니다.
 
-## Serving Boundary
+이 저장소는 다음 문제를 다룹니다.
 
-Dashboard and ad execution must not synchronously call Decision for per-request
-serving. They should read the contract database directly. When available, they
-should read the Data Source Contract owned `active_ad_serving_assignments` view.
+- 행동 로그에서 프로모션에 반응할 가능성이 높은 고객군을 찾습니다.
+- 고객군별 근거와 브랜드 맥락을 반영한 콘텐츠 후보를 생성합니다.
+- 프로모션 실행과 광고 실험을 재시도해도 같은 결과가 유지되도록 관리합니다.
+- 노출·클릭·예약 이벤트로 성과를 평가하고, 실패한 고객군만 다음 루프로 보냅니다.
 
-Decision does not provide active_ad_serving_assignments and does not own that
-view. The data-source contract owns database schemas and serving views.
+## 오프라인 검증 성과
 
-## Promotion Run Scope
+| 항목 | 결과 |
+| --- | ---: |
+| Expedia 전체 행동 로그 검증 규모 | 37,670,293건 |
+| 검증 사용자 | 1,198,786명 |
+| 전체 기준률보다 높은 고객군 후보 비율 | 90.70% |
+| 유효 후보를 찾은 시나리오 비율 | 100% |
+| 후보 평균 예약 전환율 향상 | +7.63%p |
 
-Promotion runs are idempotent by project, promotion, analysis, generation,
-normalized non-fallback `segment_ids`, and loop count. A retry of the same scope
-returns the stored run; a different segment scope creates an independent run.
-Run responses expose the normalized `segment_ids`, and each ad experiment marks
-fallback membership with `is_fallback`.
+Expedia 전체 행동 로그를 활용한 오프라인 평가에서 모든 시나리오의 유효한 고객군 후보를 찾았습니다. 후보의 90.70%가 전체 기준 예약률을 웃돌았으며, 후보 고객군의 평균 예약 전환율은 기준 대비 7.63%p 높았습니다. 평가 방법과 예측 오차를 포함한 전체 결과는 [검증 결과](#검증-결과)에서 확인할 수 있습니다.
 
-`segment_scope_fingerprint` is SHA-256 over only the sorted, unique segment ID
-array serialized as compact JSON. The remaining identity fields are enforced by
-the composite database constraint and a short digest in `promotion_run_id`.
+## 아키텍처
 
-Explicit run scopes and failed-only automatic next-loop requests are always
-enabled. Deploy this Decision version only after the Data Source Contract
-expand/backfill/finalize rollout is complete and the Dashboard exact
-scope/lineage reader is deployed.
+```mermaid
+flowchart TD
+    Dashboard["Dashboard / 운영자"]
+    API["Decision API"]
+    Analysis["1. 고객군 분석<br/>행동·호텔·프로모션 근거"]
+    Generation["2. 콘텐츠 생성<br/>브랜드 맥락·생성 근거"]
+    Run["3. Promotion Run<br/>고객군별 Ad Experiment"]
+    Assignment["4. 배치 배정<br/>64차원 벡터·실험군 설계"]
+    Serving[("Aurora PostgreSQL<br/>배정·콘텐츠·실험 결과")]
+    Delivery["Dashboard 광고 실행<br/>DB 조회만 사용"]
+    Collector["Collector / SDK"]
+    Events[("ClickHouse<br/>행동·노출·클릭·예약 이벤트")]
+    Evaluation["5. 실험 평가<br/>유입률·예약 전환율"]
+    NextLoop["6. Next Loop<br/>실패 고객군만 재실행"]
+    Models["OpenAI / Gemini"]
 
-Dashboard integration requirements and the versioned response fixture are in
-[`docs/dashboard-segment-experiment-integration-fix-spec.md`](docs/dashboard-segment-experiment-integration-fix-spec.md).
-
-Automatic next-loop analysis and generation IDs include a bounded digest of the
-source promotion run. Different source scopes can therefore advance to the same
-loop count without colliding in their upstream lifecycle rows or generated
-content IDs.
-
-## Next Loop Integration Note
-
-B6 next-loop currently defines the decision-side orchestration and the
-analysis/generation call boundary. The real analysis and generation adapters are
-left for a follow-up integration PR after the analysis and generation flows are
-ready to honor failed segment focus inputs end to end.
-
-## Logging Work Rule
-
-Before adding or changing application logs, read
-[docs/reference_logging.md](docs/reference_logging.md). Decision logs must stay
-JSON structured, use context propagation, keep stable snake_case `event` names,
-and follow the shared Loop-Ad logging standard from the Dashboard API reference.
-
-## Local Validation Tools
-
-- [Expedia 세그먼트 추천 백테스트](docs/expedia_segment_backtest.md): 과거 행동과
-  미래 예약 라벨을 시간 분리해 AI 추천 후보 묶음과 예상 전환율을 검증한다.
-- [외부 데이터셋 세그먼트 추천 검증](docs/external_segment_backtest.md): Airbnb,
-  Booking.com, Synerise의 서로 다른 결과 계약으로 추천의 외부 일반화를 검증한다.
-
-### 이메일 3종 로컬 미리보기
-
-V2 handoff bundle을 이용해 설명형·8숙소형·비교형 이메일을 생성·검증한다.
-
-```bash
-.venv/bin/python scripts/render_email_variant_previews.py \
-  --bundle-root "/absolute/path/to/brand-context-handoff-demo_project-v2"
+    Dashboard -->|라이프사이클 요청| API
+    API --> Analysis --> Generation --> Run --> Assignment --> Serving
+    Models --> Generation
+    Events --> Analysis
+    Events --> Assignment
+    Serving --> Delivery --> Collector --> Events
+    Events --> Evaluation
+    Serving --> Evaluation --> NextLoop --> Analysis
 ```
 
-결과는 `artifacts/email-variant-previews/index.html`에서 확인한다. 실행 중
-OpenAI, Gemini, DB, S3를 호출하지 않으며 bundle의 checksum을 검증한다.
-`*.production.html`은 공개 이미지 URL과 placeholder를 보존한 production renderer의
-출력이고, `*.local.html`은 오프라인 미리보기를 위해 이미지만 로컬
-`assets/`로 치환한 복사본이다.
+Decision API는 **계산 결과를 쓰는 서비스**입니다. 배너 조회, 리다이렉트, 이메일·문자 발송처럼 사용자 요청의 지연 시간에 직접 영향을 주는 기능은 Dashboard가 소유합니다. 이 경계 덕분에 모델과 외부 생성 API의 응답 시간이 광고 서빙 경로에 전파되지 않습니다.
 
-운영의 V2 offer 기반 이메일 3종은 모두 검증된 catalog 이미지를
-재사용하며 Gemini를 호출하지 않는다. 설명형 상단 hero는 아래 여행지
-소개에서 사용하는 대표 숙소와 겹치지 않는 catalog 이미지를 선택한다.
-특정 숙소 asset이 누락된 경우 사실과 다른 생성 사진으로 대체하지 않고
-실패한다. Gemini 이미지 생성 기능은 새 이미지가 필요한 다른 크리에이티브
-형식에 그대로 남아 있으며, 여러 요청은 최대 3개까지 병렬 실행한다.
-팔레트·무드보드·콜라주 생성을 금지하고 인물이 필요한 경우 20~39세
-성인만 표현하도록 제한한다.
+## 주요 기능
 
-## Full-source Sealed Evaluation
+### 1. 근거 기반 고객군 분석
 
-2026-07-15 평가는 Kaggle Expedia Hotel Recommendations의 `train.csv` 원본 전체를
-로컬 서비스 ClickHouse `expedia_hotel_events` 테이블에 적재한 뒤 실행했다.
+- 호텔 탐색, 클릭, 예약 시작·완료 신호를 64차원 행동 벡터로 표현합니다.
+- 프로모션 의도와 고객 행동을 함께 사용해 고객군 후보를 만들고 우선순위를 계산합니다.
+- 고객군 정의, 벡터, 표본, 선택 근거를 저장해 이후 생성과 실험이 같은 입력을 재사용하게 합니다.
+- 과거 행동과 미래 예약 라벨을 시간 기준으로 분리해 오프라인 성능을 검증합니다.
 
-- 원본 행동 로그: 37,670,293건
-- 사용자: 1,198,786명
-- 예약 행: 3,000,693건
-- 관찰 기간: 2013-01-07 ~ 2014-12-31
+### 2. 비동기 콘텐츠 생성
+
+- 브랜드 컨텍스트와 고객군 근거를 결합해 이메일·SMS·온사이트 배너 후보를 만듭니다.
+- 콘텐츠 생성 요청은 `202 Accepted`로 접수하고 DB 기반 coordinator가 처리합니다.
+- `Idempotency-Key`, lease, heartbeat, 재시도 정책으로 중복 생성과 작업 유실을 방지합니다.
+- 생성 원문, 프롬프트, 브랜드 자료, 이미지 결과에 SHA-256 메타데이터를 남겨 출처를 추적합니다.
+
+### 3. 재현 가능한 프로모션 실험
+
+- 한 프로모션 실행 안에서 고객군별 `ad_experiment`를 생성합니다.
+- 정렬·중복 제거한 고객군 범위를 SHA-256 fingerprint로 고정해 동일 요청의 멱등성을 보장합니다.
+- `all_treatment`와 결정적 `randomized_holdout` 실험 설계를 지원합니다.
+- 실행 범위, 콘텐츠, 고객 배정, 평가 결과의 lineage를 PostgreSQL에 함께 저장합니다.
+
+### 4. 대규모 고객 배정
+
+- ClickHouse에서 고객 행동 벡터를 읽고 후보를 검색한 뒤 cosine similarity로 재정렬합니다.
+- 최고 유사도가 실행 계약의 임계값보다 낮으면 fallback 정책을 적용합니다.
+- 같은 `promotion_run_id + user_id`는 재시도해도 같은 배정을 유지합니다.
+- 배정 결과에 고객군, 광고 실험, 콘텐츠 식별자를 함께 저장하므로 광고 실행 시 Decision 호출이 필요 없습니다.
+
+### 5. 평가와 실패 고객군 재실행
+
+- 광고 실험 단위로 유입률과 예약 전환율을 계산합니다.
+- 분모가 0이거나 표본이 부족한 경우를 성공·실패와 분리해 기록합니다.
+- 프로모션 전체를 `all_segments` 또는 `promotion_average` 기준으로 집계합니다.
+- 다음 루프에는 목표를 달성하지 못한 고객군만 포함하고 성공한 고객군은 그대로 유지합니다.
+
+## 핵심 API 흐름
+
+| 단계 | API | 역할 |
+| --- | --- | --- |
+| 고객군 추천 | `POST /decision/v1/promotions/{promotion_id}/segment-suggestions/recommend` | 행동·호텔·프로모션 근거로 후보 고객군 생성 |
+| 고객군 확정 분석 | `POST /decision/v1/promotions/{promotion_id}/analyses` | 확정 고객군과 벡터·근거 저장 |
+| 콘텐츠 생성 | `POST /decision/v1/promotions/{promotion_id}/generation` | 비동기 콘텐츠 생성 접수 |
+| 실행 생성 | `POST /decision/v1/promotions/{promotion_id}/runs` | Promotion Run과 Ad Experiment 생성 |
+| 고객 배정 | `POST /decision/v1/promotion-runs/{promotion_run_id}/segment-assignments/build` | 벡터 기반 배치 배정 |
+| 실험 평가 | `POST /decision/v1/ad-experiments/{ad_experiment_id}/evaluate` | 광고 실험 단위 성과 계산 |
+| 실행 평가 | `POST /decision/v1/promotion-runs/{promotion_run_id}/evaluate` | 프로모션 실행 전체 성과 집계 |
+| 다음 루프 | `POST /decision/v1/promotion-runs/{promotion_run_id}/next-loop` | 실패 고객군만 분석·생성·실험 재실행 |
+
+`/internal/*` 엔드포인트는 `X-Loop-Ad-Internal-Key`를 검증합니다. 사용자 요청 시점의 단순 조회 API와 실시간 segment-match API는 의도적으로 제공하지 않습니다.
+
+## 기술적 선택
+
+| 문제 | 선택 | 이유 |
+| --- | --- | --- |
+| 모델 호출이 광고 응답 시간을 늘릴 수 있음 | Decision write path와 Dashboard serving path 분리 | 서빙 경로를 DB 조회만으로 유지 |
+| 재시도 시 중복 실행이 생길 수 있음 | scope fingerprint와 DB unique constraint | 애플리케이션·DB 두 계층에서 멱등성 보장 |
+| 전체 고객과 모든 고객군의 전수 비교 비용 | 후보 검색 후 cosine reranking | 대규모 배치 비용을 줄이면서 임계값 판정 유지 |
+| 실험 배정이 실행마다 달라질 수 있음 | salt 기반 결정적 holdout | 재실행과 감사 시 같은 실험군 재현 |
+| 생성 작업이 외부 API 장애에 취약함 | DB lease·heartbeat·bounded retry | 프로세스 재시작 후에도 작업 상태 복구 |
+| 성공 고객군까지 반복하면 학습 비용이 낭비됨 | failed-only next loop | 이미 성과를 낸 고객군을 보존하고 실패 범위만 개선 |
+| 최종 데이터에 맞춘 사후 조정 위험 | sealed manifest와 artifact hash | 평가 입력·코드·모델의 변경 여부를 감사 가능하게 유지 |
+
+## 기술 스택
+
+- **API·런타임:** Python 3.11+, FastAPI, Uvicorn, Pydantic
+- **데이터:** Aurora PostgreSQL, ClickHouse, 64차원 행동 벡터
+- **생성·AI:** OpenAI API, Gemini API
+- **인프라:** Docker, AWS ECS, S3, GitHub Actions
+- **관측·품질:** structlog 기반 JSON 로그, Pytest, sealed offline evaluation
+
+## 프로젝트 구조
+
+```text
+app/
+├── analysis/            # 고객군 추천, 64차원 벡터, 근거 리포트
+├── generation/          # 비동기 콘텐츠·이미지 생성과 artifact 추적
+├── decision/            # 실행 생성, 배정, 평가, next-loop
+├── internal/            # 내부 배치 API
+├── uplift/              # uplift 학습·검증 계약
+├── main.py              # FastAPI 애플리케이션과 라우터 구성
+└── server.py            # PORT 기반 0.0.0.0 서버 진입점
+offline_evaluation/      # 봉인 평가와 외부 데이터셋 재검증
+tests/                   # 서비스·저장소·API·계약 테스트
+scripts/                 # 백필, 백테스트, 로컬 미리보기 도구
+```
+
+## 로컬 실행
+
+### 사전 조건
+
+- Python 3.11 이상
+- 계약 스키마가 적용된 PostgreSQL과 ClickHouse
+- 콘텐츠 생성을 실행하려면 OpenAI·Gemini API 키와 S3 접근 권한
+
+이 서비스는 데이터 스키마를 소유하지 않습니다. 로컬 DB에는 별도의 Data Source Contract 스키마가 준비되어 있어야 합니다.
+
+### Python으로 실행
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+
+cp .env.example .env
+# .env의 필수 연결 정보와 키를 로컬 값으로 교체합니다.
+
+python -m app.server
+```
+
+정상적으로 기동되면 다음 요청이 HTTP 200을 반환합니다.
+
+```bash
+curl http://localhost:8080/health
+```
+
+### Docker Compose로 실행
+
+`compose.yml`은 호스트의 PostgreSQL·ClickHouse에 연결하고 API를 `localhost:8081`에 노출합니다.
+
+```bash
+cp .env.example .env
+# .env를 로컬 환경에 맞게 수정합니다.
+docker compose up --build decision-api
+curl http://localhost:8081/health
+```
+
+## 테스트
+
+```bash
+pytest -q
+```
+
+주요 테스트 범위는 다음과 같습니다.
+
+- Promotion Run과 Ad Experiment 생성 및 멱등성
+- 64차원 벡터 검증, cosine matching, fallback
+- 안정적인 고객 배정과 randomized holdout 재현성
+- 유입률·예약 전환율·표본 부족 처리
+- 성공 고객군 제외와 failed-only next loop
+- 금지된 실시간 서빙 API와 공개 용어 경계
+- 생성 요청의 멱등성, lease, heartbeat, artifact 무결성
+
+## 검증 결과
+
+### 대규모 오프라인 검증
+
+Kaggle Expedia Hotel Recommendations의 전체 행동 로그를 ClickHouse에 적재하고, 과거 행동과 미래 예약을 시간 기준으로 분리해 고객군 선택 성능을 검증했습니다.
+
+| 항목 | 결과 |
+| --- | ---: |
+| 행동 로그 | 37,670,293건 |
+| 사용자 | 1,198,786명 |
+| 전체 기준률보다 높은 고객군 후보 | 90.70% |
+| 유효 후보를 찾은 시나리오 | 100% |
+| 후보 평균 예약 전환율 향상 | +7.63%p |
+
+사전에 정의한 고객군 선택 기준은 충족했습니다. 다만 예상 전환율의 평균 절대오차는 4.63%p로 목표 기준인 3.5%p 이하를 충족하지 못했습니다. 따라서 이 모델은 절대 전환율을 보장하는 용도가 아니라, 프로모션에 반응할 가능성이 높은 고객군의 우선순위를 정하는 용도로 사용합니다.
+
+<details>
+<summary>평가 방법과 전체 판정</summary>
+
+원본 데이터의 관찰 기간은 2013-01-07부터 2014-12-31까지입니다. 2013년 행동으로 학습 데이터를 만들고 2014년 데이터로 개발 검증을 수행했습니다. 최종 평가는 개발 목적지와 겹치지 않는 2014년 7~12월의 18개 목적지 시나리오를 먼저 봉인한 뒤 한 번 실행했습니다.
+
+| 지표 | 결과 | 사전 기준 | 판정 |
+| --- | ---: | ---: | --- |
+| 전체 기준률보다 높은 후보 비율 | 90.70% | 60% 이상 | 통과 |
+| 유효 후보를 찾은 시나리오 | 100% | 70% 이상 | 통과 |
+| 모든 후보가 기준률을 넘은 시나리오 | 80% | 50% 이상 | 통과 |
+| 후보 평균 향상 | +7.63%p | 0%p 이상 | 통과 |
+| 최저 후보 평균 향상 | +4.95%p | 0%p 이상 | 통과 |
+| 예상 전환율 편향 | +0.71%p | 절댓값 1.5%p 이하 | 통과 |
+| 예상 전환율 평균 절대오차 | 4.63%p | 3.5%p 이하 | 미달 |
+| Brier skill score | 0.0063 | 0 초과 | 통과 |
+
+고객군 선별과 우선순위화에는 유효한 결과를 확인했지만, 절대 전환율을 정밀하게 예측하는 용도로는 사전 기준을 충족하지 못했습니다.
+
+</details>
+
+<details>
+<summary>재현성 및 외부 데이터셋 검증</summary>
+
+평가 결과가 최종 데이터에 맞춰 사후 조정되지 않도록 원본 데이터, 실행 코드, 평가 manifest와 모델을 해시로 고정했습니다.
+
 - 사용자 추가 표본 추출: 없음 (`user_sample_modulo=1`)
 - 원본 fingerprint: `6e779cce23d70b54e9733784688f2a9224803b76d0eb98e6c02cd7af15ba5f75`
-
-모델은 2013년 행동으로 만든 96개 후보 성과 사례와 5,554명 후보 사용자 관측을
-학습했다. 2014년 데이터는 개발 검증에 사용했고, 최종 평가는 개발 목적지와 겹치지
-않는 2014년 7~12월의 18개 목적지 시나리오를 manifest에 먼저 봉인한 뒤 한 번
-실행했다. 따라서 “3,767만 행을 그대로 모델 입력으로 사용했다”기보다, 전체 행동
-로그로 시점별 사용자 행동 특성과 미래 30일 목적지 일치 예약 결과를 산출해
-학습·검증했다고 해석해야 한다.
-
-### Expedia 최종 평가 결과
-
 - manifest: `0b02550d60ee50ba54eb25aba6f1fb83cf654df11f2bb0047553b9e8063fc692`
 - 실행 코드: `8f798ab1f40fa9322970a4365a73515ddae391c0`
 - 모델 SHA-256: `30312e413c5520e28aa0c2c08c89350224df9cf8a7e2cf22c3b88aad9cee6aab`
-- 판정: **실패 (`failed`)**
-- 결과가 관측된 시나리오: 15개
-- 평가 후보 결과: 43개
-- 전체 기준률보다 성과가 높은 후보 비율: 90.70% (기준 60% 이상, 통과)
-- 하나 이상의 유효 후보를 찾은 시나리오 비율: 100% (기준 70% 이상, 통과)
-- 모든 후보가 기준률을 넘은 시나리오 비율: 80% (기준 50% 이상, 통과)
-- 후보 평균 향상: +7.63%p (기준 0%p 이상, 통과)
-- 가장 성과가 낮은 후보의 평균 향상: +4.95%p (기준 0%p 이상, 통과)
-- 예상 전환율 편향: +0.71%p (절댓값 기준 1.5%p 이하, 통과)
-- 예상 전환율 평균 절대오차: 4.63%p (기준 3.5%p 이하, **실패**)
-- Brier skill score: 0.0063 (기준 0 초과, 통과)
+- 최종 평가 이후 기준·모델 재조정: 없음
 
-이 결과는 추천 로직이 전체 사용자보다 미래 예약 가능성이 높은 고객군을 찾는
-능력은 확인했지만, 후보별 예상 예약 전환율을 사전 기준 이내로 정밀하게 맞히지는
-못했다는 뜻이다. 최종 데이터에 맞춰 기준이나 모델을 사후 변경하지 않는다.
+Expedia 전체 원본으로 학습한 모델을 고정한 뒤 외부 데이터셋에서도 고객군 농축 여부를 검증했습니다.
 
-과거 371,836행의 결정적 1% 사용자 표본으로 실행한 결과는 전체 원본 평가로 볼 수
-없어 공식 결론에서 제외했다. 해당 실행 기록은 삭제하거나 덮어쓰지 않고 감사
-목적으로만 보존한다.
+| 데이터셋 | 판정 | 관측 시나리오 | 후보 평균 향상 |
+| --- | --- | ---: | ---: |
+| Airbnb | 통과 | 1 | +1.04%p |
+| Booking.com | 통과 | 3 | +8.73%p |
+| Synerise | 판단 유보 | 2 | +3.29%p |
 
-### 외부 데이터 재평가
+외부 데이터셋마다 결과 정의가 다르므로 Expedia의 예약 전환율 오차와 직접 비교하지 않습니다. 외부 검증은 후보 고객군의 농축 여부를 확인하는 보조 근거이며, 숙박 예약 전환율 모델의 일반화를 최종 증명하지는 않습니다.
 
-전체 Expedia 원본으로 학습한 동일 모델을 고정한 뒤 Airbnb, Booking.com,
-Synerise 원본 해시를 각각 새 manifest에 봉인해 실행했다.
+과거의 결정적 1% 사용자 표본 실행은 전체 원본 평가로 간주하지 않고 감사 기록으로만 보존합니다.
 
-| 데이터셋 | 판정 | 관측 시나리오 | 후보 평균 향상 | 해석 |
-| --- | --- | ---: | ---: | --- |
-| Airbnb | 통과 | 1 | +1.04%p | 첫 예약 사용자 농축 여부만 검증 가능 |
-| Booking.com | 통과 | 3 | +8.73%p | 3개 중 2개 시나리오에서 기준률 초과 |
-| Synerise | 판단 유보 | 2 | +3.29%p | 품질 지표는 양수지만 최소 3개 관측 기준 미달 |
+</details>
 
-외부 데이터의 결과 정의는 Expedia의 “향후 30일 목적지 일치 예약”과 다르므로
-예상 예약 전환율의 오차를 직접 비교하지 않는다. 외부 평가는 추천 후보가 각
-데이터셋의 결과 사용자를 평균보다 많이 포함하는지 확인하는 보조 근거이며,
-숙박 예약 전환율 모델의 일반화가 최종 증명됐다는 의미는 아니다.
+## 운영 경계
+
+- 계약 용어로 이 서비스는 `lifecycle write API`이며 `Decision hot path`가 아닙니다.
+- 서버는 `PORT`를 읽고 `0.0.0.0:${PORT}`에 바인딩합니다.
+- `/health`는 정상 상태에서 HTTP 200을 반환합니다.
+- 필수 환경 변수가 없거나 잘못되면 트래픽을 받기 전에 실패합니다.
+- `/internal/*`는 `X-Loop-Ad-Internal-Key`를 검증합니다.
+- 비밀값과 인증 정보는 로그에 남기지 않습니다.
+- 데이터베이스 스키마와 광고 서빙용 view는 Data Source Contract가 소유합니다.
+- Dashboard는 배정·콘텐츠·실험 결과를 DB에서 직접 읽으며 Decision을 동기 호출하지 않습니다.
+
+Decision does not provide active_ad_serving_assignments. 해당 광고 서빙 view는 Data Source Contract가 소유하고 Dashboard가 읽습니다.
+
+초기 `B6 next-loop`는 실제 분석·생성 adapter 연결을 `follow-up integration PR`로 분리했지만, 현재 `dev` 구현은 실패 고객군의 분석·생성·실행 연결을 서비스 내부에서 수행합니다.
+
+Promotion Run 응답 계약은 [`docs/contracts/decision-promotion-run-response.v1.json`](docs/contracts/decision-promotion-run-response.v1.json), uplift 학습 구조는 [`docs/uplift_modeling_architecture.md`](docs/uplift_modeling_architecture.md)에서 확인할 수 있습니다.

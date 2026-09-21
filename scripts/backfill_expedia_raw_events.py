@@ -22,12 +22,25 @@ from pathlib import Path
 SQL_PATH = Path(__file__).with_name("expedia_to_raw_events.sql")
 START_MARKER = "-- TRANSFORM_SELECT_START"
 END_MARKER = "-- TRANSFORM_SELECT_END"
+UNBOUNDED_SORT = """            ORDER BY cityHash64(concat(
+                toString(user_id), '|',
+                toString(date_time), '|',
+                toString(srch_destination_id), '|',
+                toString(hotel_market), '|',
+                toString(hotel_cluster)
+            ))
+            LIMIT source_row_limit"""
+UNBOUNDED_STREAM = """            LIMIT source_row_limit"""
 
 
 def main() -> int:
     args = parse_args()
     sql = SQL_PATH.read_text(encoding="utf-8")
-    query = build_query(sql, mode=args.mode)
+    query = build_query(
+        sql,
+        mode=args.mode,
+        max_source_rows=args.max_source_rows,
+    )
     command = clickhouse_command(args)
     completed = subprocess.run(  # noqa: S603 - command is fixed, arguments are parsed.
         command,
@@ -110,7 +123,9 @@ def nonnegative_int(value: str) -> int:
     return parsed
 
 
-def build_query(sql: str, *, mode: str) -> str:
+def build_query(sql: str, *, mode: str, max_source_rows: int) -> str:
+    if max_source_rows == 0:
+        sql = remove_unbounded_source_sort(sql)
     if mode == "execute":
         return sql
     transform_select = extract_transform_select(sql)
@@ -143,6 +158,19 @@ GROUP BY event_name
 ORDER BY event_name ASC
 FORMAT PrettyCompact
 """
+
+
+def remove_unbounded_source_sort(sql: str) -> str:
+    """Stream a full-source backfill instead of sorting every wide source row.
+
+    The deterministic sort is needed only when a finite source-row limit picks
+    a reproducible prefix. With an unlimited insert it changes no membership or
+    event identity and can exceed the ClickHouse query memory limit.
+    """
+
+    if sql.count(UNBOUNDED_SORT) != 1:
+        raise RuntimeError("Expedia source sort contract changed")
+    return sql.replace(UNBOUNDED_SORT, UNBOUNDED_STREAM, 1)
 
 
 def extract_transform_select(sql: str) -> str:
