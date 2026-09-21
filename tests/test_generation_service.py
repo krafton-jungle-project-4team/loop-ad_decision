@@ -410,7 +410,7 @@ def test_durable_email_generation_persists_candidate_redirect_contracts() -> Non
     card_creative = result.content_candidates[1].metadata_json["creative"]
     assert len(card_creative["link_targets"]) == 3
     assert card_creative["renderer"]["template_version"] == (
-        "email.offer-cards.v4"
+        "email.offer-cards.v5"
     )
     assert card_creative["source"]["required_placeholders"] == [
         "{{redirect_url}}",

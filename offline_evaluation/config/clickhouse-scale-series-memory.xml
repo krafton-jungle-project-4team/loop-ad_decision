@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<!--
+  Benchmark-only ClickHouse ceiling for the Expedia scale-series build.
+
+  Docker Desktop is frozen at 36 GiB RAM plus 4 GiB swap.  The full-corpus
+  one-shot aggregate exceeded that physical boundary and was OOM-killed.
+  Keep the server tracker below physical RAM and bound peak memory through
+  the benchmark-only deterministic user-shard executor instead.  This does
+  not change the production feature formulas or vector manifest.
+-->
+<clickhouse>
+    <max_server_memory_usage>32000000000</max_server_memory_usage>
+    <max_server_memory_usage_to_ram_ratio>0.85</max_server_memory_usage_to_ram_ratio>
+</clickhouse>
