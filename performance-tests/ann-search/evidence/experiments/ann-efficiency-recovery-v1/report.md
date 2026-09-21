@@ -53,6 +53,9 @@ database-cold gates.
 
 - [Scale-transition chart](scale-crossover.svg)
 - [Machine-readable measurements](scale-crossover.csv)
+- [DB-cold per-run distribution and interpretation](cold-tail-analysis.md)
+- [DB-cold derived rows](cold-tail-runs.csv)
+- [DB-cold machine-readable summary](cold-tail-summary.json)
 
 The corrected full-membership stage tested 46 candidate settings. None passed
 pre-confirmation, so no final full-membership confirmation was run. Therefore:

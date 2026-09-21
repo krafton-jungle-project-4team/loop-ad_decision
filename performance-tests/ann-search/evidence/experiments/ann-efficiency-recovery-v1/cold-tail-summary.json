@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "analysis_type": "existing_measurement_reanalysis",
+  "new_benchmark_executed": false,
+  "description": "Per-run DB-cold distribution for the fixed 750K/1M Goal 3 confirmation cell.",
+  "selection": {
+    "candidate_type": "funnel_recovery",
+    "requested_k": 500,
+    "ef_search": 200,
+    "iterative_scan": "relaxed_order",
+    "max_scan_tuples": 20000,
+    "corpus_user_count": [
+      750000,
+      1000000
+    ],
+    "phase": "confirmation_cold",
+    "measured": true
+  },
+  "validated_identity": {
+    "query_id": "v2-funnel-recovery-21-c",
+    "scenario_id": "v2-funnel-recovery-21-c",
+    "same_query_at_both_cohorts": true
+  },
+  "calculation": {
+    "percentile_function": "offline_evaluation.ann_search_experiment.percentile",
+    "percentile_method": "linear interpolation at (n - 1) * quantile",
+    "observations_per_cohort": 30,
+    "outlier_removal": false,
+    "ann_exceeds_exact_p95_definition": "ANN duration > same cohort Exact p95",
+    "paired_slower_definition": "ANN duration > Exact duration at the same iteration"
+  },
+  "input_files": [
+    {
+      "name": "kernel-cold-raw.jsonl",
+      "bytes": 652587,
+      "sha256": "ae8236478e0964b249de140d970f7e39ee0569933f4e2638049583a816cfddb9"
+    },
+    {
+      "name": "kernel-cold-confirmation.jsonl",
+      "bytes": 38513,
+      "sha256": "c7d5533764f7453bf8bb7b1dc1a053dda9cafa869258a7287525f63eeecf652e"
+    },
+    {
+      "name": "kernel-confirmation.jsonl",
+      "bytes": 292211,
+      "sha256": "adb14f48baa19c43df25e27c8767c60506038d6845b7f568c0f9c71cd4d4346a"
+    },
+    {
+      "name": "candidate-retrieval-final-confirmation.jsonl",
+      "bytes": 302403,
+      "sha256": "b9f21012572d9cae276f204794661c85a84dab9f5face945b4f97456d8716be7"
+    },
+    {
+      "name": "conclusion.json",
+      "bytes": 2206,
+      "sha256": "01713185d12879cba0fba91e39caba43fb5ff17e708067dce438f7edaca4dc38"
+    }
+  ],
+  "checkpoint_summary": {
+    "path": "performance-tests/ann-search/evidence/experiments/ann-efficiency-recovery-v1/summary.json",
+    "sha256": "5b1a84a1baa84fdff0ebca7a6d827ce57b6cd113b1c428ef58306ed47ead42ef"
+  },
+  "cross_checks": {
+    "raw_matches_kernel_cold_confirmation": true,
+    "raw_matches_final_confirmation": true,
+    "warm_summary_matches_final_confirmation": true,
+    "checkpoint_summary_matches_source": true,
+    "conclusion_preserved": {
+      "ann_candidate_retrieval_passed": true,
+      "ann_full_membership_passed": false,
+      "deployable_common_setting": false,
+      "ann_policy_candidate": false
+    }
+  },
+  "cohorts": {
+    "750000": {
+      "run_count": 30,
+      "exact_median_ms": 74.17722900000001,
+      "exact_p95_ms": 80.38135989999999,
+      "exact_max_ms": 82.678083,
+      "ann_median_ms": 26.478229499999998,
+      "ann_p95_ms": 95.02518749999996,
+      "ann_max_ms": 163.108167,
+      "ann_to_exact_p95_ratio": 1.1821793960467688,
+      "ann_exceeds_cohort_exact_p95_count": 3,
+      "ann_slower_than_paired_exact_count": 3
+    },
+    "1000000": {
+      "run_count": 30,
+      "exact_median_ms": 116.3715,
+      "exact_p95_ms": 131.02766279999997,
+      "exact_max_ms": 161.829833,
+      "ann_median_ms": 22.7958335,
+      "ann_p95_ms": 28.127377449999987,
+      "ann_max_ms": 36.808541,
+      "ann_to_exact_p95_ratio": 0.21466747440144365,
+      "ann_exceeds_cohort_exact_p95_count": 0,
+      "ann_slower_than_paired_exact_count": 0
+    }
+  },
+  "claim_boundary": {
+    "db_cold_definition": "Existing runner PostgreSQL restart procedure; OS/disk cache clearing is not claimed.",
+    "cause_of_slow_runs": "Not identifiable from these stored measurements alone.",
+    "general_service_tail_latency_established": false,
+    "existing_full_membership_and_fallback_conclusions_changed": false
+  }
+}
