@@ -1,0 +1,20 @@
+{
+  "architecture": "linux/arm64",
+  "baseline_restore_verified": true,
+  "contract_sha": "0ec2cef0290f4659ad21ccc1dd2a20df2801ff50",
+  "ddl_sha256": "bad4948fe47485e7508a3cd389e9db84fdda3edfed4a1f4883b03554bcb38691",
+  "files": {
+    "expected.json": "0fb6c279a84c65e585cc17edaa0103288f952a7061cb5c4d4de0711814f6c2f9",
+    "rows.json": "e5442c03965dcca14f29df3e108e9e2e1036541e4f96e4cef4c2952071b27350"
+  },
+  "generated_at": "2026-09-19T06:17:45.993122+00:00",
+  "lock_sha256": "150c68697cc7eb2ec9df230ec705976a454c6d96b4cf366ec6ff100e778d82af",
+  "postgres_image": "pgvector/pgvector:0.8.0-pg16@sha256:a132765ec351c65111b5b675928a3a0515a466a40f97277329db8b8209ad8bc9",
+  "procedure": "Immutable git archive; synthetic seed; actual POST /runs; commit; export before/after images; fresh DDL restore using valid lifecycle SQL transitions; same baseline API reuse.",
+  "procedure_sha256": "0b848286e7a52a16f694214b62c8c2fc464f6ad9548500c644ead3f83034cc9c",
+  "producer_sha": "e1de8b29b902b54df3a58f21f1daa27c1171fe80",
+  "python_image": "python:3.12-slim@sha256:b699c2a51f4f834fa1a5f7f7cba0356e71d82fae37d4628223b11d93b71e9ebe",
+  "runner_image": "sha256:3986d52f880eb0887a67ec73b407166531ef9fc7328af64149255c9dd432406d",
+  "seed_sha256": "468b8ebf7962d70f7ca7667d9e679a6b50db3f4d2821574248aa8b1ae1e8679a",
+  "synthetic_only": true
+}

@@ -1,0 +1,14 @@
+{
+  "RCG-01": ["test_create_commits_exact_scope"],
+  "RCG-02": ["test_retry_reuses_committed_run"],
+  "RCG-03": ["test_scope_order_and_duplicates"],
+  "RCG-04": ["test_disjoint_scopes_are_distinct"],
+  "RCG-05": ["test_rejects_invalid_source_without_writes[missing-analysis]", "test_rejects_invalid_source_without_writes[missing-generation]", "test_rejects_invalid_source_without_writes[missing-segments]", "test_rejects_invalid_source_without_writes[wrong-analysis-generation]", "test_rejects_invalid_source_without_writes[outside]", "test_rejects_invalid_source_without_writes[empty]", "test_rejects_invalid_source_without_writes[blank]", "test_rejects_invalid_source_without_writes[fallback]"],
+  "RCG-06": ["test_failure_after_real_writes_rolls_back[experiment-insert]", "test_failure_after_real_writes_rolls_back[target-binding]"],
+  "RCG-07": ["test_deferred_binding_failure_rolls_back"],
+  "RCG-08": ["test_baseline_rows_are_reused"],
+  "RCG-09": ["test_overlapping_target_binding_is_rejected"],
+  "RCG-10": ["test_concurrent_requests_preserve_atomic_scope[commit]"],
+  "RCG-11": ["test_concurrent_requests_preserve_atomic_scope[rollback]"],
+  "RCG-12": ["test_concurrent_requests_preserve_atomic_scope[overlap]", "test_concurrent_requests_preserve_atomic_scope[overlap-reverse]"]
+}

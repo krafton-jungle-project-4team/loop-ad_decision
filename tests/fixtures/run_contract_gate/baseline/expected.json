@@ -1,0 +1,72 @@
+{
+  "request": {
+    "analysis_id": "rcg_synthetic_analysis",
+    "generation_id": "rcg_synthetic_generation",
+    "loop_count": 1,
+    "segment_ids": [
+      "rcg_segment_a",
+      "rcg_segment_b"
+    ]
+  },
+  "response": {
+    "ad_experiments": [
+      {
+        "ad_experiment_id": "adexp_prun_rcg_synthetic_promotion_loop_1_b4431a0faba17de3eac61ddf_286f2e687151_rcg_segment_922e3880",
+        "channel": "onsite_banner",
+        "content_id": "rcg_segment_a_content",
+        "content_option_id": "rcg_segment_a_option",
+        "is_fallback": false,
+        "loop_count": 1,
+        "segment_id": "rcg_segment_a",
+        "segment_name": "Synthetic rcg_segment_a",
+        "status": "planned"
+      },
+      {
+        "ad_experiment_id": "adexp_prun_rcg_synthetic_promotion_loop_1_b4431a0faba17de3eac61ddf_286f2e687151_rcg_segment_47a8ee7c",
+        "channel": "onsite_banner",
+        "content_id": "rcg_segment_b_content",
+        "content_option_id": "rcg_segment_b_option",
+        "is_fallback": false,
+        "loop_count": 1,
+        "segment_id": "rcg_segment_b",
+        "segment_name": "Synthetic rcg_segment_b",
+        "status": "planned"
+      }
+    ],
+    "analysis_id": "rcg_synthetic_analysis",
+    "campaign_id": "rcg_synthetic_campaign",
+    "generation_id": "rcg_synthetic_generation",
+    "goal_snapshot_json": {
+      "analysis_id": "rcg_synthetic_analysis",
+      "channel": "onsite_banner",
+      "generation_id": "rcg_synthetic_generation",
+      "goal_basis": "all_segments",
+      "goal_metric": "booking_conversion_rate",
+      "goal_target_value": "0.100000",
+      "loop_count": 1,
+      "max_loop_count": 3,
+      "min_sample_size": 1,
+      "outcome_spec": {
+        "outcome_definition_version": "booking-outcome.v1",
+        "outcome_event_name": "booking_complete",
+        "outcome_filter": {
+          "destination_ids": []
+        },
+        "outcome_metric": "booking_conversion_rate",
+        "uplift_training_eligible": true
+      },
+      "outcome_spec_hash": "02d72a181ba9e6c82a0a905444116440f3d7aa4b5b6cfcf27a9d0fc205df711d",
+      "promotion_id": "rcg_synthetic_promotion",
+      "source": "promotions"
+    },
+    "loop_count": 1,
+    "project_id": "rcg_synthetic_project",
+    "promotion_id": "rcg_synthetic_promotion",
+    "promotion_run_id": "prun_rcg_synthetic_promotion_loop_1_b4431a0faba17de3eac61ddf_286f2e687151",
+    "segment_ids": [
+      "rcg_segment_a",
+      "rcg_segment_b"
+    ],
+    "status": "planned"
+  }
+}
