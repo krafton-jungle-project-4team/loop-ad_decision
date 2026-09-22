@@ -280,6 +280,77 @@ def test_run_api_accepts_explicit_scope_without_runtime_gate(
     assert connection.close_count == 1
 
 
+def test_run_api_commits_before_sending_success_response(monkeypatch) -> None:
+    connection = RecordingConnection()
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    response_starts: list[tuple[int, int, int]] = []
+
+    async def observe_response(scope, receive, send):
+        async def record_send(message):
+            if message["type"] == "http.response.start":
+                response_starts.append(
+                    (
+                        message["status"],
+                        connection.commit_count,
+                        connection.close_count,
+                    )
+                )
+            await send(message)
+
+        await app(scope, receive, record_send)
+
+    with TestClient(observe_response) as client:
+        response = client.post(
+            "/decision/v1/promotions/promo_banner_001/runs",
+            json={},
+        )
+
+    assert response.status_code == 200
+    assert response_starts == [(200, 1, 1)]
+    assert connection.rollback_count == 0
+
+
+@pytest.mark.parametrize(
+    "commit_error",
+    [
+        errors.CheckViolation("synthetic deferred binding failure"),
+        errors.SerializationFailure("synthetic commit serialization failure"),
+    ],
+    ids=["deferred-constraint", "serialization-failure"],
+)
+def test_run_api_returns_error_when_commit_fails(monkeypatch, commit_error) -> None:
+    connection = RecordingConnection()
+
+    def fail_commit() -> None:
+        connection.commit_count += 1
+        raise commit_error
+
+    monkeypatch.setattr(connection, "commit", fail_commit)
+    monkeypatch.setattr(
+        "app.decision.router.create_postgres_connection",
+        lambda _settings: connection,
+    )
+    app = create_app(settings=load_settings(valid_env()))
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.post(
+            "/decision/v1/promotions/promo_banner_001/runs",
+            json={},
+        )
+
+    assert response.status_code == 500
+    assert response.text == "Internal Server Error"
+    assert connection.commit_count == 1
+    assert connection.rollback_count == 1
+    assert connection.close_count == 1
+    executed_sql = [compact_sql(query) for query, _params in connection.executed]
+    assert any("insert into promotion_runs" in query for query in executed_sql)
+    assert any("insert into ad_experiments" in query for query in executed_sql)
+
+
 def test_run_api_rolls_back_when_service_validation_fails(monkeypatch) -> None:
     connections: list[RecordingConnection] = []
 

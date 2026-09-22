@@ -458,7 +458,11 @@ def get_next_loop_service(request: Request) -> Iterator[NextLoopService]:
 async def create_promotion_run(
     promotion_id: str,
     request: Request,
-    promotion_run_service: PromotionRunService = Depends(get_promotion_run_service),
+    # Commit (including deferred constraints) must finish before sending HTTP 200.
+    promotion_run_service: PromotionRunService = Depends(
+        get_promotion_run_service,
+        scope="function",
+    ),
 ) -> RunCreateResponse:
     run_request = await _parse_run_create_request(request)
     try:

@@ -182,6 +182,7 @@ def test_hard_match_population_is_frozen_by_vector_revision_cutoff() -> None:
     )
     assert "FROM user_behavior_vector_revisions" in sql
     assert "ingested_at <=" in sql
+    assert "parseDateTime64BestEffort(" in sql
     assert "vector_version = {vector_version:String}" in sql
     assert "received_at <=" in sql
     assert "raw_event_received_cutoff" in sql
@@ -195,6 +196,49 @@ def test_hard_match_population_is_frozen_by_vector_revision_cutoff() -> None:
         in normalized_sql
     )
     assert "parseDateTimeBestEffort({source_revision_cutoff:String})" not in sql
+
+
+def test_predicate_chunk_size_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="predicate_chunk_size must be positive"):
+        PgClickHouseAudienceVectorSearchRepository(
+            postgres=_UnusedRepository(),
+            clickhouse=_UnusedRepository(),
+            predicate_chunk_size=0,
+        )
+
+
+@pytest.mark.parametrize("chunk_size", [1, 2, 10_000])
+def test_cohort_hard_match_count_is_invariant_to_chunk_size(chunk_size: int) -> None:
+    calls: list[list[str]] = []
+    cutoff = "2026-07-01T00:00:00Z"
+
+    class GenerationDb:
+        def fetchone(self, query, params):
+            assert params == ("project", "v2", cutoff, "generation")
+            return {"window_start": "2026-06-01T00:00:00Z",
+                    "source_revision_cutoff": cutoff}
+
+    class PredicateDb:
+        def query(self, query, *, parameters):
+            ids = parameters["user_ids"]
+            calls.append(ids)
+            assert parameters["project_id"] == "project"
+            assert parameters["raw_event_received_cutoff"] == cutoff
+            return _RawExactQueryResult([uid for uid in ids if uid in {"u0", "u2", "u4"}])
+
+    repository = PgClickHouseAudienceVectorSearchRepository(
+        postgres=GenerationDb(), clickhouse=PredicateDb(),
+        predicate_chunk_size=chunk_size,
+    )
+    cohort = ["u0", "u1", "u2", "u3", "u4"]
+    result = repository.count_hard_matches_for_user_ids(
+        project_id="project", vector_generation_id="generation", vector_version="v2",
+        source_cutoff=cutoff, hard_predicate_keys=("hotel_product_interest",),
+        predicate_parameters={}, user_ids=cohort,
+    )
+    assert result == 3
+    assert [uid for batch in calls for uid in batch] == cohort
+    assert all(len(batch) <= chunk_size for batch in calls)
 
 
 def test_hard_match_rate_sample_uses_stable_salted_order() -> None:

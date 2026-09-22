@@ -1,0 +1,121 @@
+name: Run Contract Gate
+
+on:
+  pull_request:
+    branches: [integration/run-contract-gate, dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fixed-required:
+    name: Fixed contract (required)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    env:
+      RCG_DIRECTORY: run-contract-gate-${{ github.run_id }}-${{ github.run_attempt }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Record CI provenance
+        env:
+          CI_EVENT: ${{ github.event_name }}
+          CI_REF: ${{ github.ref }}
+          CI_SHA: ${{ github.sha }}
+          CI_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          CI_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          CI_HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          CI_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          context = {key: os.environ.get(key, "") for key in (
+              "CI_EVENT", "CI_REF", "CI_SHA", "CI_BASE_REF", "CI_BASE_SHA",
+              "CI_HEAD_REF", "CI_HEAD_SHA", "GITHUB_REPOSITORY",
+              "GITHUB_RUN_ID", "GITHUB_RUN_ATTEMPT", "GITHUB_WORKFLOW_REF",
+          )}
+          context["checkout_sha"] = subprocess.check_output(
+              ["git", "rev-parse", "HEAD"], text=True
+          ).strip()
+          # Keep metadata outside the new directory created by the Gate itself.
+          (Path(os.environ["RUNNER_TEMP"]) / "run-contract-gate-ci.json").write_text(
+              json.dumps(context, indent=2) + "\n"
+          )
+          PY
+
+      - name: Run fixed and latest Gate
+        env:
+          RCG_OUTPUT: ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}
+        run: |
+          set +e
+          ./scripts/run-contract-gate.sh "$RCG_OUTPUT"
+          gate_exit=$?
+          set -e
+          printf '%s\n' "$gate_exit" > "$RUNNER_TEMP/run-contract-gate-exit.txt"
+          exit "$gate_exit"
+
+      - name: Latest contract (warning only)
+        if: ${{ always() }}
+        env:
+          RCG_OUTPUT: ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = Path(os.environ["RCG_OUTPUT"]) / "result.json"
+          if not result.is_file():
+              print("::warning title=Latest contract::No Gate result; latest was not verified.")
+          else:
+              status = json.loads(result.read_text()).get("latest_status")
+              if status == "PASS":
+                  print("Latest contract: PASS (warning-only lane).")
+              elif status == "WARN_DRIFT":
+                  print("::warning title=Latest contract::WARN_DRIFT; inspect the latest artifact. Fixed verdict is unchanged.")
+              else:
+                  print("::warning title=Latest contract::WARN_UNVERIFIED; inspect the Gate result and latest artifact. Fixed verdict is unchanged.")
+          PY
+
+      - name: Preserve required results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: run-contract-gate-required-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/run-contract-gate-ci.json
+            ${{ runner.temp }}/run-contract-gate-exit.txt
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/result.json
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/inputs.json
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/*.json
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/junit.xml
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/responses/
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/fixed/consumer/
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/controls/*.json
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/controls/junit.xml
+
+      - name: Preserve latest warning results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: run-contract-gate-latest-warning-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/*.json
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/junit.xml
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/responses/
+            ${{ runner.temp }}/${{ env.RCG_DIRECTORY }}/latest/consumer/
