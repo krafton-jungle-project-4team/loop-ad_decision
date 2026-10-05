@@ -589,7 +589,7 @@ def _parse_custom_structured_spec(
             segment_id,
             "custom structured predicates do not match the template version",
         )
-    query_signal_keys = _custom_query_signal_keys(custom_conditions)
+    query_signal_keys = custom_query_signal_keys(custom_conditions)
     raw_query_signal_keys = _required_text_tuple(
         raw_spec,
         "query_signal_keys",
@@ -858,7 +858,7 @@ def _canonical_property_filter_values(value: str) -> tuple[str, ...]:
     return tuple(sorted(values))
 
 
-def _custom_query_signal_keys(
+def custom_query_signal_keys(
     conditions: Sequence[Mapping[str, Any]],
 ) -> tuple[str, ...]:
     event_signals = {

@@ -160,6 +160,9 @@ def test_beam_display_uses_only_compiled_execution_conditions() -> None:
     ]
     assert "할인" not in compiled.display_model["signal_chips"]
     assert "조기 예약" not in compiled.display_model["signal_chips"]
+    assert compiled.segment_audience_spec["query_signal_keys"] == [
+        "hotel_search_intensity"
+    ]
 
 
 def test_beam_display_keeps_title_compact_with_four_execution_conditions() -> None:
@@ -222,3 +225,9 @@ def test_beam_display_keeps_title_compact_with_four_execution_conditions() -> No
         "호텔 상세 조회",
     ]
     assert compiled.display_model["title"] == "제주·오키나와 예약 이탈 고객"
+    assert compiled.segment_audience_spec["query_signal_keys"] == [
+        "booking_start_intensity",
+        "booking_start_without_complete",
+        "hotel_detail_view_intensity",
+        "hotel_search_intensity",
+    ]

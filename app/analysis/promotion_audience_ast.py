@@ -25,6 +25,7 @@ from app.audience_contract import (
     SEGMENT_AUDIENCE_CONTRACT,
     SEGMENT_AUDIENCE_SCHEMA_VERSION,
     SegmentDefinitionAudienceAdapter,
+    custom_query_signal_keys,
 )
 from app.analysis.behavior_manifest import destination_alias_groups
 from app.analysis.segment_audience_templates import (
@@ -342,7 +343,7 @@ def _custom_structured_spec(ast: PromotionAudienceAst) -> Mapping[str, Any]:
         "candidate_type": CUSTOM_STRUCTURED_CANDIDATE_TYPE,
         "condition_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
         "query_signal_keys": list(
-            _custom_structured_query_signal_keys(execution_conditions)
+            custom_query_signal_keys(execution_conditions)
         ),
         "hard_predicate_keys": [CUSTOM_STRUCTURED_CONDITION_KEY],
         "parameters": {
@@ -703,42 +704,6 @@ def _execution_condition_label(condition: Mapping[str, Any]) -> str:
     if filter_labels and (destination or months):
         parts.append("·".join(filter_labels))
     return " ".join(parts)[:120]
-
-
-def _custom_structured_query_signal_keys(
-    conditions: Sequence[Mapping[str, Any]],
-) -> tuple[str, ...]:
-    event_signals = {
-        "hotel_search": "hotel_search_intensity",
-        "hotel_click": "hotel_click_intensity",
-        "hotel_detail_view": "hotel_detail_view_intensity",
-        "promotion_impression": "promotion_impression_intensity",
-        "promotion_click": "promotion_click_intensity",
-        "campaign_redirect_click": "campaign_redirect_intensity",
-        "campaign_landing": "campaign_landing_intensity",
-        "booking_start": "booking_start_intensity",
-    }
-    signals = {
-        event_signals[str(condition["event_name"])]
-        for condition in conditions
-        if int(condition["minimum_count"]) > 0
-        and str(condition["event_name"]) in event_signals
-    }
-    has_booking_start = any(
-        condition["event_name"] == "booking_start"
-        and int(condition["minimum_count"]) > 0
-        for condition in conditions
-    )
-    has_no_booking_complete = any(
-        condition["event_name"] == "booking_complete"
-        and condition.get("maximum_count") == 0
-        for condition in conditions
-    )
-    if has_booking_start and has_no_booking_complete:
-        signals.add("booking_start_without_complete")
-    if not signals:
-        signals.add("hotel_consideration_intensity")
-    return tuple(sorted(signals))
 
 
 def _executable_condition_keys(
