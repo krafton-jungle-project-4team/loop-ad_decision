@@ -94,6 +94,7 @@ from app.audience_contract import (
     SegmentAudienceContractError,
     SegmentDefinitionAudienceAdapter,
     contract_score_threshold,
+    custom_query_signal_keys,
     custom_structured_template_hash,
 )
 from app.audience_exclusions import PromotionAudienceExclusionContext
@@ -269,6 +270,74 @@ def test_three_same_scope_predicates_share_one_batch_aggregate() -> None:
     assert "parseDateTimeBestEffort(\n                            {source_revision_cutoff:String}" not in query
     assert all(f"AS match_{index}" in query for index in range(3))
     assert len(parameters) == 9
+
+
+@pytest.mark.parametrize(
+    ("event_name", "signal"),
+    [
+        ("hotel_search", "hotel_search_intensity"),
+        ("hotel_click", "hotel_click_intensity"),
+        ("hotel_detail_view", "hotel_detail_view_intensity"),
+        ("promotion_impression", "promotion_impression_intensity"),
+        ("promotion_click", "promotion_click_intensity"),
+        ("campaign_redirect_click", "campaign_redirect_intensity"),
+        ("campaign_landing", "campaign_landing_intensity"),
+        ("booking_start", "booking_start_intensity"),
+        ("page_view", "hotel_consideration_intensity"),
+        ("booking_complete", "hotel_consideration_intensity"),
+    ],
+)
+@pytest.mark.parametrize("minimum_count", [0, 1, "2"])
+def test_custom_query_signal_keys_event_mapping_and_minimum_count(
+    event_name: str, signal: str, minimum_count: int | str
+) -> None:
+    assert custom_query_signal_keys(
+        [{"event_name": event_name, "minimum_count": minimum_count}]
+    ) == (signal if int(minimum_count) > 0 else "hotel_consideration_intensity",)
+
+
+@pytest.mark.parametrize("minimum_count", [0, 1])
+@pytest.mark.parametrize(
+    "completion_limit",
+    [{}, {"maximum_count": None}, {"maximum_count": 0},
+     {"maximum_count": 1}, {"maximum_count": "0"}],
+)
+def test_custom_query_signal_keys_booking_recovery_requires_start_and_zero_complete(
+    minimum_count: int, completion_limit: Mapping[str, object]
+) -> None:
+    signals = custom_query_signal_keys(
+        [
+            {"event_name": "booking_start", "minimum_count": minimum_count},
+            {
+                "event_name": "booking_complete",
+                "minimum_count": 0,
+                **completion_limit,
+            },
+        ]
+    )
+    expected = (
+        ("booking_start_intensity",)
+        if minimum_count
+        else ("hotel_consideration_intensity",)
+    )
+    if minimum_count and completion_limit.get("maximum_count") == 0:
+        expected += ("booking_start_without_complete",)
+    assert signals == expected
+
+
+def test_custom_query_signal_keys_default_and_sorted_unique_tuple() -> None:
+    assert custom_query_signal_keys([]) == ("hotel_consideration_intensity",)
+    conditions = [
+        {"event_name": "promotion_click", "minimum_count": 1},
+        {"event_name": "hotel_search", "minimum_count": 2},
+        {"event_name": "promotion_click", "minimum_count": 3},
+    ]
+    original = [dict(condition) for condition in conditions]
+    assert custom_query_signal_keys(conditions) == (
+        "hotel_search_intensity",
+        "promotion_click_intensity",
+    )
+    assert conditions == original
 
 
 def test_custom_structured_segment_compiles_exact_conditions_without_semantic_filter() -> None:
